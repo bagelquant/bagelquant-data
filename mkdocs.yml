@@ -1,0 +1,12 @@
+site_name: BagelQuant Data
+site_description: Unified data layer for the BagelQuant ecosystem
+theme:
+  name: mkdocs
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Concepts: concepts.md
+  - Contracts: contracts.md
+  - Panel Agreements: panel-agreements.md
+  - Providers:
+      - Tushare: providers/tushare.md
