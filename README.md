@@ -30,6 +30,13 @@ Install Tushare support:
 uv sync --extra tushare
 ```
 
+Install the local data lake GUI:
+
+```bash
+uv sync --extra gui --extra tushare
+uv run streamlit run src/bagelquant_data/gui/app.py
+```
+
 ## Quick Start
 
 ```python
@@ -165,6 +172,25 @@ manager.universe("tushare", "banks")
 Provider updates always refresh `All`; universe subsets are for user retrieval
 and filtering.
 
+## Streamlit GUI
+
+The V1 GUI manages the local lake from a Streamlit app:
+
+```bash
+uv run streamlit run src/bagelquant_data/gui/app.py
+```
+
+It stores non-secret settings in `.bagelquant-data-gui.yaml` by default:
+
+- lake root
+- configured sources and tables
+- user-defined universes
+- periodic update jobs
+
+Tushare tokens are read only from `TUSHARE_TOKEN` or Streamlit secrets. The GUI
+does not persist tokens. Periodic jobs are configured in YAML and run only when
+the user clicks "Run due jobs" in V1.
+
 ## Tushare Updates
 
 Tushare `All` is built from `stock_basic`, including listed and off-market
@@ -184,10 +210,11 @@ Defaults:
 ## Development
 
 ```bash
-uv sync --all-groups --extra tushare
+uv sync --all-groups --extra tushare --extra gui
 uv run ruff check .
 uv run pyright
 uv run pytest
+uv run mkdocs build --strict
 ```
 
 ## License

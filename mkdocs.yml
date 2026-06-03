@@ -8,5 +8,6 @@ nav:
   - Concepts: concepts.md
   - Contracts: contracts.md
   - Panel Agreements: panel-agreements.md
+  - Streamlit GUI: gui.md
   - Providers:
       - Tushare: providers/tushare.md
