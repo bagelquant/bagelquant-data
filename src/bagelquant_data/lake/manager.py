@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
 import pandas as pd
@@ -15,46 +14,8 @@ from bagelquant_data.datasource.registry import DataSourceRegistry
 from bagelquant_data.lake.local import LocalDataLake, WriteMode
 from bagelquant_data.lake.snapshot import SnapshotRef
 
-ScheduleUnit = Literal["minutes", "hours", "days"]
 ParallelMode = Literal["thread"]
-TushareTableKind = Literal["price", "fundamental", "fundamental_vip"]
-
-
-@dataclass(frozen=True, slots=True)
-class UpdateSchedule:
-    """Simple periodic update schedule."""
-
-    every: int
-    unit: ScheduleUnit = "days"
-
-    def interval(self) -> timedelta:
-        """Return schedule interval."""
-
-        if self.unit == "minutes":
-            return timedelta(minutes=self.every)
-        if self.unit == "hours":
-            return timedelta(hours=self.every)
-        return timedelta(days=self.every)
-
-
-@dataclass(slots=True)
-class UpdateJob:
-    """A repeatable provider-to-lake update job."""
-
-    source_name: str
-    request: DataRequest
-    schedule: UpdateSchedule
-    mode: WriteMode = "overwrite"
-    last_run_at: datetime | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def due(self, now: datetime | None = None) -> bool:
-        """Return whether the job should run."""
-
-        current = now or datetime.now(UTC)
-        if self.last_run_at is None:
-            return True
-        return current - self.last_run_at >= self.schedule.interval()
+TushareTableKind = Literal["general", "price", "fundamental", "fundamental_vip"]
 
 
 class DataLakeManager:
@@ -68,7 +29,6 @@ class DataLakeManager:
     ) -> None:
         self.lake = lake
         self.registry = registry or DataSourceRegistry()
-        self._jobs: dict[str, UpdateJob] = {}
 
     def add(
         self,
@@ -125,21 +85,6 @@ class DataLakeManager:
 
         return self.lake.snapshots(source, dataset)
 
-    def define_universe(
-        self,
-        source: str,
-        name: str,
-        asset_ids: list[str],
-    ) -> SnapshotRef:
-        """Define a source universe as a subset of All."""
-
-        return self.lake.define_universe(source, name, asset_ids)
-
-    def universe(self, source: str, name: str = "All") -> tuple[str, ...]:
-        """Return a source universe."""
-
-        return self.lake.universe(source, name)
-
     def update(
         self,
         source: str | DataSource,
@@ -170,9 +115,14 @@ class DataLakeManager:
         if resolved_start > resolved_end:
             raise ValueError("start_date must not be after end_date")
 
-        stock_basic = source.read(DataRequest(dataset="stock_basic"))
-        self.lake.write("tushare", "stock_basic", stock_basic, mode="overwrite")
-        all_codes = [str(code) for code in stock_basic["ts_code"].dropna().tolist()]
+        stock_basic = self.update_tushare_stock_basic()
+        stock_basic_data = self.lake.read("tushare", "stock_basic")
+        all_codes = [
+            str(code) for code in stock_basic_data["ts_code"].dropna().tolist()
+        ]
+
+        if kind == "general" or table == "stock_basic":
+            return (stock_basic,)
 
         table_kind = (
             kind
@@ -212,51 +162,30 @@ class DataLakeManager:
             parallel=parallel,
         )
 
-    def register_job(self, name: str, job: UpdateJob, *, replace: bool = False) -> None:
-        """Register a periodic update job."""
+    def update_tushare_stock_basic(self) -> SnapshotRef:
+        """Refresh the full Tushare stock universe table."""
 
-        if name in self._jobs and not replace:
-            raise ValueError(f"Update job already registered: {name}")
-        self._jobs[name] = job
-
-    def periodic_update(
-        self,
-        name: str,
-        *,
-        source_name: str,
-        request: DataRequest,
-        schedule: UpdateSchedule,
-        mode: WriteMode = "overwrite",
-        replace: bool = False,
-    ) -> UpdateJob:
-        """Configure a periodic provider-to-lake update job."""
-
-        job = UpdateJob(
-            source_name=source_name,
-            request=request,
-            schedule=schedule,
-            mode=mode,
+        source = self.registry.resolve("tushare")
+        frames = [
+            source.read(
+                DataRequest(dataset="stock_basic", filters={"list_status": status})
+            )
+            for status in ("L", "D", "P")
+        ]
+        non_empty = [frame for frame in frames if not frame.empty]
+        stock_basic = (
+            pd.concat(non_empty, axis=0, ignore_index=True)
+            if non_empty
+            else pd.DataFrame()
         )
-        self.register_job(name, job, replace=replace)
-        return job
-
-    def jobs(self) -> Mapping[str, UpdateJob]:
-        """Return registered jobs."""
-
-        return dict(self._jobs)
-
-    def run_due(self, now: datetime | None = None) -> tuple[SnapshotRef, ...]:
-        """Run due jobs once and return created snapshots."""
-
-        current = now or datetime.now(UTC)
-        snapshots = []
-        for job in self._jobs.values():
-            if job.due(current):
-                snapshots.append(
-                    self.update(job.source_name, job.request, mode=job.mode)
-                )
-                job.last_run_at = current
-        return tuple(snapshots)
+        if "ts_code" in stock_basic.columns:
+            stock_basic = stock_basic.drop_duplicates("ts_code").sort_values("ts_code")
+        return self.lake.write(
+            "tushare",
+            "stock_basic",
+            stock_basic.reset_index(drop=True),
+            mode="overwrite",
+        )
 
     def _update_tushare_price_table(
         self,

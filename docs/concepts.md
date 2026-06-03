@@ -12,11 +12,12 @@ provider for bootstrap or explicit refresh.
 
 ## Data Lake Manager
 
-`DataLakeManager` owns add, edit, delete, list, provider update, and periodic
-job orchestration for the local lake.
+`DataLakeManager` owns add, edit, delete, list, and manual provider updates for
+the local lake.
 
-Provider updates refresh each source's `All` universe. User-defined universes
-are validated subsets of `All` and do not limit lake refreshes.
+Each source's first configured table is its universe-like reference table. For
+Tushare, this is `stock_basic`, refreshed from listed, delisted, and paused
+stocks to avoid survivorship bias.
 
 ## Transform
 

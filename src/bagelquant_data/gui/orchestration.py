@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 from typing import Any
 
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
-from bagelquant_data.gui.config import GuiConfig, PeriodicJobConfig, TableConfig
+from bagelquant_data.datasource.base import DataRequest
+from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
 from bagelquant_data.lake import DataLakeManager
 from bagelquant_data.lake.snapshot import SnapshotRef
 
@@ -46,6 +46,19 @@ def token_from_environment(streamlit_secrets: Any | None = None) -> str | None:
     return str(value) if value else None
 
 
+def token_from_config(
+    config: GuiConfig,
+    *,
+    streamlit_secrets: Any | None = None,
+) -> str | None:
+    """Resolve a GUI token source, preferring persisted config."""
+
+    for source in config.sources:
+        if source.provider == "tushare" and source.token:
+            return source.token
+    return token_from_environment(streamlit_secrets)
+
+
 def build_registry(*, tushare_token: str | None = None) -> DataSourceRegistry:
     """Build a registry for configured GUI providers."""
 
@@ -58,49 +71,77 @@ def build_registry(*, tushare_token: str | None = None) -> DataSourceRegistry:
 def run_table_update(
     manager: DataLakeManager,
     table: TableConfig,
+    *,
+    start_date: str = "2000-01-01",
+    end_date: str | None = None,
+    workers: int = 4,
 ) -> tuple[SnapshotRef, ...]:
     """Run the configured provider update for a table."""
 
     if table.source != "tushare":
         raise ValueError(f"Unsupported GUI update source: {table.source}")
+    if table.kind == "general":
+        if table.name == "stock_basic":
+            return (manager.update_tushare_stock_basic(),)
+        return (
+            manager.update(
+                "tushare",
+                DataRequest(dataset=table.name),
+                mode=table.update_mode,
+            ),
+        )
     return manager.update_tushare_all(
         table.name,
         kind=table.kind,
-        start_date=table.start_date,
-        end_date=table.end_date,
-        workers=table.workers,
+        start_date=start_date,
+        end_date=end_date,
+        workers=workers,
     )
 
 
-def run_due_jobs(
+def enabled_update_tables(config: GuiConfig) -> tuple[TableConfig, ...]:
+    """Return enabled tables in source order, with each first table first."""
+
+    tables: list[TableConfig] = []
+    for source in config.sources:
+        if not source.enabled:
+            continue
+        source_tables = tuple(table for table in source.tables if table.enabled)
+        if source.provider == "tushare" and not any(
+            table.name == "stock_basic" for table in source_tables
+        ):
+            tables.append(
+                TableConfig(source=source.name, name="stock_basic", kind="general")
+            )
+        tables.extend(source_tables)
+    return tuple(tables)
+
+
+def run_all_table_updates(
     manager: DataLakeManager,
     config: GuiConfig,
-    *,
-    now: datetime | None = None,
 ) -> tuple[SnapshotRef, ...]:
-    """Run configured jobs that are due and update their timestamps."""
+    """Run all enabled configured table updates manually."""
 
-    current = now or datetime.now(UTC)
     snapshots: list[SnapshotRef] = []
-    for job in config.periodic_jobs:
-        if job.due(current):
-            snapshots.extend(run_periodic_job(manager, job))
-            job.last_run_at = current.isoformat()
+    for table in enabled_update_tables(config):
+        snapshots.extend(
+            run_table_update(
+                manager,
+                table,
+                start_date=config.update_start_date,
+                end_date=None,
+                workers=config.update_workers,
+            )
+        )
     return tuple(snapshots)
 
 
-def run_periodic_job(
-    manager: DataLakeManager,
-    job: PeriodicJobConfig,
-) -> tuple[SnapshotRef, ...]:
-    """Run one configured periodic job."""
+def default_tushare_source() -> SourceConfig:
+    """Return the default Tushare GUI source."""
 
-    table = TableConfig(
-        source=job.source,
-        name=job.table,
-        kind=job.kind,
-        start_date=job.start_date,
-        end_date=job.end_date,
-        workers=job.workers,
+    return SourceConfig(
+        name="tushare",
+        provider="tushare",
+        tables=[TableConfig(source="tushare", name="stock_basic", kind="general")],
     )
-    return run_table_update(manager, table)

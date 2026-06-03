@@ -39,12 +39,15 @@ year/month.
 
 ## All Universe
 
-The Tushare `All` universe is sourced from `stock_basic`. Asset ids are stored
-as `tushare_<ts_code>`, for example `tushare_000300.SH`.
+The Tushare `All` universe is sourced from `stock_basic`. Refreshes read list
+statuses `L`, `D`, and `P`, then de-duplicate by `ts_code`, so delisted and
+paused stocks remain available and survivorship bias is avoided. Asset ids are
+stored as `tushare_<ts_code>`, for example `tushare_000300.SH`.
 
 ## Update Strategy
 
-- `stock_basic` refreshes the All universe.
+- `stock_basic` refreshes the All universe from listed, delisted, and paused
+  stocks.
 - `daily` and `index_daily` are fetched day by day to avoid Tushare row limits.
 - Fundamental tables are fetched id by id using `ts_code`.
 - VIP fundamental tables such as `income_vip` are fetched by reporting season

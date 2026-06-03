@@ -146,31 +146,29 @@ manager.list_tables("tushare")
 lake.read("tushare", "daily", year=2024, month=1)
 ```
 
-Periodic updates are represented as jobs that an external scheduler, cron, app,
-or service can call:
+Run provider updates manually when you want a fresh snapshot:
 
 ```python
-job = manager.periodic_update(
-    "tushare-daily",
-    source_name="tushare",
-    request=DataRequest(dataset="daily", filters={"ts_code": "000001.SZ"}),
-    schedule=UpdateSchedule(every=1, unit="days"),
+manager.update_tushare_all(
+    "daily",
+    start_date="2000-01-01",
+    end_date="2024-12-31",
+    workers=4,
 )
-manager.run_due()
 ```
 
 ## Universes
 
-Each source has an `All` universe. User-defined universes must be subsets of
-`All`:
+Each source's first configured table is the source universe-like reference
+table. For Tushare, that table is `stock_basic`.
 
 ```python
-manager.define_universe("tushare", "banks", ["000001.SZ", "600000.SH"])
-manager.universe("tushare", "banks")
+manager.update_tushare_stock_basic()
+lake.asset_ids("tushare")
 ```
 
-Provider updates always refresh `All`; universe subsets are for user retrieval
-and filtering.
+Tushare `stock_basic` is refreshed from listed, delisted, and paused stocks to
+avoid survivorship bias.
 
 ## Streamlit GUI
 
@@ -180,32 +178,32 @@ The V1 GUI manages the local lake from a Streamlit app:
 uv run streamlit run src/bagelquant_data/gui/app.py
 ```
 
-It stores non-secret settings in `.bagelquant-data-gui.yaml` by default:
+It stores settings in `.bagelquant-data-gui.yaml` by default:
 
 - lake root
 - configured sources and tables
-- user-defined universes
-- periodic update jobs
+- shared update start date and worker count
+- Tushare token, when configured in the GUI
 
-Tushare tokens are read only from `TUSHARE_TOKEN` or Streamlit secrets. The GUI
-does not persist tokens. Periodic jobs are configured in YAML and run only when
-the user clicks "Run due jobs" in V1.
+Token resolution order in the GUI is configured source token, `TUSHARE_TOKEN`,
+then Streamlit secrets. Updates are manual: use **Data Sources** to configure
+tables from the local Tushare catalog and click **Update data lake**.
 
 ## Tushare Updates
 
-Tushare `All` is built from `stock_basic`, including listed and off-market
-stocks returned by the provider. Price-like tables such as `daily` and
-`index_daily` are fetched day by day to avoid provider row limits. Fundamental
-tables are fetched id by id through `ts_code` and use the existing local table
-to request only incremental changes after the latest `f_ann_date`. VIP
-fundamental tables such as `income_vip` are fetched by reporting season with
-`period`, so they do not loop through every stock.
+Tushare `All` is built from `stock_basic`, including listed (`L`), delisted
+(`D`), and paused (`P`) stocks returned by the provider. Price-like tables such
+as `daily` and `index_daily` are fetched day by day to avoid provider row
+limits. Fundamental tables are fetched id by id through `ts_code` and use the
+existing local table to request only incremental changes after the latest
+`f_ann_date`. VIP fundamental tables such as `income_vip` are fetched by
+reporting season with `period`, so they do not loop through every stock.
 
 Defaults:
 
 - `start_date="2000-01-01"`
 - `end_date=today`
-- threaded provider reads through `workers`
+- threaded provider reads through `workers`, defaulting to 8 in the GUI
 
 ## Development
 

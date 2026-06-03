@@ -158,38 +158,6 @@ class LocalDataLake:
 
         return self.write(source, dataset, data, mode="overwrite", metadata=metadata)
 
-    def define_universe(
-        self,
-        source: str,
-        name: str,
-        asset_ids: list[str],
-    ) -> SnapshotRef:
-        """Define a source universe as a subset of the source All universe."""
-
-        all_assets = set(self.asset_ids(source))
-        normalized = [_normalize_asset_id(source, asset_id) for asset_id in asset_ids]
-        missing = sorted(set(normalized).difference(all_assets))
-        if missing:
-            raise LakeError(f"Universe contains assets outside All: {missing}")
-        frame = pd.DataFrame(
-            {"universe": [name] * len(normalized), "asset_id": normalized}
-        )
-        return self.write(
-            source,
-            f"__universe_{name}",
-            frame,
-            mode="overwrite",
-            update_catalogs=False,
-        )
-
-    def universe(self, source: str, name: str = "All") -> tuple[str, ...]:
-        """Return universe asset ids."""
-
-        if name == "All":
-            return self.asset_ids(source)
-        data = self.read(source, f"__universe_{name}")
-        return tuple(str(asset_id) for asset_id in data["asset_id"].tolist())
-
     def asset_ids(self, source: str) -> tuple[str, ...]:
         """Return known source asset ids."""
 
@@ -521,7 +489,7 @@ class LocalDataLake:
         *,
         created_at: datetime,
     ) -> None:
-        ignored = {"create_time", "delete_flag"}
+        ignored = {"index", "create_time", "delete_flag"}
         existing = set(self.data_item_ids(source))
         discovered = {
             f"{source}_{dataset}_{column}"

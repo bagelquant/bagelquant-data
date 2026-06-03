@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+from bagelquant_data.gui import tushare_catalog
 from bagelquant_data.gui.codegen import (
     RetrievalSelection,
     lake_read_snippet,
@@ -17,31 +18,32 @@ from bagelquant_data.gui.codegen import (
 from bagelquant_data.gui.config import (
     DEFAULT_CONFIG_PATH,
     GuiConfig,
-    PeriodicJobConfig,
     SourceConfig,
     TableConfig,
-    UniverseConfig,
     load_config,
     save_config,
 )
 from bagelquant_data.gui.orchestration import (
     build_registry,
-    run_due_jobs,
-    run_table_update,
+    default_tushare_source,
+    run_all_table_updates,
     token_available,
-    token_from_environment,
+    token_from_config,
 )
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
-TABLE_KINDS = ("price", "fundamental", "fundamental_vip")
-SCHEDULE_UNITS = ("minutes", "hours", "days")
+TABLE_KINDS = ("general", "price", "fundamental", "fundamental_vip")
 
 
 def main() -> None:
     """Run the Streamlit GUI."""
 
-    st.set_page_config(page_title="BagelQuant Data Lake", layout="wide")
+    st.set_page_config(
+        page_title="BagelQuant Data Lake",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.title("BagelQuant Data Lake")
 
     config_path = Path(
@@ -50,12 +52,14 @@ def main() -> None:
     config = _session_config(config_path)
     config.lake_root = st.sidebar.text_input("Lake root", value=config.lake_root)
 
-    token = token_from_environment(st.secrets)
+    token = token_from_config(config, streamlit_secrets=st.secrets)
     token_state = (
-        "available" if token_available(streamlit_secrets=st.secrets) else "missing"
+        "available"
+        if token or token_available(streamlit_secrets=st.secrets)
+        else "missing"
     )
     st.sidebar.caption(f"Tushare token: {token_state}")
-    if st.sidebar.button("Save config", use_container_width=True):
+    if st.sidebar.button("Save config", width="stretch"):
         save_config(config, config_path)
         st.sidebar.success("Config saved")
 
@@ -63,15 +67,13 @@ def main() -> None:
     registry = build_registry(tushare_token=token)
     manager = DataLakeManager(lake, registry=registry)
 
-    tabs = st.tabs(["Lake Setup", "Data Sources", "Retrieve Data", "Update Data Lake"])
+    tabs = st.tabs(["Lake Setup", "Data Sources", "Retrieve Data"])
     with tabs[0]:
         _lake_setup(config, manager)
     with tabs[1]:
-        _data_sources(config)
+        _data_sources(config, manager, config_path, token is not None)
     with tabs[2]:
         _retrieve_data(config, lake)
-    with tabs[3]:
-        _update_data_lake(config, manager, config_path, token is not None)
 
 
 def _session_config(path: Path) -> GuiConfig:
@@ -88,16 +90,15 @@ def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
     st.subheader("Lake Contents")
     sources = manager.list_sources()
     tables = manager.list_tables()
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b = st.columns(2)
     col_a.metric("Sources", len(sources))
     col_b.metric("Tables", len(tables))
-    col_c.metric("Configured universes", len(config.universes))
 
     st.dataframe(
         pd.DataFrame(tables, columns=["source", "table"])
         if tables
         else pd.DataFrame(columns=["source", "table"]),
-        use_container_width=True,
+        width="stretch",
     )
 
     selected_source = st.selectbox(
@@ -127,7 +128,7 @@ def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
                     }
                     for item in snapshots
                 ),
-                use_container_width=True,
+                width="stretch",
                 height=180,
             )
             confirm_delete = st.checkbox(
@@ -137,151 +138,349 @@ def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
             if st.button(
                 "Delete local table",
                 disabled=not confirm_delete,
-                use_container_width=False,
+                width="content",
             ):
                 manager.delete(selected_source, selected_table)
                 st.success(f"Deleted {selected_source}/{selected_table}")
                 st.rerun()
-        st.caption("Asset ids")
-        st.dataframe(
-            pd.DataFrame({"asset_id": manager.lake.asset_ids(selected_source)}),
-            use_container_width=True,
-            height=180,
-        )
-        st.caption("Data item ids")
-        st.dataframe(
-            pd.DataFrame({"data_item_id": manager.lake.data_item_ids(selected_source)}),
-            use_container_width=True,
-            height=180,
-        )
-
-    st.subheader("Universes")
-    with st.form("add_universe"):
-        source = st.text_input("Universe source", value=selected_source or "tushare")
-        name = st.text_input("Universe name", value="my-universe")
-        raw_assets = st.text_area("Asset ids, one per line", value="")
-        submitted = st.form_submit_button("Save universe")
-    if submitted:
-        asset_ids = [line.strip() for line in raw_assets.splitlines() if line.strip()]
-        _upsert_universe(
-            config,
-            UniverseConfig(source=source, name=name, asset_ids=asset_ids),
-        )
-        if asset_ids:
-            manager.define_universe(source, name, asset_ids)
-        st.success(f"Saved universe {name}")
-
-    if config.universes:
-        st.dataframe(
-            pd.DataFrame(
-                {
-                    "source": item.source,
-                    "name": item.name,
-                    "assets": len(item.asset_ids),
-                }
-                for item in config.universes
-            ),
-            use_container_width=True,
-        )
-        delete_universe = st.selectbox(
-            "Delete configured universe",
-            options=[""] + [f"{item.source}/{item.name}" for item in config.universes],
-        )
-        if st.button("Delete universe config", disabled=not delete_universe):
-            source, name = delete_universe.split("/", maxsplit=1)
-            config.universes = [
-                item
-                for item in config.universes
-                if not (item.source == source and item.name == name)
-            ]
-            st.success(f"Deleted universe config {delete_universe}")
-            st.rerun()
+    st.subheader("Data Items")
+    data_items = _data_item_catalog(manager.lake, tables)
+    item_sources = (
+        sorted(data_items["source"].unique().tolist()) if not data_items.empty else []
+    )
+    item_source = st.selectbox(
+        "Data item source",
+        options=["All", *item_sources],
+        key="data-item-source",
+    )
+    filtered_items = data_items
+    if item_source != "All":
+        filtered_items = filtered_items.loc[filtered_items["source"] == item_source]
+    item_tables = (
+        sorted(filtered_items["table"].unique().tolist())
+        if not filtered_items.empty
+        else []
+    )
+    item_table = st.selectbox(
+        "Data item table",
+        options=["All", *item_tables],
+        key="data-item-table",
+    )
+    if item_table != "All":
+        filtered_items = filtered_items.loc[filtered_items["table"] == item_table]
+    st.dataframe(
+        filtered_items,
+        width="stretch",
+        height=260,
+    )
 
 
-def _data_sources(config: GuiConfig) -> None:
+def _data_sources(
+    config: GuiConfig,
+    manager: DataLakeManager,
+    config_path: Path,
+    provider_ready: bool,
+) -> None:
+    _ensure_tushare_stock_basic(config)
+    _sync_source_tokens_from_session(config)
+    st.subheader("Update Data Lake")
+    settings = st.columns([2, 1])
+    config.update_start_date = settings[0].text_input(
+        "Update start date",
+        value=config.update_start_date,
+        key="update-start-date",
+    )
+    config.update_workers = int(
+        settings[1].number_input(
+            "Workers",
+            min_value=1,
+            max_value=64,
+            value=config.update_workers,
+            key="update-workers",
+        )
+    )
+    current_token = token_from_config(config, streamlit_secrets=st.secrets)
+    provider_ready = provider_ready or current_token is not None
+    if not provider_ready:
+        st.warning("Configure a Tushare token before provider updates.")
+    if st.button(
+        "Update data lake",
+        disabled=not provider_ready,
+        width="content",
+    ):
+        update_manager = DataLakeManager(
+            manager.lake,
+            registry=build_registry(tushare_token=current_token),
+        )
+        with st.spinner("Updating enabled data source tables"):
+            snapshots = run_all_table_updates(update_manager, config)
+        save_config(config, config_path)
+        st.success(f"Created {len(snapshots)} snapshot partition set(s)")
+
     st.subheader("Configured Sources")
-    if st.button("Add Tushare", use_container_width=False):
-        if "tushare" not in config.source_names():
-            config.sources.append(SourceConfig(name="tushare", provider="tushare"))
-        st.success("Tushare source configured")
-
     for source in config.sources:
-        with st.expander(f"{source.name} ({source.provider})", expanded=True):
-            source.enabled = st.checkbox(
-                "Enabled",
-                value=source.enabled,
-                key=f"source-enabled-{source.name}",
-            )
-            if st.button(
-                "Delete source config",
-                key=f"delete-source-{source.name}",
-                use_container_width=False,
-            ):
-                config.sources = [
-                    item for item in config.sources if item.name != source.name
-                ]
-                st.success(f"Deleted source config {source.name}")
-                st.rerun()
-            _table_editor(source)
+        st.markdown(f"#### {source.name} ({source.provider})")
+        source_controls = st.columns([1, 3, 1])
+        source.enabled = source_controls[0].checkbox(
+            "Enabled",
+            value=source.enabled,
+            key=f"source-enabled-{source.name}",
+        )
+        if source.provider == "tushare":
+            source.token = source_controls[1].text_input(
+                "Tushare token",
+                value=source.token or "",
+                type="password",
+                key=f"source-token-{source.name}",
+            ) or None
+        if source_controls[2].button(
+            "Delete source",
+            key=f"delete-source-{source.name}",
+            width="content",
+        ):
+            config.sources = [
+                item for item in config.sources if item.name != source.name
+            ]
+            st.success(f"Deleted source config {source.name}")
+            st.rerun()
+        _table_editor(source)
+
+    st.divider()
+    if st.button("Add source", width="content"):
+        if "tushare" not in config.source_names():
+            config.sources.append(default_tushare_source())
+            st.success("Tushare source configured")
+            st.rerun()
+        st.info("Tushare source is already configured.")
+
+
+def _sync_source_tokens_from_session(config: GuiConfig) -> None:
+    for source in config.sources:
+        if source.provider != "tushare":
+            continue
+        key = f"source-token-{source.name}"
+        if key in st.session_state:
+            source.token = str(st.session_state[key]) or None
 
 
 def _table_editor(source: SourceConfig) -> None:
     st.caption("Tables")
-    for index, table in enumerate(source.tables):
-        cols = st.columns([2, 2, 2, 2, 1])
-        table.name = cols[0].text_input(
-            "Table",
-            value=table.name,
-            key=f"table-name-{source.name}-{index}",
+    if not source.tables:
+        st.info("No tables configured for this source.")
+    for category in _configured_table_categories(source):
+        st.markdown(f"##### {category}")
+        header = st.columns([1, 2, 2, 4, 2])
+        header[0].caption("Enabled")
+        header[1].caption("Table")
+        header[2].caption("Kind")
+        header[3].caption("Description")
+        header[4].caption("Action")
+        for index, table in _configured_tables_for_category(source, category):
+            cols = st.columns([1, 2, 2, 4, 2])
+            required = source.provider == "tushare" and table.name == "stock_basic"
+            table.enabled = cols[0].checkbox(
+                "Enabled",
+                value=True if required else table.enabled,
+                key=f"table-enabled-{source.name}-{index}",
+                disabled=required,
+                label_visibility="collapsed",
+            )
+            table.name = cols[1].text_input(
+                "Table",
+                value=table.name,
+                key=f"table-name-{source.name}-{index}",
+                disabled=required,
+                label_visibility="collapsed",
+            )
+            table.kind = cols[2].selectbox(
+                "Kind",
+                options=TABLE_KINDS,
+                index=TABLE_KINDS.index(table.kind),
+                key=f"table-kind-{source.name}-{index}",
+                disabled=required,
+                label_visibility="collapsed",
+            )
+            cols[3].caption(
+                tushare_catalog.tushare_table_description(table.name) or "-"
+            )
+            if required:
+                cols[4].caption("Required")
+                table.enabled = True
+                table.kind = "general"
+                continue
+            _table_delete_controls(source, index, table, cols[4])
+    with st.expander("Add table", expanded=False):
+        add_cols = st.columns([2, 5, 2, 1])
+        categories = _tushare_table_categories()
+        selected_category = add_cols[0].selectbox(
+            "Category",
+            options=categories,
+            key=f"add-table-category-{source.name}",
         )
-        table.kind = cols[1].selectbox(
-            "Kind",
+        catalog = _tushare_table_catalog_for_category(selected_category)
+        labels = [entry.label for entry in catalog]
+        selected_label = add_cols[1].selectbox(
+            "New table",
+            options=labels,
+            key=f"add-table-name-{source.name}-{selected_category}",
+        )
+        selected_entry = catalog[labels.index(selected_label)]
+        kind = add_cols[2].selectbox(
+            "Table kind",
             options=TABLE_KINDS,
-            index=TABLE_KINDS.index(table.kind),
-            key=f"table-kind-{source.name}-{index}",
+            index=TABLE_KINDS.index(selected_entry.default_kind),
+            key=f"add-table-kind-{source.name}-{selected_entry.api}",
         )
-        table.start_date = cols[2].text_input(
-            "Start",
-            value=table.start_date,
-            key=f"table-start-{source.name}-{index}",
+        if add_cols[3].button(
+            "Add table",
+            key=f"add-table-submit-{source.name}",
+            width="content",
+        ):
+            _add_source_table(source, selected_entry.api, kind)
+
+
+def _add_source_table(source: SourceConfig, name: str, kind: str) -> None:
+    if any(table.name == name for table in source.tables):
+        st.warning(f"{name} is already configured.")
+        return
+    source.tables.append(
+        TableConfig(
+            source=source.name,
+            name=name,
+            kind=kind,
         )
-        table.end_date = cols[3].text_input(
-            "End",
-            value=table.end_date or "",
-            key=f"table-end-{source.name}-{index}",
-        ) or None
-        table.workers = cols[4].number_input(
-            "Workers",
-            min_value=1,
-            max_value=64,
-            value=table.workers,
-            key=f"table-workers-{source.name}-{index}",
+    )
+    for key in (
+        f"add-table-category-{source.name}",
+        f"add-table-submit-{source.name}",
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key.startswith(
+            (
+                f"add-table-name-{source.name}-",
+                f"add-table-kind-{source.name}-",
+            )
+        ):
+            st.session_state.pop(key, None)
+    st.success(f"Added {name}")
+    st.rerun()
+
+
+def _configured_table_categories(source: SourceConfig) -> tuple[str, ...]:
+    categories = []
+    for table in source.tables:
+        category = _table_category(table.name)
+        if category not in categories:
+            categories.append(category)
+    return tuple(categories)
+
+
+def _configured_tables_for_category(
+    source: SourceConfig,
+    category: str,
+) -> tuple[tuple[int, TableConfig], ...]:
+    indexed = [
+        (index, table)
+        for index, table in enumerate(source.tables)
+        if _table_category(table.name) == category
+    ]
+    return tuple(
+        sorted(
+            indexed,
+            key=lambda item: (
+                0 if item[1].name == "stock_basic" else 1,
+                _table_display_name(item[1].name),
+                item[1].name,
+            ),
         )
-        if st.button(
+    )
+
+
+def _table_category(api: str) -> str:
+    entry = tushare_catalog.tushare_table_entry(api)
+    return entry.category_zh if entry is not None else "未分类"
+
+
+def _table_display_name(api: str) -> str:
+    entry = tushare_catalog.tushare_table_entry(api)
+    return entry.name_zh if entry is not None else api
+
+
+def _tushare_table_categories() -> tuple[str, ...]:
+    helper = getattr(tushare_catalog, "tushare_table_categories", None)
+    if callable(helper):
+        return helper()
+    catalog = tushare_catalog.tushare_table_catalog()
+    return tuple(
+        dict.fromkeys(entry.category_zh for entry in catalog)
+    )
+
+
+def _tushare_table_catalog_for_category(category_zh: str):
+    helper = getattr(tushare_catalog, "tushare_table_catalog_for_category", None)
+    if callable(helper):
+        return helper(category_zh)
+    return tuple(
+        entry
+        for entry in tushare_catalog.tushare_table_catalog()
+        if entry.category_zh == category_zh
+    )
+
+
+def _table_delete_controls(
+    source: SourceConfig,
+    index: int,
+    table: TableConfig,
+    container,
+) -> None:
+    key = f"pending-delete-table-{source.name}-{index}"
+    if st.session_state.get(key) != table.name:
+        if container.button(
             "Delete table config",
             key=f"delete-table-{source.name}-{index}",
-            use_container_width=False,
+            width="content",
         ):
-            del source.tables[index]
-            st.success(f"Deleted table config {table.name}")
+            st.session_state[key] = table.name
             st.rerun()
-    with st.form(f"add-table-{source.name}"):
-        name = st.text_input("New table", value="daily")
-        kind = st.selectbox("Table kind", options=TABLE_KINDS)
-        start_date = st.text_input("Start date", value="2000-01-01")
-        workers = st.number_input("Workers", min_value=1, max_value=64, value=4)
-        add = st.form_submit_button("Add table")
-    if add:
-        source.tables.append(
+        return
+    confirm_cols = container.columns(2)
+    if confirm_cols[0].button(
+        "Confirm",
+        key=f"confirm-delete-table-{source.name}-{index}",
+        width="content",
+    ):
+        del source.tables[index]
+        st.session_state.pop(key, None)
+        st.success(f"Deleted table config {table.name}")
+        st.rerun()
+    if confirm_cols[1].button(
+        "Cancel",
+        key=f"cancel-delete-table-{source.name}-{index}",
+        width="content",
+    ):
+        st.session_state.pop(key, None)
+        st.rerun()
+
+
+def _ensure_tushare_stock_basic(config: GuiConfig) -> None:
+    for source in config.sources:
+        if source.provider != "tushare":
+            continue
+        source.tables = [
+            table
+            for table in source.tables
+            if not (table.source == source.name and table.name == "stock_basic")
+        ]
+        source.tables.insert(
+            0,
             TableConfig(
                 source=source.name,
-                name=name,
-                kind=kind,
-                start_date=start_date,
-                workers=int(workers),
-            )
+                name="stock_basic",
+                kind=tushare_catalog.default_tushare_table_kind("stock_basic"),
+                enabled=True,
+            ),
         )
-        st.success(f"Added {name}")
 
 
 def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
@@ -292,40 +491,59 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
         table.name for table in config.tables_for(source)
     )
     table = st.selectbox("Table", options=tables or ("daily",), key="retrieve-table")
-    cols = st.columns(4)
-    year = _optional_int(cols[0].text_input("Year", value=""))
-    month = _optional_int(cols[1].text_input("Month", value=""))
-    fields = _csv_values(cols[2].text_input("Fields", value=""))
-    universe = _csv_values(cols[3].text_input("Universe", value=""))
+    cols = st.columns(2)
+    start_date = cols[0].text_input("Start date", value="2000-01-01")
+    end_date = cols[1].text_input("End date", value="2024-12-31")
 
     try:
-        data = lake.read(source, table, year=year, month=month)
+        data = lake.read(source, table)
     except DatasetNotFoundError:
         data = pd.DataFrame()
         st.info("No local data found for this selection.")
-    if fields and not data.empty:
-        available = [field for field in fields if field in data.columns]
-        if available:
-            data = data.loc[:, available]
-    st.dataframe(data.head(500), use_container_width=True)
 
-    panel_field = st.text_input("Panel field", value=fields[0] if fields else "close")
+    available_fields = [str(column) for column in data.columns]
+    panel_field = st.selectbox(
+        "Panel field",
+        options=available_fields or ["close"],
+        index=(available_fields.index("close") if "close" in available_fields else 0),
+        key="panel-field",
+    )
+    preview = _filter_by_date(data, start_date=start_date, end_date=end_date)
+    st.dataframe(preview.iloc[:50, :20], width="stretch")
+
     include_core = st.checkbox("Include optional bagelquant-core conversion snippet")
+    if include_core:
+        st.caption(
+            "The conversion snippet shows how to turn a panel agreement payload "
+            "into downstream bagelquant-core Domain and Panel objects."
+        )
     selection = RetrievalSelection(
         lake_root=config.lake_root,
         source=source,
         table=table,
-        year=year,
-        month=month,
-        fields=tuple(fields),
-        universe=tuple(universe),
+        fields=(panel_field,),
         panel_field=panel_field,
+        start_date=start_date,
+        end_date=end_date,
         include_core_conversion=include_core,
     )
     snippet_choice = st.radio(
         "Generated code",
         options=("LocalDataLake read", "Loader read", "Panel agreement"),
         horizontal=True,
+    )
+    st.caption(
+        {
+            "LocalDataLake read": (
+                "Reads the selected local lake table directly from disk."
+            ),
+            "Loader read": (
+                "Uses Loader for lake-first retrieval with provider fallback options."
+            ),
+            "Panel agreement": (
+                "Shapes one field into a panel-ready agreement for downstream systems."
+            ),
+        }[snippet_choice]
     )
     snippet = {
         "LocalDataLake read": lake_read_snippet,
@@ -335,98 +553,75 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
     st.code(snippet, language="python")
 
 
-def _update_data_lake(
-    config: GuiConfig,
-    manager: DataLakeManager,
-    config_path: Path,
-    provider_ready: bool,
-) -> None:
-    st.subheader("Update Data Lake")
-    if not provider_ready:
-        st.warning("Set TUSHARE_TOKEN or Streamlit secrets before provider updates.")
-
-    table_options = [
-        table
-        for source in config.sources
-        for table in source.tables
-        if source.enabled and table.enabled
-    ]
-    labels = [f"{table.source}/{table.name}" for table in table_options]
-    selected = st.selectbox("Configured table", options=labels)
-    if st.button("Update now", disabled=not provider_ready or not table_options):
-        table = table_options[labels.index(selected)]
-        with st.spinner(f"Updating {selected}"):
-            snapshots = run_table_update(manager, table)
-        st.success(f"Created {len(snapshots)} snapshot partition set(s)")
-
-    st.subheader("Periodic Jobs")
-    _job_editor(config)
-    if st.button("Run due jobs", disabled=not provider_ready):
-        with st.spinner("Running due jobs"):
-            snapshots = run_due_jobs(manager, config, now=datetime.now(UTC))
-        save_config(config, config_path)
-        st.success(f"Created {len(snapshots)} snapshot partition set(s)")
-
-
-def _job_editor(config: GuiConfig) -> None:
-    if config.periodic_jobs:
-        st.dataframe(
-            pd.DataFrame(
+def _data_item_catalog(
+    lake: LocalDataLake,
+    tables: tuple[tuple[str, str], ...],
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for source, table in tables:
+        if table.startswith("__"):
+            continue
+        try:
+            data = lake.read(source, table)
+        except DatasetNotFoundError:
+            continue
+        fields = [str(column) for column in data.reset_index().columns]
+        for field in fields:
+            if field in {"index", "create_time", "delete_flag"}:
+                continue
+            rows.append(
                 {
-                    "name": job.name,
-                    "source": job.source,
-                    "table": job.table,
-                    "kind": job.kind,
-                    "schedule": f"{job.every} {job.unit}",
-                    "enabled": job.enabled,
-                    "last_run_at": job.last_run_at,
+                    "source": source,
+                    "table": table,
+                    "field": field,
+                    "data_item_id": f"{source}_{table}_{field}",
                 }
-                for job in config.periodic_jobs
-            ),
-            use_container_width=True,
-        )
-    with st.form("add-periodic-job"):
-        name = st.text_input("Job name", value="tushare-daily")
-        source = st.text_input("Source", value="tushare")
-        table = st.text_input("Table", value="daily")
-        kind = st.selectbox("Kind", options=TABLE_KINDS)
-        every = st.number_input("Every", min_value=1, value=1)
-        unit = st.selectbox("Unit", options=SCHEDULE_UNITS, index=2)
-        start_date = st.text_input("Start date", value="2000-01-01")
-        workers = st.number_input("Workers", min_value=1, max_value=64, value=4)
-        add = st.form_submit_button("Add job")
-    if add:
-        config.periodic_jobs.append(
-            PeriodicJobConfig(
-                name=name,
-                source=source,
-                table=table,
-                kind=kind,
-                every=int(every),
-                unit=unit,
-                start_date=start_date,
-                workers=int(workers),
             )
-        )
-        st.success(f"Added job {name}")
+    return pd.DataFrame(rows, columns=["source", "table", "field", "data_item_id"])
 
 
-def _upsert_universe(config: GuiConfig, universe: UniverseConfig) -> None:
-    config.universes = [
-        item
-        for item in config.universes
-        if not (item.source == universe.source and item.name == universe.name)
-    ]
-    config.universes.append(universe)
+def _filter_by_date(
+    data: pd.DataFrame,
+    *,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    if data.empty:
+        return data
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if isinstance(data.index, pd.DatetimeIndex):
+        return data.loc[(data.index >= start) & (data.index <= end)]
+    date_column = next(
+        (
+            column
+            for column in ("date", "trade_date", "f_ann_date", "datetime", "timestamp")
+            if column in data.columns
+        ),
+        None,
+    )
+    if date_column is None:
+        return data
+    dates = pd.to_datetime(data[date_column].astype(str), errors="coerce")
+    return data.loc[(dates >= start) & (dates <= end)]
 
 
-def _csv_values(value: str) -> list[str]:
-    return [part.strip() for part in value.split(",") if part.strip()]
+def _running_under_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:
+        return False
+    return get_script_run_ctx(suppress_warning=True) is not None
 
 
-def _optional_int(value: str) -> int | None:
-    return int(value) if value.strip() else None
+def _run_with_streamlit() -> None:
+    from streamlit.web import cli as streamlit_cli
+
+    sys.argv = ["streamlit", "run", str(Path(__file__).resolve()), *sys.argv[1:]]
+    raise SystemExit(streamlit_cli.main())
 
 
 if __name__ == "__main__":
+    if not _running_under_streamlit():
+        _run_with_streamlit()
     main()
