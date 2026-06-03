@@ -53,6 +53,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pandas" },
+    { name = "streamlit" },
 ]
 
 [package.optional-dependencies]
@@ -81,6 +82,7 @@ requires-dist = [
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6.1" },
     { name = "pandas", specifier = ">=3.0.0" },
     { name = "pyyaml", marker = "extra == 'gui'", specifier = ">=6.0.2" },
+    { name = "streamlit", specifier = ">=1.58.0" },
     { name = "streamlit", marker = "extra == 'gui'", specifier = ">=1.52.0" },
     { name = "tushare", marker = "extra == 'tushare'", specifier = ">=1.4.21" },
 ]

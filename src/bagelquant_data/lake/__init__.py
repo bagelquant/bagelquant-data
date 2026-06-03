@@ -3,7 +3,7 @@
 from bagelquant_data.lake.base import LakeStore
 from bagelquant_data.lake.catalog import LakeCatalog
 from bagelquant_data.lake.local import LocalDataLake
-from bagelquant_data.lake.manager import DataLakeManager, UpdateJob, UpdateSchedule
+from bagelquant_data.lake.manager import DataLakeManager
 from bagelquant_data.lake.partition import PartitionSpec
 from bagelquant_data.lake.reader import LakeReader
 from bagelquant_data.lake.snapshot import SnapshotRef
@@ -18,6 +18,4 @@ __all__ = [
     "LocalDataLake",
     "PartitionSpec",
     "SnapshotRef",
-    "UpdateJob",
-    "UpdateSchedule",
 ]

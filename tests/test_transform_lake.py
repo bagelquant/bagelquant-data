@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pandas as pd
 
 from bagelquant_data.datasource import DataRequest, DataSourceRegistry
@@ -9,8 +7,6 @@ from bagelquant_data.lake import (
     DataLakeManager,
     LocalDataLake,
     PartitionSpec,
-    UpdateJob,
-    UpdateSchedule,
 )
 from bagelquant_data.loader import Loader
 from bagelquant_data.transform import Transform
@@ -123,7 +119,7 @@ def test_stock_basic_is_row_table_not_date_indexed(tmp_path) -> None:
     assert {"create_time", "delete_flag"}.issubset(stock_basic.columns)
 
 
-def test_user_universe_must_be_subset_of_all(tmp_path) -> None:
+def test_stock_basic_updates_source_asset_catalog(tmp_path) -> None:
     lake = LocalDataLake(tmp_path)
     lake.add(
         "tushare",
@@ -131,10 +127,7 @@ def test_user_universe_must_be_subset_of_all(tmp_path) -> None:
         pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]}),
     )
 
-    lake.define_universe("tushare", "banks", ["000001.SZ"])
-
-    assert lake.universe("tushare") == ("tushare_000001.SZ", "tushare_600000.SH")
-    assert lake.universe("tushare", "banks") == ("tushare_000001.SZ",)
+    assert lake.asset_ids("tushare") == ("tushare_000001.SZ", "tushare_600000.SH")
 
 
 def test_lake_manager_add_edit_delete(tmp_path) -> None:
@@ -170,45 +163,17 @@ def test_loader_prefers_lake_and_refresh_updates_from_provider(tmp_path) -> None
     assert source.calls == 1
 
 
-def test_manager_update_and_periodic_jobs(tmp_path) -> None:
+def test_manager_update_reads_provider_once(tmp_path) -> None:
     registry = DataSourceRegistry()
     source = CountingSource()
     registry.register(source)
     manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
-    job = UpdateJob(
-        source_name="fake",
-        request=DataRequest(dataset="prices"),
-        schedule=UpdateSchedule(every=1, unit="days"),
-        last_run_at=datetime(2024, 1, 1, tzinfo=UTC),
-    )
-    manager.register_job("daily-prices", job)
 
-    early = manager.run_due(datetime(2024, 1, 1, 12, tzinfo=UTC))
-    due = manager.run_due(datetime(2024, 1, 2, 1, tzinfo=UTC))
+    snapshot = manager.update("fake", DataRequest(dataset="prices"))
 
-    assert early == ()
-    assert len(due) == 1
+    assert snapshot.dataset == "prices"
     assert manager.lake.read("fake", "prices")["value"].tolist() == [1]
     assert source.calls == 1
-
-
-def test_manager_periodic_update_convenience(tmp_path) -> None:
-    registry = DataSourceRegistry()
-    source = CountingSource()
-    registry.register(source)
-    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
-
-    job = manager.periodic_update(
-        "daily-prices",
-        source_name="fake",
-        request=DataRequest(dataset="prices"),
-        schedule=UpdateSchedule(every=1, unit="days"),
-    )
-    snapshots = manager.run_due()
-
-    assert job.source_name == "fake"
-    assert len(snapshots) == 1
-    assert manager.list_tables("fake") == (("fake", "prices"),)
 
 
 def test_tushare_all_price_update_reads_day_by_day(tmp_path) -> None:
@@ -225,13 +190,39 @@ def test_tushare_all_price_update_reads_day_by_day(tmp_path) -> None:
     )
     daily = manager.lake.read("tushare", "daily")
 
-    assert source.calls["stock_basic"] == [{}]
+    assert source.calls["stock_basic"] == [
+        {"list_status": "L"},
+        {"list_status": "D"},
+        {"list_status": "P"},
+    ]
     assert sorted(source.calls["daily"], key=lambda item: str(item["trade_date"])) == [
         {"trade_date": "20240101"},
         {"trade_date": "20240102"},
     ]
     assert daily.index.name == "date"
     assert daily["ts_code"].tolist() == ["000001.SZ", "000001.SZ"]
+
+
+def test_tushare_stock_basic_reads_all_statuses_and_deduplicates(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+
+    manager.update_tushare_stock_basic()
+
+    stock_basic = manager.lake.read("tushare", "stock_basic")
+    assert source.calls["stock_basic"] == [
+        {"list_status": "L"},
+        {"list_status": "D"},
+        {"list_status": "P"},
+    ]
+    assert stock_basic["ts_code"].tolist() == ["000001.SZ", "300001.SZ", "600000.SH"]
+    assert manager.lake.asset_ids("tushare") == (
+        "tushare_000001.SZ",
+        "tushare_300001.SZ",
+        "tushare_600000.SH",
+    )
 
 
 def test_tushare_fundamental_update_reads_incremental_id_by_id(tmp_path) -> None:
@@ -262,6 +253,7 @@ def test_tushare_fundamental_update_reads_incremental_id_by_id(tmp_path) -> None
     calls = sorted(source.calls["income"], key=lambda item: str(item["ts_code"]))
     assert calls == [
         {"end_date": "20240104", "start_date": "20240103", "ts_code": "000001.SZ"},
+        {"end_date": "20240104", "start_date": "20240101", "ts_code": "300001.SZ"},
         {"end_date": "20240104", "start_date": "20240101", "ts_code": "600000.SH"},
     ]
 
@@ -352,7 +344,13 @@ class FakeTushareUpdateSource:
             call["end_date"] = pd.Timestamp(request.end_date).strftime("%Y%m%d")
         self.calls.setdefault(request.dataset, []).append(call)
         if request.dataset == "stock_basic":
-            return pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]})
+            status = request.filters.get("list_status")
+            codes = {
+                "L": ["000001.SZ", "600000.SH"],
+                "D": ["300001.SZ", "000001.SZ"],
+                "P": ["600000.SH"],
+            }.get(status, ["000001.SZ", "600000.SH"])
+            return pd.DataFrame({"ts_code": codes})
         if request.dataset == "daily":
             trade_date = str(request.filters["trade_date"])
             return pd.DataFrame(

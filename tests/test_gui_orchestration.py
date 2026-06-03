@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
-from bagelquant_data.gui.config import GuiConfig, PeriodicJobConfig, TableConfig
+from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
 from bagelquant_data.gui.orchestration import (
-    run_due_jobs,
+    enabled_update_tables,
+    run_all_table_updates,
     run_table_update,
     token_available,
+    token_from_config,
 )
 
 
@@ -15,18 +15,29 @@ def test_token_available_checks_env_without_exposing_value() -> None:
     assert not token_available(environ={})
 
 
+def test_token_from_config_prefers_persisted_source_token() -> None:
+    config = GuiConfig(
+        sources=[SourceConfig(name="tushare", token="configured-token")]
+    )
+
+    assert token_from_config(config) == "configured-token"
+
+
 def test_run_table_update_delegates_to_tushare_all_update() -> None:
     manager = FakeManager()
     table = TableConfig(
         source="tushare",
         name="income_vip",
         kind="fundamental_vip",
+    )
+
+    snapshots = run_table_update(
+        manager,  # type: ignore[arg-type]
+        table,
         start_date="2024-01-01",
         end_date="2024-12-31",
         workers=8,
     )
-
-    snapshots = run_table_update(manager, table)  # type: ignore[arg-type]
 
     assert snapshots == ("snapshot",)
     assert manager.calls == [
@@ -40,39 +51,67 @@ def test_run_table_update_delegates_to_tushare_all_update() -> None:
     ]
 
 
-def test_run_due_jobs_updates_due_job_timestamps() -> None:
+def test_run_table_update_handles_general_stock_basic() -> None:
+    manager = FakeManager()
+    table = TableConfig(source="tushare", name="stock_basic", kind="general")
+
+    snapshots = run_table_update(manager, table)  # type: ignore[arg-type]
+
+    assert snapshots == ("stock-basic",)
+    assert manager.stock_basic_calls == 1
+
+
+def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
     manager = FakeManager()
     config = GuiConfig(
-        periodic_jobs=[
-            PeriodicJobConfig(
-                name="daily",
-                source="tushare",
-                table="daily",
-                last_run_at="2024-01-01T00:00:00+00:00",
-            ),
-            PeriodicJobConfig(
-                name="recent",
-                source="tushare",
-                table="income",
-                kind="fundamental",
-                last_run_at="2024-01-02T00:00:00+00:00",
-            ),
-        ]
+        update_start_date="2020-01-01",
+        update_end_date="2024-12-31",
+        update_workers=6,
+        sources=[
+            SourceConfig(
+                name="tushare",
+                tables=[
+                    TableConfig(source="tushare", name="stock_basic", kind="general"),
+                    TableConfig(source="tushare", name="daily", kind="price"),
+                    TableConfig(
+                        source="tushare",
+                        name="disabled",
+                        kind="price",
+                        enabled=False,
+                    ),
+                ],
+            )
+        ],
     )
-    now = datetime(2024, 1, 2, 1, tzinfo=UTC)
 
-    snapshots = run_due_jobs(manager, config, now=now)  # type: ignore[arg-type]
+    snapshots = run_all_table_updates(manager, config)  # type: ignore[arg-type]
 
-    assert snapshots == ("snapshot",)
-    assert len(manager.calls) == 1
-    assert manager.calls[0]["table"] == "daily"
-    assert config.periodic_jobs[0].last_run_at == now.isoformat()
-    assert config.periodic_jobs[1].last_run_at == "2024-01-02T00:00:00+00:00"
+    assert enabled_update_tables(config)[0].name == "stock_basic"
+    assert snapshots == ("stock-basic", "snapshot")
+    assert manager.stock_basic_calls == 1
+    assert manager.calls == [
+        {
+            "table": "daily",
+            "kind": "price",
+            "start_date": "2020-01-01",
+            "end_date": None,
+            "workers": 6,
+        }
+    ]
+
+
+def test_gui_config_defaults_update_workers_to_eight() -> None:
+    assert GuiConfig().update_workers == 8
 
 
 class FakeManager:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.stock_basic_calls = 0
+
+    def update_tushare_stock_basic(self):
+        self.stock_basic_calls += 1
+        return "stock-basic"
 
     def update_tushare_all(
         self,
@@ -93,3 +132,6 @@ class FakeManager:
             }
         )
         return ("snapshot",)
+
+    def update(self, *args, **kwargs):
+        return "general"
