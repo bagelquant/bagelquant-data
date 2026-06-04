@@ -113,6 +113,7 @@ class LocalDataLake:
                 "metadata": dict(metadata or {}),
                 "rows": len(partition),
                 "columns": list(partition.columns),
+                **_table_metadata(dataset, partition),
             }
             (snapshot_dir / "metadata.json").write_text(
                 json.dumps(payload, indent=2, sort_keys=True, default=str),
@@ -131,7 +132,13 @@ class LocalDataLake:
                 )
             )
             self._write_partition_catalog(source, dataset, year, month, refs[-1])
-        self._write_table_catalog(source, dataset, snapshot_id, created_at)
+        self._write_table_catalog(
+            source,
+            dataset,
+            snapshot_id,
+            created_at,
+            metadata=_table_metadata(dataset, frame),
+        )
         if update_catalogs:
             self._update_main_tables(source, dataset, frame, created_at=created_at)
         return refs[0]
@@ -172,17 +179,16 @@ class LocalDataLake:
     def data_item_ids(self, source: str) -> tuple[str, ...]:
         """Return known source data item ids."""
 
-        try:
-            data = self.read(source, "__data_item_ids")
-        except DatasetNotFoundError:
+        data = self.data_items(source)
+        if data.empty:
             return ()
         return tuple(str(item_id) for item_id in data["data_item_id"].tolist())
 
-    def panel_field_ids(self, source: str | None = None) -> tuple[str, ...]:
-        """Return qualified field ids that can be selected as panel fields."""
+    def data_items(self, source: str | None = None) -> pd.DataFrame:
+        """Return known data item catalog rows without reading user datasets."""
 
+        frames: list[pd.DataFrame] = []
         sources = (source,) if source is not None else self.list_sources()
-        ids: set[str] = set()
         for source_name in sources:
             try:
                 data = self.read(source_name, "__data_item_ids")
@@ -190,20 +196,49 @@ class LocalDataLake:
                 continue
             if "data_item_id" not in data.columns:
                 continue
-            for item_id in data["data_item_id"].dropna().astype(str).tolist():
-                try:
-                    resolved = self.resolve_panel_field(item_id)
-                except (DatasetNotFoundError, LakeError):
-                    continue
-                if resolved is not None:
-                    ids.add(item_id)
+            frames.append(_normalize_data_item_catalog(source_name, data, self))
+        if not frames:
+            return pd.DataFrame(
+                columns=["source", "table", "field", "data_item_id"]
+            )
+        combined = pd.concat(frames, axis=0, ignore_index=True)
+        return combined.drop_duplicates("data_item_id").sort_values(
+            ["source", "table", "field", "data_item_id"],
+            ignore_index=True,
+        )
+
+    def panel_field_ids(self, source: str | None = None) -> tuple[str, ...]:
+        """Return qualified field ids that can be selected as panel fields."""
+
+        ids: set[str] = set()
+        for row in self.data_items(source).itertuples(index=False):
+            if self._catalog_marks_panel_field(
+                str(row.source),
+                str(row.table),
+                str(row.field),
+            ):
+                ids.add(str(row.data_item_id))
         return tuple(sorted(ids))
 
     def resolve_panel_field(
         self,
         qualified_id: str,
+        *,
+        validate_with_read: bool = True,
     ) -> tuple[str, str, str] | None:
         """Resolve ``source_dataset_field`` into source, dataset, and field."""
+
+        catalog = self.data_items()
+        if not catalog.empty:
+            matches = catalog.loc[catalog["data_item_id"].astype(str) == qualified_id]
+            for row in matches.itertuples(index=False):
+                source = str(row.source)
+                dataset = str(row.table)
+                field = str(row.field)
+                if self._catalog_marks_panel_field(source, dataset, field):
+                    return source, dataset, field
+                if not validate_with_read and self._has_table_catalog(source, dataset):
+                    return None
 
         for source, dataset in self.list_datasets():
             prefix = f"{source}_{dataset}_"
@@ -212,6 +247,12 @@ class LocalDataLake:
             field = qualified_id.removeprefix(prefix)
             if not field:
                 continue
+            if self._catalog_marks_panel_field(source, dataset, field):
+                return source, dataset, field
+            if not validate_with_read and self._has_table_catalog(source, dataset):
+                return None
+            if not validate_with_read:
+                return source, dataset, field
             try:
                 data = self.read(source, dataset)
             except DatasetNotFoundError:
@@ -246,6 +287,34 @@ class LocalDataLake:
         if end_date is not None:
             panel = panel.loc[panel.index <= pd.Timestamp(end_date)]
         return panel
+
+    def update_catalog_entries(
+        self,
+        source: str,
+        dataset: str,
+        *,
+        asset_ids: set[str] | None = None,
+        fields: set[str] | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        """Merge known asset and data item entries for a dataset."""
+
+        if dataset.startswith("__"):
+            return
+        resolved_created_at = created_at or datetime.now(UTC)
+        if asset_ids:
+            self._merge_asset_ids(
+                source,
+                asset_ids,
+                created_at=resolved_created_at,
+            )
+        if fields:
+            self._merge_data_item_ids(
+                source,
+                dataset,
+                fields,
+                created_at=resolved_created_at,
+            )
 
     def delete(
         self,
@@ -468,6 +537,8 @@ class LocalDataLake:
         dataset: str,
         snapshot_id: str,
         created_at: datetime,
+        *,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         dataset_dir = self._dataset_dir(source, dataset)
         dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -478,6 +549,7 @@ class LocalDataLake:
             "format": "parquet",
             "updated_at": created_at.isoformat(),
         }
+        payload.update(dict(metadata or {}))
         self._table_catalog_path(source, dataset).write_text(
             json.dumps(payload, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -548,6 +620,28 @@ class LocalDataLake:
     ) -> Path:
         return self._partition_dir(source, dataset, year, month) / "_catalog.json"
 
+    def _has_table_catalog(self, source: str, dataset: str) -> bool:
+        return self._table_catalog_path(source, dataset).exists()
+
+    def _table_catalog_metadata(self, source: str, dataset: str) -> dict[str, Any]:
+        catalog_path = self._table_catalog_path(source, dataset)
+        if not catalog_path.exists():
+            return {}
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def _catalog_marks_panel_field(
+        self,
+        source: str,
+        dataset: str,
+        field: str,
+    ) -> bool:
+        metadata = self._table_catalog_metadata(source, dataset)
+        panel_fields = metadata.get("panel_fields")
+        if not isinstance(panel_fields, list):
+            return False
+        return field in {str(item) for item in panel_fields}
+
     def _update_main_tables(
         self,
         source: str,
@@ -571,11 +665,20 @@ class LocalDataLake:
         asset_column = _infer_asset_column(frame)
         if asset_column is None:
             return
-        existing = set(self.asset_ids(source))
         discovered = {
             _normalize_asset_id(source, value)
             for value in frame[asset_column].dropna().astype(str).tolist()
         }
+        self._merge_asset_ids(source, discovered, created_at=created_at)
+
+    def _merge_asset_ids(
+        self,
+        source: str,
+        discovered: set[str],
+        *,
+        created_at: datetime,
+    ) -> None:
+        existing = set(self.asset_ids(source))
         data = pd.DataFrame({"asset_id": sorted(existing.union(discovered))})
         self.write(
             source,
@@ -584,7 +687,7 @@ class LocalDataLake:
             mode="overwrite",
             metadata={
                 "system_table": True,
-                "updated_from": asset_column,
+                "updated_from": "catalog_entries",
                 "created_at": created_at.isoformat(),
             },
             update_catalogs=False,
@@ -599,13 +702,41 @@ class LocalDataLake:
         created_at: datetime,
     ) -> None:
         ignored = {"index", "create_time", "delete_flag"}
-        existing = set(self.data_item_ids(source))
         discovered = {
-            f"{source}_{dataset}_{column}"
+            str(column)
             for column in frame.reset_index().columns
             if column not in ignored
         }
-        data = pd.DataFrame({"data_item_id": sorted(existing.union(discovered))})
+        self._merge_data_item_ids(
+            source,
+            dataset,
+            discovered,
+            created_at=created_at,
+        )
+
+    def _merge_data_item_ids(
+        self,
+        source: str,
+        dataset: str,
+        fields: set[str],
+        *,
+        created_at: datetime,
+    ) -> None:
+        existing = self.data_items(source)
+        discovered = pd.DataFrame(
+            {
+                "source": source,
+                "table": dataset,
+                "field": column,
+                "data_item_id": f"{source}_{dataset}_{column}",
+            }
+            for column in fields
+        )
+        data = pd.concat([existing, discovered], axis=0, ignore_index=True)
+        data = data.drop_duplicates("data_item_id").sort_values(
+            ["source", "table", "field", "data_item_id"],
+            ignore_index=True,
+        )
         self.write(
             source,
             "__data_item_ids",
@@ -652,6 +783,82 @@ def _partition_frame(
         mask = (years == year) & (months == month)
         partitions[(year, month)] = frame.loc[mask.to_numpy()].copy(deep=True)
     return partitions
+
+
+def _table_metadata(table: str, frame: pd.DataFrame) -> dict[str, Any]:
+    date_column = _infer_partition_column(frame.reset_index())
+    return {
+        "asset_column": _infer_asset_column(frame),
+        "date_column": date_column,
+        "panel_fields": _panel_value_fields(table, frame, date_column=date_column),
+    }
+
+
+def _panel_value_fields(
+    table: str,
+    frame: pd.DataFrame,
+    *,
+    date_column: str | None,
+) -> list[str]:
+    if (
+        table.startswith("__")
+        or table in {"stock_basic"}
+        or date_column is None
+        or _infer_asset_column(frame) is None
+    ):
+        return []
+    fields = [
+        str(column)
+        for column in frame.reset_index().columns
+        if _is_panel_value_field(frame, field=str(column), date_column=date_column)
+    ]
+    return sorted(dict.fromkeys(fields))
+
+
+def _normalize_data_item_catalog(
+    source: str,
+    data: pd.DataFrame,
+    lake: LocalDataLake,
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for raw_item_id in data["data_item_id"].dropna().astype(str).tolist():
+        row = data.loc[data["data_item_id"].astype(str) == raw_item_id].iloc[0]
+        table = str(row["table"]) if "table" in data.columns else ""
+        field = str(row["field"]) if "field" in data.columns else ""
+        row_source = str(row["source"]) if "source" in data.columns else source
+        if not table or not field:
+            resolved = _resolve_qualified_data_item(row_source, raw_item_id, lake)
+            if resolved is None:
+                continue
+            row_source, table, field = resolved
+        rows.append(
+            {
+                "source": row_source,
+                "table": table,
+                "field": field,
+                "data_item_id": raw_item_id,
+            }
+        )
+    return pd.DataFrame(rows, columns=["source", "table", "field", "data_item_id"])
+
+
+def _resolve_qualified_data_item(
+    source: str,
+    qualified_id: str,
+    lake: LocalDataLake,
+) -> tuple[str, str, str] | None:
+    datasets = sorted(
+        (dataset for dataset_source, dataset in lake.list_datasets(source)),
+        key=len,
+        reverse=True,
+    )
+    for dataset in datasets:
+        prefix = f"{source}_{dataset}_"
+        if qualified_id.startswith(prefix):
+            field = qualified_id.removeprefix(prefix)
+            if field:
+                return source, dataset, field
+    return None
 
 
 def shape_panel_field(data: pd.DataFrame, *, field: str) -> pd.DataFrame:
