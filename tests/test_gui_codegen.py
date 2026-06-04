@@ -55,3 +55,18 @@ def test_panel_agreement_snippet_can_include_core_conversion_text() -> None:
     assert ".load_panel(" in snippet
     assert "field='close'" in snippet
     assert "from bagelquant_core import Domain, Panel" in snippet
+
+
+def test_panel_field_snippets_use_qualified_field_without_table_selection() -> None:
+    selection = RetrievalSelection(
+        lake_root=".lake",
+        source="tushare",
+        table="daily",
+        qualified_panel_field="tushare_daily_close",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+    )
+
+    assert "lake.read_panel_field('tushare_daily_close'" in lake_read_snippet(selection)
+    assert ".load_panel_field(" in loader_read_snippet(selection)
+    assert "dataset='daily'" not in panel_agreement_snippet(selection)

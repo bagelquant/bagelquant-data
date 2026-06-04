@@ -100,6 +100,18 @@ def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
     ]
 
 
+def test_run_table_update_passes_progress_callback() -> None:
+    manager = FakeManager()
+    table = TableConfig(source="tushare", name="daily", kind="price")
+
+    def progress(_event):
+        pass
+
+    run_table_update(manager, table, progress=progress)  # type: ignore[arg-type]
+
+    assert manager.calls[-1]["progress"] is progress
+
+
 def test_gui_config_defaults_update_workers_to_eight() -> None:
     assert GuiConfig().update_workers == 8
 
@@ -121,16 +133,18 @@ class FakeManager:
         start_date: str,
         end_date: str | None,
         workers: int,
+        progress=None,
     ):
-        self.calls.append(
-            {
-                "table": table,
-                "kind": kind,
-                "start_date": start_date,
-                "end_date": end_date,
-                "workers": workers,
-            }
-        )
+        call = {
+            "table": table,
+            "kind": kind,
+            "start_date": start_date,
+            "end_date": end_date,
+            "workers": workers,
+        }
+        if progress is not None:
+            call["progress"] = progress
+        self.calls.append(call)
         return ("snapshot",)
 
     def update(self, *args, **kwargs):

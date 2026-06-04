@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import pandas as pd
 import streamlit as st
@@ -31,6 +33,7 @@ from bagelquant_data.gui.orchestration import (
     token_from_config,
 )
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
+from bagelquant_data.lake.manager import TushareTableKind
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 TABLE_KINDS = ("general", "price", "fundamental", "fundamental_vip")
@@ -212,9 +215,26 @@ def _data_sources(
             manager.lake,
             registry=build_registry(tushare_token=current_token),
         )
-        with st.spinner("Updating enabled data source tables"):
-            snapshots = run_all_table_updates(update_manager, config)
+        progress_bar = st.progress(0.0)
+        status = st.empty()
+
+        def on_progress(event: Mapping[str, Any]) -> None:
+            completed = int(cast(int | str, event.get("completed", 0)))
+            total = int(cast(int | str, event.get("total", 0)))
+            fraction = completed / total if total else 1.0
+            progress_bar.progress(min(1.0, fraction))
+            status.write(
+                f"Updating {event.get('table')} {event.get('item')} "
+                f"({completed}/{total})"
+            )
+
+        snapshots = run_all_table_updates(
+            update_manager,
+            config,
+            progress=on_progress,
+        )
         save_config(config, config_path)
+        progress_bar.progress(1.0)
         st.success(f"Created {len(snapshots)} snapshot partition set(s)")
 
     st.subheader("Configured Sources")
@@ -300,9 +320,7 @@ def _table_editor(source: SourceConfig) -> None:
                 disabled=required,
                 label_visibility="collapsed",
             )
-            cols[3].caption(
-                tushare_catalog.tushare_table_description(table.name) or "-"
-            )
+            cols[3].markdown(_table_description_markdown(table.name))
             if required:
                 cols[4].caption("Required")
                 table.enabled = True
@@ -312,24 +330,51 @@ def _table_editor(source: SourceConfig) -> None:
     with st.expander("Add table", expanded=False):
         add_cols = st.columns([2, 5, 2, 1])
         categories = _tushare_table_categories()
-        selected_category = add_cols[0].selectbox(
-            "Category",
-            options=categories,
-            key=f"add-table-category-{source.name}",
+        selected_category = cast(
+            str,
+            add_cols[0].selectbox(
+                "Category",
+                options=categories,
+                key=f"add-table-category-{source.name}",
+            ),
         )
-        catalog = _tushare_table_catalog_for_category(selected_category)
+        catalog = _available_tushare_table_catalog_for_category(
+            source,
+            selected_category,
+        )
+        if not catalog:
+            add_cols[1].info("All APIs in this category are already configured.")
+            add_cols[2].selectbox(
+                "Table kind",
+                options=TABLE_KINDS,
+                disabled=True,
+                key=f"add-table-kind-empty-{source.name}-{selected_category}",
+            )
+            add_cols[3].button(
+                "Add table",
+                disabled=True,
+                key=f"add-table-submit-empty-{source.name}",
+                width="content",
+            )
+            return
         labels = [entry.label for entry in catalog]
-        selected_label = add_cols[1].selectbox(
-            "New table",
-            options=labels,
-            key=f"add-table-name-{source.name}-{selected_category}",
+        selected_label = cast(
+            str,
+            add_cols[1].selectbox(
+                "New table",
+                options=labels,
+                key=f"add-table-name-{source.name}-{selected_category}",
+            ),
         )
         selected_entry = catalog[labels.index(selected_label)]
-        kind = add_cols[2].selectbox(
-            "Table kind",
-            options=TABLE_KINDS,
-            index=TABLE_KINDS.index(selected_entry.default_kind),
-            key=f"add-table-kind-{source.name}-{selected_entry.api}",
+        kind = cast(
+            TushareTableKind,
+            add_cols[2].selectbox(
+                "Table kind",
+                options=TABLE_KINDS,
+                index=TABLE_KINDS.index(selected_entry.default_kind),
+                key=f"add-table-kind-{source.name}-{selected_entry.api}",
+            ),
         )
         if add_cols[3].button(
             "Add table",
@@ -339,7 +384,11 @@ def _table_editor(source: SourceConfig) -> None:
             _add_source_table(source, selected_entry.api, kind)
 
 
-def _add_source_table(source: SourceConfig, name: str, kind: str) -> None:
+def _add_source_table(
+    source: SourceConfig,
+    name: str,
+    kind: TushareTableKind,
+) -> None:
     if any(table.name == name for table in source.tables):
         st.warning(f"{name} is already configured.")
         return
@@ -355,7 +404,8 @@ def _add_source_table(source: SourceConfig, name: str, kind: str) -> None:
         f"add-table-submit-{source.name}",
     ):
         st.session_state.pop(key, None)
-    for key in list(st.session_state):
+    for key in list(st.session_state.keys()):
+        key = str(key)
         if key.startswith(
             (
                 f"add-table-name-{source.name}-",
@@ -368,12 +418,12 @@ def _add_source_table(source: SourceConfig, name: str, kind: str) -> None:
 
 
 def _configured_table_categories(source: SourceConfig) -> tuple[str, ...]:
-    categories = []
+    categories: list[str] = []
     for table in source.tables:
         category = _table_category(table.name)
         if category not in categories:
             categories.append(category)
-    return tuple(categories)
+    return tuple(sorted(categories, key=_category_order))
 
 
 def _configured_tables_for_category(
@@ -390,7 +440,7 @@ def _configured_tables_for_category(
             indexed,
             key=lambda item: (
                 0 if item[1].name == "stock_basic" else 1,
-                _table_display_name(item[1].name),
+                _table_order(item[1].name),
                 item[1].name,
             ),
         )
@@ -407,10 +457,33 @@ def _table_display_name(api: str) -> str:
     return entry.name_zh if entry is not None else api
 
 
+def _table_order(api: str) -> int:
+    entry = tushare_catalog.tushare_table_entry(api)
+    return entry.doc_order if entry is not None else 10**9
+
+
+def _category_order(category: str) -> int:
+    categories = _tushare_table_categories()
+    try:
+        return categories.index(category)
+    except ValueError:
+        return 10**9
+
+
+def _table_description_markdown(api: str) -> str:
+    entry = tushare_catalog.tushare_table_entry(api)
+    if entry is None:
+        return "-"
+    description = tushare_catalog.tushare_table_description(api) or "-"
+    if entry.source_url is None:
+        return description
+    return f"{description}  \n[Docs]({entry.source_url})"
+
+
 def _tushare_table_categories() -> tuple[str, ...]:
     helper = getattr(tushare_catalog, "tushare_table_categories", None)
     if callable(helper):
-        return helper()
+        return cast(tuple[str, ...], helper())
     catalog = tushare_catalog.tushare_table_catalog()
     return tuple(
         dict.fromkeys(entry.category_zh for entry in catalog)
@@ -420,11 +493,30 @@ def _tushare_table_categories() -> tuple[str, ...]:
 def _tushare_table_catalog_for_category(category_zh: str):
     helper = getattr(tushare_catalog, "tushare_table_catalog_for_category", None)
     if callable(helper):
-        return helper(category_zh)
+        return cast(
+            tuple[tushare_catalog.TushareTableCatalogEntry, ...],
+            helper(category_zh),
+        )
     return tuple(
         entry
         for entry in tushare_catalog.tushare_table_catalog()
         if entry.category_zh == category_zh
+    )
+
+
+def _configured_api_names(source: SourceConfig) -> set[str]:
+    return {table.name for table in source.tables}
+
+
+def _available_tushare_table_catalog_for_category(
+    source: SourceConfig,
+    category_zh: str,
+) -> tuple[tushare_catalog.TushareTableCatalogEntry, ...]:
+    configured = _configured_api_names(source)
+    return tuple(
+        entry
+        for entry in _tushare_table_catalog_for_category(category_zh)
+        if entry.api not in configured
     )
 
 
@@ -485,31 +577,25 @@ def _ensure_tushare_stock_basic(config: GuiConfig) -> None:
 
 def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
     st.subheader("Retrieve Data")
-    sources = lake.list_sources() or tuple(config.source_names()) or ("tushare",)
-    source = st.selectbox("Source", options=sources, key="retrieve-source")
-    tables = tuple(table for src, table in lake.list_tables(source)) or tuple(
-        table.name for table in config.tables_for(source)
-    )
-    table = st.selectbox("Table", options=tables or ("daily",), key="retrieve-table")
     cols = st.columns(2)
     start_date = cols[0].text_input("Start date", value="2000-01-01")
     end_date = cols[1].text_input("End date", value="2024-12-31")
-
-    try:
-        data = lake.read(source, table)
-    except DatasetNotFoundError:
-        data = pd.DataFrame()
-        st.info("No local data found for this selection.")
-
-    available_fields = [str(column) for column in data.columns]
-    panel_field = st.selectbox(
+    field_ids = lake.panel_field_ids()
+    qualified_field = st.selectbox(
         "Panel field",
-        options=available_fields or ["close"],
-        index=(available_fields.index("close") if "close" in available_fields else 0),
+        options=field_ids or ("tushare_daily_close",),
         key="panel-field",
     )
-    preview = _filter_by_date(data, start_date=start_date, end_date=end_date)
-    st.dataframe(preview.iloc[:50, :20], width="stretch")
+    try:
+        panel = lake.read_panel_field(
+            qualified_field,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        st.dataframe(panel.iloc[:50, :20], width="stretch")
+    except DatasetNotFoundError:
+        panel = pd.DataFrame()
+        st.info("No local panel data found for this selection.")
 
     include_core = st.checkbox("Include optional bagelquant-core conversion snippet")
     if include_core:
@@ -517,12 +603,15 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
             "The conversion snippet shows how to turn a panel agreement payload "
             "into downstream bagelquant-core Domain and Panel objects."
         )
+    resolved = lake.resolve_panel_field(qualified_field)
+    source, table, panel_field = resolved or ("tushare", "daily", "close")
     selection = RetrievalSelection(
         lake_root=config.lake_root,
         source=source,
         table=table,
         fields=(panel_field,),
         panel_field=panel_field,
+        qualified_panel_field=qualified_field,
         start_date=start_date,
         end_date=end_date,
         include_core_conversion=include_core,
@@ -535,13 +624,13 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
     st.caption(
         {
             "LocalDataLake read": (
-                "Reads the selected local lake table directly from disk."
+                "Reads the selected panel field directly from disk."
             ),
             "Loader read": (
-                "Uses Loader for lake-first retrieval with provider fallback options."
+                "Uses Loader to create a panel agreement from the local lake field."
             ),
             "Panel agreement": (
-                "Shapes one field into a panel-ready agreement for downstream systems."
+                "Shapes the selected field into a panel-ready agreement."
             ),
         }[snippet_choice]
     )

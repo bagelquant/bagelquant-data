@@ -131,6 +131,7 @@ Every table is normalized with:
 - columns `create_time` and `delete_flag`
 - source asset ids in `__asset_ids`
 - source data item ids in `__data_item_ids`
+- Parquet snapshot files under each year/month partition
 
 Reference tables that are not panel-like, such as `stock_basic`, keep their
 ordinary row index.
@@ -193,11 +194,11 @@ tables from the local Tushare catalog and click **Update data lake**.
 
 Tushare `All` is built from `stock_basic`, including listed (`L`), delisted
 (`D`), and paused (`P`) stocks returned by the provider. Price-like tables such
-as `daily` and `index_daily` are fetched day by day to avoid provider row
-limits. Fundamental tables are fetched id by id through `ts_code` and use the
-existing local table to request only incremental changes after the latest
-`f_ann_date`. VIP fundamental tables such as `income_vip` are fetched by
-reporting season with `period`, so they do not loop through every stock.
+as `daily` and `index_daily` are fetched and written day by day to avoid
+provider row limits and resume incrementally. Fundamental tables are fetched id
+by id through `ts_code` and write each completed asset batch immediately. VIP
+fundamental tables such as `income_vip` are fetched and written by reporting
+season with `period`, so they do not loop through every stock.
 
 Defaults:
 

@@ -20,6 +20,8 @@ class TushareTableCatalogEntry:
     description_zh: str
     category_zh: str
     default_kind: TushareTableKind
+    category_path: tuple[str, ...] = ()
+    doc_order: int = 0
     source_url: str | None = None
 
     @property
@@ -36,7 +38,7 @@ def tushare_table_catalog() -> tuple[TushareTableCatalogEntry, ...]:
     resource = files("bagelquant_data.gui").joinpath("tushare_tables.json")
     payload = json.loads(resource.read_text(encoding="utf-8"))
     entries = tuple(_entry_from_mapping(item) for item in payload)
-    return tuple(sorted(entries, key=lambda item: (item.category_zh, item.api)))
+    return tuple(sorted(entries, key=lambda item: (item.doc_order, item.api)))
 
 
 @cache
@@ -91,6 +93,8 @@ def _entry_from_mapping(payload: dict[str, Any]) -> TushareTableCatalogEntry:
         description_zh=str(payload["description_zh"]),
         category_zh=str(payload["category_zh"]),
         default_kind=_table_kind(payload["default_kind"]),
+        category_path=tuple(str(item) for item in payload.get("category_path", ())),
+        doc_order=int(payload.get("doc_order", 0)),
         source_url=(
             str(payload["source_url"])
             if payload.get("source_url") not in {None, ""}

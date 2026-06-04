@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,9 +49,9 @@ class LocalDataLake:
         for ref in refs:
             if ref.path is None:
                 continue
-            data_path = ref.path / "data.csv"
+            data_path = ref.path / "data.parquet"
             if data_path.exists():
-                frames.append(_read_table_csv(data_path, table=dataset))
+                frames.append(_read_table_parquet(data_path, table=dataset))
         if not frames:
             raise DatasetNotFoundError(f"No local lake data files: {source}/{dataset}")
         if len(frames) == 1:
@@ -93,10 +93,11 @@ class LocalDataLake:
                 previous = self._read_partition_latest(source, dataset, year, month)
                 if previous is not None:
                     partition = pd.concat([previous, partition], axis=0)
+            partition = _normalize_parquet_types(partition)
             snapshot_dir = self._snapshot_dir(source, dataset, year, month, snapshot_id)
             snapshot_dir.mkdir(parents=True, exist_ok=False)
-            partition.to_csv(
-                snapshot_dir / "data.csv",
+            partition.to_parquet(
+                snapshot_dir / "data.parquet",
                 index=partition.index.name == "date",
             )
             payload = {
@@ -104,6 +105,7 @@ class LocalDataLake:
                 "table": dataset,
                 "dataset": dataset,
                 "snapshot_id": snapshot_id,
+                "format": "parquet",
                 "year": year,
                 "month": month,
                 "created_at": created_at.isoformat(),
@@ -175,6 +177,75 @@ class LocalDataLake:
         except DatasetNotFoundError:
             return ()
         return tuple(str(item_id) for item_id in data["data_item_id"].tolist())
+
+    def panel_field_ids(self, source: str | None = None) -> tuple[str, ...]:
+        """Return qualified field ids that can be selected as panel fields."""
+
+        sources = (source,) if source is not None else self.list_sources()
+        ids: set[str] = set()
+        for source_name in sources:
+            try:
+                data = self.read(source_name, "__data_item_ids")
+            except DatasetNotFoundError:
+                continue
+            if "data_item_id" not in data.columns:
+                continue
+            for item_id in data["data_item_id"].dropna().astype(str).tolist():
+                try:
+                    resolved = self.resolve_panel_field(item_id)
+                except (DatasetNotFoundError, LakeError):
+                    continue
+                if resolved is not None:
+                    ids.add(item_id)
+        return tuple(sorted(ids))
+
+    def resolve_panel_field(
+        self,
+        qualified_id: str,
+    ) -> tuple[str, str, str] | None:
+        """Resolve ``source_dataset_field`` into source, dataset, and field."""
+
+        for source, dataset in self.list_datasets():
+            prefix = f"{source}_{dataset}_"
+            if not qualified_id.startswith(prefix):
+                continue
+            field = qualified_id.removeprefix(prefix)
+            if not field:
+                continue
+            try:
+                data = self.read(source, dataset)
+            except DatasetNotFoundError:
+                return None
+            if field not in data.columns or _infer_asset_column(data) is None:
+                return None
+            date_column = _infer_partition_column(data.reset_index())
+            if date_column is None:
+                return None
+            if not _is_panel_value_field(data, field=field, date_column=date_column):
+                return None
+            return source, dataset, field
+        return None
+
+    def read_panel_field(
+        self,
+        qualified_id: str,
+        *,
+        start_date: str | datetime | None = None,
+        end_date: str | datetime | None = None,
+    ) -> pd.DataFrame:
+        """Read a qualified lake field as a date x asset-id panel."""
+
+        resolved = self.resolve_panel_field(qualified_id)
+        if resolved is None:
+            raise DatasetNotFoundError(f"No panel field: {qualified_id}")
+        source, dataset, field = resolved
+        data = self.read(source, dataset)
+        panel = shape_panel_field(data, field=field)
+        if start_date is not None:
+            panel = panel.loc[panel.index >= pd.Timestamp(start_date)]
+        if end_date is not None:
+            panel = panel.loc[panel.index <= pd.Timestamp(end_date)]
+        return panel
 
     def delete(
         self,
@@ -266,6 +337,40 @@ class LocalDataLake:
         ]
         return refs[0] if refs else None
 
+    def latest_partitions(
+        self,
+        source: str,
+        dataset: str,
+    ) -> tuple[SnapshotRef, ...]:
+        """Return the latest snapshot ref for each partition."""
+
+        refs: list[SnapshotRef] = []
+        table_dir = self._dataset_dir(source, dataset)
+        if not table_dir.exists():
+            return ()
+        for year_dir in sorted(table_dir.glob("year=*")):
+            for month_dir in sorted(year_dir.glob("month=*")):
+                year = _parse_partition_number(year_dir.name, "year")
+                month = _parse_partition_number(month_dir.name, "month")
+                catalog_path = self._partition_catalog_path(
+                    source, dataset, year, month
+                )
+                if not catalog_path.exists():
+                    continue
+                payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+                snapshot_id = payload.get("latest_snapshot")
+                if isinstance(snapshot_id, str):
+                    refs.append(
+                        self._snapshot_ref(
+                            source,
+                            dataset,
+                            snapshot_id,
+                            year=year,
+                            month=month,
+                        )
+                    )
+        return tuple(refs)
+
     def ingest(
         self,
         source: DataSource,
@@ -296,11 +401,8 @@ class LocalDataLake:
         refs = self.snapshots(source, dataset)
         if snapshot is not None:
             refs = tuple(ref for ref in refs if ref.snapshot_id == snapshot)
-        elif year is None and month is None:
-            latest = self.latest(source, dataset)
-            if latest is None:
-                return ()
-            refs = tuple(ref for ref in refs if ref.snapshot_id == latest.snapshot_id)
+        else:
+            refs = self.latest_partitions(source, dataset)
         if year is not None:
             refs = tuple(ref for ref in refs if ref.year == year)
         if month is not None:
@@ -322,9 +424,14 @@ class LocalDataLake:
         if not isinstance(snapshot_id, str):
             return None
         data_path = (
-            self._snapshot_dir(source, dataset, year, month, snapshot_id) / "data.csv"
+            self._snapshot_dir(source, dataset, year, month, snapshot_id)
+            / "data.parquet"
         )
-        return _read_table_csv(data_path, table=dataset) if data_path.exists() else None
+        return (
+            _read_table_parquet(data_path, table=dataset)
+            if data_path.exists()
+            else None
+        )
 
     def _snapshot_ref(
         self,
@@ -368,6 +475,7 @@ class LocalDataLake:
             "source": source,
             "table": dataset,
             "latest_snapshot": snapshot_id,
+            "format": "parquet",
             "updated_at": created_at.isoformat(),
         }
         self._table_catalog_path(source, dataset).write_text(
@@ -388,6 +496,7 @@ class LocalDataLake:
         payload = {
             "source": source,
             "table": dataset,
+            "format": "parquet",
             "year": year,
             "month": month,
             "latest_snapshot": snapshot.snapshot_id,
@@ -545,6 +654,26 @@ def _partition_frame(
     return partitions
 
 
+def shape_panel_field(data: pd.DataFrame, *, field: str) -> pd.DataFrame:
+    """Shape long lake data into a date x asset-id panel."""
+
+    if field not in data.columns:
+        raise LakeError(f"Panel field is missing from data: {field}")
+    asset_column = _infer_asset_column(data)
+    if asset_column is None:
+        raise LakeError("Panel data is missing an asset id column")
+    frame = data.reset_index()
+    date_column = _infer_partition_column(frame)
+    if date_column is None:
+        raise LakeError("Panel data is missing a date column")
+    frame[date_column] = pd.to_datetime(frame[date_column])
+    panel = frame.pivot(index=date_column, columns=asset_column, values=field)
+    panel.index = pd.DatetimeIndex(panel.index)
+    panel.index.name = "date"
+    panel.columns = panel.columns.astype(str)
+    return panel.sort_index().sort_index(axis=1)
+
+
 def _infer_partition_column(frame: pd.DataFrame) -> str | None:
     if frame.index.name == "date":
         return "date"
@@ -585,13 +714,42 @@ def _normalize_table(
     return normalized.sort_index()
 
 
-def _read_table_csv(path: Path, *, table: str) -> pd.DataFrame:
-    frame = pd.read_csv(path)
-    if _is_panel_like_table(table, frame, None) and "date" in frame.columns:
-        frame["date"] = pd.to_datetime(frame["date"])
-        frame = frame.set_index("date")
-        frame.index.name = "date"
-        return frame.sort_index()
+def _normalize_parquet_types(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy(deep=True)
+    for column, dtype in normalized.dtypes.items():
+        if not pd.api.types.is_object_dtype(dtype):
+            continue
+        values = normalized[column].dropna()
+        if values.empty:
+            continue
+        if any(isinstance(value, date | datetime | pd.Timestamp) for value in values):
+            normalized[column] = normalized[column].map(
+                lambda value: _date_value_to_string(value) if pd.notna(value) else value
+            )
+    return normalized
+
+
+def _date_value_to_string(value: object) -> object:
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    return value
+
+
+def _read_table_parquet(path: Path, *, table: str) -> pd.DataFrame:
+    frame = pd.read_parquet(path)
+    if _is_panel_like_table(table, frame, None):
+        if isinstance(frame.index, pd.DatetimeIndex):
+            frame.index.name = "date"
+            return frame.sort_index()
+        if "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"])
+            frame = frame.set_index("date")
+            frame.index.name = "date"
+            return frame.sort_index()
     return frame
 
 
@@ -610,6 +768,29 @@ def _infer_asset_column(frame: pd.DataFrame) -> str | None:
         if column in frame.columns:
             return column
     return None
+
+
+def _is_panel_value_field(
+    frame: pd.DataFrame,
+    *,
+    field: str,
+    date_column: str,
+) -> bool:
+    asset_column = _infer_asset_column(frame)
+    ignored = {
+        "index",
+        "date",
+        date_column,
+        "trade_date",
+        "f_ann_date",
+        "datetime",
+        "timestamp",
+        "create_time",
+        "delete_flag",
+    }
+    if asset_column is not None:
+        ignored.add(asset_column)
+    return field not in ignored
 
 
 def _normalize_asset_id(source: str, asset_id: object) -> str:

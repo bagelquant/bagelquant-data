@@ -204,3 +204,32 @@ def test_tushare_retry_wraps_failures() -> None:
 
     with pytest.raises(DataSourceError, match="permission denied"):
         source.read(DataRequest(dataset="daily"))
+
+
+def test_tushare_access_limit_retries_after_one_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RateLimitedClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily(self, **params):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("API access limit exceeded")
+            return pd.DataFrame({"value": [1]})
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("bagelquant_data.datasource.tushare.time.sleep", sleeps.append)
+    client = RateLimitedClient()
+    source = TushareDataSource(
+        token="token",
+        client=client,
+        retry=RetryConfig(attempts=2),
+    )
+
+    frame = source.read(DataRequest(dataset="daily"))
+
+    assert frame["value"].tolist() == [1]
+    assert client.calls == 2
+    assert sleeps == [60.0]

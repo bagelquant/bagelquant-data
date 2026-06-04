@@ -13,6 +13,7 @@ class RetrievalSelection:
     lake_root: str
     source: str
     table: str
+    qualified_panel_field: str | None = None
     year: int | None = None
     month: int | None = None
     fields: tuple[str, ...] = ()
@@ -28,6 +29,23 @@ class RetrievalSelection:
 def lake_read_snippet(selection: RetrievalSelection) -> str:
     """Return code for reading directly from ``LocalDataLake``."""
 
+    if selection.qualified_panel_field is not None:
+        kwargs = _optional_kwargs(
+            start_date=selection.start_date,
+            end_date=selection.end_date,
+        )
+        return "\n".join(
+            [
+                "from bagelquant_data.lake import LocalDataLake",
+                "",
+                f"lake = LocalDataLake({_literal(selection.lake_root)})",
+                (
+                    "panel = lake.read_panel_field("
+                    f"{_literal(selection.qualified_panel_field)}{kwargs})"
+                ),
+                "panel.head()",
+            ]
+        )
     kwargs = _optional_kwargs(
         year=selection.year,
         month=selection.month,
@@ -49,6 +67,24 @@ def lake_read_snippet(selection: RetrievalSelection) -> str:
 def loader_read_snippet(selection: RetrievalSelection) -> str:
     """Return code for lake-first loader retrieval."""
 
+    if selection.qualified_panel_field is not None:
+        start_date = selection.start_date or "2024-01-01"
+        end_date = selection.end_date or "2024-12-31"
+        return "\n".join(
+            [
+                "from bagelquant_data.lake import LocalDataLake",
+                "from bagelquant_data.loader import Loader",
+                "",
+                f"lake = LocalDataLake({_literal(selection.lake_root)})",
+                "agreement = Loader(lake=lake).load_panel_field(",
+                f"    {_literal(selection.qualified_panel_field)},",
+                f"    start_date={_literal(start_date)},",
+                f"    end_date={_literal(end_date)},",
+                f"    region={_literal(selection.region)},",
+                ")",
+                "agreement.frame.head()",
+            ]
+        )
     load_kwargs = _loader_kwargs(selection)
     return "\n".join(
         [
@@ -72,6 +108,25 @@ def loader_read_snippet(selection: RetrievalSelection) -> str:
 def panel_agreement_snippet(selection: RetrievalSelection) -> str:
     """Return code for producing a panel agreement."""
 
+    if selection.qualified_panel_field is not None:
+        start_date = selection.start_date or "2024-01-01"
+        end_date = selection.end_date or "2024-12-31"
+        lines = [
+            "from bagelquant_data.lake import LocalDataLake",
+            "from bagelquant_data.loader import Loader",
+            "",
+            f"lake = LocalDataLake({_literal(selection.lake_root)})",
+            "agreement = Loader(lake=lake).load_panel_field(",
+            f"    {_literal(selection.qualified_panel_field)},",
+            f"    start_date={_literal(start_date)},",
+            f"    end_date={_literal(end_date)},",
+            f"    region={_literal(selection.region)},",
+            ")",
+            "agreement.frame.head()",
+        ]
+        if selection.include_core_conversion:
+            lines.extend(["", core_conversion_snippet()])
+        return "\n".join(lines)
     field = selection.panel_field or (
         selection.fields[0] if selection.fields else "close"
     )

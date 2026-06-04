@@ -34,9 +34,12 @@ Use **Data Sources** to configure Tushare tables from the local Tushare catalog.
 The catalog stores API names, Chinese descriptions, categories, and default
 kinds from the official Tushare docs. Tushare sources automatically include
 `stock_basic` as the required first table with kind `general`. Click
-**Update data lake** to manually refresh all enabled tables. The update end date
-defaults to today and the default worker count is 8.
+**Update data lake** to manually refresh all enabled tables. The GUI shows the
+current table, date/asset/period work item, completed work count, and recent
+rows written. The update end date defaults to today and the default worker count
+is 8.
 
-Use **Retrieve Data** to preview lake data and generate copyable Python code for
-direct lake reads, lake-first loader reads, panel agreements, and optional
+Use **Retrieve Data** to pick a qualified panel field id such as
+`tushare_daily_close`, preview a date-by-asset panel, and generate copyable
+Python code for direct panel reads, loader panel agreements, and optional
 downstream `bagelquant-core` conversion.

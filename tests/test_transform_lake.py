@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pandas as pd
 
 from bagelquant_data.datasource import DataRequest, DataSourceRegistry
@@ -60,6 +62,34 @@ def test_local_lake_partitions_table_by_year_and_month(tmp_path) -> None:
     assert (tmp_path / "tushare" / "daily" / "year=2024" / "month=02").exists()
     assert lake.read("tushare", "daily", year=2024, month=1)["value"].tolist() == [1]
     assert lake.read("tushare", "daily", year=2024, month=2)["value"].tolist() == [2]
+    assert (
+        tmp_path
+        / "tushare"
+        / "daily"
+        / "year=2024"
+        / "month=01"
+        / "snapshots"
+        / ref.snapshot_id
+        / "data.parquet"
+    ).exists()
+
+
+def test_local_lake_reads_latest_snapshot_per_partition(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame({"trade_date": ["20240131"], "value": [1]}),
+    )
+    lake.write(
+        "tushare",
+        "daily",
+        pd.DataFrame({"trade_date": ["20240201"], "value": [2]}),
+        mode="append",
+        partition_column="trade_date",
+    )
+
+    assert lake.read("tushare", "daily")["value"].tolist() == [1, 2]
 
 
 def test_lake_panel_like_date_index_is_sorted(tmp_path) -> None:
@@ -102,6 +132,32 @@ def test_lake_tables_have_lifecycle_columns_and_main_id_tables(tmp_path) -> None
     assert {"create_time", "delete_flag"}.issubset(daily.columns)
     assert lake.asset_ids("tushare") == ("tushare_000300.SH",)
     assert "tushare_daily_close" in lake.data_item_ids("tushare")
+
+
+def test_lake_reads_qualified_panel_field(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ", "600000.SH", "000001.SZ"],
+                "trade_date": ["20240102", "20240102", "20240103"],
+                "close": [10.0, 20.0, 11.0],
+            }
+        ),
+    )
+
+    panel = lake.read_panel_field(
+        "tushare_daily_close",
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+    )
+
+    assert lake.panel_field_ids() == ("tushare_daily_close",)
+    assert panel.index.name == "date"
+    assert panel.columns.tolist() == ["000001.SZ", "600000.SH"]
+    assert panel.loc[pd.Timestamp("2024-01-02"), "600000.SH"] == 20.0
 
 
 def test_stock_basic_is_row_table_not_date_indexed(tmp_path) -> None:
@@ -201,6 +257,48 @@ def test_tushare_all_price_update_reads_day_by_day(tmp_path) -> None:
     ]
     assert daily.index.name == "date"
     assert daily["ts_code"].tolist() == ["000001.SZ", "000001.SZ"]
+
+
+def test_tushare_price_update_skips_existing_dates_and_reports_progress(
+    tmp_path,
+) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240101"],
+                "close": [1.0],
+            }
+        ),
+    )
+    events = []
+
+    manager.update_tushare_all(
+        "daily",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        workers=2,
+        progress=events.append,
+    )
+
+    assert source.calls["daily"] == [{"trade_date": "20240102"}]
+    assert events == [
+        {
+            "table": "daily",
+            "kind": "price",
+            "item": "2024-01-02",
+            "completed": 1,
+            "total": 1,
+            "rows_written": 1,
+            "snapshot": events[0]["snapshot"],
+        }
+    ]
 
 
 def test_tushare_stock_basic_reads_all_statuses_and_deduplicates(tmp_path) -> None:
@@ -344,7 +442,7 @@ class FakeTushareUpdateSource:
             call["end_date"] = pd.Timestamp(request.end_date).strftime("%Y%m%d")
         self.calls.setdefault(request.dataset, []).append(call)
         if request.dataset == "stock_basic":
-            status = request.filters.get("list_status")
+            status = cast(str, request.filters.get("list_status"))
             codes = {
                 "L": ["000001.SZ", "600000.SH"],
                 "D": ["300001.SZ", "000001.SZ"],
