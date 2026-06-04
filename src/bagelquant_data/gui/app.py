@@ -27,13 +27,14 @@ from bagelquant_data.gui.config import (
 )
 from bagelquant_data.gui.orchestration import (
     build_registry,
+    build_update_report,
     default_tushare_source,
-    run_all_table_updates,
+    run_update_report,
     token_available,
     token_from_config,
 )
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
-from bagelquant_data.lake.manager import TushareTableKind
+from bagelquant_data.lake.manager import TushareTableKind, TushareUpdateReport
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 TABLE_KINDS = ("general", "price", "fundamental", "fundamental_vip")
@@ -227,11 +228,31 @@ def _data_sources(
     provider_ready = provider_ready or current_token is not None
     if not provider_ready:
         st.warning("Configure a Tushare token before provider updates.")
-    if st.button(
-        "Update data lake",
-        disabled=not provider_ready,
+    report_key = "bq-data-update-report"
+    signature_key = "bq-data-update-report-signature"
+    current_signature = _update_report_signature(config)
+    actions = st.columns([1, 1, 4])
+    if actions[0].button("Scan updates", width="content"):
+        report = build_update_report(manager, config)
+        st.session_state[report_key] = report
+        st.session_state[signature_key] = current_signature
+        save_config(config, config_path)
+    report = cast(TushareUpdateReport | None, st.session_state.get(report_key))
+    report_current = st.session_state.get(signature_key) == current_signature
+    if report is not None:
+        st.dataframe(
+            pd.DataFrame(_update_report_rows(report)),
+            width="stretch",
+            hide_index=True,
+        )
+        if not report_current:
+            st.warning("Scan settings changed. Run Scan updates again.")
+    if actions[1].button(
+        "Confirm update",
+        disabled=not provider_ready or report is None or not report_current,
         width="content",
     ):
+        confirmed_report = cast(TushareUpdateReport, report)
         update_manager = DataLakeManager(
             manager.lake,
             registry=build_registry(tushare_token=current_token),
@@ -249,9 +270,10 @@ def _data_sources(
                 f"({completed}/{total})"
             )
 
-        snapshots = run_all_table_updates(
+        snapshots = run_update_report(
             update_manager,
-            config,
+            confirmed_report,
+            workers=config.update_workers,
             progress=on_progress,
         )
         save_config(config, config_path)
@@ -302,6 +324,55 @@ def _sync_source_tokens_from_session(config: GuiConfig) -> None:
         key = f"source-token-{source.name}"
         if key in st.session_state:
             source.token = str(st.session_state[key]) or None
+
+
+def _update_report_signature(config: GuiConfig) -> tuple[object, ...]:
+    return (
+        config.update_start_date,
+        config.update_end_date,
+        tuple(
+            (
+                source.name,
+                source.enabled,
+                tuple(
+                    (
+                        table.source,
+                        table.name,
+                        table.kind,
+                        table.enabled,
+                    )
+                    for table in source.tables
+                ),
+            )
+            for source in config.sources
+        ),
+    )
+
+
+def _update_report_rows(report: TushareUpdateReport) -> list[dict[str, object]]:
+    rows = []
+    for plan in report.plans:
+        pending = ", ".join(plan.pending_items[:5])
+        if len(plan.pending_items) > 5:
+            pending = f"{pending}, ..."
+        rows.append(
+            {
+                "source": report.source,
+                "table": plan.table,
+                "kind": plan.kind,
+                "status": plan.status,
+                "effective_start": (
+                    plan.effective_start.isoformat()
+                    if plan.effective_start is not None
+                    else ""
+                ),
+                "end_date": plan.requested_end.isoformat(),
+                "job_count": plan.estimated_job_count,
+                "pending_items": pending,
+                "reason": plan.reason,
+            }
+        )
+    return rows
 
 
 def _table_editor(source: SourceConfig) -> None:

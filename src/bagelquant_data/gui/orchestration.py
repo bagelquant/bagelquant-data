@@ -9,7 +9,7 @@ from typing import Any
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.datasource.base import DataRequest
 from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
-from bagelquant_data.lake import DataLakeManager
+from bagelquant_data.lake import DataLakeManager, TushareUpdateReport
 from bagelquant_data.lake.snapshot import SnapshotRef
 
 ProgressCallback = Callable[[Mapping[str, Any]], None]
@@ -123,6 +123,37 @@ def enabled_update_tables(config: GuiConfig) -> tuple[TableConfig, ...]:
     return tuple(tables)
 
 
+def build_update_report(
+    manager: DataLakeManager,
+    config: GuiConfig,
+) -> TushareUpdateReport:
+    """Scan enabled GUI tables and return a dry-run update report."""
+
+    tables = enabled_update_tables(config)
+    return manager.scan_tushare_updates(
+        [table.name for table in tables],
+        kinds={table.name: table.kind for table in tables},
+        start_date=config.update_start_date,
+        end_date=config.update_end_date,
+    )
+
+
+def run_update_report(
+    manager: DataLakeManager,
+    report: TushareUpdateReport,
+    *,
+    workers: int = 4,
+    progress: ProgressCallback | None = None,
+) -> tuple[SnapshotRef, ...]:
+    """Execute a confirmed update report."""
+
+    return manager.execute_tushare_update_report(
+        report,
+        workers=workers,
+        progress=progress,
+    )
+
+
 def run_all_table_updates(
     manager: DataLakeManager,
     config: GuiConfig,
@@ -131,19 +162,13 @@ def run_all_table_updates(
 ) -> tuple[SnapshotRef, ...]:
     """Run all enabled configured table updates manually."""
 
-    snapshots: list[SnapshotRef] = []
-    for table in enabled_update_tables(config):
-        snapshots.extend(
-            run_table_update(
-                manager,
-                table,
-                start_date=config.update_start_date,
-                end_date=None,
-                workers=config.update_workers,
-                progress=progress,
-            )
-        )
-    return tuple(snapshots)
+    report = build_update_report(manager, config)
+    return run_update_report(
+        manager,
+        report,
+        workers=config.update_workers,
+        progress=progress,
+    )
 
 
 def default_tushare_source() -> SourceConfig:

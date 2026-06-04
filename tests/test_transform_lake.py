@@ -345,16 +345,107 @@ def test_tushare_price_update_skips_existing_dates_and_reports_progress(
     )
 
     assert source.calls["daily"] == [{"trade_date": "20240102"}]
-    assert events == [
+    price_events = [event for event in events if event["table"] == "daily"]
+    assert price_events == [
         {
             "table": "daily",
             "kind": "price",
             "item": "2024-01-02",
-            "completed": 1,
-            "total": 1,
+            "completed": price_events[0]["completed"],
+            "total": 2,
             "rows_written": 1,
-            "snapshot": events[0]["snapshot"],
+            "snapshot": price_events[0]["snapshot"],
         }
+    ]
+    assert len(manager.lake.snapshots("tushare", "daily")) == 2
+
+
+def test_tushare_price_update_skips_existing_date_without_snapshot(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240101"],
+                "close": [1.0],
+            }
+        ),
+    )
+    snapshots = manager.lake.snapshots("tushare", "daily")
+
+    refs = manager.update_tushare_all(
+        "daily",
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        workers=2,
+    )
+
+    assert [ref.dataset for ref in refs] == ["stock_basic"]
+    assert source.calls["daily"] == []
+    assert manager.lake.snapshots("tushare", "daily") == snapshots
+
+
+def test_tushare_price_update_writes_new_dates_as_day_partitions(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+
+    manager.update_tushare_all(
+        "daily",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        workers=2,
+    )
+
+    daily_path = tmp_path / "tushare" / "daily" / "year=2024" / "month=01"
+    assert daily_path.exists()
+    assert (daily_path / "day=01").exists()
+    assert (daily_path / "day=02").exists()
+    assert manager.lake.read("tushare", "daily")["trade_date"].tolist() == [
+        "20240101",
+        "20240102",
+    ]
+
+
+def test_tushare_update_scan_reports_missing_price_dates_without_provider_calls(
+    tmp_path,
+) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240101"],
+                "close": [1.0],
+            }
+        ),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+
+    assert source.calls["daily"] == []
+    assert report.plans[0].status == "pending"
+    assert report.plans[0].effective_start == pd.Timestamp("2024-01-02").date()
+    assert report.plans[0].pending_items == ("2024-01-02", "2024-01-03")
+    assert [job.filters for job in report.jobs] == [
+        {"trade_date": "20240102"},
+        {"trade_date": "20240103"},
     ]
 
 
@@ -380,11 +471,16 @@ def test_tushare_stock_basic_reads_all_statuses_and_deduplicates(tmp_path) -> No
     )
 
 
-def test_tushare_fundamental_update_reads_incremental_id_by_id(tmp_path) -> None:
+def test_tushare_fundamental_update_reads_incremental_asset_jobs(tmp_path) -> None:
     registry = DataSourceRegistry()
     source = FakeTushareUpdateSource()
     registry.register(source)
     manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]}),
+    )
     manager.lake.add(
         "tushare",
         "income",
@@ -407,10 +503,160 @@ def test_tushare_fundamental_update_reads_incremental_id_by_id(tmp_path) -> None
 
     calls = sorted(source.calls["income"], key=lambda item: str(item["ts_code"]))
     assert calls == [
-        {"end_date": "20240104", "start_date": "20240103", "ts_code": "000001.SZ"},
-        {"end_date": "20240104", "start_date": "20240101", "ts_code": "300001.SZ"},
+        {"end_date": "20240104", "start_date": "20240102", "ts_code": "000001.SZ"},
         {"end_date": "20240104", "start_date": "20240101", "ts_code": "600000.SH"},
     ]
+    income = manager.lake.read("tushare", "income")
+    assert income["f_ann_date"].tolist() == [
+        "20240101",
+        "20240102",
+        "20240102",
+        "20240103",
+    ]
+
+
+def test_tushare_update_scan_reports_fundamental_effective_start(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "income",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "f_ann_date": ["20240102"],
+                "revenue": [1.0],
+            }
+        ),
+    )
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]}),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["income"],
+        kinds={"income": "fundamental"},
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+    )
+
+    assert source.calls["income"] == []
+    assert report.plans[0].effective_start == pd.Timestamp("2024-01-01").date()
+    assert report.plans[0].pending_items == ("000001.SZ", "600000.SH")
+    jobs_by_asset = {str(job.filters["ts_code"]): job for job in report.jobs}
+    assert jobs_by_asset["000001.SZ"].start_date == pd.Timestamp("2024-01-02").date()
+    assert jobs_by_asset["600000.SH"].start_date == pd.Timestamp("2024-01-01").date()
+    assert all(
+        job.end_date == pd.Timestamp("2024-01-04").date()
+        for job in report.jobs
+    )
+
+
+def test_tushare_update_scan_reports_fundamental_jobs_without_existing_table(
+    tmp_path,
+) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]}),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["income"],
+        kinds={"income": "fundamental"},
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+    )
+
+    assert source.calls["income"] == []
+    assert report.plans[0].effective_start == pd.Timestamp("2024-01-01").date()
+    assert report.plans[0].estimated_job_count == 2
+    assert report.plans[0].pending_items == ("000001.SZ", "600000.SH")
+    assert [job.filters for job in report.jobs] == [
+        {"ts_code": "000001.SZ"},
+        {"ts_code": "600000.SH"},
+    ]
+    assert all(
+        job.start_date == pd.Timestamp("2024-01-01").date()
+        for job in report.jobs
+    )
+
+
+def test_tushare_update_scan_uses_asset_catalog_for_new_fundamental_table(
+    tmp_path,
+) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ", "600000.SH"],
+                "trade_date": ["20240102", "20240102"],
+                "close": [1.0, 2.0],
+            }
+        ),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["income"],
+        kinds={"income": "fundamental"},
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+    )
+
+    assert report.plans[0].estimated_job_count == 2
+    assert report.plans[0].pending_items == ("000001.SZ", "600000.SH")
+    assert [job.filters for job in report.jobs] == [
+        {"ts_code": "000001.SZ"},
+        {"ts_code": "600000.SH"},
+    ]
+
+
+def test_tushare_fundamental_update_filters_boundary_duplicates(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "income",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "f_ann_date": ["20240102"],
+                "revenue": [1.0],
+            }
+        ),
+    )
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ"]}),
+    )
+
+    manager.update_tushare_all(
+        "income",
+        kind="fundamental",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        workers=2,
+    )
+
+    income = manager.lake.read("tushare", "income")
+    assert income["f_ann_date"].tolist() == ["20240102"]
+    assert income["revenue"].tolist() == [1.0]
 
 
 def test_tushare_vip_fundamental_update_reads_by_season(tmp_path) -> None:
@@ -449,6 +695,11 @@ def test_tushare_vip_fundamental_update_is_incremental_by_season(tmp_path) -> No
             }
         ),
     )
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ"]}),
+    )
 
     manager.update_tushare_all(
         "income_vip",
@@ -460,6 +711,82 @@ def test_tushare_vip_fundamental_update_is_incremental_by_season(tmp_path) -> No
     assert sorted(source.calls["income_vip"], key=lambda item: str(item["period"])) == [
         {"period": "20240930"},
         {"period": "20241231"},
+    ]
+
+
+def test_tushare_update_scan_reports_missing_vip_quarters(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "income_vip",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "f_ann_date": ["20240630"],
+                "revenue": [1.0],
+            }
+        ),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["income_vip"],
+        kinds={"income_vip": "fundamental_vip"},
+        start_date="2024-01-01",
+        end_date="2024-12-31",
+    )
+
+    assert source.calls["income_vip"] == []
+    assert report.plans[0].pending_items == ("2024-09-30", "2024-12-31")
+    assert [job.filters for job in report.jobs] == [
+        {"period": "20240930"},
+        {"period": "20241231"},
+    ]
+
+
+def test_tushare_update_report_execution_uses_confirmed_jobs(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+    )
+
+    manager.execute_tushare_update_report(report, workers=2)
+    manager.execute_tushare_update_report(report, workers=2)
+
+    assert source.calls["daily"] == [
+        {"trade_date": "20240101"},
+        {"trade_date": "20240101"},
+    ]
+
+
+def test_tushare_vip_fundamental_update_writes_quarter_partitions(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+
+    manager.update_tushare_all(
+        "income_vip",
+        start_date="2024-01-01",
+        end_date="2024-06-30",
+        workers=2,
+    )
+
+    assert (tmp_path / "tushare" / "income_vip" / "year=2024" / "quarter=1").exists()
+    assert (tmp_path / "tushare" / "income_vip" / "year=2024" / "quarter=2").exists()
+    assert manager.lake.read("tushare", "income_vip")["f_ann_date"].tolist() == [
+        "20240331",
+        "20240331",
+        "20240630",
+        "20240630",
     ]
 
 
@@ -526,13 +853,23 @@ class FakeTushareUpdateSource:
                 }
             )
         if request.dataset == "income":
-            return pd.DataFrame(
+            start = pd.Timestamp(request.start_date)
+            next_day = start + pd.Timedelta(days=1)
+            ts_code = str(request.filters["ts_code"])
+            data = pd.DataFrame(
                 {
-                    "ts_code": [request.filters["ts_code"]],
-                    "f_ann_date": [request.start_date],
-                    "revenue": [2.0],
+                    "ts_code": [ts_code, ts_code],
+                    "f_ann_date": [
+                        start.strftime("%Y%m%d"),
+                        next_day.strftime("%Y%m%d"),
+                    ],
+                    "revenue": [2.0, 3.0],
                 }
             )
+            if request.end_date is not None:
+                end = pd.Timestamp(request.end_date).strftime("%Y%m%d")
+                data = data.loc[data["f_ann_date"] <= end]
+            return data
         if request.dataset == "income_vip":
             period = str(request.filters["period"])
             return pd.DataFrame(

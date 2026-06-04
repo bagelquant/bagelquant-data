@@ -35,7 +35,7 @@ Tushare dates are normalized to `YYYYMMDD`. Tokens are never included in
 
 When Tushare data is ingested into `LocalDataLake`, tables such as `daily` are
 stored under the `tushare` source namespace and partitioned by `trade_date`
-year/month.
+year/month/day.
 
 ## All Universe
 
@@ -48,11 +48,16 @@ stored as `tushare_<ts_code>`, for example `tushare_000300.SH`.
 
 - `stock_basic` refreshes the All universe from listed, delisted, and paused
   stocks.
+- Updates can be scanned first from local lake state, producing a report of
+  pending tables, effective start dates, and executable jobs.
 - `daily` and `index_daily` are fetched day by day to avoid Tushare row limits.
-- Fundamental tables are fetched id by id using `ts_code`.
+- Existing price dates are skipped before provider calls and stored at day
+  granularity, so appending a new trading day does not rewrite older days.
+- Fundamental tables create one job per local `stock_basic.ts_code`, starting
+  from that asset's latest local `f_ann_date`; boundary rows are de-duplicated
+  locally.
 - VIP fundamental tables such as `income_vip` are fetched by reporting season
-  with `period`, so they do not loop through every `ts_code`.
-- Fundamental refreshes are incremental, starting after the latest local
-  `f_ann_date` for each id or after the latest local season for VIP tables.
+  with `period`, stored by year/quarter, and skipped when the quarter already
+  exists locally.
 - Default update range is `2000-01-01` through today.
 - Provider requests can run concurrently with the `workers` setting.
