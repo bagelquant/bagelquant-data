@@ -10,7 +10,7 @@ import pandas as pd
 
 from bagelquant_data.datasource.base import DataRequest
 from bagelquant_data.datasource.registry import DataSourceRegistry, default_registry
-from bagelquant_data.lake.local import LocalDataLake
+from bagelquant_data.lake.local import LocalDataLake, shape_panel_field
 from bagelquant_data.metadata.contract import (
     DataContract,
     DatasetIdentity,
@@ -220,11 +220,10 @@ class Loader:
             refresh=refresh,
         )
         frame = _shape_panel(
-            provider=source.name,
-            dataset=dataset,
             data=loaded.data,
             field=field,
         )
+        frame = _filter_panel_dates(frame, start_date=start_date, end_date=end_date)
         agreement = PanelInputAgreement(
             kind=kind,
             frame=frame,
@@ -243,6 +242,61 @@ class Loader:
         )
         return agreement
 
+    def load_panel_field(
+        self,
+        qualified_id: str,
+        *,
+        start_date: Any,
+        end_date: Any,
+        region: str,
+        kind: PanelKind = "numeric_panel",
+        universe: Sequence[Any] | pd.DataFrame = (),
+        dataset_name: str | None = None,
+    ) -> PanelInputAgreement:
+        """Load a qualified lake field id as a panel-ready agreement."""
+
+        if self._lake is None:
+            raise DataSourceError("load_panel_field requires a configured lake")
+        resolved = self._lake.resolve_panel_field(qualified_id)
+        if resolved is None:
+            raise DatasetNotFoundError(f"No panel field: {qualified_id}")
+        source_name, dataset, field = resolved
+        requested_universe = normalize_universe(universe)
+        frame = self._lake.read_panel_field(
+            qualified_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if isinstance(requested_universe, pd.DataFrame):
+            universe_columns = tuple(
+                str(column) for column in requested_universe.columns
+            )
+            if universe_columns:
+                frame = frame.reindex(columns=universe_columns)
+        elif len(requested_universe) > 0:
+            frame = frame.reindex(columns=[str(item) for item in requested_universe])
+        else:
+            requested_universe = tuple(str(column) for column in frame.columns)
+        return PanelInputAgreement(
+            kind=kind,
+            frame=frame,
+            domain_spec=DomainSpec(
+                region=region,
+                universe=requested_universe,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+            dataset_name=dataset_name or f"{source_name}.{dataset}.{field}",
+            metadata={
+                "provider": source_name,
+                "dataset": dataset,
+                "origin": "lake",
+                "field": field,
+                "qualified_id": qualified_id,
+                "panel_kind": kind,
+            },
+        )
+
     def _source(self):
         if self._source_name is None:
             raise DataSourceError("Loader source is not selected")
@@ -251,24 +305,25 @@ class Loader:
 
 def _shape_panel(
     *,
-    provider: str,
-    dataset: str,
     data: pd.DataFrame,
     field: str,
 ) -> pd.DataFrame:
-    if provider == "tushare" and dataset == "daily":
-        required = {"trade_date", "ts_code", field}
-        missing = required.difference(data.columns)
-        if missing:
-            raise ContractValidationError(
-                f"Tushare daily response is missing columns: {sorted(missing)}"
-            )
-        frame = data.pivot(index="trade_date", columns="ts_code", values=field)
-        frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index.astype(str)))
-        return frame.sort_index().sort_index(axis=1)
-    raise ContractValidationError(
-        f"No panel shaper registered for provider={provider!r}, dataset={dataset!r}"
-    )
+    try:
+        return shape_panel_field(data, field=field)
+    except Exception as exc:
+        raise ContractValidationError(str(exc)) from exc
+
+
+def _filter_panel_dates(
+    frame: pd.DataFrame,
+    *,
+    start_date: Any,
+    end_date: Any,
+) -> pd.DataFrame:
+    return frame.loc[
+        (frame.index >= pd.Timestamp(start_date))
+        & (frame.index <= pd.Timestamp(end_date))
+    ]
 
 
 def _normalize_loaded_output(dataset: str, data: pd.DataFrame) -> pd.DataFrame:

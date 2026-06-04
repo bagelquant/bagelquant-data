@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from threading import Lock
 from typing import Any, Literal
 
 import pandas as pd
@@ -16,6 +17,7 @@ from bagelquant_data.lake.snapshot import SnapshotRef
 
 ParallelMode = Literal["thread"]
 TushareTableKind = Literal["general", "price", "fundamental", "fundamental_vip"]
+ProgressCallback = Callable[[Mapping[str, Any]], None]
 
 
 class DataLakeManager:
@@ -106,6 +108,7 @@ class DataLakeManager:
         end_date: str | date | datetime | None = None,
         workers: int = 4,
         parallel: ParallelMode = "thread",
+        progress: ProgressCallback | None = None,
     ) -> tuple[SnapshotRef, ...]:
         """Update Tushare All universe into the local lake."""
 
@@ -142,6 +145,7 @@ class DataLakeManager:
                 end_date=resolved_end,
                 workers=workers,
                 parallel=parallel,
+                progress=progress,
             )
         if table_kind == "fundamental_vip":
             return self._update_tushare_fundamental_vip_table(
@@ -151,6 +155,7 @@ class DataLakeManager:
                 end_date=resolved_end,
                 workers=workers,
                 parallel=parallel,
+                progress=progress,
             )
         return self._update_tushare_fundamental_table(
             source=source,
@@ -160,6 +165,7 @@ class DataLakeManager:
             end_date=resolved_end,
             workers=workers,
             parallel=parallel,
+            progress=progress,
         )
 
     def update_tushare_stock_basic(self) -> SnapshotRef:
@@ -196,38 +202,62 @@ class DataLakeManager:
         end_date: date,
         workers: int,
         parallel: ParallelMode,
+        progress: ProgressCallback | None,
     ) -> tuple[SnapshotRef, ...]:
-        dates = _date_range(start_date, end_date)
+        existing_dates = _existing_dates(self.lake, "tushare", table)
+        dates = [
+            day
+            for day in _date_range(start_date, end_date)
+            if day not in existing_dates
+        ]
+        refs: list[SnapshotRef] = []
+        completed = 0
+        total = len(dates)
+        write_lock = Lock()
 
-        def read_day(day: date) -> pd.DataFrame:
-            return source.read(
+        def read_day(day: date) -> tuple[date, pd.DataFrame]:
+            return day, source.read(
                 DataRequest(
                     dataset=table,
                     filters={"trade_date": day.strftime("%Y%m%d")},
                 )
             )
 
-        frames = _parallel_map(read_day, dates, workers=workers, parallel=parallel)
-        data = pd.concat(
-            [frame for frame in frames if not frame.empty],
-            ignore_index=True,
-        )
-        if data.empty:
-            return ()
-        return (
-            self.lake.write(
-                "tushare",
-                table,
-                data,
-                mode="overwrite",
-                partition_column="trade_date",
-                metadata={
-                    "update_strategy": "day_by_day_all",
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                },
-            ),
-        )
+        for day, data in _parallel_iter(
+            read_day,
+            dates,
+            workers=workers,
+            parallel=parallel,
+        ):
+            with write_lock:
+                ref = None
+                if not data.empty:
+                    ref = self.lake.write(
+                        "tushare",
+                        table,
+                        data,
+                        mode="append",
+                        partition_column="trade_date",
+                        metadata={
+                            "update_strategy": "day_by_day_incremental",
+                            "trade_date": day.isoformat(),
+                            "start_date": start_date.isoformat(),
+                            "end_date": end_date.isoformat(),
+                        },
+                    )
+                    refs.append(ref)
+                completed += 1
+                _emit_progress(
+                    progress,
+                    table=table,
+                    kind="price",
+                    item=day.isoformat(),
+                    completed=completed,
+                    total=total,
+                    rows_written=0 if data.empty else len(data),
+                    snapshot=ref,
+                )
+        return tuple(refs)
 
     def _update_tushare_fundamental_table(
         self,
@@ -239,14 +269,22 @@ class DataLakeManager:
         end_date: date,
         workers: int,
         parallel: ParallelMode,
+        progress: ProgressCallback | None,
     ) -> tuple[SnapshotRef, ...]:
         existing = _existing_table(self.lake, "tushare", table)
-
-        def read_code(ts_code: str) -> pd.DataFrame:
+        targets: list[tuple[str, date]] = []
+        for ts_code in all_codes:
             code_start = _incremental_start(existing, ts_code, start_date)
-            if code_start > end_date:
-                return pd.DataFrame()
-            return source.read(
+            if code_start <= end_date:
+                targets.append((ts_code, code_start))
+        refs: list[SnapshotRef] = []
+        completed = 0
+        total = len(targets)
+        write_lock = Lock()
+
+        def read_code(target: tuple[str, date]) -> tuple[str, pd.DataFrame]:
+            ts_code, code_start = target
+            return ts_code, source.read(
                 DataRequest(
                     dataset=table,
                     filters={"ts_code": ts_code},
@@ -255,28 +293,41 @@ class DataLakeManager:
                 )
             )
 
-        frames = _parallel_map(read_code, all_codes, workers=workers, parallel=parallel)
-        changes = pd.concat(
-            [frame for frame in frames if not frame.empty],
-            ignore_index=True,
-        )
-        if changes.empty:
-            return ()
-        mode: WriteMode = "append" if existing is not None else "overwrite"
-        return (
-            self.lake.write(
-                "tushare",
-                table,
-                changes,
-                mode=mode,
-                partition_column="f_ann_date",
-                metadata={
-                    "update_strategy": "id_by_id_incremental",
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                },
-            ),
-        )
+        for ts_code, data in _parallel_iter(
+            read_code,
+            targets,
+            workers=workers,
+            parallel=parallel,
+        ):
+            with write_lock:
+                ref = None
+                if not data.empty:
+                    ref = self.lake.write(
+                        "tushare",
+                        table,
+                        data,
+                        mode="append",
+                        partition_column="f_ann_date",
+                        metadata={
+                            "update_strategy": "id_by_id_incremental",
+                            "asset_id": ts_code,
+                            "start_date": start_date.isoformat(),
+                            "end_date": end_date.isoformat(),
+                        },
+                    )
+                    refs.append(ref)
+                completed += 1
+                _emit_progress(
+                    progress,
+                    table=table,
+                    kind="fundamental",
+                    item=ts_code,
+                    completed=completed,
+                    total=total,
+                    rows_written=0 if data.empty else len(data),
+                    snapshot=ref,
+                )
+        return tuple(refs)
 
     def _update_tushare_fundamental_vip_table(
         self,
@@ -287,43 +338,61 @@ class DataLakeManager:
         end_date: date,
         workers: int,
         parallel: ParallelMode,
+        progress: ProgressCallback | None,
     ) -> tuple[SnapshotRef, ...]:
         existing = _existing_table(self.lake, "tushare", table)
         periods = _incremental_periods(existing, start_date, end_date)
+        refs: list[SnapshotRef] = []
+        completed = 0
+        total = len(periods)
+        write_lock = Lock()
 
-        def read_period(period: date) -> pd.DataFrame:
-            return source.read(
+        def read_period(period: date) -> tuple[date, pd.DataFrame]:
+            return period, source.read(
                 DataRequest(
                     dataset=table,
                     filters={"period": period.strftime("%Y%m%d")},
                 )
             )
 
-        frames = _parallel_map(read_period, periods, workers=workers, parallel=parallel)
-        changes = pd.concat(
-            [frame for frame in frames if not frame.empty],
-            ignore_index=True,
-        )
-        if changes.empty:
-            return ()
-        mode: WriteMode = "append" if existing is not None else "overwrite"
-        return (
-            self.lake.write(
-                "tushare",
-                table,
-                changes,
-                mode=mode,
-                partition_column="f_ann_date",
-                metadata={
-                    "update_strategy": "season_by_season_incremental",
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                },
-            ),
-        )
+        for period, data in _parallel_iter(
+            read_period,
+            periods,
+            workers=workers,
+            parallel=parallel,
+        ):
+            with write_lock:
+                ref = None
+                if not data.empty:
+                    ref = self.lake.write(
+                        "tushare",
+                        table,
+                        data,
+                        mode="append",
+                        partition_column="f_ann_date",
+                        metadata={
+                            "update_strategy": "season_by_season_incremental",
+                            "period": period.isoformat(),
+                            "start_date": start_date.isoformat(),
+                            "end_date": end_date.isoformat(),
+                        },
+                    )
+                    refs.append(ref)
+                completed += 1
+                _emit_progress(
+                    progress,
+                    table=table,
+                    kind="fundamental_vip",
+                    item=period.isoformat(),
+                    completed=completed,
+                    total=total,
+                    rows_written=0 if data.empty else len(data),
+                    snapshot=ref,
+                )
+        return tuple(refs)
 
 
-def _parallel_map(
+def _parallel_iter(
     fn,
     values,
     *,
@@ -334,7 +403,34 @@ def _parallel_map(
         raise ValueError("Only thread parallelism is supported for provider updates")
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [executor.submit(fn, value) for value in values]
-        return [future.result() for future in as_completed(futures)]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def _emit_progress(
+    progress: ProgressCallback | None,
+    *,
+    table: str,
+    kind: TushareTableKind,
+    item: str,
+    completed: int,
+    total: int,
+    rows_written: int,
+    snapshot: SnapshotRef | None,
+) -> None:
+    if progress is None:
+        return
+    progress(
+        {
+            "table": table,
+            "kind": kind,
+            "item": item,
+            "completed": completed,
+            "total": total,
+            "rows_written": rows_written,
+            "snapshot": snapshot,
+        }
+    )
 
 
 def _date_range(start: date, end: date) -> list[date]:
@@ -373,6 +469,24 @@ def _existing_table(
         return lake.read(source, table)
     except Exception:
         return None
+
+
+def _existing_dates(
+    lake: LocalDataLake,
+    source: str,
+    table: str,
+) -> set[date]:
+    existing = _existing_table(lake, source, table)
+    if existing is None or existing.empty:
+        return set()
+    if isinstance(existing.index, pd.DatetimeIndex):
+        return {value.date() for value in existing.index.dropna().unique()}
+    if "trade_date" not in existing.columns:
+        return set()
+    raw_dates = [
+        str(value) for value in existing["trade_date"].tolist() if pd.notna(value)
+    ]
+    return {_parse_yyyymmdd(value) for value in raw_dates}
 
 
 def _incremental_start(

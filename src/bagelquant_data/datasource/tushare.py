@@ -25,6 +25,7 @@ class RetryConfig:
     attempts: int = 3
     delay_seconds: float = 0.5
     backoff: float = 2.0
+    access_limit_sleep_seconds: float = 60.0
 
 
 class TushareDataSource:
@@ -137,8 +138,11 @@ class TushareDataSource:
                 last_error = exc
                 if attempt >= self._retry.attempts or not self._transient(exc):
                     raise DataSourceError(f"Tushare request failed: {exc}") from exc
-                time.sleep(delay)
-                delay *= self._retry.backoff
+                if _is_access_limit(exc):
+                    time.sleep(self._retry.access_limit_sleep_seconds)
+                else:
+                    time.sleep(delay)
+                    delay *= self._retry.backoff
         raise DataSourceError("Tushare request failed") from last_error
 
 
@@ -163,4 +167,22 @@ def _tushare_date(value: Any) -> str:
 
 def _is_transient(exc: Exception) -> bool:
     message = str(exc).lower()
-    return any(token in message for token in ("timeout", "temporar", "rate", "retry"))
+    return _is_access_limit(exc) or any(
+        token in message for token in ("timeout", "temporar", "rate", "retry")
+    )
+
+
+def _is_access_limit(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "access limit",
+            "api access",
+            "rate limit",
+            "访问限制",
+            "频次",
+            "每分钟",
+            "超过",
+        )
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
@@ -10,6 +11,8 @@ from bagelquant_data.datasource.base import DataRequest
 from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
 from bagelquant_data.lake import DataLakeManager
 from bagelquant_data.lake.snapshot import SnapshotRef
+
+ProgressCallback = Callable[[Mapping[str, Any]], None]
 
 
 def token_available(
@@ -75,6 +78,7 @@ def run_table_update(
     start_date: str = "2000-01-01",
     end_date: str | None = None,
     workers: int = 4,
+    progress: ProgressCallback | None = None,
 ) -> tuple[SnapshotRef, ...]:
     """Run the configured provider update for a table."""
 
@@ -90,13 +94,15 @@ def run_table_update(
                 mode=table.update_mode,
             ),
         )
-    return manager.update_tushare_all(
-        table.name,
-        kind=table.kind,
-        start_date=start_date,
-        end_date=end_date,
-        workers=workers,
-    )
+    kwargs: dict[str, Any] = {
+        "kind": table.kind,
+        "start_date": start_date,
+        "end_date": end_date,
+        "workers": workers,
+    }
+    if progress is not None:
+        kwargs["progress"] = progress
+    return manager.update_tushare_all(table.name, **kwargs)
 
 
 def enabled_update_tables(config: GuiConfig) -> tuple[TableConfig, ...]:
@@ -120,6 +126,8 @@ def enabled_update_tables(config: GuiConfig) -> tuple[TableConfig, ...]:
 def run_all_table_updates(
     manager: DataLakeManager,
     config: GuiConfig,
+    *,
+    progress: ProgressCallback | None = None,
 ) -> tuple[SnapshotRef, ...]:
     """Run all enabled configured table updates manually."""
 
@@ -132,6 +140,7 @@ def run_all_table_updates(
                 start_date=config.update_start_date,
                 end_date=None,
                 workers=config.update_workers,
+                progress=progress,
             )
         )
     return tuple(snapshots)

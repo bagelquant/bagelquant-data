@@ -24,9 +24,9 @@ The normal path is provider to local lake to user. `Loader` reads from the local
 lake first when configured. Provider access is used for bootstrap and refresh.
 
 The package keeps provider access, metadata, transformation, and storage
-interfaces independent. Local V1 storage uses source/table/year/month CSV
+interfaces independent. Local V1 storage uses source/table/year/month Parquet
 snapshots with JSON metadata, while the interfaces leave room for future
-parquet, Iceberg, Delta, object storage, or cloud backends.
+Iceberg, Delta, object storage, or cloud backends.
 
 ```text
 lake-root/
