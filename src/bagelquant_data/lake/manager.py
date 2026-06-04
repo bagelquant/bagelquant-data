@@ -211,6 +211,8 @@ class DataLakeManager:
             if day not in existing_dates
         ]
         refs: list[SnapshotRef] = []
+        catalog_assets: set[str] = set()
+        catalog_fields: set[str] = set()
         completed = 0
         total = len(dates)
         write_lock = Lock()
@@ -244,8 +246,12 @@ class DataLakeManager:
                             "start_date": start_date.isoformat(),
                             "end_date": end_date.isoformat(),
                         },
+                        update_catalogs=False,
                     )
                     refs.append(ref)
+                    assets, fields = _catalog_entries(data)
+                    catalog_assets.update(assets)
+                    catalog_fields.update(fields)
                 completed += 1
                 _emit_progress(
                     progress,
@@ -257,6 +263,12 @@ class DataLakeManager:
                     rows_written=0 if data.empty else len(data),
                     snapshot=ref,
                 )
+        self.lake.update_catalog_entries(
+            "tushare",
+            table,
+            asset_ids=catalog_assets,
+            fields=catalog_fields,
+        )
         return tuple(refs)
 
     def _update_tushare_fundamental_table(
@@ -278,6 +290,8 @@ class DataLakeManager:
             if code_start <= end_date:
                 targets.append((ts_code, code_start))
         refs: list[SnapshotRef] = []
+        catalog_assets: set[str] = set()
+        catalog_fields: set[str] = set()
         completed = 0
         total = len(targets)
         write_lock = Lock()
@@ -314,8 +328,12 @@ class DataLakeManager:
                             "start_date": start_date.isoformat(),
                             "end_date": end_date.isoformat(),
                         },
+                        update_catalogs=False,
                     )
                     refs.append(ref)
+                    assets, fields = _catalog_entries(data)
+                    catalog_assets.update(assets)
+                    catalog_fields.update(fields)
                 completed += 1
                 _emit_progress(
                     progress,
@@ -327,6 +345,12 @@ class DataLakeManager:
                     rows_written=0 if data.empty else len(data),
                     snapshot=ref,
                 )
+        self.lake.update_catalog_entries(
+            "tushare",
+            table,
+            asset_ids=catalog_assets,
+            fields=catalog_fields,
+        )
         return tuple(refs)
 
     def _update_tushare_fundamental_vip_table(
@@ -343,6 +367,8 @@ class DataLakeManager:
         existing = _existing_table(self.lake, "tushare", table)
         periods = _incremental_periods(existing, start_date, end_date)
         refs: list[SnapshotRef] = []
+        catalog_assets: set[str] = set()
+        catalog_fields: set[str] = set()
         completed = 0
         total = len(periods)
         write_lock = Lock()
@@ -376,8 +402,12 @@ class DataLakeManager:
                             "start_date": start_date.isoformat(),
                             "end_date": end_date.isoformat(),
                         },
+                        update_catalogs=False,
                     )
                     refs.append(ref)
+                    assets, fields = _catalog_entries(data)
+                    catalog_assets.update(assets)
+                    catalog_fields.update(fields)
                 completed += 1
                 _emit_progress(
                     progress,
@@ -389,6 +419,12 @@ class DataLakeManager:
                     rows_written=0 if data.empty else len(data),
                     snapshot=ref,
                 )
+        self.lake.update_catalog_entries(
+            "tushare",
+            table,
+            asset_ids=catalog_assets,
+            fields=catalog_fields,
+        )
         return tuple(refs)
 
 
@@ -431,6 +467,29 @@ def _emit_progress(
             "snapshot": snapshot,
         }
     )
+
+
+def _catalog_entries(data: pd.DataFrame) -> tuple[set[str], set[str]]:
+    asset_column = next(
+        (
+            column
+            for column in ("ts_code", "symbol", "asset_id", "code")
+            if column in data.columns
+        ),
+        None,
+    )
+    assets = (
+        set(data[asset_column].dropna().astype(str).tolist())
+        if asset_column is not None
+        else set()
+    )
+    ignored = {"index", "create_time", "delete_flag"}
+    fields = {
+        str(column)
+        for column in data.reset_index().columns
+        if column not in ignored
+    }
+    return assets, fields
 
 
 def _date_range(start: date, end: date) -> list[date]:

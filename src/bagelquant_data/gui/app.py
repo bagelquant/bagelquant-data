@@ -37,6 +37,7 @@ from bagelquant_data.lake.manager import TushareTableKind
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 TABLE_KINDS = ("general", "price", "fundamental", "fundamental_vip")
+MAX_BROWSER_DATAFRAME_BYTES = 150 * 1024 * 1024
 
 
 def main() -> None:
@@ -67,15 +68,30 @@ def main() -> None:
         st.sidebar.success("Config saved")
 
     lake = LocalDataLake(config.lake_root)
-    registry = build_registry(tushare_token=token)
-    manager = DataLakeManager(lake, registry=registry)
+    manager = DataLakeManager(lake)
+    page = st.sidebar.radio(
+        "Page",
+        options=("Lake Setup", "Data Sources", "Retrieve Data"),
+        key="bq-data-gui-page",
+    )
+    _render_page(config, manager, lake, config_path, token is not None, page)
 
-    tabs = st.tabs(["Lake Setup", "Data Sources", "Retrieve Data"])
-    with tabs[0]:
+
+def _render_page(
+    config: GuiConfig,
+    manager: DataLakeManager,
+    lake: LocalDataLake,
+    config_path: Path,
+    provider_ready: bool,
+    page: str,
+) -> None:
+    """Render only the selected GUI page."""
+
+    if page == "Lake Setup":
         _lake_setup(config, manager)
-    with tabs[1]:
-        _data_sources(config, manager, config_path, token is not None)
-    with tabs[2]:
+    elif page == "Data Sources":
+        _data_sources(config, manager, config_path, provider_ready)
+    else:
         _retrieve_data(config, lake)
 
 
@@ -147,7 +163,7 @@ def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
                 st.success(f"Deleted {selected_source}/{selected_table}")
                 st.rerun()
     st.subheader("Data Items")
-    data_items = _data_item_catalog(manager.lake, tables)
+    data_items = _data_item_catalog(manager.lake, config)
     item_sources = (
         sorted(data_items["source"].unique().tolist()) if not data_items.empty else []
     )
@@ -176,6 +192,11 @@ def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
         width="stretch",
         height=260,
     )
+    if data_items.empty and tables:
+        st.warning(
+            "No data item catalog found. Update or rewrite a table to rebuild "
+            "catalog metadata."
+        )
 
 
 def _data_sources(
@@ -288,45 +309,45 @@ def _table_editor(source: SourceConfig) -> None:
     if not source.tables:
         st.info("No tables configured for this source.")
     for category in _configured_table_categories(source):
-        st.markdown(f"##### {category}")
-        header = st.columns([1, 2, 2, 4, 2])
-        header[0].caption("Enabled")
-        header[1].caption("Table")
-        header[2].caption("Kind")
-        header[3].caption("Description")
-        header[4].caption("Action")
-        for index, table in _configured_tables_for_category(source, category):
-            cols = st.columns([1, 2, 2, 4, 2])
-            required = source.provider == "tushare" and table.name == "stock_basic"
-            table.enabled = cols[0].checkbox(
-                "Enabled",
-                value=True if required else table.enabled,
-                key=f"table-enabled-{source.name}-{index}",
-                disabled=required,
-                label_visibility="collapsed",
-            )
-            table.name = cols[1].text_input(
-                "Table",
-                value=table.name,
-                key=f"table-name-{source.name}-{index}",
-                disabled=required,
-                label_visibility="collapsed",
-            )
-            table.kind = cols[2].selectbox(
-                "Kind",
-                options=TABLE_KINDS,
-                index=TABLE_KINDS.index(table.kind),
-                key=f"table-kind-{source.name}-{index}",
-                disabled=required,
-                label_visibility="collapsed",
-            )
-            cols[3].markdown(_table_description_markdown(table.name))
-            if required:
-                cols[4].caption("Required")
-                table.enabled = True
-                table.kind = "general"
-                continue
-            _table_delete_controls(source, index, table, cols[4])
+        with st.expander(category, expanded=False):
+            header = st.columns([1, 2, 2, 4, 2])
+            header[0].caption("Enabled")
+            header[1].caption("Table")
+            header[2].caption("Kind")
+            header[3].caption("Description")
+            header[4].caption("Action")
+            for index, table in _configured_tables_for_category(source, category):
+                cols = st.columns([1, 2, 2, 4, 2])
+                required = source.provider == "tushare" and table.name == "stock_basic"
+                table.enabled = cols[0].checkbox(
+                    "Enabled",
+                    value=True if required else table.enabled,
+                    key=f"table-enabled-{source.name}-{index}",
+                    disabled=required,
+                    label_visibility="collapsed",
+                )
+                table.name = cols[1].text_input(
+                    "Table",
+                    value=table.name,
+                    key=f"table-name-{source.name}-{index}",
+                    disabled=required,
+                    label_visibility="collapsed",
+                )
+                table.kind = cols[2].selectbox(
+                    "Kind",
+                    options=TABLE_KINDS,
+                    index=TABLE_KINDS.index(table.kind),
+                    key=f"table-kind-{source.name}-{index}",
+                    disabled=required,
+                    label_visibility="collapsed",
+                )
+                cols[3].markdown(_table_description_markdown(table.name))
+                if required:
+                    cols[4].caption("Required")
+                    table.enabled = True
+                    table.kind = "general"
+                    continue
+                _table_delete_controls(source, index, table, cols[4])
     with st.expander("Add table", expanded=False):
         add_cols = st.columns([2, 5, 2, 1])
         categories = _tushare_table_categories()
@@ -580,22 +601,54 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
     cols = st.columns(2)
     start_date = cols[0].text_input("Start date", value="2000-01-01")
     end_date = cols[1].text_input("End date", value="2024-12-31")
-    field_ids = lake.panel_field_ids()
-    qualified_field = st.selectbox(
-        "Panel field",
-        options=field_ids or ("tushare_daily_close",),
-        key="panel-field",
+    data_items = _data_item_catalog(lake, config)
+    data_item_ids = (
+        data_items["data_item_id"].dropna().astype(str).tolist()
+        if not data_items.empty
+        else []
     )
-    try:
-        panel = lake.read_panel_field(
-            qualified_field,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        st.dataframe(panel.iloc[:50, :20], width="stretch")
-    except DatasetNotFoundError:
-        panel = pd.DataFrame()
-        st.info("No local panel data found for this selection.")
+    qualified_field = st.selectbox(
+        "Select data item",
+        options=data_item_ids or ("tushare_daily_close",),
+        key="select-data-item",
+    )
+    source, table, panel_field = _selected_data_item(
+        data_items,
+        str(qualified_field),
+        lake,
+    )
+    if st.button("Load preview", width="content"):
+        try:
+            resolved = lake.resolve_panel_field(
+                str(qualified_field),
+                validate_with_read=False,
+            )
+            if resolved is not None:
+                panel = lake.read_panel_field(
+                    str(qualified_field),
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                preview, notice = _browser_dataframe_payload(
+                    _preview_panel_frame(panel)
+                )
+                if notice:
+                    st.warning(notice)
+                st.dataframe(preview, width="stretch")
+            else:
+                data = lake.read(source, table)
+                preview = _preview_table_frame(
+                    data,
+                    panel_field=panel_field,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                preview, notice = _browser_dataframe_payload(preview)
+                if notice:
+                    st.warning(notice)
+                st.dataframe(preview, width="stretch")
+        except DatasetNotFoundError:
+            st.info("No local data found for this selection.")
 
     include_core = st.checkbox("Include optional bagelquant-core conversion snippet")
     if include_core:
@@ -603,15 +656,15 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
             "The conversion snippet shows how to turn a panel agreement payload "
             "into downstream bagelquant-core Domain and Panel objects."
         )
-    resolved = lake.resolve_panel_field(qualified_field)
-    source, table, panel_field = resolved or ("tushare", "daily", "close")
+    resolved = lake.resolve_panel_field(str(qualified_field), validate_with_read=False)
+    qualified_panel_field = str(qualified_field) if resolved is not None else None
     selection = RetrievalSelection(
         lake_root=config.lake_root,
         source=source,
         table=table,
         fields=(panel_field,),
         panel_field=panel_field,
-        qualified_panel_field=qualified_field,
+        qualified_panel_field=qualified_panel_field,
         start_date=start_date,
         end_date=end_date,
         include_core_conversion=include_core,
@@ -644,29 +697,114 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
 
 def _data_item_catalog(
     lake: LocalDataLake,
-    tables: tuple[tuple[str, str], ...],
+    config: GuiConfig | None = None,
 ) -> pd.DataFrame:
+    frames = [lake.data_items()]
+    if config is not None:
+        frames.append(_configured_data_items(config))
+    data = pd.concat(frames, axis=0, ignore_index=True)
+    if data.empty:
+        return pd.DataFrame(columns=["source", "table", "field", "data_item_id"])
+    return data.drop_duplicates("data_item_id").sort_values(
+        ["source", "table", "field", "data_item_id"],
+        ignore_index=True,
+    )
+
+
+def _configured_data_items(config: GuiConfig) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
-    for source, table in tables:
-        if table.startswith("__"):
+    for source in config.sources:
+        if not source.enabled:
             continue
-        try:
-            data = lake.read(source, table)
-        except DatasetNotFoundError:
-            continue
-        fields = [str(column) for column in data.reset_index().columns]
-        for field in fields:
-            if field in {"index", "create_time", "delete_flag"}:
+        for table in source.tables:
+            if not table.enabled:
                 continue
-            rows.append(
-                {
-                    "source": source,
-                    "table": table,
-                    "field": field,
-                    "data_item_id": f"{source}_{table}_{field}",
-                }
-            )
+            for field in table.fields:
+                rows.append(
+                    {
+                        "source": source.name,
+                        "table": table.name,
+                        "field": field,
+                        "data_item_id": f"{source.name}_{table.name}_{field}",
+                    }
+                )
     return pd.DataFrame(rows, columns=["source", "table", "field", "data_item_id"])
+
+
+def _selected_data_item(
+    data_items: pd.DataFrame,
+    qualified_id: str,
+    lake: LocalDataLake,
+) -> tuple[str, str, str]:
+    if not data_items.empty:
+        matches = data_items.loc[data_items["data_item_id"].astype(str) == qualified_id]
+        if not matches.empty:
+            row = matches.iloc[0]
+            return str(row["source"]), str(row["table"]), str(row["field"])
+    resolved = lake.resolve_panel_field(qualified_id, validate_with_read=False)
+    return resolved or ("tushare", "daily", "close")
+
+
+def _preview_panel_frame(panel: pd.DataFrame) -> pd.DataFrame:
+    return panel
+
+
+def _preview_table_frame(
+    data: pd.DataFrame,
+    *,
+    panel_field: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    preview = _filter_by_date(
+        data.reset_index(),
+        start_date=start_date,
+        end_date=end_date,
+    )
+    preview_columns = [
+        column
+        for column in ("date", "trade_date", "f_ann_date", panel_field)
+        if column in preview.columns
+    ]
+    return preview.loc[:, preview_columns]
+
+
+def _browser_dataframe_payload(
+    data: pd.DataFrame,
+    *,
+    max_bytes: int = MAX_BROWSER_DATAFRAME_BYTES,
+) -> tuple[pd.DataFrame, str | None]:
+    size = _dataframe_size_bytes(data)
+    if size <= max_bytes or data.empty:
+        return data, None
+    rows = _rows_that_fit(data, max_bytes=max_bytes, size_bytes=size)
+    preview = data.iloc[:rows, :]
+    notice = (
+        f"Selected data is {_format_bytes(size)}, which is too large to send to "
+        f"the browser safely. Showing {len(preview):,} of {len(data):,} rows."
+    )
+    return preview, notice
+
+
+def _dataframe_size_bytes(data: pd.DataFrame) -> int:
+    return int(data.memory_usage(index=True, deep=True).sum())
+
+
+def _rows_that_fit(
+    data: pd.DataFrame,
+    *,
+    max_bytes: int,
+    size_bytes: int,
+) -> int:
+    bytes_per_row = max(size_bytes / max(len(data), 1), 1)
+    return max(1, min(len(data), int(max_bytes / bytes_per_row)))
+
+
+def _format_bytes(size: int) -> str:
+    mib = size / (1024 * 1024)
+    if mib >= 1024:
+        return f"{mib / 1024:.1f} GB"
+    return f"{mib:.1f} MB"
 
 
 def _filter_by_date(

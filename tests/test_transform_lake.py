@@ -132,6 +132,63 @@ def test_lake_tables_have_lifecycle_columns_and_main_id_tables(tmp_path) -> None
     assert {"create_time", "delete_flag"}.issubset(daily.columns)
     assert lake.asset_ids("tushare") == ("tushare_000300.SH",)
     assert "tushare_daily_close" in lake.data_item_ids("tushare")
+    data_items = lake.data_items("tushare")
+    close = data_items.loc[data_items["data_item_id"] == "tushare_daily_close"].iloc[0]
+    assert close["source"] == "tushare"
+    assert close["table"] == "daily"
+    assert close["field"] == "close"
+
+
+def test_lake_data_items_support_old_one_column_catalog(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000300.SH"],
+                "trade_date": ["20240131"],
+                "close": [1.0],
+            }
+        ),
+    )
+    lake.write(
+        "tushare",
+        "__data_item_ids",
+        pd.DataFrame({"data_item_id": ["tushare_daily_close"]}),
+        mode="overwrite",
+        update_catalogs=False,
+    )
+
+    data_items = lake.data_items("tushare")
+
+    assert data_items.to_dict("records") == [
+        {
+            "source": "tushare",
+            "table": "daily",
+            "field": "close",
+            "data_item_id": "tushare_daily_close",
+        }
+    ]
+
+
+def test_panel_field_ids_uses_catalog_metadata_without_reading_table(tmp_path) -> None:
+    lake = CountingLocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240102"],
+                "close": [10.0],
+            }
+        ),
+    )
+    lake.read_calls.clear()
+
+    assert lake.panel_field_ids() == ("tushare_daily_close",)
+    assert ("tushare", "daily") not in lake.read_calls
 
 
 def test_lake_reads_qualified_panel_field(tmp_path) -> None:
@@ -421,6 +478,16 @@ class CountingSource:
 
     def describe(self, dataset: str):
         return {"dataset": dataset}
+
+
+class CountingLocalDataLake(LocalDataLake):
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.read_calls: list[tuple[str, str]] = []
+
+    def read(self, source: str, dataset: str, **kwargs) -> pd.DataFrame:
+        self.read_calls.append((source, dataset))
+        return super().read(source, dataset, **kwargs)
 
 
 class FakeTushareUpdateSource:
