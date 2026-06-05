@@ -9,6 +9,8 @@ from bagelquant_data.lake import (
     DataLakeManager,
     LocalDataLake,
     PartitionSpec,
+    TushareTradingCalendarRef,
+    TushareUniverseRef,
 )
 from bagelquant_data.loader import Loader
 from bagelquant_data.transform import Transform
@@ -303,11 +305,7 @@ def test_tushare_all_price_update_reads_day_by_day(tmp_path) -> None:
     )
     daily = manager.lake.read("tushare", "daily")
 
-    assert source.calls["stock_basic"] == [
-        {"list_status": "L"},
-        {"list_status": "D"},
-        {"list_status": "P"},
-    ]
+    assert source.calls["stock_basic"] == []
     assert sorted(source.calls["daily"], key=lambda item: str(item["trade_date"])) == [
         {"trade_date": "20240101"},
         {"trade_date": "20240102"},
@@ -352,7 +350,7 @@ def test_tushare_price_update_skips_existing_dates_and_reports_progress(
             "kind": "price",
             "item": "2024-01-02",
             "completed": price_events[0]["completed"],
-            "total": 2,
+            "total": 1,
             "rows_written": 1,
             "snapshot": price_events[0]["snapshot"],
         }
@@ -385,7 +383,7 @@ def test_tushare_price_update_skips_existing_date_without_snapshot(tmp_path) -> 
         workers=2,
     )
 
-    assert [ref.dataset for ref in refs] == ["stock_basic"]
+    assert refs == ()
     assert source.calls["daily"] == []
     assert manager.lake.snapshots("tushare", "daily") == snapshots
 
@@ -445,6 +443,63 @@ def test_tushare_update_scan_reports_missing_price_dates_without_provider_calls(
     assert report.plans[0].pending_items == ("2024-01-02", "2024-01-03")
     assert [job.filters for job in report.jobs] == [
         {"trade_date": "20240102"},
+        {"trade_date": "20240103"},
+    ]
+
+
+def test_tushare_trading_calendar_update_writes_calendar_table(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+
+    ref = manager.update_tushare_trading_calendar(
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+
+    trade_cal = manager.lake.read("tushare", "trade_cal")
+    assert ref.dataset == "trade_cal"
+    assert source.calls["trade_cal"] == [
+        {"end_date": "20240103", "start_date": "20240101"}
+    ]
+    assert trade_cal["cal_date"].tolist() == ["20240101", "20240102", "20240103"]
+
+
+def test_tushare_price_scan_uses_open_trading_calendar_dates(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "trade_cal",
+        pd.DataFrame(
+            {
+                "cal_date": ["20240101", "20240102", "20240103"],
+                "is_open": [1, 0, 1],
+            }
+        ),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        trading_calendars={
+            "daily": TushareTradingCalendarRef(
+                name="trade_cal",
+                table="trade_cal",
+                date_column="cal_date",
+                open_column="is_open",
+            )
+        },
+    )
+
+    assert report.plans[0].pending_items == ("2024-01-01", "2024-01-03")
+    assert [job.filters for job in report.jobs] == [
+        {"trade_date": "20240101"},
         {"trade_date": "20240103"},
     ]
 
@@ -588,6 +643,38 @@ def test_tushare_update_scan_reports_fundamental_jobs_without_existing_table(
         job.start_date == pd.Timestamp("2024-01-01").date()
         for job in report.jobs
     )
+
+
+def test_tushare_fundamental_scan_uses_configured_universe_table(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "index_basic",
+        pd.DataFrame({"ts_code": ["000300.SH", "000905.SH"]}),
+    )
+
+    report = manager.scan_tushare_updates(
+        ["index_member"],
+        kinds={"index_member": "fundamental"},
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+        universes={
+            "index_member": TushareUniverseRef(
+                name="index_basic",
+                table="index_basic",
+                code_column="ts_code",
+            )
+        },
+    )
+
+    assert report.plans[0].pending_items == ("000300.SH", "000905.SH")
+    assert [job.filters for job in report.jobs] == [
+        {"ts_code": "000300.SH"},
+        {"ts_code": "000905.SH"},
+    ]
 
 
 def test_tushare_update_scan_uses_asset_catalog_for_new_fundamental_table(
@@ -823,9 +910,12 @@ class FakeTushareUpdateSource:
     def __init__(self) -> None:
         self.calls: dict[str, list[dict[str, object]]] = {
             "stock_basic": [],
+            "trade_cal": [],
+            "index_basic": [],
             "daily": [],
             "income": [],
             "income_vip": [],
+            "index_member": [],
         }
 
     def read(self, request: DataRequest) -> pd.DataFrame:
@@ -843,6 +933,15 @@ class FakeTushareUpdateSource:
                 "P": ["600000.SH"],
             }.get(status, ["000001.SZ", "600000.SH"])
             return pd.DataFrame({"ts_code": codes})
+        if request.dataset == "trade_cal":
+            return pd.DataFrame(
+                {
+                    "cal_date": ["20240101", "20240102", "20240103"],
+                    "is_open": [1, 0, 1],
+                }
+            )
+        if request.dataset == "index_basic":
+            return pd.DataFrame({"ts_code": ["000300.SH", "000905.SH"]})
         if request.dataset == "daily":
             trade_date = str(request.filters["trade_date"])
             return pd.DataFrame(
@@ -870,6 +969,9 @@ class FakeTushareUpdateSource:
                 end = pd.Timestamp(request.end_date).strftime("%Y%m%d")
                 data = data.loc[data["f_ann_date"] <= end]
             return data
+        if request.dataset == "index_member":
+            ts_code = str(request.filters["ts_code"])
+            return pd.DataFrame({"ts_code": [ts_code], "f_ann_date": ["20240101"]})
         if request.dataset == "income_vip":
             period = str(request.filters["period"])
             return pd.DataFrame(

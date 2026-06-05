@@ -17,6 +17,30 @@ UpdateMode = Literal["append", "overwrite"]
 
 
 @dataclass(slots=True)
+class UniverseConfig:
+    """Configured source universe reference table."""
+
+    source: str
+    table: str
+    kind: TushareTableKind = "general"
+    code_column: str = "ts_code"
+    enabled: bool = True
+
+
+@dataclass(slots=True)
+class TradingCalendarConfig:
+    """Configured source trading calendar reference table."""
+
+    source: str
+    table: str
+    kind: TushareTableKind = "general"
+    date_column: str = "cal_date"
+    open_column: str = "is_open"
+    filters: dict[str, str] = field(default_factory=dict)
+    enabled: bool = True
+
+
+@dataclass(slots=True)
 class TableConfig:
     """Configured source table update target."""
 
@@ -27,6 +51,8 @@ class TableConfig:
     update_mode: UpdateMode = "overwrite"
     fields: list[str] = field(default_factory=list)
     enabled: bool = True
+    universe: str | None = None
+    trading_calendar: str | None = None
 
 
 @dataclass(slots=True)
@@ -37,6 +63,8 @@ class SourceConfig:
     provider: str = "tushare"
     token: str | None = None
     enabled: bool = True
+    universes: list[UniverseConfig] = field(default_factory=list)
+    trading_calendars: list[TradingCalendarConfig] = field(default_factory=list)
     tables: list[TableConfig] = field(default_factory=list)
 
 
@@ -111,10 +139,49 @@ def _source_from_mapping(payload: Mapping[str, Any]) -> SourceConfig:
         provider=str(payload.get("provider", "tushare")),
         token=_optional_str(payload.get("token")),
         enabled=bool(payload.get("enabled", True)),
+        universes=[
+            _universe_from_mapping(item)
+            for item in _mapping_list(
+                payload.get("universes", []),
+                "sources[].universes",
+            )
+        ],
+        trading_calendars=[
+            _trading_calendar_from_mapping(item)
+            for item in _mapping_list(
+                payload.get("trading_calendars", []),
+                "sources[].trading_calendars",
+            )
+        ],
         tables=[
             _table_from_mapping(item)
             for item in _mapping_list(payload.get("tables", []), "sources[].tables")
         ],
+    )
+
+
+def _universe_from_mapping(payload: Mapping[str, Any]) -> UniverseConfig:
+    return UniverseConfig(
+        source=str(payload.get("source", "tushare")),
+        table=str(payload.get("table", payload.get("name", "stock_basic"))),
+        kind=_table_kind(payload.get("kind", "general")),
+        code_column=str(payload.get("code_column", "ts_code")),
+        enabled=bool(payload.get("enabled", True)),
+    )
+
+
+def _trading_calendar_from_mapping(payload: Mapping[str, Any]) -> TradingCalendarConfig:
+    filters = payload.get("filters", {})
+    if not isinstance(filters, Mapping):
+        raise ValueError("sources[].trading_calendars[].filters must be a mapping")
+    return TradingCalendarConfig(
+        source=str(payload.get("source", "tushare")),
+        table=str(payload.get("table", payload.get("name", "trade_cal"))),
+        kind=_table_kind(payload.get("kind", "general")),
+        date_column=str(payload.get("date_column", "cal_date")),
+        open_column=str(payload.get("open_column", "is_open")),
+        filters={str(key): str(value) for key, value in filters.items()},
+        enabled=bool(payload.get("enabled", True)),
     )
 
 
@@ -127,6 +194,8 @@ def _table_from_mapping(payload: Mapping[str, Any]) -> TableConfig:
         update_mode=_update_mode(payload.get("update_mode", "overwrite")),
         fields=[str(field) for field in payload.get("fields", [])],
         enabled=bool(payload.get("enabled", True)),
+        universe=_optional_str(payload.get("universe")),
+        trading_calendar=_optional_str(payload.get("trading_calendar")),
     )
 
 
@@ -161,23 +230,63 @@ def _optional_str(value: Any) -> str | None:
 def _normalize_source(source: SourceConfig) -> SourceConfig:
     if source.provider != "tushare":
         return source
-    source.tables = _with_required_stock_basic(source.name, source.tables)
+    source.universes = _with_default_stock_universe(
+        source.name,
+        source.universes,
+        source.tables,
+    )
+    source.trading_calendars = _with_default_trading_calendar(
+        source.name,
+        source.trading_calendars,
+    )
+    source.tables = [
+        table
+        for table in source.tables
+        if not (
+            table.source == source.name
+            and table.name in {"stock_basic", "trade_cal"}
+        )
+    ]
     return source
 
 
-def _with_required_stock_basic(
+def _with_default_stock_universe(
     source_name: str,
+    universes: list[UniverseConfig],
     tables: list[TableConfig],
-) -> list[TableConfig]:
-    stock_basic = TableConfig(
+) -> list[UniverseConfig]:
+    stock_basic = UniverseConfig(
         source=source_name,
-        name="stock_basic",
+        table="stock_basic",
         kind="general",
+        code_column="ts_code",
         enabled=True,
     )
-    normalized = [
-        table
+    normalized = [item for item in universes if item.table != "stock_basic"]
+    if any(
+        table.source == source_name and table.name == "stock_basic"
         for table in tables
-        if not (table.source == source_name and table.name == "stock_basic")
-    ]
+    ):
+        return [stock_basic, *normalized]
+    if any(item.table == "stock_basic" for item in universes):
+        return universes
     return [stock_basic, *normalized]
+
+
+def _with_default_trading_calendar(
+    source_name: str,
+    calendars: list[TradingCalendarConfig],
+) -> list[TradingCalendarConfig]:
+    if any(item.table == "trade_cal" for item in calendars):
+        return calendars
+    return [
+        TradingCalendarConfig(
+            source=source_name,
+            table="trade_cal",
+            kind="general",
+            date_column="cal_date",
+            open_column="is_open",
+            enabled=True,
+        ),
+        *calendars,
+    ]

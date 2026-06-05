@@ -5,6 +5,8 @@ from bagelquant_data.lake.catalog import LakeCatalog
 from bagelquant_data.lake.local import LocalDataLake
 from bagelquant_data.lake.manager import (
     DataLakeManager,
+    TushareTradingCalendarRef,
+    TushareUniverseRef,
     TushareUpdateJob,
     TushareUpdatePlan,
     TushareUpdateReport,
@@ -23,6 +25,8 @@ __all__ = [
     "LocalDataLake",
     "PartitionSpec",
     "SnapshotRef",
+    "TushareTradingCalendarRef",
+    "TushareUniverseRef",
     "TushareUpdateJob",
     "TushareUpdatePlan",
     "TushareUpdateReport",

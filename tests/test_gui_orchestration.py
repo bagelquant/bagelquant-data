@@ -2,15 +2,23 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
-from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
+from bagelquant_data.gui.config import (
+    GuiConfig,
+    SourceConfig,
+    TableConfig,
+    TradingCalendarConfig,
+    UniverseConfig,
+)
 from bagelquant_data.gui.orchestration import (
     build_update_report,
     enabled_update_tables,
     run_all_table_updates,
+    run_reference_updates,
     run_table_update,
     run_update_report,
     token_available,
     token_from_config,
+    update_binding_errors,
 )
 from bagelquant_data.lake import TushareUpdatePlan, TushareUpdateReport
 
@@ -75,9 +83,26 @@ def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
         sources=[
             SourceConfig(
                 name="tushare",
+                universes=[
+                    UniverseConfig(
+                        source="tushare",
+                        table="stock_basic",
+                    )
+                ],
+                trading_calendars=[
+                    TradingCalendarConfig(
+                        source="tushare",
+                        table="trade_cal",
+                    )
+                ],
                 tables=[
-                    TableConfig(source="tushare", name="stock_basic", kind="general"),
-                    TableConfig(source="tushare", name="daily", kind="price"),
+                    TableConfig(
+                        source="tushare",
+                        name="daily",
+                        kind="price",
+                        universe="stock_basic",
+                        trading_calendar="trade_cal",
+                    ),
                     TableConfig(
                         source="tushare",
                         name="disabled",
@@ -91,14 +116,15 @@ def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
 
     snapshots = run_all_table_updates(manager, config)  # type: ignore[arg-type]
 
-    assert enabled_update_tables(config)[0].name == "stock_basic"
+    assert enabled_update_tables(config)[0].name == "daily"
     assert snapshots == ("stock-basic", "snapshot")
     assert manager.scan_calls == [
         {
-            "tables": ["stock_basic", "daily"],
-            "kinds": {"stock_basic": "general", "daily": "price"},
+            "tables": ["daily"],
+            "kinds": {"daily": "price"},
             "start_date": "2020-01-01",
             "end_date": "2024-12-31",
+            "trading_calendars": {"daily": "trade_cal"},
         }
     ]
     assert manager.report_workers == 6
@@ -112,9 +138,26 @@ def test_build_update_report_uses_enabled_tables() -> None:
         sources=[
             SourceConfig(
                 name="tushare",
+                universes=[
+                    UniverseConfig(
+                        source="tushare",
+                        table="stock_basic",
+                    )
+                ],
+                trading_calendars=[
+                    TradingCalendarConfig(
+                        source="tushare",
+                        table="trade_cal",
+                    )
+                ],
                 tables=[
-                    TableConfig(source="tushare", name="stock_basic", kind="general"),
-                    TableConfig(source="tushare", name="daily", kind="price"),
+                    TableConfig(
+                        source="tushare",
+                        name="daily",
+                        kind="price",
+                        universe="stock_basic",
+                        trading_calendar="trade_cal",
+                    ),
                 ],
             )
         ],
@@ -123,7 +166,118 @@ def test_build_update_report_uses_enabled_tables() -> None:
     report = build_update_report(manager, config)  # type: ignore[arg-type]
 
     assert report is manager.report
-    assert manager.scan_calls[-1]["tables"] == ["stock_basic", "daily"]
+    assert manager.scan_calls[-1]["tables"] == ["daily"]
+
+
+def test_single_trading_calendar_is_used_as_default() -> None:
+    manager = FakeManager()
+    config = GuiConfig(
+        update_start_date="2020-01-01",
+        update_end_date="2024-12-31",
+        sources=[
+            SourceConfig(
+                name="tushare",
+                universes=[
+                    UniverseConfig(source="tushare", table="stock_basic"),
+                ],
+                trading_calendars=[
+                    TradingCalendarConfig(source="tushare", table="trade_cal"),
+                ],
+                tables=[
+                    TableConfig(
+                        source="tushare",
+                        name="daily",
+                        kind="price",
+                        universe="stock_basic",
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert update_binding_errors(config) == ()
+
+    build_update_report(manager, config)  # type: ignore[arg-type]
+
+    assert manager.scan_calls[-1]["trading_calendars"] == {"daily": "trade_cal"}
+
+
+def test_multiple_trading_calendars_require_table_binding() -> None:
+    config = GuiConfig(
+        sources=[
+            SourceConfig(
+                name="tushare",
+                universes=[
+                    UniverseConfig(source="tushare", table="stock_basic"),
+                ],
+                trading_calendars=[
+                    TradingCalendarConfig(source="tushare", table="trade_cal"),
+                    TradingCalendarConfig(source="tushare", table="fut_trade_cal"),
+                ],
+                tables=[
+                    TableConfig(
+                        source="tushare",
+                        name="daily",
+                        kind="price",
+                        universe="stock_basic",
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert update_binding_errors(config) == (
+        "tushare/daily is missing an enabled trading calendar",
+    )
+
+
+def test_missing_non_general_bindings_are_reported() -> None:
+    config = GuiConfig(
+        sources=[
+            SourceConfig(
+                name="tushare",
+                tables=[TableConfig(source="tushare", name="daily", kind="price")],
+            )
+        ]
+    )
+
+    assert update_binding_errors(config) == (
+        "tushare/daily is missing an enabled universe",
+        "tushare/daily is missing an enabled trading calendar",
+    )
+
+
+def test_run_reference_updates_updates_universes_and_calendars() -> None:
+    manager = FakeManager()
+    config = GuiConfig(
+        update_start_date="2020-01-01",
+        update_end_date="2024-12-31",
+        sources=[
+            SourceConfig(
+                name="tushare",
+                universes=[
+                    UniverseConfig(
+                        source="tushare",
+                        table="stock_basic",
+                    )
+                ],
+                trading_calendars=[
+                    TradingCalendarConfig(
+                        source="tushare",
+                        table="trade_cal",
+                    )
+                ],
+            )
+        ],
+    )
+
+    snapshots = run_reference_updates(manager, config)  # type: ignore[arg-type]
+
+    assert snapshots == ("stock-basic", "trade-cal")
+    assert manager.reference_calls == [
+        ("universe", "stock_basic"),
+        ("calendar", "trade_cal", "2020-01-01", "2024-12-31", {}),
+    ]
 
 
 def test_run_update_report_executes_confirmed_report() -> None:
@@ -160,6 +314,7 @@ class FakeManager:
         self.calls: list[dict[str, object]] = []
         self.scan_calls: list[dict[str, object]] = []
         self.executed_reports: list[TushareUpdateReport] = []
+        self.reference_calls: list[tuple[object, ...]] = []
         self.stock_basic_calls = 0
         self.report_workers = 0
         self.report = TushareUpdateReport(
@@ -219,6 +374,8 @@ class FakeManager:
         kinds,
         start_date,
         end_date,
+        universes=None,
+        trading_calendars=None,
     ):
         self.scan_calls.append(
             {
@@ -226,9 +383,30 @@ class FakeManager:
                 "kinds": dict(kinds),
                 "start_date": start_date,
                 "end_date": end_date,
+                "trading_calendars": {
+                    table: calendar.table if calendar is not None else None
+                    for table, calendar in (trading_calendars or {}).items()
+                },
             }
         )
         return self.report
+
+    def update_tushare_universe(self, table):
+        self.reference_calls.append(("universe", table))
+        return "stock-basic"
+
+    def update_tushare_trading_calendar(
+        self,
+        table,
+        *,
+        start_date,
+        end_date,
+        filters,
+    ):
+        self.reference_calls.append(
+            ("calendar", table, start_date, end_date, filters)
+        )
+        return "trade-cal"
 
     def execute_tushare_update_report(
         self,

@@ -8,8 +8,19 @@ from typing import Any
 
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.datasource.base import DataRequest
-from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
-from bagelquant_data.lake import DataLakeManager, TushareUpdateReport
+from bagelquant_data.gui.config import (
+    GuiConfig,
+    SourceConfig,
+    TableConfig,
+    TradingCalendarConfig,
+    UniverseConfig,
+)
+from bagelquant_data.lake import (
+    DataLakeManager,
+    TushareTradingCalendarRef,
+    TushareUniverseRef,
+    TushareUpdateReport,
+)
 from bagelquant_data.lake.snapshot import SnapshotRef
 
 ProgressCallback = Callable[[Mapping[str, Any]], None]
@@ -106,21 +117,49 @@ def run_table_update(
 
 
 def enabled_update_tables(config: GuiConfig) -> tuple[TableConfig, ...]:
-    """Return enabled tables in source order, with each first table first."""
+    """Return enabled non-reference tables in source order."""
 
     tables: list[TableConfig] = []
     for source in config.sources:
         if not source.enabled:
             continue
-        source_tables = tuple(table for table in source.tables if table.enabled)
-        if source.provider == "tushare" and not any(
-            table.name == "stock_basic" for table in source_tables
-        ):
-            tables.append(
-                TableConfig(source=source.name, name="stock_basic", kind="general")
-            )
-        tables.extend(source_tables)
+        reference_tables = {
+            item.table for item in source.universes if item.enabled
+        }.union(item.table for item in source.trading_calendars if item.enabled)
+        tables.extend(
+            table
+            for table in source.tables
+            if table.enabled and table.name not in reference_tables
+        )
     return tuple(tables)
+
+
+def update_binding_errors(config: GuiConfig) -> tuple[str, ...]:
+    """Return validation errors for enabled non-general table bindings."""
+
+    errors: list[str] = []
+    source_by_name = {source.name: source for source in config.sources}
+    for table in enabled_update_tables(config):
+        if table.kind == "general":
+            continue
+        source = source_by_name.get(table.source)
+        if source is None:
+            errors.append(f"{table.source}/{table.name} source is not configured")
+            continue
+        universe_tables = {item.table for item in source.universes if item.enabled}
+        calendars = [item for item in source.trading_calendars if item.enabled]
+        calendar_tables = {item.table for item in calendars}
+        if not table.universe or table.universe not in universe_tables:
+            errors.append(f"{table.source}/{table.name} is missing an enabled universe")
+        if table.trading_calendar and table.trading_calendar not in calendar_tables:
+            errors.append(
+                f"{table.source}/{table.name} is missing an enabled trading calendar"
+            )
+        elif not table.trading_calendar and len(calendars) != 1:
+            errors.append(
+                f"{table.source}/{table.name} is missing an enabled trading calendar"
+            )
+    return tuple(errors)
 
 
 def build_update_report(
@@ -129,12 +168,17 @@ def build_update_report(
 ) -> TushareUpdateReport:
     """Scan enabled GUI tables and return a dry-run update report."""
 
+    errors = update_binding_errors(config)
+    if errors:
+        raise ValueError("; ".join(errors))
     tables = enabled_update_tables(config)
     return manager.scan_tushare_updates(
         [table.name for table in tables],
         kinds={table.name: table.kind for table in tables},
         start_date=config.update_start_date,
         end_date=config.update_end_date,
+        universes=_table_universe_refs(config, tables),
+        trading_calendars=_table_calendar_refs(config, tables),
     )
 
 
@@ -171,11 +215,134 @@ def run_all_table_updates(
     )
 
 
+def run_reference_updates(
+    manager: DataLakeManager,
+    config: GuiConfig,
+) -> tuple[SnapshotRef, ...]:
+    """Update enabled universe and trading calendar reference resources."""
+
+    refs: list[SnapshotRef] = []
+    for source in config.sources:
+        if not source.enabled or source.provider != "tushare":
+            continue
+        for universe in source.universes:
+            if universe.enabled:
+                refs.append(manager.update_tushare_universe(universe.table))
+        for calendar in source.trading_calendars:
+            if calendar.enabled:
+                refs.append(
+                    manager.update_tushare_trading_calendar(
+                        calendar.table,
+                        start_date=config.update_start_date,
+                        end_date=config.update_end_date,
+                        filters=calendar.filters,
+                    )
+                )
+    return tuple(refs)
+
+
 def default_tushare_source() -> SourceConfig:
     """Return the default Tushare GUI source."""
 
     return SourceConfig(
         name="tushare",
         provider="tushare",
-        tables=[TableConfig(source="tushare", name="stock_basic", kind="general")],
+        universes=[
+            UniverseConfig(
+                source="tushare",
+                table="stock_basic",
+                kind="general",
+                code_column="ts_code",
+            )
+        ],
+        trading_calendars=[
+            TradingCalendarConfig(
+                source="tushare",
+                table="trade_cal",
+                kind="general",
+                date_column="cal_date",
+                open_column="is_open",
+            )
+        ],
+        tables=[],
     )
+
+
+def _table_universe_refs(
+    config: GuiConfig,
+    tables: tuple[TableConfig, ...],
+) -> dict[str, TushareUniverseRef | None]:
+    source_by_name = {source.name: source for source in config.sources}
+    refs: dict[str, TushareUniverseRef | None] = {}
+    for table in tables:
+        source = source_by_name.get(table.source)
+        universe = _universe_by_name(source, table.universe) if source else None
+        if universe is None:
+            refs[table.name] = None
+        else:
+            refs[table.name] = TushareUniverseRef(
+                name=universe.table,
+                table=universe.table,
+                code_column=universe.code_column,
+            )
+    return refs
+
+
+def _table_calendar_refs(
+    config: GuiConfig,
+    tables: tuple[TableConfig, ...],
+) -> dict[str, TushareTradingCalendarRef | None]:
+    source_by_name = {source.name: source for source in config.sources}
+    refs: dict[str, TushareTradingCalendarRef | None] = {}
+    for table in tables:
+        source = source_by_name.get(table.source)
+        calendar = _calendar_for_table(source, table.trading_calendar)
+        if calendar is None:
+            refs[table.name] = None
+        else:
+            refs[table.name] = TushareTradingCalendarRef(
+                name=calendar.table,
+                table=calendar.table,
+                date_column=calendar.date_column,
+                open_column=calendar.open_column,
+                filters=calendar.filters,
+            )
+    return refs
+
+
+def _calendar_for_table(
+    source: SourceConfig | None,
+    name: str | None,
+) -> TradingCalendarConfig | None:
+    if source is None:
+        return None
+    if name is not None:
+        return _calendar_by_name(source, name)
+    enabled = [calendar for calendar in source.trading_calendars if calendar.enabled]
+    if len(enabled) == 1:
+        return enabled[0]
+    return None
+
+
+def _universe_by_name(
+    source: SourceConfig | None,
+    name: str | None,
+) -> UniverseConfig | None:
+    if source is None or name is None:
+        return None
+    for universe in source.universes:
+        if universe.enabled and universe.table == name:
+            return universe
+    return None
+
+
+def _calendar_by_name(
+    source: SourceConfig | None,
+    name: str | None,
+) -> TradingCalendarConfig | None:
+    if source is None or name is None:
+        return None
+    for calendar in source.trading_calendars:
+        if calendar.enabled and calendar.table == name:
+            return calendar
+    return None

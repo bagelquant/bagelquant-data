@@ -23,6 +23,26 @@ ProgressCallback = Callable[[Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
+class TushareUniverseRef:
+    """Local reference table used as the asset universe for Tushare updates."""
+
+    name: str
+    table: str
+    code_column: str = "ts_code"
+
+
+@dataclass(frozen=True, slots=True)
+class TushareTradingCalendarRef:
+    """Local reference table used as the trading calendar for Tushare updates."""
+
+    name: str
+    table: str = "trade_cal"
+    date_column: str = "cal_date"
+    open_column: str = "is_open"
+    filters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class TushareUpdateJob:
     """Confirmed provider request needed to update a Tushare lake table."""
 
@@ -36,6 +56,8 @@ class TushareUpdateJob:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     item: str = ""
     mode: WriteMode = "append"
+    universe: str | None = None
+    trading_calendar: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +73,8 @@ class TushareUpdatePlan:
     reason: str
     estimated_job_count: int
     status: TushareUpdateStatus
+    universe: str | None = None
+    trading_calendar: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +178,8 @@ class DataLakeManager:
         workers: int = 4,
         parallel: ParallelMode = "thread",
         progress: ProgressCallback | None = None,
+        universe: TushareUniverseRef | None = None,
+        trading_calendar: TushareTradingCalendarRef | None = None,
     ) -> tuple[SnapshotRef, ...]:
         """Update Tushare All universe into the local lake."""
 
@@ -161,15 +187,19 @@ class DataLakeManager:
         resolved_start = _normalize_date(start_date)
         if resolved_start > resolved_end:
             raise ValueError("start_date must not be after end_date")
-        tables = [table] if table == "stock_basic" else ["stock_basic", table]
-        kinds: dict[str, TushareTableKind | None] = {"stock_basic": "general"}
+        tables = [table]
+        kinds: dict[str, TushareTableKind | None] = {}
         if kind is not None:
             kinds[table] = kind
+        universes = {table: universe} if universe is not None else None
+        calendars = {table: trading_calendar} if trading_calendar is not None else None
         report = self.scan_tushare_updates(
             tables,
             kinds=kinds,
             start_date=resolved_start,
             end_date=resolved_end,
+            universes=universes,
+            trading_calendars=calendars,
         )
         return self.execute_tushare_update_report(
             report,
@@ -185,6 +215,8 @@ class DataLakeManager:
         kinds: Mapping[str, TushareTableKind | None] | None = None,
         start_date: str | date | datetime = "2000-01-01",
         end_date: str | date | datetime | None = None,
+        universes: Mapping[str, TushareUniverseRef | None] | None = None,
+        trading_calendars: Mapping[str, TushareTradingCalendarRef | None] | None = None,
     ) -> TushareUpdateReport:
         """Scan the local lake and build a dry-run Tushare update report."""
 
@@ -201,6 +233,8 @@ class DataLakeManager:
                 table_kind,
                 start_date=resolved_start,
                 end_date=resolved_end,
+                universe=(universes or {}).get(table),
+                trading_calendar=(trading_calendars or {}).get(table),
             )
             plans.append(plan)
             jobs.extend(table_jobs)
@@ -302,6 +336,8 @@ class DataLakeManager:
         *,
         start_date: date,
         end_date: date,
+        universe: TushareUniverseRef | None = None,
+        trading_calendar: TushareTradingCalendarRef | None = None,
     ) -> tuple[TushareUpdatePlan, tuple[TushareUpdateJob, ...]]:
         if table == "stock_basic":
             job = TushareUpdateJob(
@@ -348,14 +384,24 @@ class DataLakeManager:
                 (job,),
             )
         if kind == "price":
-            return self._scan_tushare_price_table(table, start_date, end_date)
+            return self._scan_tushare_price_table(
+                table,
+                start_date,
+                end_date,
+                trading_calendar=trading_calendar or _default_tushare_calendar_ref(),
+            )
         if kind == "fundamental_vip":
             return self._scan_tushare_fundamental_vip_table(
                 table,
                 start_date,
                 end_date,
             )
-        return self._scan_tushare_fundamental_table(table, start_date, end_date)
+        return self._scan_tushare_fundamental_table(
+            table,
+            start_date,
+            end_date,
+            universe=universe or _default_tushare_universe_ref(),
+        )
 
     def update_tushare_stock_basic(self) -> SnapshotRef:
         """Refresh the full Tushare stock universe table."""
@@ -368,6 +414,45 @@ class DataLakeManager:
             stock_basic.reset_index(drop=True),
             mode="overwrite",
         )
+
+    def update_tushare_universe(
+        self,
+        table: str,
+        *,
+        mode: WriteMode = "overwrite",
+    ) -> SnapshotRef:
+        """Refresh a Tushare universe reference table."""
+
+        source = self.registry.resolve("tushare")
+        if table == "stock_basic":
+            data = self._read_tushare_stock_basic(source)
+        else:
+            data = source.read(DataRequest(dataset=table))
+        return self.lake.write("tushare", table, data.reset_index(drop=True), mode=mode)
+
+    def update_tushare_trading_calendar(
+        self,
+        table: str = "trade_cal",
+        *,
+        start_date: str | date | datetime = "2000-01-01",
+        end_date: str | date | datetime | None = None,
+        filters: Mapping[str, Any] | None = None,
+        mode: WriteMode = "overwrite",
+    ) -> SnapshotRef:
+        """Refresh a Tushare trading calendar reference table."""
+
+        source = self.registry.resolve("tushare")
+        resolved_end = _normalize_date(end_date or date.today())
+        resolved_start = _normalize_date(start_date)
+        data = source.read(
+            DataRequest(
+                dataset=table,
+                filters=dict(filters or {}),
+                start_date=resolved_start,
+                end_date=resolved_end,
+            )
+        )
+        return self.lake.write("tushare", table, data.reset_index(drop=True), mode=mode)
 
     def _read_tushare_stock_basic(self, source: DataSource) -> pd.DataFrame:
         frames = [
@@ -391,11 +476,19 @@ class DataLakeManager:
         table: str,
         start_date: date,
         end_date: date,
+        *,
+        trading_calendar: TushareTradingCalendarRef,
     ) -> tuple[TushareUpdatePlan, tuple[TushareUpdateJob, ...]]:
         existing_dates = _existing_dates(self.lake, "tushare", table)
         dates = [
             day
-            for day in _date_range(start_date, end_date)
+            for day in _local_trading_dates(
+                self.lake,
+                "tushare",
+                trading_calendar,
+                start_date,
+                end_date,
+            )
             if day not in existing_dates
         ]
         jobs = tuple(
@@ -410,8 +503,10 @@ class DataLakeManager:
                     "trade_date": day.isoformat(),
                     "start_date": start_date.isoformat(),
                     "end_date": end_date.isoformat(),
+                    "trading_calendar": trading_calendar.name,
                 },
                 item=day.isoformat(),
+                trading_calendar=trading_calendar.name,
             )
             for day in dates
         )
@@ -431,6 +526,7 @@ class DataLakeManager:
                 ),
                 estimated_job_count=len(jobs),
                 status="pending" if jobs else "up_to_date",
+                trading_calendar=trading_calendar.name,
             ),
             jobs,
         )
@@ -440,9 +536,11 @@ class DataLakeManager:
         table: str,
         start_date: date,
         end_date: date,
+        *,
+        universe: TushareUniverseRef,
     ) -> tuple[TushareUpdatePlan, tuple[TushareUpdateJob, ...]]:
         existing = _existing_table(self.lake, "tushare", table)
-        ts_codes = _local_tushare_codes(self.lake)
+        ts_codes = _local_tushare_codes(self.lake, universe=universe)
         if not ts_codes:
             return (
                 TushareUpdatePlan(
@@ -452,9 +550,13 @@ class DataLakeManager:
                     requested_end=end_date,
                     effective_start=None,
                     pending_items=(),
-                    reason="no local stock_basic ts_code values available",
+                    reason=(
+                        f"no local {universe.table}.{universe.code_column} "
+                        "values available"
+                    ),
                     estimated_job_count=0,
                     status="up_to_date",
+                    universe=universe.name,
                 ),
                 (),
             )
@@ -476,8 +578,10 @@ class DataLakeManager:
                         "asset_id": ts_code,
                         "start_date": update_start.isoformat(),
                         "end_date": end_date.isoformat(),
+                        "universe": universe.name,
                     },
                     item=ts_code,
+                    universe=universe.name,
                 )
             )
         pending_items = tuple(job.item for job in jobs)
@@ -502,6 +606,7 @@ class DataLakeManager:
                 ),
                 estimated_job_count=len(jobs),
                 status="pending" if jobs else "up_to_date",
+                universe=universe.name,
             ),
             tuple(jobs),
         )
@@ -910,17 +1015,82 @@ def _existing_dates(
     return {_parse_yyyymmdd(value) for value in raw_dates}
 
 
-def _local_tushare_codes(lake: LocalDataLake) -> tuple[str, ...]:
-    stock_basic = _existing_table(lake, "tushare", "stock_basic")
-    if stock_basic is not None and "ts_code" in stock_basic.columns:
-        codes = [str(code) for code in stock_basic["ts_code"].dropna().tolist()]
+def _default_tushare_universe_ref() -> TushareUniverseRef:
+    return TushareUniverseRef(
+        name="stock_basic",
+        table="stock_basic",
+        code_column="ts_code",
+    )
+
+
+def _default_tushare_calendar_ref() -> TushareTradingCalendarRef:
+    return TushareTradingCalendarRef(
+        name="trade_cal",
+        table="trade_cal",
+        date_column="cal_date",
+        open_column="is_open",
+    )
+
+
+def _local_tushare_codes(
+    lake: LocalDataLake,
+    *,
+    universe: TushareUniverseRef,
+) -> tuple[str, ...]:
+    universe_table = _existing_table(lake, "tushare", universe.table)
+    if universe_table is not None and universe.code_column in universe_table.columns:
+        codes = [
+            str(code)
+            for code in universe_table[universe.code_column].dropna().tolist()
+        ]
         return tuple(dict.fromkeys(codes))
+    if universe.table != "stock_basic":
+        return ()
     codes = [
         _strip_tushare_asset_prefix(asset_id)
         for asset_id in lake.asset_ids("tushare")
         if asset_id
     ]
     return tuple(dict.fromkeys(codes))
+
+
+def _local_trading_dates(
+    lake: LocalDataLake,
+    source: str,
+    calendar: TushareTradingCalendarRef,
+    start_date: date,
+    end_date: date,
+) -> tuple[date, ...]:
+    calendar_table = _existing_table(lake, source, calendar.table)
+    if calendar_table is None or calendar_table.empty:
+        return tuple(_date_range(start_date, end_date))
+    if calendar.date_column not in calendar_table.columns:
+        return tuple(_date_range(start_date, end_date))
+    frame = calendar_table
+    if calendar.open_column in frame.columns:
+        frame = frame.loc[frame[calendar.open_column].map(_is_open_calendar_value)]
+    raw_dates = [
+        str(value)
+        for value in frame[calendar.date_column].tolist()
+        if pd.notna(value)
+    ]
+    dates = sorted(
+        {
+            _parse_yyyymmdd(value)
+            for value in raw_dates
+            if start_date <= _parse_yyyymmdd(value) <= end_date
+        }
+    )
+    return tuple(dates)
+
+
+def _is_open_calendar_value(value: object) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "yes", "y", "open"}
 
 
 def _strip_tushare_asset_prefix(asset_id: str) -> str:
