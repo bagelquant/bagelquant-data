@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import cast
 
 import pandas as pd
+import pytest
 
 from bagelquant_data.datasource import DataRequest, DataSourceRegistry
 from bagelquant_data.lake import (
     DataLakeManager,
     LocalDataLake,
     PartitionSpec,
+    TushareTableUpdateSpec,
     TushareTradingCalendarRef,
     TushareUniverseRef,
 )
@@ -217,6 +219,117 @@ def test_lake_reads_qualified_panel_field(tmp_path) -> None:
     assert panel.index.name == "date"
     assert panel.columns.tolist() == ["000001.SZ", "600000.SH"]
     assert panel.loc[pd.Timestamp("2024-01-02"), "600000.SH"] == 20.0
+
+
+def test_local_lake_read_projects_columns_and_preserves_date_index(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240102"],
+                "close": [10.0],
+                "open": [9.0],
+            }
+        ),
+    )
+
+    projected = lake.read("tushare", "daily", columns=["close"])
+
+    assert projected.index.name == "date"
+    assert projected.columns.tolist() == ["close"]
+    assert projected["close"].tolist() == [10.0]
+
+
+def test_local_lake_read_prunes_partitions_by_date_range(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.write(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240131"],
+                "close": [10.0],
+            }
+        ),
+        partition_column="trade_date",
+    )
+    lake.write(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240201"],
+                "close": [11.0],
+            }
+        ),
+        partition_column="trade_date",
+    )
+    january = next(
+        tmp_path.glob("tushare/daily/year=2024/month=01/snapshots/*/data.parquet")
+    )
+    january.write_text("corrupt if read", encoding="utf-8")
+
+    data = lake.read("tushare", "daily", start_date="2024-02-01")
+
+    assert data["close"].tolist() == [11.0]
+
+
+def test_loader_lake_read_applies_field_projection(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    registry = DataSourceRegistry()
+    registry.register(CountingSource())
+    lake.add(
+        "fake",
+        "prices",
+        pd.DataFrame(
+            {
+                "trade_date": ["20240102"],
+                "value": [1.0],
+                "other": [2.0],
+            }
+        ),
+    )
+
+    loaded = Loader(registry=registry, lake=lake).source("fake").load(
+        "prices",
+        fields=("value",),
+    )
+
+    assert loaded.metadata["origin"] == "lake"
+    assert loaded.data.columns.tolist() == ["value"]
+
+
+def test_read_panel_field_projects_to_required_columns(tmp_path) -> None:
+    lake = CountingLocalDataLake(tmp_path)
+    lake.add(
+        "tushare",
+        "daily",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240102"],
+                "close": [10.0],
+                "open": [9.0],
+            }
+        ),
+    )
+    lake.read_kwargs.clear()
+
+    panel = lake.read_panel_field("tushare_daily_close", start_date="2024-01-02")
+
+    assert panel.columns.tolist() == ["000001.SZ"]
+    assert lake.read_kwargs[-1]["columns"] == [
+        "close",
+        "ts_code",
+        "date",
+        "trade_date",
+        "f_ann_date",
+    ]
 
 
 def test_stock_basic_is_row_table_not_date_indexed(tmp_path) -> None:
@@ -483,18 +596,20 @@ def test_tushare_price_scan_uses_open_trading_calendar_dates(tmp_path) -> None:
     )
 
     report = manager.scan_tushare_updates(
-        ["daily"],
-        kinds={"daily": "price"},
+        specs=(
+            TushareTableUpdateSpec(
+                table="daily",
+                kind="price",
+                trading_calendar=TushareTradingCalendarRef(
+                    name="trade_cal",
+                    table="trade_cal",
+                    date_column="cal_date",
+                    open_column="is_open",
+                ),
+            ),
+        ),
         start_date="2024-01-01",
         end_date="2024-01-03",
-        trading_calendars={
-            "daily": TushareTradingCalendarRef(
-                name="trade_cal",
-                table="trade_cal",
-                date_column="cal_date",
-                open_column="is_open",
-            )
-        },
     )
 
     assert report.plans[0].pending_items == ("2024-01-01", "2024-01-03")
@@ -502,6 +617,45 @@ def test_tushare_price_scan_uses_open_trading_calendar_dates(tmp_path) -> None:
         {"trade_date": "20240101"},
         {"trade_date": "20240103"},
     ]
+
+
+def test_tushare_update_spec_scan_matches_legacy_map_scan(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+    manager.lake.add(
+        "tushare",
+        "trade_cal",
+        pd.DataFrame({"cal_date": ["20240101"], "is_open": [1]}),
+    )
+
+    legacy = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        trading_calendars={
+            "daily": TushareTradingCalendarRef(name="trade_cal", table="trade_cal")
+        },
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+    )
+    modern = manager.scan_tushare_updates(
+        specs=(
+            TushareTableUpdateSpec(
+                table="daily",
+                kind="price",
+                trading_calendar=TushareTradingCalendarRef(
+                    name="trade_cal",
+                    table="trade_cal",
+                ),
+            ),
+        ),
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+    )
+
+    assert modern.jobs == legacy.jobs
+    assert modern.plans == legacy.plans
 
 
 def test_tushare_stock_basic_reads_all_statuses_and_deduplicates(tmp_path) -> None:
@@ -568,6 +722,54 @@ def test_tushare_fundamental_update_reads_incremental_asset_jobs(tmp_path) -> No
         "20240102",
         "20240103",
     ]
+
+
+def test_tushare_execute_preloads_existing_fundamental_table_once(tmp_path) -> None:
+    source = FakeTushareUpdateSource()
+    registry = DataSourceRegistry()
+    registry.register(source)
+    lake = CountingLocalDataLake(tmp_path)
+    manager = DataLakeManager(lake, registry=registry)
+    manager.lake.add(
+        "tushare",
+        "stock_basic",
+        pd.DataFrame({"ts_code": ["000001.SZ", "600000.SH"]}),
+    )
+    manager.lake.add(
+        "tushare",
+        "income",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "f_ann_date": ["20240101"],
+                "revenue": [1.0],
+            }
+        ),
+    )
+    report = manager.scan_tushare_updates(
+        specs=(TushareTableUpdateSpec(table="income", kind="fundamental"),),
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+    lake.read_calls.clear()
+
+    manager.execute_tushare_update_report(report, workers=1)
+
+    assert lake.read_calls.count(("tushare", "income")) == 1
+
+
+def test_tushare_update_rejects_zero_workers(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    registry.register(FakeTushareUpdateSource())
+    manager = DataLakeManager(LocalDataLake(tmp_path), registry=registry)
+
+    with pytest.raises(ValueError, match="workers"):
+        manager.execute_tushare_update_report(
+            manager.scan_tushare_updates(
+                specs=(TushareTableUpdateSpec(table="stock_basic", kind="general"),),
+            ),
+            workers=0,
+        )
 
 
 def test_tushare_update_scan_reports_fundamental_effective_start(tmp_path) -> None:
@@ -898,9 +1100,11 @@ class CountingLocalDataLake(LocalDataLake):
     def __init__(self, root) -> None:
         super().__init__(root)
         self.read_calls: list[tuple[str, str]] = []
+        self.read_kwargs: list[dict[str, object]] = []
 
     def read(self, source: str, dataset: str, **kwargs) -> pd.DataFrame:
         self.read_calls.append((source, dataset))
+        self.read_kwargs.append(dict(kwargs))
         return super().read(source, dataset, **kwargs)
 
 

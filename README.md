@@ -41,7 +41,12 @@ uv run streamlit run src/bagelquant_data/gui/app.py
 
 ```python
 from bagelquant_data.datasource import DataRequest, DataSourceRegistry, TushareDataSource
-from bagelquant_data.lake import DataLakeManager, LocalDataLake
+from bagelquant_data.lake import (
+    DataLakeManager,
+    LocalDataLake,
+    TushareTableUpdateSpec,
+    TushareTradingCalendarRef,
+)
 from bagelquant_data.loader import Loader
 
 registry = DataSourceRegistry()
@@ -62,13 +67,28 @@ manager.update(
 
 daily = Loader(registry=registry, lake=lake).source("tushare").load(
     "daily",
+    fields=("close",),
+    start_date="2024-01-01",
+    end_date="2024-01-31",
 )
 
 daily.data.head()
 ```
 
 When a lake is configured, `Loader` reads the local lake first. Use
-`refresh=True` to fetch the provider and write a new local snapshot.
+`refresh=True` to fetch the provider and write a new local snapshot. Local lake
+reads support projection and date filters, so downstream workflows can avoid
+loading whole Parquet snapshots:
+
+```python
+lake.read(
+    "tushare",
+    "daily",
+    columns=("close",),
+    start_date="2024-01-01",
+    end_date="2024-01-31",
+)
+```
 
 ## Panel Agreements
 
@@ -150,13 +170,31 @@ lake.read("tushare", "daily", year=2024, month=1)
 Run provider updates manually when you want a fresh snapshot:
 
 ```python
-manager.update_tushare_all(
-    "daily",
+report = manager.scan_tushare_updates(
+    specs=(
+        TushareTableUpdateSpec(
+            table="daily",
+            kind="price",
+            trading_calendar=TushareTradingCalendarRef(
+                name="trade_cal",
+                table="trade_cal",
+            ),
+        ),
+    ),
     start_date="2000-01-01",
     end_date="2024-12-31",
+)
+manager.execute_tushare_update_report(
+    report,
     workers=4,
 )
 ```
+
+`update_tushare_all(...)` remains available as a convenience wrapper for one
+table. New code should prefer `scan_tushare_updates(specs=...)` because it keeps
+table kind, universe, and trading calendar bindings together. The older
+`scan_tushare_updates(["daily"], kinds=..., universes=..., trading_calendars=...)`
+call shape is still accepted for migration.
 
 ## Universes
 
@@ -219,6 +257,10 @@ uv run pyright
 uv run pytest
 uv run mkdocs build --strict
 ```
+
+On Windows, `pyright` may fail before analysis if the resolved `node.exe` is not
+executable by the current process. Confirm `where node` resolves to a usable
+Node runtime, then rerun `uv run pyright`.
 
 ## License
 

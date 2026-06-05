@@ -129,7 +129,14 @@ class Loader:
         )
         if self._lake is not None and not refresh:
             try:
-                data = self._lake.read(source.name, dataset, snapshot=snapshot)
+                data = self._lake.read(
+                    source.name,
+                    dataset,
+                    snapshot=snapshot,
+                    columns=fields or None,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 return self._loaded_dataset(
                     data=data,
                     source_name=source.name,
