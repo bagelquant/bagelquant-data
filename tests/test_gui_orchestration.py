@@ -120,8 +120,7 @@ def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
     assert snapshots == ("stock-basic", "snapshot")
     assert manager.scan_calls == [
         {
-            "tables": ["daily"],
-            "kinds": {"daily": "price"},
+            "specs": [("daily", "price")],
             "start_date": "2020-01-01",
             "end_date": "2024-12-31",
             "trading_calendars": {"daily": "trade_cal"},
@@ -166,7 +165,7 @@ def test_build_update_report_uses_enabled_tables() -> None:
     report = build_update_report(manager, config)  # type: ignore[arg-type]
 
     assert report is manager.report
-    assert manager.scan_calls[-1]["tables"] == ["daily"]
+    assert manager.scan_calls[-1]["specs"] == [("daily", "price")]
 
 
 def test_single_trading_calendar_is_used_as_default() -> None:
@@ -367,25 +366,19 @@ class FakeManager:
     def update(self, *args, **kwargs):
         return "general"
 
-    def scan_tushare_updates(
-        self,
-        tables,
-        *,
-        kinds,
-        start_date,
-        end_date,
-        universes=None,
-        trading_calendars=None,
-    ):
+    def scan_tushare_updates(self, *, specs, start_date, end_date):
         self.scan_calls.append(
             {
-                "tables": list(tables),
-                "kinds": dict(kinds),
+                "specs": [(spec.table, spec.kind) for spec in specs],
                 "start_date": start_date,
                 "end_date": end_date,
                 "trading_calendars": {
-                    table: calendar.table if calendar is not None else None
-                    for table, calendar in (trading_calendars or {}).items()
+                    spec.table: (
+                        spec.trading_calendar.table
+                        if spec.trading_calendar is not None
+                        else None
+                    )
+                    for spec in specs
                 },
             }
         )

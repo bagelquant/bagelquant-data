@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from threading import Lock
 from typing import Any, Literal
@@ -15,78 +14,19 @@ from bagelquant_data.datasource.base import DataRequest, DataSource
 from bagelquant_data.datasource.registry import DataSourceRegistry
 from bagelquant_data.lake.local import LocalDataLake, WriteMode
 from bagelquant_data.lake.snapshot import SnapshotRef
+from bagelquant_data.lake.tushare_update import (
+    TushareTableKind,
+    TushareTableUpdateSpec,
+    TushareTradingCalendarRef,
+    TushareUniverseRef,
+    TushareUpdateJob,
+    TushareUpdatePlan,
+    TushareUpdateReport,
+)
+from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 ParallelMode = Literal["thread"]
-TushareTableKind = Literal["general", "price", "fundamental", "fundamental_vip"]
-TushareUpdateStatus = Literal["pending", "up_to_date"]
 ProgressCallback = Callable[[Mapping[str, Any]], None]
-
-
-@dataclass(frozen=True, slots=True)
-class TushareUniverseRef:
-    """Local reference table used as the asset universe for Tushare updates."""
-
-    name: str
-    table: str
-    code_column: str = "ts_code"
-
-
-@dataclass(frozen=True, slots=True)
-class TushareTradingCalendarRef:
-    """Local reference table used as the trading calendar for Tushare updates."""
-
-    name: str
-    table: str = "trade_cal"
-    date_column: str = "cal_date"
-    open_column: str = "is_open"
-    filters: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class TushareUpdateJob:
-    """Confirmed provider request needed to update a Tushare lake table."""
-
-    table: str
-    kind: TushareTableKind
-    filters: Mapping[str, Any] = field(default_factory=dict)
-    start_date: date | None = None
-    end_date: date | None = None
-    partition_column: str | None = None
-    partition_granularity: Literal["month", "day", "quarter"] = "month"
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-    item: str = ""
-    mode: WriteMode = "append"
-    universe: str | None = None
-    trading_calendar: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TushareUpdatePlan:
-    """Dry-run summary for a configured Tushare table."""
-
-    table: str
-    kind: TushareTableKind
-    requested_start: date
-    requested_end: date
-    effective_start: date | None
-    pending_items: tuple[str, ...]
-    reason: str
-    estimated_job_count: int
-    status: TushareUpdateStatus
-    universe: str | None = None
-    trading_calendar: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TushareUpdateReport:
-    """Dry-run report plus executable jobs for confirmed Tushare updates."""
-
-    generated_at: datetime
-    source: str
-    requested_start: date
-    requested_end: date
-    plans: tuple[TushareUpdatePlan, ...]
-    jobs: tuple[TushareUpdateJob, ...]
 
 
 class DataLakeManager:
@@ -187,19 +127,20 @@ class DataLakeManager:
         resolved_start = _normalize_date(start_date)
         if resolved_start > resolved_end:
             raise ValueError("start_date must not be after end_date")
-        tables = [table]
         kinds: dict[str, TushareTableKind | None] = {}
         if kind is not None:
             kinds[table] = kind
-        universes = {table: universe} if universe is not None else None
-        calendars = {table: trading_calendar} if trading_calendar is not None else None
         report = self.scan_tushare_updates(
-            tables,
-            kinds=kinds,
+            specs=(
+                TushareTableUpdateSpec(
+                    table=table,
+                    kind=kinds.get(table),
+                    universe=universe,
+                    trading_calendar=trading_calendar,
+                ),
+            ),
             start_date=resolved_start,
             end_date=resolved_end,
-            universes=universes,
-            trading_calendars=calendars,
         )
         return self.execute_tushare_update_report(
             report,
@@ -210,8 +151,10 @@ class DataLakeManager:
 
     def scan_tushare_updates(
         self,
-        tables: list[str] | tuple[str, ...],
+        tables: list[str] | tuple[str, ...] | None = None,
         *,
+        specs: list[TushareTableUpdateSpec] | tuple[TushareTableUpdateSpec, ...]
+        | None = None,
         kinds: Mapping[str, TushareTableKind | None] | None = None,
         start_date: str | date | datetime = "2000-01-01",
         end_date: str | date | datetime | None = None,
@@ -220,21 +163,28 @@ class DataLakeManager:
     ) -> TushareUpdateReport:
         """Scan the local lake and build a dry-run Tushare update report."""
 
+        update_specs = _update_specs_from_inputs(
+            tables=tables,
+            specs=specs,
+            kinds=kinds,
+            universes=universes,
+            trading_calendars=trading_calendars,
+        )
         resolved_end = _normalize_date(end_date or date.today())
         resolved_start = _normalize_date(start_date)
         if resolved_start > resolved_end:
             raise ValueError("start_date must not be after end_date")
         plans: list[TushareUpdatePlan] = []
         jobs: list[TushareUpdateJob] = []
-        for table in tables:
-            table_kind = _resolve_tushare_table_kind(table, (kinds or {}).get(table))
+        for spec in update_specs:
+            table_kind = _resolve_tushare_table_kind(spec.table, spec.kind)
             plan, table_jobs = self._scan_tushare_table(
-                table,
+                spec.table,
                 table_kind,
                 start_date=resolved_start,
                 end_date=resolved_end,
-                universe=(universes or {}).get(table),
-                trading_calendar=(trading_calendars or {}).get(table),
+                universe=spec.universe,
+                trading_calendar=spec.trading_calendar,
             )
             plans.append(plan)
             jobs.extend(table_jobs)
@@ -257,17 +207,20 @@ class DataLakeManager:
     ) -> tuple[SnapshotRef, ...]:
         """Execute provider jobs from a confirmed Tushare update report."""
 
+        _validate_parallel(workers=workers, parallel=parallel)
         source = self.registry.resolve("tushare")
-        if parallel != "thread":
-            raise ValueError(
-                "Only thread parallelism is supported for provider updates"
-            )
         refs: list[SnapshotRef] = []
         catalog_assets: dict[str, set[str]] = {}
         catalog_fields: dict[str, set[str]] = {}
         completed = 0
         total = len(report.jobs)
         write_lock = Lock()
+        existing_fundamentals = {
+            table: _existing_table(self.lake, "tushare", table)
+            for table in {
+                job.table for job in report.jobs if job.kind == "fundamental"
+            }
+        }
 
         def read_job(job: TushareUpdateJob) -> tuple[TushareUpdateJob, pd.DataFrame]:
             if job.table == "stock_basic":
@@ -291,7 +244,7 @@ class DataLakeManager:
                 ref = None
                 if job.kind == "fundamental":
                     data = _filter_incremental_rows(
-                        _existing_table(self.lake, "tushare", job.table),
+                        existing_fundamentals.get(job.table),
                         data,
                     )
                 if not data.empty:
@@ -887,12 +840,41 @@ def _parallel_iter(
     workers: int,
     parallel: ParallelMode,
 ):
-    if parallel != "thread":
-        raise ValueError("Only thread parallelism is supported for provider updates")
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+    _validate_parallel(workers=workers, parallel=parallel)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(fn, value) for value in values]
         for future in as_completed(futures):
             yield future.result()
+
+
+def _validate_parallel(*, workers: int, parallel: ParallelMode) -> None:
+    if workers < 1:
+        raise ValueError("workers must be greater than or equal to 1")
+    if parallel != "thread":
+        raise ValueError("Only thread parallelism is supported for provider updates")
+
+
+def _update_specs_from_inputs(
+    *,
+    tables: list[str] | tuple[str, ...] | None,
+    specs: list[TushareTableUpdateSpec] | tuple[TushareTableUpdateSpec, ...] | None,
+    kinds: Mapping[str, TushareTableKind | None] | None,
+    universes: Mapping[str, TushareUniverseRef | None] | None,
+    trading_calendars: Mapping[str, TushareTradingCalendarRef | None] | None,
+) -> tuple[TushareTableUpdateSpec, ...]:
+    if specs is not None:
+        return tuple(specs)
+    if tables is None:
+        raise ValueError("scan_tushare_updates requires specs or tables")
+    return tuple(
+        TushareTableUpdateSpec(
+            table=table,
+            kind=(kinds or {}).get(table),
+            universe=(universes or {}).get(table),
+            trading_calendar=(trading_calendars or {}).get(table),
+        )
+        for table in tables
+    )
 
 
 def _emit_progress(
@@ -993,7 +975,7 @@ def _existing_table(
 ) -> pd.DataFrame | None:
     try:
         return lake.read(source, table)
-    except Exception:
+    except DatasetNotFoundError:
         return None
 
 

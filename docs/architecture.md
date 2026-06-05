@@ -37,6 +37,16 @@ lake-root/
           snapshots/
 ```
 
+Reads can project columns and filter dates at the lake boundary. `LocalDataLake`
+uses partition metadata to skip snapshots outside the requested range, then
+applies exact date filtering after reading. This keeps the API simple while
+reducing IO for common panel-field and date-window reads.
+
+The lake maintains source-level system catalogs for asset ids and data item ids.
+Table catalog metadata records inferred date, asset, and panel field columns so
+`read_panel_field` can load only the requested field plus the minimum date and
+asset columns needed to shape a date-by-asset panel.
+
 ## Dependency Direction
 
 `bagelquant-data` is below downstream repositories. It must not import
@@ -46,3 +56,11 @@ The communication boundary with `bagelquant-core` is `PanelInputAgreement`.
 That agreement exposes pandas data and `DomainSpec` constructor kwargs, leaving
 `bagelquant-core` responsible for creating `Domain`, `Panel`, and
 `CategoryPanel`.
+
+## Tushare Update Specs
+
+Provider updates are described with `TushareTableUpdateSpec`. A spec keeps a
+table's kind, universe reference, and trading calendar reference in one object,
+which avoids parallel argument maps drifting apart. The manager scans specs into
+a dry-run `TushareUpdateReport`, and execution consumes only the confirmed jobs
+from that report.

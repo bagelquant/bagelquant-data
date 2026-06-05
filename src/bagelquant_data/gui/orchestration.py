@@ -17,6 +17,7 @@ from bagelquant_data.gui.config import (
 )
 from bagelquant_data.lake import (
     DataLakeManager,
+    TushareTableUpdateSpec,
     TushareTradingCalendarRef,
     TushareUniverseRef,
     TushareUpdateReport,
@@ -172,13 +173,20 @@ def build_update_report(
     if errors:
         raise ValueError("; ".join(errors))
     tables = enabled_update_tables(config)
+    universes = _table_universe_refs(config, tables)
+    calendars = _table_calendar_refs(config, tables)
     return manager.scan_tushare_updates(
-        [table.name for table in tables],
-        kinds={table.name: table.kind for table in tables},
+        specs=tuple(
+            TushareTableUpdateSpec(
+                table=table.name,
+                kind=table.kind,
+                universe=universes.get(table.name),
+                trading_calendar=calendars.get(table.name),
+            )
+            for table in tables
+        ),
         start_date=config.update_start_date,
         end_date=config.update_end_date,
-        universes=_table_universe_refs(config, tables),
-        trading_calendars=_table_calendar_refs(config, tables),
     )
 
 

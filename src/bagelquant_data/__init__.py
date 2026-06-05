@@ -5,6 +5,7 @@ from bagelquant_data.datasource.registry import DataSourceRegistry, default_regi
 from bagelquant_data.lake import (
     DataLakeManager,
     LocalDataLake,
+    TushareTableUpdateSpec,
 )
 from bagelquant_data.loader.loader import LoadedDataset, Loader, PanelInputAgreement
 from bagelquant_data.metadata.contract import DataContract, DomainSpec
@@ -25,5 +26,6 @@ __all__ = [
     "LocalDataLake",
     "PanelInputAgreement",
     "Transform",
+    "TushareTableUpdateSpec",
     "default_registry",
 ]

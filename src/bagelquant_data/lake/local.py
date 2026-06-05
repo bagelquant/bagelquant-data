@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -52,31 +52,59 @@ class LocalDataLake:
         year: int | None = None,
         month: int | None = None,
         snapshot: str | None = None,
+        columns: Sequence[str] | None = None,
+        start_date: str | date | datetime | pd.Timestamp | None = None,
+        end_date: str | date | datetime | pd.Timestamp | None = None,
     ) -> pd.DataFrame:
         """Read table data from selected year/month partitions."""
 
+        resolved_start = _optional_timestamp(start_date)
+        resolved_end = _optional_timestamp(end_date)
         refs = self._refs_for_read(
             source,
             dataset,
             year=year,
             month=month,
             snapshot=snapshot,
+            start_date=resolved_start,
+            end_date=resolved_end,
         )
         if not refs:
             raise DatasetNotFoundError(f"No local lake table: {source}/{dataset}")
 
+        read_columns = _read_columns_for_projection(
+            requested=columns,
+            metadata=self._table_catalog_metadata(source, dataset),
+        )
         frames = []
         for ref in refs:
             if ref.path is None:
                 continue
             data_path = ref.path / "data.parquet"
             if data_path.exists():
-                frames.append(_read_table_parquet(data_path, table=dataset))
+                frames.append(
+                    _read_table_parquet(
+                        data_path,
+                        table=dataset,
+                        columns=read_columns,
+                    )
+                )
         if not frames:
             raise DatasetNotFoundError(f"No local lake data files: {source}/{dataset}")
         if len(frames) == 1:
-            return frames[0]
-        return pd.concat(frames, axis=0).sort_index()
+            return _finalize_read_frame(
+                frames[0],
+                columns=columns,
+                start_date=resolved_start,
+                end_date=resolved_end,
+            )
+        combined = pd.concat(frames, axis=0).sort_index()
+        return _finalize_read_frame(
+            combined,
+            columns=columns,
+            start_date=resolved_start,
+            end_date=resolved_end,
+        )
 
     def write(
         self,
@@ -309,12 +337,16 @@ class LocalDataLake:
         if resolved is None:
             raise DatasetNotFoundError(f"No panel field: {qualified_id}")
         source, dataset, field = resolved
-        data = self.read(source, dataset)
+        metadata = self._table_catalog_metadata(source, dataset)
+        read_columns = _panel_read_columns(field=field, metadata=metadata)
+        data = self.read(
+            source,
+            dataset,
+            columns=read_columns,
+            start_date=start_date,
+            end_date=end_date,
+        )
         panel = shape_panel_field(data, field=field)
-        if start_date is not None:
-            panel = panel.loc[panel.index >= pd.Timestamp(start_date)]
-        if end_date is not None:
-            panel = panel.loc[panel.index <= pd.Timestamp(end_date)]
         return panel
 
     def update_catalog_entries(
@@ -473,6 +505,8 @@ class LocalDataLake:
         year: int | None,
         month: int | None,
         snapshot: str | None,
+        start_date: pd.Timestamp | None,
+        end_date: pd.Timestamp | None,
     ) -> tuple[SnapshotRef, ...]:
         refs = self.snapshots(source, dataset)
         if snapshot is not None:
@@ -483,6 +517,16 @@ class LocalDataLake:
             refs = tuple(ref for ref in refs if ref.year == year)
         if month is not None:
             refs = tuple(ref for ref in refs if ref.month == month)
+        if start_date is not None or end_date is not None:
+            refs = tuple(
+                ref
+                for ref in refs
+                if _ref_overlaps_date_range(
+                    ref,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
         return refs
 
     def _read_partition_latest(
@@ -841,45 +885,169 @@ def _partition_frame(
     days = partition_values.dt.day.astype(int)
     quarters = partition_values.dt.quarter.astype(int)
     if granularity == "day":
-        keys = {
+        key_values = [
             _PartitionKey(year, month, day)
-            for year, month, day in zip(
-                years.tolist(),
-                months.tolist(),
-                days.tolist(),
-                strict=True,
-            )
-        }
+            for year, month, day in zip(years, months, days, strict=True)
+        ]
     elif granularity == "quarter":
-        keys = {
+        key_values = [
             _PartitionKey(year, quarter=quarter)
-            for year, quarter in zip(years.tolist(), quarters.tolist(), strict=True)
-        }
+            for year, quarter in zip(years, quarters, strict=True)
+        ]
     else:
-        keys = {
+        key_values = [
             _PartitionKey(year, month)
-            for year, month in zip(years.tolist(), months.tolist(), strict=True)
-        }
+            for year, month in zip(years, months, strict=True)
+        ]
 
+    working = frame.copy(deep=False)
+    working["__partition_key"] = key_values
     partitions: dict[_PartitionKey, pd.DataFrame] = {}
-    for key in sorted(
-        keys,
-        key=lambda item: (
-            item.year,
-            item.quarter or 0,
-            item.month or 0,
-            item.day or 0,
-        ),
+    for key, partition in working.groupby("__partition_key", sort=False):
+        partitions[key] = partition.drop(columns="__partition_key").copy(deep=True)
+    return dict(
+        sorted(
+            partitions.items(),
+            key=lambda item: _partition_sort_key(item[0]),
+        )
+    )
+
+
+def _partition_sort_key(item: _PartitionKey) -> tuple[int, int, int, int]:
+    return (
+        item.year,
+        item.quarter or 0,
+        item.month or 0,
+        item.day or 0,
+    )
+
+
+def _ref_overlaps_date_range(
+    ref: SnapshotRef,
+    *,
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> bool:
+    if ref.quarter is not None:
+        month = (ref.quarter - 1) * 3 + 1
+        ref_start = pd.Timestamp(date(ref.year, month, 1))
+        ref_end = ref_start + pd.offsets.QuarterEnd(startingMonth=month + 2)
+    elif ref.month is not None:
+        ref_start = pd.Timestamp(date(ref.year, ref.month, ref.day or 1))
+        ref_end = (
+            ref_start
+            if ref.day is not None
+            else ref_start + pd.offsets.MonthEnd()
+        )
+    else:
+        ref_start = pd.Timestamp(date(ref.year, 1, 1))
+        ref_end = pd.Timestamp(date(ref.year, 12, 31))
+    if start_date is not None and ref_end < start_date:
+        return False
+    if end_date is not None and ref_start > end_date:
+        return False
+    return True
+
+
+def _optional_timestamp(
+    value: str | date | datetime | pd.Timestamp | None,
+) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value)
+
+
+def _read_columns_for_projection(
+    *,
+    requested: Sequence[str] | None,
+    metadata: Mapping[str, Any],
+) -> list[str] | None:
+    if requested is None:
+        return None
+    columns = list(dict.fromkeys(str(column) for column in requested))
+    for helper in (
+        metadata.get("date_column"),
+        metadata.get("asset_column"),
+        "date",
+        "trade_date",
+        "f_ann_date",
     ):
-        mask = years == key.year
-        if key.quarter is not None:
-            mask = mask & (quarters == key.quarter)
-        if key.month is not None:
-            mask = mask & (months == key.month)
-        if key.day is not None:
-            mask = mask & (days == key.day)
-        partitions[key] = frame.loc[mask.to_numpy()].copy(deep=True)
-    return partitions
+        if isinstance(helper, str) and helper and helper not in columns:
+            columns.append(helper)
+    return columns
+
+
+def _panel_read_columns(
+    *,
+    field: str,
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    columns = [field]
+    for helper in (
+        metadata.get("asset_column"),
+        metadata.get("date_column"),
+        "date",
+        "trade_date",
+        "f_ann_date",
+    ):
+        if isinstance(helper, str) and helper and helper not in columns:
+            columns.append(helper)
+    return columns
+
+
+def _finalize_read_frame(
+    frame: pd.DataFrame,
+    *,
+    columns: Sequence[str] | None,
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    filtered = _filter_frame_date_range(
+        frame,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if columns is None:
+        return filtered
+    requested = [str(column) for column in columns if str(column) in filtered.columns]
+    return filtered.loc[:, requested]
+
+
+def _filter_frame_date_range(
+    frame: pd.DataFrame,
+    *,
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if start_date is None and end_date is None:
+        return frame
+    if isinstance(frame.index, pd.DatetimeIndex):
+        mask = pd.Series(True, index=range(len(frame)))
+        if start_date is not None:
+            mask &= frame.index.to_series(index=range(len(frame))) >= start_date
+        if end_date is not None:
+            mask &= frame.index.to_series(index=range(len(frame))) <= end_date
+        return frame.loc[mask.to_numpy()]
+    column = _infer_partition_column(frame)
+    if column is None or column not in frame.columns:
+        return frame
+    dates = pd.to_datetime(frame[column].astype(str), errors="coerce")
+    mask = pd.Series(True, index=range(len(frame)))
+    if start_date is not None:
+        mask &= dates.reset_index(drop=True) >= start_date
+    if end_date is not None:
+        mask &= dates.reset_index(drop=True) <= end_date
+    return frame.loc[mask.to_numpy()]
+
+
+def _project_existing_columns(
+    frame: pd.DataFrame,
+    columns: Sequence[str] | None,
+) -> pd.DataFrame:
+    if columns is None:
+        return frame
+    existing = [column for column in columns if column in frame.columns]
+    return frame.loc[:, existing]
 
 
 def _deduplicate_append_partition(frame: pd.DataFrame) -> pd.DataFrame:
@@ -944,11 +1112,12 @@ def _normalize_data_item_catalog(
     lake: LocalDataLake,
 ) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
-    for raw_item_id in data["data_item_id"].dropna().astype(str).tolist():
-        row = data.loc[data["data_item_id"].astype(str) == raw_item_id].iloc[0]
-        table = str(row["table"]) if "table" in data.columns else ""
-        field = str(row["field"]) if "field" in data.columns else ""
-        row_source = str(row["source"]) if "source" in data.columns else source
+    for row in data.dropna(subset=["data_item_id"]).itertuples(index=False):
+        row_values = row._asdict()
+        raw_item_id = str(row_values["data_item_id"])
+        table = str(row_values["table"]) if "table" in row_values else ""
+        field = str(row_values["field"]) if "field" in row_values else ""
+        row_source = str(row_values["source"]) if "source" in row_values else source
         if not table or not field:
             resolved = _resolve_qualified_data_item(row_source, raw_item_id, lake)
             if resolved is None:
@@ -1069,8 +1238,16 @@ def _date_value_to_string(value: object) -> object:
     return value
 
 
-def _read_table_parquet(path: Path, *, table: str) -> pd.DataFrame:
-    frame = pd.read_parquet(path)
+def _read_table_parquet(
+    path: Path,
+    *,
+    table: str,
+    columns: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    try:
+        frame = pd.read_parquet(path, columns=columns)
+    except (KeyError, ValueError, OSError):
+        frame = _project_existing_columns(pd.read_parquet(path), columns)
     if _is_panel_like_table(table, frame, None):
         if isinstance(frame.index, pd.DatetimeIndex):
             frame.index.name = "date"
