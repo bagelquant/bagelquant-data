@@ -188,17 +188,21 @@ It stores settings in `.bagelquant-data-gui.yaml` by default:
 
 Token resolution order in the GUI is configured source token, `TUSHARE_TOKEN`,
 then Streamlit secrets. Updates are manual: use **Data Sources** to configure
-tables from the local Tushare catalog and click **Update data lake**.
+tables from the local Tushare catalog, click **Scan updates** to review the
+local-lake update report, then click **Confirm update** to run the reported
+jobs.
 
 ## Tushare Updates
 
 Tushare `All` is built from `stock_basic`, including listed (`L`), delisted
 (`D`), and paused (`P`) stocks returned by the provider. Price-like tables such
-as `daily` and `index_daily` are fetched and written day by day to avoid
-provider row limits and resume incrementally. Fundamental tables are fetched id
-by id through `ts_code` and write each completed asset batch immediately. VIP
-fundamental tables such as `income_vip` are fetched and written by reporting
-season with `period`, so they do not loop through every stock.
+as `daily` and `index_daily` are scanned locally for missing trade dates, then
+fetched and written day by day to avoid provider row limits and resume
+incrementally. Fundamental tables create one confirmed job per `ts_code`, with
+each job starting from that asset's latest local `f_ann_date`. VIP fundamental
+tables such as `income_vip` are scanned and written by reporting season with
+`period`, so they do not loop through every stock. The GUI always scans first
+and executes only the confirmed report jobs.
 
 Defaults:
 

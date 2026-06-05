@@ -8,10 +8,20 @@ from bagelquant_data.gui.app import (
     _data_item_catalog,
     _preview_panel_frame,
     _preview_table_frame,
+    _remember_expanded,
     _render_page,
+    _sync_table_controls_from_session,
+    _table_category_expanded_key,
     _table_description_markdown,
 )
-from bagelquant_data.gui.config import GuiConfig, SourceConfig, TableConfig
+from bagelquant_data.gui.config import (
+    GuiConfig,
+    SourceConfig,
+    TableConfig,
+    TradingCalendarConfig,
+    UniverseConfig,
+)
+from bagelquant_data.gui.orchestration import update_binding_errors
 
 
 def test_streamlit_app_module_imports() -> None:
@@ -139,6 +149,47 @@ def test_render_page_dispatches_only_selected_page(monkeypatch) -> None:
     )
 
     assert calls == ["retrieve"]
+
+
+def test_table_control_sync_clears_stale_universe_warning(monkeypatch) -> None:
+    import bagelquant_data.gui.app as app
+
+    config = GuiConfig(
+        sources=[
+            SourceConfig(
+                name="tushare",
+                universes=[UniverseConfig(source="tushare", table="stock_basic")],
+                trading_calendars=[
+                    TradingCalendarConfig(source="tushare", table="trade_cal")
+                ],
+                tables=[TableConfig(source="tushare", name="daily", kind="price")],
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        app.st,
+        "session_state",
+        {
+            "table-universe-tushare-0": "stock_basic",
+            "table-calendar-tushare-0": "trade_cal",
+        },
+    )
+
+    _sync_table_controls_from_session(config)
+
+    assert update_binding_errors(config) == ()
+
+
+def test_remember_expanded_marks_table_category(monkeypatch) -> None:
+    import bagelquant_data.gui.app as app
+
+    state: dict[str, bool] = {}
+    monkeypatch.setattr(app.st, "session_state", state)
+    key = _table_category_expanded_key("tushare", "Stock / Basic")
+
+    _remember_expanded(key)
+
+    assert state[key] is True
 
 
 class FakeCatalogLake:

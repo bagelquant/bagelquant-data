@@ -22,18 +22,23 @@ from bagelquant_data.gui.config import (
     GuiConfig,
     SourceConfig,
     TableConfig,
+    TradingCalendarConfig,
+    UniverseConfig,
     load_config,
     save_config,
 )
 from bagelquant_data.gui.orchestration import (
     build_registry,
+    build_update_report,
     default_tushare_source,
-    run_all_table_updates,
+    run_reference_updates,
+    run_update_report,
     token_available,
     token_from_config,
+    update_binding_errors,
 )
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
-from bagelquant_data.lake.manager import TushareTableKind
+from bagelquant_data.lake.manager import TushareTableKind, TushareUpdateReport
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 TABLE_KINDS = ("general", "price", "fundamental", "fundamental_vip")
@@ -106,6 +111,14 @@ def _session_config(path: Path) -> GuiConfig:
 
 
 def _lake_setup(config: GuiConfig, manager: DataLakeManager) -> None:
+    _how_to(
+        "How to use Lake Setup",
+        (
+            "Review what is already stored in the local lake. Use the source and "
+            "table selectors to inspect snapshots, and use the data item catalog "
+            "to confirm which qualified fields are available for retrieval."
+        ),
+    )
     st.subheader("Lake Contents")
     sources = manager.list_sources()
     tables = manager.list_tables()
@@ -205,8 +218,19 @@ def _data_sources(
     config_path: Path,
     provider_ready: bool,
 ) -> None:
-    _ensure_tushare_stock_basic(config)
+    _ensure_tushare_references(config)
     _sync_source_tokens_from_session(config)
+    _sync_table_controls_from_session(config)
+    _how_to(
+        "How to use Data Sources",
+        (
+            "Configure provider references first: universes define which codes a "
+            "table updates across, and trading calendars define which dates are "
+            "valid update dates. Click Update universes/calendars to refresh "
+            "those reference tables, then scan normal table updates and confirm "
+            "the exact reported jobs."
+        ),
+    )
     st.subheader("Update Data Lake")
     settings = st.columns([2, 1])
     config.update_start_date = settings[0].text_input(
@@ -227,11 +251,50 @@ def _data_sources(
     provider_ready = provider_ready or current_token is not None
     if not provider_ready:
         st.warning("Configure a Tushare token before provider updates.")
-    if st.button(
-        "Update data lake",
+    report_key = "bq-data-update-report"
+    signature_key = "bq-data-update-report-signature"
+    current_signature = _update_report_signature(config)
+    binding_errors = update_binding_errors(config)
+    for error in binding_errors:
+        st.warning(error)
+    actions = st.columns([1, 1, 1, 4])
+    if actions[0].button(
+        "Update universes/calendars",
         disabled=not provider_ready,
         width="content",
     ):
+        update_manager = DataLakeManager(
+            manager.lake,
+            registry=build_registry(tushare_token=current_token),
+        )
+        refs = run_reference_updates(update_manager, config)
+        save_config(config, config_path)
+        st.success(f"Updated {len(refs)} reference resource(s)")
+    if actions[1].button(
+        "Scan updates",
+        disabled=bool(binding_errors),
+        width="content",
+    ):
+        report = build_update_report(manager, config)
+        st.session_state[report_key] = report
+        st.session_state[signature_key] = current_signature
+        save_config(config, config_path)
+    report = cast(TushareUpdateReport | None, st.session_state.get(report_key))
+    report_current = st.session_state.get(signature_key) == current_signature
+    if report is not None:
+        st.dataframe(
+            pd.DataFrame(_update_report_rows(report)),
+            width="stretch",
+            hide_index=True,
+        )
+        if not report_current:
+            st.warning("Scan settings changed. Run Scan updates again.")
+    if actions[2].button(
+        "Confirm update",
+        disabled=not provider_ready or report is None or not report_current,
+        width="content",
+    ):
+        confirmed_report = cast(TushareUpdateReport, report)
         update_manager = DataLakeManager(
             manager.lake,
             registry=build_registry(tushare_token=current_token),
@@ -249,9 +312,10 @@ def _data_sources(
                 f"({completed}/{total})"
             )
 
-        snapshots = run_all_table_updates(
+        snapshots = run_update_report(
             update_manager,
-            config,
+            confirmed_report,
+            workers=config.update_workers,
             progress=on_progress,
         )
         save_config(config, config_path)
@@ -284,6 +348,7 @@ def _data_sources(
             ]
             st.success(f"Deleted source config {source.name}")
             st.rerun()
+        _reference_editor(source)
         _table_editor(source)
 
     st.divider()
@@ -304,33 +369,271 @@ def _sync_source_tokens_from_session(config: GuiConfig) -> None:
             source.token = str(st.session_state[key]) or None
 
 
+def _sync_table_controls_from_session(config: GuiConfig) -> None:
+    for source in config.sources:
+        for index, table in enumerate(source.tables):
+            enabled_key = f"table-enabled-{source.name}-{index}"
+            if enabled_key in st.session_state:
+                table.enabled = bool(st.session_state[enabled_key])
+            kind_key = f"table-kind-{source.name}-{index}"
+            if kind_key in st.session_state:
+                table.kind = cast(TushareTableKind, str(st.session_state[kind_key]))
+            universe_key = f"table-universe-{source.name}-{index}"
+            if universe_key in st.session_state:
+                table.universe = str(st.session_state[universe_key]) or None
+            calendar_key = f"table-calendar-{source.name}-{index}"
+            if calendar_key in st.session_state:
+                table.trading_calendar = str(st.session_state[calendar_key]) or None
+
+
+def _update_report_signature(config: GuiConfig) -> tuple[object, ...]:
+    return (
+        config.update_start_date,
+        config.update_end_date,
+        tuple(
+            (
+                source.name,
+                source.enabled,
+                tuple(
+                    (
+                        universe.source,
+                        universe.table,
+                        universe.kind,
+                        universe.code_column,
+                        universe.enabled,
+                    )
+                    for universe in source.universes
+                ),
+                tuple(
+                    (
+                        calendar.source,
+                        calendar.table,
+                        calendar.kind,
+                        calendar.date_column,
+                        calendar.open_column,
+                        tuple(sorted(calendar.filters.items())),
+                        calendar.enabled,
+                    )
+                    for calendar in source.trading_calendars
+                ),
+                tuple(
+                    (
+                        table.source,
+                        table.name,
+                        table.kind,
+                        table.enabled,
+                        table.universe,
+                        table.trading_calendar,
+                    )
+                    for table in source.tables
+                ),
+            )
+            for source in config.sources
+        ),
+    )
+
+
+def _update_report_rows(report: TushareUpdateReport) -> list[dict[str, object]]:
+    rows = []
+    for plan in report.plans:
+        pending = ", ".join(plan.pending_items[:5])
+        if len(plan.pending_items) > 5:
+            pending = f"{pending}, ..."
+        rows.append(
+            {
+                "source": report.source,
+                "table": plan.table,
+                "kind": plan.kind,
+                "status": plan.status,
+                "effective_start": (
+                    plan.effective_start.isoformat()
+                    if plan.effective_start is not None
+                    else ""
+                ),
+                "end_date": plan.requested_end.isoformat(),
+                "job_count": plan.estimated_job_count,
+                "pending_items": pending,
+                "reason": plan.reason,
+            }
+        )
+    return rows
+
+
+def _how_to(title: str, body: str) -> None:
+    with st.expander(title, expanded=False):
+        st.markdown(body)
+
+
+def _reference_editor(source: SourceConfig) -> None:
+    if source.provider != "tushare":
+        return
+    with st.expander("Universes", expanded=False):
+        st.caption(
+            "Universes are reference tables that provide asset codes for "
+            "non-general table updates."
+        )
+        header = st.columns([1, 3, 2, 2])
+        header[0].caption("Enabled")
+        header[1].caption("Table")
+        header[2].caption("Code column")
+        header[3].caption("Action")
+        if not source.universes:
+            st.info("No universes configured for this source.")
+        for index, universe in enumerate(source.universes):
+            cols = st.columns([1, 3, 2, 2])
+            universe.enabled = cols[0].checkbox(
+                "Enabled",
+                value=universe.enabled,
+                key=f"universe-enabled-{source.name}-{index}",
+                label_visibility="collapsed",
+            )
+            universe.table = cast(
+                str,
+                cols[1].selectbox(
+                    "Table",
+                    options=_tushare_catalog_api_options(universe.table),
+                    index=_selected_option_index(
+                        _tushare_catalog_api_options(universe.table),
+                        universe.table,
+                    ),
+                    key=f"universe-table-{source.name}-{index}",
+                    label_visibility="collapsed",
+                ),
+            )
+            universe.code_column = cols[2].text_input(
+                "Code column",
+                value=universe.code_column,
+                key=f"universe-code-column-{source.name}-{index}",
+                label_visibility="collapsed",
+            )
+            if cols[3].button(
+                "Delete",
+                key=f"delete-universe-{source.name}-{index}",
+                width="content",
+            ):
+                del source.universes[index]
+                st.rerun()
+        if st.button(
+            "Add universe",
+            key=f"add-universe-{source.name}",
+            width="content",
+        ):
+            source.universes.append(
+                UniverseConfig(
+                    source=source.name,
+                    table=_first_available_reference_table(
+                        source,
+                        preferred="index_basic",
+                    ),
+                    kind="general",
+                    code_column="ts_code",
+                )
+            )
+            st.rerun()
+    with st.expander("Trading calendars", expanded=False):
+        st.caption(
+            "Trading calendars are reference tables that define open dates for "
+            "date-by-date updates."
+        )
+        header = st.columns([1, 3, 2, 2, 2])
+        header[0].caption("Enabled")
+        header[1].caption("Table")
+        header[2].caption("Date column")
+        header[3].caption("Open column")
+        header[4].caption("Action")
+        if not source.trading_calendars:
+            st.info("No trading calendars configured for this source.")
+        for index, calendar in enumerate(source.trading_calendars):
+            cols = st.columns([1, 3, 2, 2, 2])
+            calendar.enabled = cols[0].checkbox(
+                "Enabled",
+                value=calendar.enabled,
+                key=f"calendar-enabled-{source.name}-{index}",
+                label_visibility="collapsed",
+            )
+            calendar.table = cast(
+                str,
+                cols[1].selectbox(
+                    "Table",
+                    options=_tushare_catalog_api_options(calendar.table),
+                    index=_selected_option_index(
+                        _tushare_catalog_api_options(calendar.table),
+                        calendar.table,
+                    ),
+                    key=f"calendar-table-{source.name}-{index}",
+                    label_visibility="collapsed",
+                ),
+            )
+            calendar.date_column = cols[2].text_input(
+                "Date column",
+                value=calendar.date_column,
+                key=f"calendar-date-column-{source.name}-{index}",
+                label_visibility="collapsed",
+            )
+            calendar.open_column = cols[3].text_input(
+                "Open column",
+                value=calendar.open_column,
+                key=f"calendar-open-column-{source.name}-{index}",
+                label_visibility="collapsed",
+            )
+            if cols[4].button(
+                "Delete",
+                key=f"delete-calendar-{source.name}-{index}",
+                width="content",
+            ):
+                del source.trading_calendars[index]
+                st.rerun()
+        if st.button(
+            "Add calendar",
+            key=f"add-calendar-{source.name}",
+            width="content",
+        ):
+            source.trading_calendars.append(
+                TradingCalendarConfig(
+                    source=source.name,
+                    table=_first_available_reference_table(
+                        source,
+                        preferred="trade_cal",
+                    ),
+                    kind="general",
+                    date_column="cal_date",
+                    open_column="is_open",
+                )
+            )
+            st.rerun()
+
+
 def _table_editor(source: SourceConfig) -> None:
     st.caption("Tables")
     if not source.tables:
         st.info("No tables configured for this source.")
     for category in _configured_table_categories(source):
-        with st.expander(category, expanded=False):
-            header = st.columns([1, 2, 2, 4, 2])
+        expanded_key = _table_category_expanded_key(source.name, category)
+        with st.expander(category, expanded=bool(st.session_state.get(expanded_key))):
+            header = st.columns([1, 2, 2, 2, 2, 3, 2])
             header[0].caption("Enabled")
             header[1].caption("Table")
             header[2].caption("Kind")
-            header[3].caption("Description")
-            header[4].caption("Action")
+            header[3].caption("Universe")
+            header[4].caption("Calendar")
+            header[5].caption("Description")
+            header[6].caption("Action")
             for index, table in _configured_tables_for_category(source, category):
-                cols = st.columns([1, 2, 2, 4, 2])
-                required = source.provider == "tushare" and table.name == "stock_basic"
+                cols = st.columns([1, 2, 2, 2, 2, 3, 2])
                 table.enabled = cols[0].checkbox(
                     "Enabled",
-                    value=True if required else table.enabled,
+                    value=table.enabled,
                     key=f"table-enabled-{source.name}-{index}",
-                    disabled=required,
+                    on_change=_remember_expanded,
+                    args=(expanded_key,),
                     label_visibility="collapsed",
                 )
                 table.name = cols[1].text_input(
                     "Table",
                     value=table.name,
                     key=f"table-name-{source.name}-{index}",
-                    disabled=required,
+                    on_change=_remember_expanded,
+                    args=(expanded_key,),
                     label_visibility="collapsed",
                 )
                 table.kind = cols[2].selectbox(
@@ -338,16 +641,20 @@ def _table_editor(source: SourceConfig) -> None:
                     options=TABLE_KINDS,
                     index=TABLE_KINDS.index(table.kind),
                     key=f"table-kind-{source.name}-{index}",
-                    disabled=required,
+                    on_change=_remember_expanded,
+                    args=(expanded_key,),
                     label_visibility="collapsed",
                 )
-                cols[3].markdown(_table_description_markdown(table.name))
-                if required:
-                    cols[4].caption("Required")
-                    table.enabled = True
-                    table.kind = "general"
-                    continue
-                _table_delete_controls(source, index, table, cols[4])
+                _table_binding_selectors(
+                    source,
+                    table,
+                    index,
+                    cols[3],
+                    cols[4],
+                    expanded_key,
+                )
+                cols[5].markdown(_table_description_markdown(table.name))
+                _table_delete_controls(source, index, table, cols[6])
     with st.expander("Add table", expanded=False):
         add_cols = st.columns([2, 5, 2, 1])
         categories = _tushare_table_categories()
@@ -403,6 +710,96 @@ def _table_editor(source: SourceConfig) -> None:
             width="content",
         ):
             _add_source_table(source, selected_entry.api, kind)
+
+
+def _table_binding_selectors(
+    source: SourceConfig,
+    table: TableConfig,
+    index: int,
+    universe_container,
+    calendar_container,
+    expanded_key: str,
+) -> None:
+    universe_options = ["", *[item.table for item in source.universes if item.enabled]]
+    enabled_calendars = [
+        item.table for item in source.trading_calendars if item.enabled
+    ]
+    calendar_options = [
+        "",
+        *enabled_calendars,
+    ]
+    disabled = table.kind == "general"
+    if disabled:
+        table.universe = None
+        table.trading_calendar = None
+    elif table.trading_calendar is None and len(enabled_calendars) == 1:
+        table.trading_calendar = enabled_calendars[0]
+    table.universe = cast(
+        str,
+        universe_container.selectbox(
+            "Universe",
+            options=universe_options,
+            index=_selected_option_index(universe_options, table.universe),
+            key=f"table-universe-{source.name}-{index}",
+            disabled=disabled,
+            on_change=_remember_expanded,
+            args=(expanded_key,),
+            label_visibility="collapsed",
+        ),
+    ) or None
+    table.trading_calendar = cast(
+        str,
+        calendar_container.selectbox(
+            "Calendar",
+            options=calendar_options,
+            index=_selected_option_index(calendar_options, table.trading_calendar),
+            key=f"table-calendar-{source.name}-{index}",
+            disabled=disabled or len(enabled_calendars) == 1,
+            on_change=_remember_expanded,
+            args=(expanded_key,),
+            label_visibility="collapsed",
+        ),
+    ) or None
+
+
+def _table_category_expanded_key(source_name: str, category: str) -> str:
+    return f"table-category-expanded-{source_name}-{category}"
+
+
+def _remember_expanded(key: str) -> None:
+    st.session_state[key] = True
+
+
+def _selected_option_index(options: list[str], value: str | None) -> int:
+    if value in options:
+        return options.index(cast(str, value))
+    return 0
+
+
+def _tushare_catalog_api_options(current: str | None = None) -> list[str]:
+    options = [entry.api for entry in tushare_catalog.tushare_table_catalog()]
+    if current and current not in options:
+        return [current, *options]
+    return options
+
+
+def _first_available_reference_table(
+    source: SourceConfig,
+    *,
+    preferred: str,
+) -> str:
+    configured = (
+        {universe.table for universe in source.universes}
+        .union(calendar.table for calendar in source.trading_calendars)
+        .union(table.name for table in source.tables)
+    )
+    options = _tushare_catalog_api_options(preferred)
+    if preferred not in configured:
+        return preferred
+    for option in options:
+        if option not in configured:
+            return option
+    return preferred
 
 
 def _add_source_table(
@@ -526,7 +923,11 @@ def _tushare_table_catalog_for_category(category_zh: str):
 
 
 def _configured_api_names(source: SourceConfig) -> set[str]:
-    return {table.name for table in source.tables}
+    return (
+        {table.name for table in source.tables}
+        .union(universe.table for universe in source.universes)
+        .union(calendar.table for calendar in source.trading_calendars)
+    )
 
 
 def _available_tushare_table_catalog_for_category(
@@ -576,27 +977,54 @@ def _table_delete_controls(
         st.rerun()
 
 
-def _ensure_tushare_stock_basic(config: GuiConfig) -> None:
+def _ensure_tushare_references(config: GuiConfig) -> None:
     for source in config.sources:
         if source.provider != "tushare":
             continue
+        if not any(universe.table == "stock_basic" for universe in source.universes):
+            source.universes.insert(
+                0,
+                UniverseConfig(
+                    source=source.name,
+                    table="stock_basic",
+                    kind=tushare_catalog.default_tushare_table_kind("stock_basic"),
+                    code_column="ts_code",
+                    enabled=True,
+                ),
+            )
+        if not any(
+            calendar.table == "trade_cal" for calendar in source.trading_calendars
+        ):
+            source.trading_calendars.insert(
+                0,
+                TradingCalendarConfig(
+                    source=source.name,
+                    table="trade_cal",
+                    kind=tushare_catalog.default_tushare_table_kind("trade_cal"),
+                    date_column="cal_date",
+                    open_column="is_open",
+                    enabled=True,
+                ),
+            )
         source.tables = [
             table
             for table in source.tables
-            if not (table.source == source.name and table.name == "stock_basic")
+            if not (
+                table.source == source.name
+                and table.name in {"stock_basic", "trade_cal"}
+            )
         ]
-        source.tables.insert(
-            0,
-            TableConfig(
-                source=source.name,
-                name="stock_basic",
-                kind=tushare_catalog.default_tushare_table_kind("stock_basic"),
-                enabled=True,
-            ),
-        )
 
 
 def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
+    _how_to(
+        "How to use Retrieve Data",
+        (
+            "Choose a date range and a qualified data item id, then load a "
+            "browser-safe preview. Use the generated code selector to copy the "
+            "matching local lake, loader, or panel-agreement access pattern."
+        ),
+    )
     st.subheader("Retrieve Data")
     cols = st.columns(2)
     start_date = cols[0].text_input("Start date", value="2000-01-01")

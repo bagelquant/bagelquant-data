@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +17,25 @@ from bagelquant_data.lake.snapshot import SnapshotRef
 from bagelquant_data.utils.exceptions import DatasetNotFoundError, LakeError
 
 WriteMode = Literal["append", "overwrite"]
+PartitionGranularity = Literal["month", "day", "quarter"]
+
+
+@dataclass(frozen=True, slots=True)
+class _PartitionKey:
+    year: int
+    month: int | None = None
+    day: int | None = None
+    quarter: int | None = None
+
+    def metadata(self) -> dict[str, int]:
+        payload = {"year": self.year}
+        if self.month is not None:
+            payload["month"] = self.month
+        if self.day is not None:
+            payload["day"] = self.day
+        if self.quarter is not None:
+            payload["quarter"] = self.quarter
+        return payload
 
 
 class LocalDataLake:
@@ -67,12 +87,17 @@ class LocalDataLake:
         mode: WriteMode = "append",
         metadata: Mapping[str, Any] | None = None,
         partition_column: str | None = None,
+        partition_granularity: PartitionGranularity = "month",
         update_catalogs: bool = True,
     ) -> SnapshotRef:
-        """Write immutable snapshots partitioned by table/year/month."""
+        """Write immutable snapshots partitioned by table date granularity."""
 
         if mode not in {"append", "overwrite"}:
             raise LakeError("mode must be 'append' or 'overwrite'")
+        if partition_granularity not in {"month", "day", "quarter"}:
+            raise LakeError(
+                "partition_granularity must be 'month', 'day', or 'quarter'"
+            )
         frame = data.copy(deep=True)
         snapshot_id = _snapshot_id()
         created_at = datetime.now(UTC)
@@ -86,15 +111,17 @@ class LocalDataLake:
             frame,
             created_at=created_at,
             partition_column=partition_column,
+            granularity=partition_granularity,
         )
         refs = []
-        for (year, month), partition in partitioned.items():
+        for key, partition in partitioned.items():
             if mode == "append":
-                previous = self._read_partition_latest(source, dataset, year, month)
+                previous = self._read_partition_latest(source, dataset, key)
                 if previous is not None:
                     partition = pd.concat([previous, partition], axis=0)
+                    partition = _deduplicate_append_partition(partition)
             partition = _normalize_parquet_types(partition)
-            snapshot_dir = self._snapshot_dir(source, dataset, year, month, snapshot_id)
+            snapshot_dir = self._snapshot_dir(source, dataset, key, snapshot_id)
             snapshot_dir.mkdir(parents=True, exist_ok=False)
             partition.to_parquet(
                 snapshot_dir / "data.parquet",
@@ -106,8 +133,8 @@ class LocalDataLake:
                 "dataset": dataset,
                 "snapshot_id": snapshot_id,
                 "format": "parquet",
-                "year": year,
-                "month": month,
+                **key.metadata(),
+                "partition_granularity": partition_granularity,
                 "created_at": created_at.isoformat(),
                 "mode": mode,
                 "metadata": dict(metadata or {}),
@@ -124,14 +151,16 @@ class LocalDataLake:
                     source=source,
                     dataset=dataset,
                     snapshot_id=snapshot_id,
-                    year=year,
-                    month=month,
+                    year=key.year,
+                    month=key.month,
+                    day=key.day,
+                    quarter=key.quarter,
                     path=snapshot_dir,
                     created_at=created_at,
                     metadata=payload,
                 )
             )
-            self._write_partition_catalog(source, dataset, year, month, refs[-1])
+            self._write_partition_catalog(source, dataset, key, refs[-1])
         self._write_table_catalog(
             source,
             dataset,
@@ -372,21 +401,12 @@ class LocalDataLake:
         if not table_dir.exists():
             return ()
         refs = []
-        for year_dir in sorted(table_dir.glob("year=*")):
-            for month_dir in sorted(year_dir.glob("month=*")):
-                snapshot_root = month_dir / "snapshots"
-                paths = snapshot_root.iterdir() if snapshot_root.exists() else ()
-                for path in sorted(paths):
-                    if path.is_dir():
-                        refs.append(
-                            self._snapshot_ref(
-                                source,
-                                dataset,
-                                path.name,
-                                year=_parse_partition_number(year_dir.name, "year"),
-                                month=_parse_partition_number(month_dir.name, "month"),
-                            )
-                        )
+        for key, partition_dir in self._partition_dirs(source, dataset):
+            snapshot_root = partition_dir / "snapshots"
+            paths = snapshot_root.iterdir() if snapshot_root.exists() else ()
+            for path in sorted(paths):
+                if path.is_dir():
+                    refs.append(self._snapshot_ref(source, dataset, path.name, key=key))
         return tuple(refs)
 
     def latest(self, source: str, dataset: str) -> SnapshotRef | None:
@@ -417,27 +437,14 @@ class LocalDataLake:
         table_dir = self._dataset_dir(source, dataset)
         if not table_dir.exists():
             return ()
-        for year_dir in sorted(table_dir.glob("year=*")):
-            for month_dir in sorted(year_dir.glob("month=*")):
-                year = _parse_partition_number(year_dir.name, "year")
-                month = _parse_partition_number(month_dir.name, "month")
-                catalog_path = self._partition_catalog_path(
-                    source, dataset, year, month
-                )
-                if not catalog_path.exists():
-                    continue
-                payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-                snapshot_id = payload.get("latest_snapshot")
-                if isinstance(snapshot_id, str):
-                    refs.append(
-                        self._snapshot_ref(
-                            source,
-                            dataset,
-                            snapshot_id,
-                            year=year,
-                            month=month,
-                        )
-                    )
+        for key, partition_dir in self._partition_dirs(source, dataset):
+            catalog_path = partition_dir / "_catalog.json"
+            if not catalog_path.exists():
+                continue
+            payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+            snapshot_id = payload.get("latest_snapshot")
+            if isinstance(snapshot_id, str):
+                refs.append(self._snapshot_ref(source, dataset, snapshot_id, key=key))
         return tuple(refs)
 
     def ingest(
@@ -482,10 +489,9 @@ class LocalDataLake:
         self,
         source: str,
         dataset: str,
-        year: int,
-        month: int,
+        key: _PartitionKey,
     ) -> pd.DataFrame | None:
-        catalog_path = self._partition_catalog_path(source, dataset, year, month)
+        catalog_path = self._partition_catalog_path(source, dataset, key)
         if not catalog_path.exists():
             return None
         payload = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -493,8 +499,7 @@ class LocalDataLake:
         if not isinstance(snapshot_id, str):
             return None
         data_path = (
-            self._snapshot_dir(source, dataset, year, month, snapshot_id)
-            / "data.parquet"
+            self._snapshot_dir(source, dataset, key, snapshot_id) / "data.parquet"
         )
         return (
             _read_table_parquet(data_path, table=dataset)
@@ -508,10 +513,9 @@ class LocalDataLake:
         dataset: str,
         snapshot_id: str,
         *,
-        year: int,
-        month: int,
+        key: _PartitionKey,
     ) -> SnapshotRef:
-        snapshot_dir = self._snapshot_dir(source, dataset, year, month, snapshot_id)
+        snapshot_dir = self._snapshot_dir(source, dataset, key, snapshot_id)
         metadata_path = snapshot_dir / "metadata.json"
         metadata: dict[str, Any] = {}
         created_at = datetime.now(UTC)
@@ -524,8 +528,10 @@ class LocalDataLake:
             source=source,
             dataset=dataset,
             snapshot_id=snapshot_id,
-            year=year,
-            month=month,
+            year=key.year,
+            month=key.month,
+            day=key.day,
+            quarter=key.quarter,
             path=snapshot_dir,
             created_at=created_at,
             metadata=metadata,
@@ -559,22 +565,20 @@ class LocalDataLake:
         self,
         source: str,
         dataset: str,
-        year: int,
-        month: int,
+        key: _PartitionKey,
         snapshot: SnapshotRef,
     ) -> None:
-        partition_dir = self._partition_dir(source, dataset, year, month)
+        partition_dir = self._partition_dir(source, dataset, key)
         partition_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "source": source,
             "table": dataset,
             "format": "parquet",
-            "year": year,
-            "month": month,
+            **key.metadata(),
             "latest_snapshot": snapshot.snapshot_id,
             "updated_at": snapshot.created_at.isoformat(),
         }
-        self._partition_catalog_path(source, dataset, year, month).write_text(
+        self._partition_catalog_path(source, dataset, key).write_text(
             json.dumps(payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
@@ -587,23 +591,25 @@ class LocalDataLake:
     def _dataset_dir(self, source: str, dataset: str) -> Path:
         return self.root / _safe_part(source) / _safe_part(dataset)
 
-    def _partition_dir(self, source: str, dataset: str, year: int, month: int) -> Path:
-        return (
-            self._dataset_dir(source, dataset)
-            / f"year={year:04d}"
-            / f"month={month:02d}"
-        )
+    def _partition_dir(self, source: str, dataset: str, key: _PartitionKey) -> Path:
+        path = self._dataset_dir(source, dataset) / f"year={key.year:04d}"
+        if key.quarter is not None:
+            return path / f"quarter={key.quarter}"
+        if key.month is not None:
+            path = path / f"month={key.month:02d}"
+        if key.day is not None:
+            path = path / f"day={key.day:02d}"
+        return path
 
     def _snapshot_dir(
         self,
         source: str,
         dataset: str,
-        year: int,
-        month: int,
+        key: _PartitionKey,
         snapshot: str,
     ) -> Path:
         return (
-            self._partition_dir(source, dataset, year, month)
+            self._partition_dir(source, dataset, key)
             / "snapshots"
             / _safe_part(snapshot)
         )
@@ -615,10 +621,65 @@ class LocalDataLake:
         self,
         source: str,
         dataset: str,
-        year: int,
-        month: int,
+        key: _PartitionKey,
     ) -> Path:
-        return self._partition_dir(source, dataset, year, month) / "_catalog.json"
+        return self._partition_dir(source, dataset, key) / "_catalog.json"
+
+    def _partition_dirs(
+        self,
+        source: str,
+        dataset: str,
+    ) -> tuple[tuple[_PartitionKey, Path], ...]:
+        table_dir = self._dataset_dir(source, dataset)
+        if not table_dir.exists():
+            return ()
+        partitions: list[tuple[_PartitionKey, Path]] = []
+        for year_dir in sorted(table_dir.glob("year=*")):
+            if not year_dir.is_dir():
+                continue
+            year = _parse_partition_number(year_dir.name, "year")
+            for quarter_dir in sorted(year_dir.glob("quarter=*")):
+                if quarter_dir.is_dir():
+                    partitions.append(
+                        (
+                            _PartitionKey(
+                                year=year,
+                                quarter=_parse_partition_number(
+                                    quarter_dir.name,
+                                    "quarter",
+                                ),
+                            ),
+                            quarter_dir,
+                        )
+                    )
+            for month_dir in sorted(year_dir.glob("month=*")):
+                if not month_dir.is_dir():
+                    continue
+                month = _parse_partition_number(month_dir.name, "month")
+                day_dirs = [
+                    path
+                    for path in sorted(month_dir.glob("day=*"))
+                    if path.is_dir()
+                ]
+                if day_dirs:
+                    partitions.extend(
+                        (
+                            _PartitionKey(
+                                year=year,
+                                month=month,
+                                day=_parse_partition_number(day_dir.name, "day"),
+                            ),
+                            day_dir,
+                        )
+                        for day_dir in day_dirs
+                    )
+                if (month_dir / "snapshots").exists() or (
+                    month_dir / "_catalog.json"
+                ).exists():
+                    partitions.append(
+                        (_PartitionKey(year=year, month=month), month_dir)
+                    )
+        return tuple(partitions)
 
     def _has_table_catalog(self, source: str, dataset: str) -> bool:
         return self._table_catalog_path(source, dataset).exists()
@@ -762,10 +823,11 @@ def _partition_frame(
     *,
     created_at: datetime,
     partition_column: str | None,
-) -> dict[tuple[int, int], pd.DataFrame]:
+    granularity: PartitionGranularity,
+) -> dict[_PartitionKey, pd.DataFrame]:
     column = partition_column or _infer_partition_column(frame)
     if column is None:
-        return {(created_at.year, created_at.month): frame}
+        return {_PartitionKey(created_at.year, created_at.month): frame}
 
     if column == "date" and frame.index.name == "date":
         partition_values = pd.Series(pd.to_datetime(frame.index), index=frame.index)
@@ -776,13 +838,74 @@ def _partition_frame(
 
     years = partition_values.dt.year.astype(int)
     months = partition_values.dt.month.astype(int)
-    keys = sorted(set(zip(years.tolist(), months.tolist(), strict=True)))
+    days = partition_values.dt.day.astype(int)
+    quarters = partition_values.dt.quarter.astype(int)
+    if granularity == "day":
+        keys = {
+            _PartitionKey(year, month, day)
+            for year, month, day in zip(
+                years.tolist(),
+                months.tolist(),
+                days.tolist(),
+                strict=True,
+            )
+        }
+    elif granularity == "quarter":
+        keys = {
+            _PartitionKey(year, quarter=quarter)
+            for year, quarter in zip(years.tolist(), quarters.tolist(), strict=True)
+        }
+    else:
+        keys = {
+            _PartitionKey(year, month)
+            for year, month in zip(years.tolist(), months.tolist(), strict=True)
+        }
 
-    partitions: dict[tuple[int, int], pd.DataFrame] = {}
-    for year, month in keys:
-        mask = (years == year) & (months == month)
-        partitions[(year, month)] = frame.loc[mask.to_numpy()].copy(deep=True)
+    partitions: dict[_PartitionKey, pd.DataFrame] = {}
+    for key in sorted(
+        keys,
+        key=lambda item: (
+            item.year,
+            item.quarter or 0,
+            item.month or 0,
+            item.day or 0,
+        ),
+    ):
+        mask = years == key.year
+        if key.quarter is not None:
+            mask = mask & (quarters == key.quarter)
+        if key.month is not None:
+            mask = mask & (months == key.month)
+        if key.day is not None:
+            mask = mask & (days == key.day)
+        partitions[key] = frame.loc[mask.to_numpy()].copy(deep=True)
     return partitions
+
+
+def _deduplicate_append_partition(frame: pd.DataFrame) -> pd.DataFrame:
+    keys = [
+        column
+        for column in (
+            "ts_code",
+            "symbol",
+            "asset_id",
+            "code",
+            "trade_date",
+            "f_ann_date",
+            "ann_date",
+            "end_date",
+            "period",
+        )
+        if column in frame.columns
+    ]
+    if frame.index.name == "date":
+        working = frame.reset_index()
+        if "date" not in keys:
+            keys.append("date")
+        return working.drop_duplicates(keys, keep="last").set_index("date").sort_index()
+    if not keys:
+        return frame.drop_duplicates(keep="last")
+    return frame.drop_duplicates(keys, keep="last")
 
 
 def _table_metadata(table: str, frame: pd.DataFrame) -> dict[str, Any]:
