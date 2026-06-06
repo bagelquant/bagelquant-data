@@ -51,7 +51,7 @@ class TableConfig:
     update_mode: UpdateMode = "overwrite"
     fields: list[str] = field(default_factory=list)
     enabled: bool = True
-    universe: str | None = None
+    universe_for_update: str | None = None
     trading_calendar: str | None = None
 
 
@@ -194,7 +194,9 @@ def _table_from_mapping(payload: Mapping[str, Any]) -> TableConfig:
         update_mode=_update_mode(payload.get("update_mode", "overwrite")),
         fields=[str(field) for field in payload.get("fields", [])],
         enabled=bool(payload.get("enabled", True)),
-        universe=_optional_str(payload.get("universe")),
+        universe_for_update=_optional_str(
+            payload.get("universe_for_update", payload.get("universe"))
+        ),
         trading_calendar=_optional_str(payload.get("trading_calendar")),
     )
 

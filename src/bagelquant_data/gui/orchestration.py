@@ -150,7 +150,10 @@ def update_binding_errors(config: GuiConfig) -> tuple[str, ...]:
         universe_tables = {item.table for item in source.universes if item.enabled}
         calendars = [item for item in source.trading_calendars if item.enabled]
         calendar_tables = {item.table for item in calendars}
-        if not table.universe or table.universe not in universe_tables:
+        if (
+            not table.universe_for_update
+            or table.universe_for_update not in universe_tables
+        ):
             errors.append(f"{table.source}/{table.name} is missing an enabled universe")
         if table.trading_calendar and table.trading_calendar not in calendar_tables:
             errors.append(
@@ -284,7 +287,9 @@ def _table_universe_refs(
     refs: dict[str, TushareUniverseRef | None] = {}
     for table in tables:
         source = source_by_name.get(table.source)
-        universe = _universe_by_name(source, table.universe) if source else None
+        universe = (
+            _universe_by_name(source, table.universe_for_update) if source else None
+        )
         if universe is None:
             refs[table.name] = None
         else:

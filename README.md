@@ -90,33 +90,32 @@ lake.read(
 )
 ```
 
-## Panel Agreements
+## Retrieved Panels
 
-`bagelquant-data` does not import `bagelquant-core`. When data should become a
-core `Panel`, loaders return a neutral agreement:
+`bagelquant-data` does not import `bagelquant-core`. For panel-shaped research
+inputs, loaders return plain data-layer objects: data, universe, and calendar.
 
 ```python
-agreement = Loader(registry=registry, lake=lake).source("tushare").load_panel(
+retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
     dataset="daily",
     field="close",
     universe=["000001.SZ", "600000.SH"],
     start_date="2024-01-01",
     end_date="2024-12-31",
-    region="CN",
 )
 ```
 
-Downstream code can convert it explicitly:
+Downstream code can use those plain objects explicitly:
 
 ```python
 from bagelquant_core import Domain, Panel
 
-domain = Domain(**agreement.domain_spec.to_core_kwargs())
+domain = Domain(calendar=retrieved.calendar, universe=retrieved.universe)
 panel = Panel.from_domain(
-    agreement.frame,
+    retrieved.data,
     domain,
-    name=agreement.dataset_name,
-    metadata=agreement.metadata,
+    name=retrieved.dataset_name,
+    metadata=retrieved.metadata,
 )
 ```
 
@@ -192,7 +191,7 @@ manager.execute_tushare_update_report(
 
 `update_tushare_all(...)` remains available as a convenience wrapper for one
 table. New code should prefer `scan_tushare_updates(specs=...)` because it keeps
-table kind, universe, and trading calendar bindings together. The older
+table kind, update universe, and trading calendar bindings together. The older
 `scan_tushare_updates(["daily"], kinds=..., universes=..., trading_calendars=...)`
 call shape is still accepted for migration.
 

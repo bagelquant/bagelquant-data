@@ -21,7 +21,6 @@ class RetrievalSelection:
     panel_field: str | None = None
     start_date: str | None = None
     end_date: str | None = None
-    region: str = "CN"
     include_core_conversion: bool = False
     filters: dict[str, str] = field(default_factory=dict)
 
@@ -70,19 +69,20 @@ def loader_read_snippet(selection: RetrievalSelection) -> str:
     if selection.qualified_panel_field is not None:
         start_date = selection.start_date or "2024-01-01"
         end_date = selection.end_date or "2024-12-31"
+        universe = selection.universe or ("000001.SZ", "600000.SH")
         return "\n".join(
             [
                 "from bagelquant_data.lake import LocalDataLake",
                 "from bagelquant_data.loader import Loader",
                 "",
                 f"lake = LocalDataLake({_literal(selection.lake_root)})",
-                "agreement = Loader(lake=lake).load_panel_field(",
+                "retrieved = Loader(lake=lake).load_panel_field(",
                 f"    {_literal(selection.qualified_panel_field)},",
+                f"    universe={_literal_list(universe)},",
                 f"    start_date={_literal(start_date)},",
                 f"    end_date={_literal(end_date)},",
-                f"    region={_literal(selection.region)},",
                 ")",
-                "agreement.frame.head()",
+                "retrieved.data.head()",
             ]
         )
     load_kwargs = _loader_kwargs(selection)
@@ -105,24 +105,25 @@ def loader_read_snippet(selection: RetrievalSelection) -> str:
     )
 
 
-def panel_agreement_snippet(selection: RetrievalSelection) -> str:
-    """Return code for producing a panel agreement."""
+def retrieved_panel_snippet(selection: RetrievalSelection) -> str:
+    """Return code for retrieving a plain panel result."""
 
     if selection.qualified_panel_field is not None:
         start_date = selection.start_date or "2024-01-01"
         end_date = selection.end_date or "2024-12-31"
+        universe = selection.universe or ("000001.SZ", "600000.SH")
         lines = [
             "from bagelquant_data.lake import LocalDataLake",
             "from bagelquant_data.loader import Loader",
             "",
             f"lake = LocalDataLake({_literal(selection.lake_root)})",
-            "agreement = Loader(lake=lake).load_panel_field(",
+            "retrieved = Loader(lake=lake).load_panel_field(",
             f"    {_literal(selection.qualified_panel_field)},",
+            f"    universe={_literal_list(universe)},",
             f"    start_date={_literal(start_date)},",
             f"    end_date={_literal(end_date)},",
-            f"    region={_literal(selection.region)},",
             ")",
-            "agreement.frame.head()",
+            "retrieved.data.head()",
         ]
         if selection.include_core_conversion:
             lines.extend(["", core_conversion_snippet()])
@@ -141,7 +142,7 @@ def panel_agreement_snippet(selection: RetrievalSelection) -> str:
         "registry = DataSourceRegistry()",
         "registry.register(TushareDataSource())",
         f"lake = LocalDataLake({_literal(selection.lake_root)})",
-        "agreement = (",
+        "retrieved = (",
         "    Loader(registry=registry, lake=lake)",
         f"    .source({_literal(selection.source)})",
         "    .load_panel(",
@@ -150,10 +151,9 @@ def panel_agreement_snippet(selection: RetrievalSelection) -> str:
         f"        universe={_literal_list(universe)},",
         f"        start_date={_literal(start_date)},",
         f"        end_date={_literal(end_date)},",
-        f"        region={_literal(selection.region)},",
         "    )",
         ")",
-        "agreement.frame.head()",
+        "retrieved.data.head()",
     ]
     if selection.include_core_conversion:
         lines.extend(["", core_conversion_snippet()])
@@ -168,15 +168,20 @@ def core_conversion_snippet() -> str:
             "# Optional downstream conversion in bagelquant-core code:",
             "from " + "bagelquant_core import Domain, Panel",
             "",
-            "domain = Domain(**agreement.domain_spec.to_core_kwargs())",
+            "domain = Domain(",
+            "    calendar=retrieved.calendar,",
+            "    universe=retrieved.universe,",
+            ")",
             "panel = Panel.from_domain(",
-            "    agreement.frame,",
+            "    retrieved.data,",
             "    domain,",
-            "    name=agreement.dataset_name,",
-            "    metadata=agreement.metadata,",
+            "    name=retrieved.dataset_name,",
+            "    metadata=retrieved.metadata,",
             ")",
         ]
     )
+
+
 
 
 def _loader_kwargs(selection: RetrievalSelection) -> str:

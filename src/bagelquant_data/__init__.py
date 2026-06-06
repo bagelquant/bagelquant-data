@@ -7,8 +7,8 @@ from bagelquant_data.lake import (
     LocalDataLake,
     TushareTableUpdateSpec,
 )
-from bagelquant_data.loader.loader import LoadedDataset, Loader, PanelInputAgreement
-from bagelquant_data.metadata.contract import DataContract, DomainSpec
+from bagelquant_data.loader.loader import LoadedDataset, Loader, RetrievedPanel
+from bagelquant_data.metadata.contract import DataContract
 from bagelquant_data.metadata.schema import DatasetSchema, FieldSchema
 from bagelquant_data.transform.pipeline import Transform
 
@@ -19,12 +19,11 @@ __all__ = [
     "DataSource",
     "DataSourceRegistry",
     "DatasetSchema",
-    "DomainSpec",
     "FieldSchema",
     "LoadedDataset",
     "Loader",
     "LocalDataLake",
-    "PanelInputAgreement",
+    "RetrievedPanel",
     "Transform",
     "TushareTableUpdateSpec",
     "default_registry",

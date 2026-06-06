@@ -1,28 +1,28 @@
-# Panel Agreements
+# Retrieved Panels
 
-`PanelInputAgreement` is the explicit bridge from `bagelquant-data` to
-`bagelquant-core`.
+`RetrievedPanel` is a neutral data-layer result. It is not a core adapter and
+does not import or construct `bagelquant-core` objects.
 
 It contains:
 
 - `kind`: `numeric_panel` or `category_panel`
-- `frame`: a pandas DataFrame
-- `domain_spec`: region, universe, start date, and end date
+- `data`: a pandas DataFrame
+- `universe`: a static asset sequence or dynamic membership DataFrame
+- `calendar`: a sorted pandas DatetimeIndex
 - `dataset_name`: stable input name
-- `metadata`: provider, request, lineage, and field metadata
+- `metadata`: provider, request, lineage, field, and calendar metadata
 
-`bagelquant-data` validates the shape of the frame but does not construct core
-objects.
+Downstream code can use those plain objects explicitly:
 
 ```python
 from bagelquant_core import Domain, Panel
 
-domain = Domain(**agreement.domain_spec.to_core_kwargs())
+domain = Domain(calendar=retrieved.calendar, universe=retrieved.universe)
 panel = Panel.from_domain(
-    agreement.frame,
+    retrieved.data,
     domain,
-    name=agreement.dataset_name,
-    metadata=agreement.metadata,
+    name=retrieved.dataset_name,
+    metadata=retrieved.metadata,
 )
 ```
 

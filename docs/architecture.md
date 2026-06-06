@@ -14,7 +14,7 @@ LocalDataLake
     |
     +--> LoadedDataset
     |
-    +--> PanelInputAgreement
+    +--> RetrievedPanel
              |
              v
        downstream adapter
@@ -52,15 +52,15 @@ asset columns needed to shape a date-by-asset panel.
 `bagelquant-data` is below downstream repositories. It must not import
 `bagelquant-core`, `bagelquant-bt`, `bagelquant-app`, or documentation sites.
 
-The communication boundary with `bagelquant-core` is `PanelInputAgreement`.
-That agreement exposes pandas data and `DomainSpec` constructor kwargs, leaving
-`bagelquant-core` responsible for creating `Domain`, `Panel`, and
-`CategoryPanel`.
+The communication boundary with `bagelquant-core` is plain retrieved data.
+`RetrievedPanel` exposes pandas data, universe, and sorted calendar objects,
+leaving downstream code responsible for creating `Domain`, `Panel`, and
+`CategoryPanel` without coupling the packages.
 
 ## Tushare Update Specs
 
 Provider updates are described with `TushareTableUpdateSpec`. A spec keeps a
-table's kind, universe reference, and trading calendar reference in one object,
+table's kind, update-universe reference, and trading calendar reference in one object,
 which avoids parallel argument maps drifting apart. The manager scans specs into
 a dry-run `TushareUpdateReport`, and execution consumes only the confirmed jobs
 from that report.

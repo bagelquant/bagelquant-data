@@ -4,7 +4,7 @@ from bagelquant_data.gui.codegen import (
     RetrievalSelection,
     lake_read_snippet,
     loader_read_snippet,
-    panel_agreement_snippet,
+    retrieved_panel_snippet,
 )
 
 
@@ -40,8 +40,8 @@ def test_loader_read_snippet_includes_fields_and_dates() -> None:
     assert "TushareDataSource()" in snippet
 
 
-def test_panel_agreement_snippet_can_include_core_conversion_text() -> None:
-    snippet = panel_agreement_snippet(
+def test_retrieved_panel_snippet_can_include_core_conversion_text() -> None:
+    snippet = retrieved_panel_snippet(
         RetrievalSelection(
             lake_root=".lake",
             source="tushare",
@@ -55,6 +55,7 @@ def test_panel_agreement_snippet_can_include_core_conversion_text() -> None:
     assert ".load_panel(" in snippet
     assert "field='close'" in snippet
     assert "from bagelquant_core import Domain, Panel" in snippet
+    assert "calendar=retrieved.calendar" in snippet
 
 
 def test_panel_field_snippets_use_qualified_field_without_table_selection() -> None:
@@ -69,4 +70,4 @@ def test_panel_field_snippets_use_qualified_field_without_table_selection() -> N
 
     assert "lake.read_panel_field('tushare_daily_close'" in lake_read_snippet(selection)
     assert ".load_panel_field(" in loader_read_snippet(selection)
-    assert "dataset='daily'" not in panel_agreement_snippet(selection)
+    assert "dataset='daily'" not in retrieved_panel_snippet(selection)
