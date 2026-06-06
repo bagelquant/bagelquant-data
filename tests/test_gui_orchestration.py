@@ -100,7 +100,7 @@ def test_run_all_table_updates_uses_enabled_tables_in_source_order() -> None:
                         source="tushare",
                         name="daily",
                         kind="price",
-                        universe="stock_basic",
+                        universe_for_update="stock_basic",
                         trading_calendar="trade_cal",
                     ),
                     TableConfig(
@@ -154,7 +154,7 @@ def test_build_update_report_uses_enabled_tables() -> None:
                         source="tushare",
                         name="daily",
                         kind="price",
-                        universe="stock_basic",
+                        universe_for_update="stock_basic",
                         trading_calendar="trade_cal",
                     ),
                 ],
@@ -187,7 +187,7 @@ def test_single_trading_calendar_is_used_as_default() -> None:
                         source="tushare",
                         name="daily",
                         kind="price",
-                        universe="stock_basic",
+                        universe_for_update="stock_basic",
                     )
                 ],
             )
@@ -218,7 +218,7 @@ def test_multiple_trading_calendars_require_table_binding() -> None:
                         source="tushare",
                         name="daily",
                         kind="price",
-                        universe="stock_basic",
+                        universe_for_update="stock_basic",
                     )
                 ],
             )

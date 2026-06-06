@@ -49,7 +49,7 @@ def test_gui_config_round_trips_yaml_without_secrets(tmp_path) -> None:
                         name="daily",
                         kind="price",
                         fields=["close"],
-                        universe="stock_basic",
+                        universe_for_update="stock_basic",
                         trading_calendar="trade_cal",
                     )
                 ],
@@ -69,7 +69,7 @@ def test_gui_config_round_trips_yaml_without_secrets(tmp_path) -> None:
     assert loaded.sources[0].universes[0].table == "stock_basic"
     assert loaded.sources[0].trading_calendars[0].table == "trade_cal"
     assert loaded.sources[0].tables[0].name == "daily"
-    assert loaded.sources[0].tables[0].universe == "stock_basic"
+    assert loaded.sources[0].tables[0].universe_for_update == "stock_basic"
     assert loaded.sources[0].tables[0].trading_calendar == "trade_cal"
     assert loaded.sources[0].tables[0].enabled
     assert "    name: stock_basic" not in saved

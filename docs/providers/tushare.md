@@ -65,7 +65,7 @@ instead of the default stock universe.
   the associated trading calendar to avoid Tushare row limits.
 - Existing price dates are skipped before provider calls and stored at day
   granularity, so appending a new trading day does not rewrite older days.
-- Fundamental tables create one job per code in the associated universe table,
+- Fundamental tables create one job per code in the associated update universe table,
   starting from that asset's latest local `f_ann_date`; boundary rows are
   de-duplicated locally.
 - VIP fundamental tables such as `income_vip` are fetched by reporting season

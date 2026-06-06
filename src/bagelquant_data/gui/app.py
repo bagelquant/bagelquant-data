@@ -15,7 +15,7 @@ from bagelquant_data.gui.codegen import (
     RetrievalSelection,
     lake_read_snippet,
     loader_read_snippet,
-    panel_agreement_snippet,
+    retrieved_panel_snippet,
 )
 from bagelquant_data.gui.config import (
     DEFAULT_CONFIG_PATH,
@@ -380,7 +380,7 @@ def _sync_table_controls_from_session(config: GuiConfig) -> None:
                 table.kind = cast(TushareTableKind, str(st.session_state[kind_key]))
             universe_key = f"table-universe-{source.name}-{index}"
             if universe_key in st.session_state:
-                table.universe = str(st.session_state[universe_key]) or None
+                table.universe_for_update = str(st.session_state[universe_key]) or None
             calendar_key = f"table-calendar-{source.name}-{index}"
             if calendar_key in st.session_state:
                 table.trading_calendar = str(st.session_state[calendar_key]) or None
@@ -422,7 +422,7 @@ def _update_report_signature(config: GuiConfig) -> tuple[object, ...]:
                         table.name,
                         table.kind,
                         table.enabled,
-                        table.universe,
+                        table.universe_for_update,
                         table.trading_calendar,
                     )
                     for table in source.tables
@@ -730,16 +730,19 @@ def _table_binding_selectors(
     ]
     disabled = table.kind == "general"
     if disabled:
-        table.universe = None
+        table.universe_for_update = None
         table.trading_calendar = None
     elif table.trading_calendar is None and len(enabled_calendars) == 1:
         table.trading_calendar = enabled_calendars[0]
-    table.universe = cast(
+    table.universe_for_update = cast(
         str,
         universe_container.selectbox(
             "Universe",
             options=universe_options,
-            index=_selected_option_index(universe_options, table.universe),
+            index=_selected_option_index(
+                universe_options,
+                table.universe_for_update,
+            ),
             key=f"table-universe-{source.name}-{index}",
             disabled=disabled,
             on_change=_remember_expanded,
@@ -1099,7 +1102,7 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
     )
     snippet_choice = st.radio(
         "Generated code",
-        options=("LocalDataLake read", "Loader read", "Panel agreement"),
+        options=("LocalDataLake read", "Loader read", "Retrieved panel"),
         horizontal=True,
     )
     st.caption(
@@ -1108,17 +1111,17 @@ def _retrieve_data(config: GuiConfig, lake: LocalDataLake) -> None:
                 "Reads the selected panel field directly from disk."
             ),
             "Loader read": (
-                "Uses Loader to create a panel agreement from the local lake field."
+                "Uses Loader to retrieve the selected data from the local lake."
             ),
-            "Panel agreement": (
-                "Shapes the selected field into a panel-ready agreement."
+            "Retrieved panel": (
+                "Retrieves panel data, universe, and calendar as plain objects."
             ),
         }[snippet_choice]
     )
     snippet = {
         "LocalDataLake read": lake_read_snippet,
         "Loader read": loader_read_snippet,
-        "Panel agreement": panel_agreement_snippet,
+        "Retrieved panel": retrieved_panel_snippet,
     }[snippet_choice](selection)
     st.code(snippet, language="python")
 

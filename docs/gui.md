@@ -43,7 +43,7 @@ Click **Update universes/calendars** to refresh reference resources. Click
 **Scan updates** to scan normal enabled tables only and review which tables need
 work, the effective start date, pending items, and job count. Click
 **Confirm update** to execute exactly the reported jobs. Non-general tables must
-select an enabled universe before they can be scanned. If a source has one
+select an enabled update universe before they can be scanned. If a source has one
 enabled trading calendar, the GUI uses it automatically; if a source has
 multiple enabled calendars, each non-general table must select one. The GUI
 shows the current table, date/asset/period work item, completed work count, and

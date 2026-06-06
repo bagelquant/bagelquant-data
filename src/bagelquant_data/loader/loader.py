@@ -1,4 +1,4 @@
-"""Loader interfaces and panel agreements."""
+"""Loader interfaces and neutral panel retrieval results."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from bagelquant_data.lake.local import LocalDataLake, shape_panel_field
 from bagelquant_data.metadata.contract import (
     DataContract,
     DatasetIdentity,
-    DomainSpec,
     PanelKind,
     normalize_universe,
 )
@@ -28,44 +27,50 @@ from bagelquant_data.utils.exceptions import (
 
 
 @dataclass(frozen=True, slots=True)
-class PanelInputAgreement:
-    """Data package ready to become a bagelquant-core Panel input."""
+class RetrievedPanel:
+    """Plain data-layer panel retrieval result."""
 
     kind: PanelKind
-    frame: pd.DataFrame
-    domain_spec: DomainSpec
+    data: pd.DataFrame
+    universe: tuple[Any, ...] | pd.DataFrame
+    calendar: pd.DatetimeIndex
     dataset_name: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._validate_frame()
+        self._validate_data()
+        self._validate_calendar()
 
-    def to_payload(self) -> dict[str, Any]:
-        """Return plain objects for downstream package adapters."""
+    def as_dict(self) -> dict[str, Any]:
+        """Return defensive plain-object copies for user code."""
 
         return {
             "kind": self.kind,
-            "frame": self.frame.copy(deep=True),
-            "domain": self.domain_spec.to_core_kwargs(),
+            "data": self.data.copy(deep=True),
+            "universe": _copy_universe(self.universe),
+            "calendar": self.calendar.copy(),
             "dataset_name": self.dataset_name,
             "metadata": dict(self.metadata),
         }
 
-    def _validate_frame(self) -> None:
-        if not isinstance(self.frame, pd.DataFrame):
-            raise ContractValidationError("panel agreement frame must be a DataFrame")
-        if self.frame.index.nlevels != 1 or self.frame.columns.nlevels != 1:
-            raise ContractValidationError("panel frame must have 1D index and columns")
-        if self.frame.index.has_duplicates or self.frame.columns.has_duplicates:
+    def _validate_data(self) -> None:
+        if not isinstance(self.data, pd.DataFrame):
+            raise ContractValidationError("retrieved panel data must be a DataFrame")
+        if self.data.index.nlevels != 1 or self.data.columns.nlevels != 1:
+            raise ContractValidationError("panel data must have 1D index and columns")
+        if self.data.index.has_duplicates or self.data.columns.has_duplicates:
             raise ContractValidationError(
-                "panel frame index and columns must be unique"
+                "panel data index and columns must be unique"
             )
         if self.kind == "numeric_panel":
-            numeric_columns = self.frame.select_dtypes(include="number").columns
-            if len(numeric_columns) != len(self.frame.columns):
+            numeric_columns = self.data.select_dtypes(include="number").columns
+            if len(numeric_columns) != len(self.data.columns):
                 raise ContractValidationError(
-                    "numeric panel frame must be fully numeric"
+                    "numeric panel data must be fully numeric"
                 )
+
+    def _validate_calendar(self) -> None:
+        _normalize_calendar(self.calendar)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +82,7 @@ class LoadedDataset:
     schema: DatasetSchema | None = None
     lineage: tuple[LineageRecord, ...] = ()
     contract: DataContract | None = None
-    panel_agreement: PanelInputAgreement | None = None
+    retrieved_panel: RetrievedPanel | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -202,14 +207,15 @@ class Loader:
         universe: Sequence[Any] | pd.DataFrame,
         start_date: Any,
         end_date: Any,
-        region: str,
         kind: PanelKind = "numeric_panel",
+        calendar: Sequence[Any] | pd.DatetimeIndex | None = None,
+        calendar_dataset: str = "trade_cal",
         filters: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
         dataset_name: str | None = None,
         refresh: bool = False,
-    ) -> PanelInputAgreement:
-        """Load and shape a dataset as a panel-ready agreement."""
+    ) -> RetrievedPanel:
+        """Load and shape a dataset, universe, and calendar as plain objects."""
 
         source = self._source()
         requested_universe = normalize_universe(universe)
@@ -231,23 +237,26 @@ class Loader:
             field=field,
         )
         frame = _filter_panel_dates(frame, start_date=start_date, end_date=end_date)
-        agreement = PanelInputAgreement(
+        panel_calendar = self._load_calendar(
+            start_date=start_date,
+            end_date=end_date,
+            calendar=calendar,
+            calendar_dataset=calendar_dataset,
+        )
+        retrieved = RetrievedPanel(
             kind=kind,
-            frame=frame,
-            domain_spec=DomainSpec(
-                region=region,
-                universe=requested_universe,
-                start_date=start_date,
-                end_date=end_date,
-            ),
+            data=frame,
+            universe=requested_universe,
+            calendar=panel_calendar,
             dataset_name=dataset_name or f"{source.name}.{dataset}.{field}",
             metadata={
                 **loaded.metadata,
                 "field": field,
                 "panel_kind": kind,
+                "calendar_dataset": calendar_dataset,
             },
         )
-        return agreement
+        return retrieved
 
     def load_panel_field(
         self,
@@ -255,12 +264,13 @@ class Loader:
         *,
         start_date: Any,
         end_date: Any,
-        region: str,
+        universe: Sequence[Any] | pd.DataFrame,
         kind: PanelKind = "numeric_panel",
-        universe: Sequence[Any] | pd.DataFrame = (),
+        calendar: Sequence[Any] | pd.DatetimeIndex | None = None,
+        calendar_dataset: str = "trade_cal",
         dataset_name: str | None = None,
-    ) -> PanelInputAgreement:
-        """Load a qualified lake field id as a panel-ready agreement."""
+    ) -> RetrievedPanel:
+        """Load a qualified lake field id, universe, and calendar."""
 
         if self._lake is None:
             raise DataSourceError("load_panel_field requires a configured lake")
@@ -282,17 +292,18 @@ class Loader:
                 frame = frame.reindex(columns=universe_columns)
         elif len(requested_universe) > 0:
             frame = frame.reindex(columns=[str(item) for item in requested_universe])
-        else:
-            requested_universe = tuple(str(column) for column in frame.columns)
-        return PanelInputAgreement(
+        panel_calendar = self._load_calendar(
+            start_date=start_date,
+            end_date=end_date,
+            calendar=calendar,
+            calendar_dataset=calendar_dataset,
+            source_name=source_name,
+        )
+        return RetrievedPanel(
             kind=kind,
-            frame=frame,
-            domain_spec=DomainSpec(
-                region=region,
-                universe=requested_universe,
-                start_date=start_date,
-                end_date=end_date,
-            ),
+            data=frame,
+            universe=requested_universe,
+            calendar=panel_calendar,
             dataset_name=dataset_name or f"{source_name}.{dataset}.{field}",
             metadata={
                 "provider": source_name,
@@ -301,7 +312,66 @@ class Loader:
                 "field": field,
                 "qualified_id": qualified_id,
                 "panel_kind": kind,
+                "calendar_dataset": calendar_dataset,
             },
+        )
+
+    def _load_calendar(
+        self,
+        *,
+        start_date: Any,
+        end_date: Any,
+        calendar: Sequence[Any] | pd.DatetimeIndex | None,
+        calendar_dataset: str,
+        source_name: str | None = None,
+    ) -> pd.DatetimeIndex:
+        if calendar is not None:
+            return _filter_calendar(
+                _normalize_calendar(calendar),
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        source = None
+        resolved_source_name = source_name or self._source_name
+        if resolved_source_name is None:
+            source = self._source()
+            resolved_source_name = source.name
+        if self._lake is not None:
+            try:
+                calendar_data = self._lake.read(
+                    resolved_source_name,
+                    calendar_dataset,
+                )
+                return _calendar_from_table(
+                    calendar_data,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except DatasetNotFoundError:
+                pass
+
+        if source is None:
+            source = self._registry.resolve(resolved_source_name)
+        if not source.exists(calendar_dataset):
+            raise DataSourceError(
+                f"No calendar available for source {resolved_source_name!r}; "
+                "pass calendar=... or load a calendar table first"
+            )
+        calendar_data = _normalize_loaded_output(
+            calendar_dataset,
+            source.read(
+                DataRequest(
+                    dataset=calendar_dataset,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            ),
+        )
+        return _calendar_from_table(
+            calendar_data,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     def _source(self):
@@ -331,6 +401,85 @@ def _filter_panel_dates(
         (frame.index >= pd.Timestamp(start_date))
         & (frame.index <= pd.Timestamp(end_date))
     ]
+
+
+def _copy_universe(
+    universe: tuple[Any, ...] | pd.DataFrame,
+) -> list[Any] | pd.DataFrame:
+    if isinstance(universe, pd.DataFrame):
+        return universe.copy(deep=True)
+    return list(universe)
+
+
+def _normalize_calendar(
+    calendar: Sequence[Any] | pd.DatetimeIndex,
+) -> pd.DatetimeIndex:
+    sessions = pd.DatetimeIndex(pd.to_datetime(pd.Index(calendar)))
+    if sessions.tz is not None:
+        sessions = sessions.tz_localize(None)
+    sessions = sessions.normalize().as_unit("ns")
+    if sessions.empty:
+        raise ContractValidationError("calendar must contain at least one session")
+    if sessions.has_duplicates:
+        raise ContractValidationError("calendar sessions must be unique")
+    if sessions.hasnans:
+        raise ContractValidationError("calendar sessions must be valid dates")
+    if not sessions.is_monotonic_increasing:
+        raise ContractValidationError("calendar sessions must be sorted ascending")
+    return sessions
+
+
+def _filter_calendar(
+    calendar: pd.DatetimeIndex,
+    *,
+    start_date: Any,
+    end_date: Any,
+) -> pd.DatetimeIndex:
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if start > end:
+        raise ContractValidationError("start_date must not be after end_date")
+    filtered = calendar[(calendar >= start) & (calendar <= end)]
+    if filtered.empty:
+        raise ContractValidationError("calendar has no sessions in requested range")
+    return filtered
+
+
+def _calendar_from_table(
+    data: pd.DataFrame,
+    *,
+    start_date: Any,
+    end_date: Any,
+) -> pd.DatetimeIndex:
+    frame = data.copy(deep=True)
+    if "is_open" in frame.columns:
+        frame = frame.loc[frame["is_open"].map(_is_open_calendar_value)]
+    date_column = _infer_calendar_date_column(frame)
+    if date_column is None:
+        if isinstance(frame.index, pd.DatetimeIndex):
+            sessions = _normalize_calendar(frame.index)
+        else:
+            raise ContractValidationError(
+                "calendar table must include a date column or DatetimeIndex"
+            )
+    else:
+        sessions = _normalize_calendar(frame[date_column].astype(str))
+    return _filter_calendar(sessions, start_date=start_date, end_date=end_date)
+
+
+def _infer_calendar_date_column(frame: pd.DataFrame) -> str | None:
+    for column in ("cal_date", "trade_date", "date", "datetime", "timestamp"):
+        if column in frame.columns:
+            return column
+    return None
+
+
+def _is_open_calendar_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "open"}
 
 
 def _normalize_loaded_output(dataset: str, data: pd.DataFrame) -> pd.DataFrame:

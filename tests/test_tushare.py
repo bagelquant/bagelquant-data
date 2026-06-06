@@ -25,6 +25,15 @@ class FakeTushareClient:
             }
         )
 
+    def trade_cal(self, **params):
+        self.calls.append(("trade_cal", params))
+        return pd.DataFrame(
+            {
+                "cal_date": ["20240101", "20240102", "20240103", "20240104"],
+                "is_open": [0, 1, 1, 1],
+            }
+        )
+
     def query(self, api_name, **params):
         self.calls.append((api_name, params))
         return pd.DataFrame({"value": [1]})
@@ -140,7 +149,7 @@ def test_tushare_generic_query_delegates() -> None:
     assert client.calls == [("income", {"ts_code": "000001.SZ"})]
 
 
-def test_tushare_daily_panel_agreement_shapes_trade_date_by_code() -> None:
+def test_tushare_daily_retrieved_panel_shapes_trade_date_by_code() -> None:
     registry = DataSourceRegistry()
     registry.register(TushareDataSource(token="token", client=FakeTushareClient()))
 
@@ -150,19 +159,24 @@ def test_tushare_daily_panel_agreement_shapes_trade_date_by_code() -> None:
         universe=["000001.SZ", "600000.SH"],
         start_date="2024-01-01",
         end_date="2024-01-31",
-        region="CN",
     )
 
     assert agreement.dataset_name == "tushare.daily.close"
-    assert agreement.frame.index.tolist() == [
+    assert agreement.data.index.tolist() == [
         pd.Timestamp("2024-01-02"),
         pd.Timestamp("2024-01-03"),
     ]
-    assert agreement.frame.columns.tolist() == ["000001.SZ", "600000.SH"]
-    assert agreement.frame.loc[pd.Timestamp("2024-01-02"), "600000.SH"] == 20.0
+    assert agreement.data.columns.tolist() == ["000001.SZ", "600000.SH"]
+    assert agreement.data.loc[pd.Timestamp("2024-01-02"), "600000.SH"] == 20.0
+    assert agreement.universe == ("000001.SZ", "600000.SH")
+    assert agreement.calendar.tolist() == [
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-03"),
+        pd.Timestamp("2024-01-04"),
+    ]
 
 
-def test_tushare_daily_panel_agreement_can_read_from_lake(tmp_path) -> None:
+def test_tushare_daily_retrieved_panel_can_read_from_lake(tmp_path) -> None:
     registry = DataSourceRegistry()
     registry.register(TushareDataSource(token="token", client=FakeTushareClient()))
     lake = LocalDataLake(tmp_path)
@@ -177,6 +191,16 @@ def test_tushare_daily_panel_agreement_can_read_from_lake(tmp_path) -> None:
             }
         ),
     )
+    lake.add(
+        "tushare",
+        "trade_cal",
+        pd.DataFrame(
+            {
+                "cal_date": ["20240101", "20240102", "20240103"],
+                "is_open": [0, 1, 1],
+            }
+        ),
+    )
 
     agreement = Loader(registry=registry, lake=lake).source("tushare").load_panel(
         dataset="daily",
@@ -184,11 +208,14 @@ def test_tushare_daily_panel_agreement_can_read_from_lake(tmp_path) -> None:
         universe=["000001.SZ"],
         start_date="2024-01-01",
         end_date="2024-01-31",
-        region="CN",
     )
 
     assert agreement.metadata["origin"] == "lake"
-    assert agreement.frame.loc[pd.Timestamp("2024-01-02"), "000001.SZ"] == 10.0
+    assert agreement.data.loc[pd.Timestamp("2024-01-02"), "000001.SZ"] == 10.0
+    assert agreement.calendar.tolist() == [
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-03"),
+    ]
 
 
 def test_tushare_retry_wraps_failures() -> None:

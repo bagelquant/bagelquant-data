@@ -2,11 +2,11 @@
 from bagelquant_core import Domain, Panel
 
 
-def to_core_panel(agreement):
-    domain = Domain(**agreement.domain_spec.to_core_kwargs())
+def to_core_panel(retrieved):
+    domain = Domain(calendar=retrieved.calendar, universe=retrieved.universe)
     return Panel.from_domain(
-        agreement.frame,
+        retrieved.data,
         domain,
-        name=agreement.dataset_name,
-        metadata=agreement.metadata,
+        name=retrieved.dataset_name,
+        metadata=retrieved.metadata,
     )

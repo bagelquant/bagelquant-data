@@ -1,4 +1,4 @@
-"""Data contracts and cross-package payload contracts."""
+"""Data contracts."""
 
 from __future__ import annotations
 
@@ -22,31 +22,6 @@ class DatasetIdentity:
     provider: str | None = None
     version: str | None = None
     snapshot: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class DomainSpec:
-    """Neutral description of the arguments needed by bagelquant-core Domain."""
-
-    region: str
-    universe: tuple[Any, ...] | pd.DataFrame
-    start_date: Any
-    end_date: Any
-
-    def to_core_kwargs(self) -> dict[str, Any]:
-        """Return kwargs matching bagelquant_core.Domain without importing it."""
-
-        universe = (
-            self.universe.copy(deep=True)
-            if isinstance(self.universe, pd.DataFrame)
-            else list(self.universe)
-        )
-        return {
-            "region": self.region,
-            "universe": universe,
-            "start_date": self.start_date,
-            "end_date": self.end_date,
-        }
 
 
 @dataclass(frozen=True, slots=True)
