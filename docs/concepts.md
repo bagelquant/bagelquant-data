@@ -3,6 +3,8 @@
 ## DataSource
 
 `DataSource` isolates provider access behind `read`, `exists`, and `describe`.
+Adapters live in `bagelquant_data.datasource` and consume `DataRequest` objects
+so callers do not depend on provider-specific client APIs.
 
 ## Loader
 
@@ -34,9 +36,13 @@ schema, freshness, ownership, version, and lineage.
 Lake storage is separated by data source, table, year, and month. Writes create
 immutable snapshots and update latest pointers at the table and partition level.
 Every stored table has a `date` index plus `create_time` and `delete_flag`
-columns. The lake also maintains source-local asset and data item id tables.
+columns. The lake also maintains source-local asset and field id tables.
 Reference tables that are not panel-like, such as `stock_basic`, keep their
 ordinary row index while still receiving lifecycle columns.
+
+Use `LocalDataLake.read` for direct table reads, `read_panel_field` for
+date-by-asset panels, `fields` for field catalogs, and `asset_ids` for source
+asset catalogs.
 
 ## Cache
 

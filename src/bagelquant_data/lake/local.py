@@ -18,6 +18,8 @@ from bagelquant_data.utils.exceptions import DatasetNotFoundError, LakeError
 
 WriteMode = Literal["append", "overwrite"]
 PartitionGranularity = Literal["month", "day", "quarter"]
+FIELD_CATALOG_TABLE = "__fields"
+LEGACY_DATA_ITEM_CATALOG_TABLE = "__data_item_ids"
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,48 +235,74 @@ class LocalDataLake:
             return ()
         return tuple(str(asset_id) for asset_id in data["asset_id"].tolist())
 
-    def data_item_ids(self, source: str) -> tuple[str, ...]:
-        """Return known source data item ids."""
+    def field_ids(self, source: str) -> tuple[str, ...]:
+        """Return known source field ids."""
 
-        data = self.data_items(source)
+        data = self.fields(source)
         if data.empty:
             return ()
-        return tuple(str(item_id) for item_id in data["data_item_id"].tolist())
+        return tuple(str(item_id) for item_id in data["field_id"].tolist())
 
-    def data_items(self, source: str | None = None) -> pd.DataFrame:
-        """Return known data item catalog rows without reading user datasets."""
+    def data_item_ids(self, source: str) -> tuple[str, ...]:
+        """Return known source field ids. Deprecated alias for ``field_ids``."""
+
+        return self.field_ids(source)
+
+    def fields(self, source: str | None = None) -> pd.DataFrame:
+        """Return known field catalog rows without reading user datasets."""
 
         frames: list[pd.DataFrame] = []
         sources = (source,) if source is not None else self.list_sources()
         for source_name in sources:
-            try:
-                data = self.read(source_name, "__data_item_ids")
-            except DatasetNotFoundError:
-                continue
-            if "data_item_id" not in data.columns:
-                continue
-            frames.append(_normalize_data_item_catalog(source_name, data, self))
+            for table_name in (FIELD_CATALOG_TABLE, LEGACY_DATA_ITEM_CATALOG_TABLE):
+                try:
+                    data = self.read(source_name, table_name)
+                except DatasetNotFoundError:
+                    continue
+                if (
+                    "field_id" not in data.columns
+                    and "data_item_id" not in data.columns
+                ):
+                    continue
+                frames.append(_normalize_field_catalog(source_name, data, self))
+                break
         if not frames:
+            combined = _metadata_field_catalog(self, source)
+        else:
+            combined = pd.concat(
+                [*frames, _metadata_field_catalog(self, source)],
+                axis=0,
+                ignore_index=True,
+            )
+        if combined.empty:
+            return pd.DataFrame(columns=["source", "table", "field", "field_id"])
+        return combined.drop_duplicates("field_id").sort_values(
+            ["source", "table", "field", "field_id"],
+            ignore_index=True,
+        )
+
+    def data_items(self, source: str | None = None) -> pd.DataFrame:
+        """Return known field catalog rows with legacy ``data_item_id`` column."""
+
+        data = self.fields(source)
+        if data.empty:
             return pd.DataFrame(
                 columns=["source", "table", "field", "data_item_id"]
             )
-        combined = pd.concat(frames, axis=0, ignore_index=True)
-        return combined.drop_duplicates("data_item_id").sort_values(
-            ["source", "table", "field", "data_item_id"],
-            ignore_index=True,
-        )
+        legacy = data.rename(columns={"field_id": "data_item_id"})
+        return legacy.loc[:, ["source", "table", "field", "data_item_id"]]
 
     def panel_field_ids(self, source: str | None = None) -> tuple[str, ...]:
         """Return qualified field ids that can be selected as panel fields."""
 
         ids: set[str] = set()
-        for row in self.data_items(source).itertuples(index=False):
+        for row in self.fields(source).itertuples(index=False):
             if self._catalog_marks_panel_field(
                 str(row.source),
                 str(row.table),
                 str(row.field),
             ):
-                ids.add(str(row.data_item_id))
+                ids.add(str(row.field_id))
         return tuple(sorted(ids))
 
     def resolve_panel_field(
@@ -285,9 +313,9 @@ class LocalDataLake:
     ) -> tuple[str, str, str] | None:
         """Resolve ``source_dataset_field`` into source, dataset, and field."""
 
-        catalog = self.data_items()
+        catalog = self.fields()
         if not catalog.empty:
-            matches = catalog.loc[catalog["data_item_id"].astype(str) == qualified_id]
+            matches = catalog.loc[catalog["field_id"].astype(str) == qualified_id]
             for row in matches.itertuples(index=False):
                 source = str(row.source)
                 dataset = str(row.table)
@@ -358,7 +386,7 @@ class LocalDataLake:
         fields: set[str] | None = None,
         created_at: datetime | None = None,
     ) -> None:
-        """Merge known asset and data item entries for a dataset."""
+        """Merge known asset and field entries for a dataset."""
 
         if dataset.startswith("__"):
             return
@@ -370,7 +398,7 @@ class LocalDataLake:
                 created_at=resolved_created_at,
             )
         if fields:
-            self._merge_data_item_ids(
+            self._merge_field_ids(
                 source,
                 dataset,
                 fields,
@@ -758,7 +786,7 @@ class LocalDataLake:
         if dataset.startswith("__"):
             return
         self._update_asset_ids(source, frame, created_at=created_at)
-        self._update_data_item_ids(source, dataset, frame, created_at=created_at)
+        self._update_field_ids(source, dataset, frame, created_at=created_at)
 
     def _update_asset_ids(
         self,
@@ -806,13 +834,23 @@ class LocalDataLake:
         *,
         created_at: datetime,
     ) -> None:
+        self._update_field_ids(source, dataset, frame, created_at=created_at)
+
+    def _update_field_ids(
+        self,
+        source: str,
+        dataset: str,
+        frame: pd.DataFrame,
+        *,
+        created_at: datetime,
+    ) -> None:
         ignored = {"index", "create_time", "delete_flag"}
         discovered = {
             str(column)
             for column in frame.reset_index().columns
             if column not in ignored
         }
-        self._merge_data_item_ids(
+        self._merge_field_ids(
             source,
             dataset,
             discovered,
@@ -827,24 +865,34 @@ class LocalDataLake:
         *,
         created_at: datetime,
     ) -> None:
-        existing = self.data_items(source)
+        self._merge_field_ids(source, dataset, fields, created_at=created_at)
+
+    def _merge_field_ids(
+        self,
+        source: str,
+        dataset: str,
+        fields: set[str],
+        *,
+        created_at: datetime,
+    ) -> None:
+        existing = self.fields(source)
         discovered = pd.DataFrame(
             {
                 "source": source,
                 "table": dataset,
                 "field": column,
-                "data_item_id": f"{source}_{dataset}_{column}",
+                "field_id": f"{source}_{dataset}_{column}",
             }
             for column in fields
         )
         data = pd.concat([existing, discovered], axis=0, ignore_index=True)
-        data = data.drop_duplicates("data_item_id").sort_values(
-            ["source", "table", "field", "data_item_id"],
+        data = data.drop_duplicates("field_id").sort_values(
+            ["source", "table", "field", "field_id"],
             ignore_index=True,
         )
         self.write(
             source,
-            "__data_item_ids",
+            FIELD_CATALOG_TABLE,
             data,
             mode="overwrite",
             metadata={"system_table": True, "created_at": created_at.isoformat()},
@@ -1080,6 +1128,7 @@ def _table_metadata(table: str, frame: pd.DataFrame) -> dict[str, Any]:
     date_column = _infer_partition_column(frame.reset_index())
     return {
         "asset_column": _infer_asset_column(frame),
+        "columns": [str(column) for column in frame.reset_index().columns],
         "date_column": date_column,
         "panel_fields": _panel_value_fields(table, frame, date_column=date_column),
     }
@@ -1106,20 +1155,21 @@ def _panel_value_fields(
     return sorted(dict.fromkeys(fields))
 
 
-def _normalize_data_item_catalog(
+def _normalize_field_catalog(
     source: str,
     data: pd.DataFrame,
     lake: LocalDataLake,
 ) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
-    for row in data.dropna(subset=["data_item_id"]).itertuples(index=False):
+    id_column = "field_id" if "field_id" in data.columns else "data_item_id"
+    for row in data.dropna(subset=[id_column]).itertuples(index=False):
         row_values = row._asdict()
-        raw_item_id = str(row_values["data_item_id"])
+        raw_field_id = str(row_values[id_column])
         table = str(row_values["table"]) if "table" in row_values else ""
         field = str(row_values["field"]) if "field" in row_values else ""
         row_source = str(row_values["source"]) if "source" in row_values else source
         if not table or not field:
-            resolved = _resolve_qualified_data_item(row_source, raw_item_id, lake)
+            resolved = _resolve_qualified_field(row_source, raw_field_id, lake)
             if resolved is None:
                 continue
             row_source, table, field = resolved
@@ -1128,13 +1178,48 @@ def _normalize_data_item_catalog(
                 "source": row_source,
                 "table": table,
                 "field": field,
-                "data_item_id": raw_item_id,
+                "field_id": raw_field_id,
             }
         )
-    return pd.DataFrame(rows, columns=["source", "table", "field", "data_item_id"])
+    return pd.DataFrame(rows, columns=["source", "table", "field", "field_id"])
+
+
+def _metadata_field_catalog(
+    lake: LocalDataLake,
+    source: str | None = None,
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for row_source, dataset in lake.list_datasets(source):
+        if dataset.startswith("__"):
+            continue
+        metadata = lake._table_catalog_metadata(row_source, dataset)
+        fields = metadata.get("columns")
+        if not isinstance(fields, list):
+            fields = metadata.get("panel_fields")
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            field_name = str(field)
+            rows.append(
+                {
+                    "source": row_source,
+                    "table": dataset,
+                    "field": field_name,
+                    "field_id": f"{row_source}_{dataset}_{field_name}",
+                }
+            )
+    return pd.DataFrame(rows, columns=["source", "table", "field", "field_id"])
 
 
 def _resolve_qualified_data_item(
+    source: str,
+    qualified_id: str,
+    lake: LocalDataLake,
+) -> tuple[str, str, str] | None:
+    return _resolve_qualified_field(source, qualified_id, lake)
+
+
+def _resolve_qualified_field(
     source: str,
     qualified_id: str,
     lake: LocalDataLake,

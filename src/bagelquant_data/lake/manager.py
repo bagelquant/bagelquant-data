@@ -27,6 +27,8 @@ from bagelquant_data.utils.exceptions import DatasetNotFoundError
 
 ParallelMode = Literal["thread"]
 ProgressCallback = Callable[[Mapping[str, Any]], None]
+TUSHARE_PRICE_UPDATE_RECORDS = "__tushare_price_update_records"
+TUSHARE_FUNDAMENTAL_UPDATE_RECORDS = "__tushare_fundamental_update_records"
 
 
 class DataLakeManager:
@@ -222,19 +224,36 @@ class DataLakeManager:
             }
         }
 
-        def read_job(job: TushareUpdateJob) -> tuple[TushareUpdateJob, pd.DataFrame]:
-            if job.table == "stock_basic":
-                return job, self._read_tushare_stock_basic(source)
-            return job, source.read(
-                DataRequest(
-                    dataset=job.table,
-                    filters=job.filters,
-                    start_date=job.start_date,
-                    end_date=job.end_date,
-                )
+        def read_job(
+            job: TushareUpdateJob,
+        ) -> tuple[TushareUpdateJob, pd.DataFrame | None, Exception | None]:
+            _emit_progress(
+                progress,
+                table=job.table,
+                kind=job.kind,
+                item=job.item,
+                completed=completed,
+                total=total,
+                rows_written=0,
+                snapshot=None,
+                status="started",
+                filters=job.filters,
             )
+            try:
+                if job.table == "stock_basic":
+                    return job, self._read_tushare_stock_basic(source), None
+                return job, source.read(
+                    DataRequest(
+                        dataset=job.table,
+                        filters=job.filters,
+                        start_date=job.start_date,
+                        end_date=job.end_date,
+                    )
+                ), None
+            except Exception as exc:
+                return job, None, exc
 
-        for job, data in _parallel_iter(
+        for job, data, error in _parallel_iter(
             read_job,
             report.jobs,
             workers=workers,
@@ -242,6 +261,24 @@ class DataLakeManager:
         ):
             with write_lock:
                 ref = None
+                if error is not None:
+                    completed += 1
+                    _emit_progress(
+                        progress,
+                        table=job.table,
+                        kind=job.kind,
+                        item=job.item,
+                        completed=completed,
+                        total=total,
+                        rows_written=0,
+                        snapshot=None,
+                        status="failed",
+                        error=str(error),
+                        filters=job.filters,
+                    )
+                    continue
+                if data is None:
+                    data = pd.DataFrame()
                 if job.kind == "fundamental":
                     data = _filter_incremental_rows(
                         existing_fundamentals.get(job.table),
@@ -262,6 +299,7 @@ class DataLakeManager:
                     assets, fields = _catalog_entries(data)
                     catalog_assets.setdefault(job.table, set()).update(assets)
                     catalog_fields.setdefault(job.table, set()).update(fields)
+                self._mark_tushare_update_record(job, data, ref)
                 completed += 1
                 _emit_progress(
                     progress,
@@ -272,6 +310,8 @@ class DataLakeManager:
                     total=total,
                     rows_written=0 if data.empty else len(data),
                     snapshot=ref,
+                    status="succeeded",
+                    filters=job.filters,
                 )
         for table in sorted(set(catalog_assets).union(catalog_fields)):
             self.lake.update_catalog_entries(
@@ -407,6 +447,66 @@ class DataLakeManager:
         )
         return self.lake.write("tushare", table, data.reset_index(drop=True), mode=mode)
 
+    def rebuild_tushare_update_records(
+        self,
+        *,
+        specs: list[TushareTableUpdateSpec] | tuple[TushareTableUpdateSpec, ...],
+        start_date: str | date | datetime = "2000-01-01",
+        end_date: str | date | datetime | None = None,
+    ) -> None:
+        """Rebuild compact update-record system tables for configured Tushare specs."""
+
+        resolved_start = _normalize_date(start_date)
+        resolved_end = _normalize_date(end_date or date.today())
+        for spec in specs:
+            kind = _resolve_tushare_table_kind(spec.table, spec.kind)
+            if kind == "price":
+                self._ensure_tushare_price_update_records(
+                    spec.table,
+                    start_date=resolved_start,
+                    end_date=resolved_end,
+                    trading_calendar=spec.trading_calendar
+                    or _default_tushare_calendar_ref(),
+                    rebuild=True,
+                )
+            elif kind == "fundamental":
+                self._ensure_tushare_fundamental_update_records(
+                    spec.table,
+                    start_date=resolved_start,
+                    universe=spec.universe or _default_tushare_universe_ref(),
+                    rebuild=True,
+                )
+
+    def scan_tushare_data_lake(
+        self,
+        *,
+        specs: list[TushareTableUpdateSpec] | tuple[TushareTableUpdateSpec, ...],
+        start_date: str | date | datetime = "2000-01-01",
+        end_date: str | date | datetime | None = None,
+    ) -> None:
+        """Rebuild Tushare update records from local lake state and config."""
+
+        self.rebuild_tushare_update_records(
+            specs=specs,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def scan_data_lake(
+        self,
+        *,
+        specs: list[TushareTableUpdateSpec] | tuple[TushareTableUpdateSpec, ...],
+        start_date: str | date | datetime = "2000-01-01",
+        end_date: str | date | datetime | None = None,
+    ) -> None:
+        """Rebuild local update records for configured provider tables."""
+
+        self.scan_tushare_data_lake(
+            specs=specs,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
     def _read_tushare_stock_basic(self, source: DataSource) -> pd.DataFrame:
         frames = [
             source.read(
@@ -432,17 +532,24 @@ class DataLakeManager:
         *,
         trading_calendar: TushareTradingCalendarRef,
     ) -> tuple[TushareUpdatePlan, tuple[TushareUpdateJob, ...]]:
-        existing_dates = _existing_dates(self.lake, "tushare", table)
+        records = self._ensure_tushare_price_update_records(
+            table,
+            start_date=start_date,
+            end_date=end_date,
+            trading_calendar=trading_calendar,
+        )
+        candidate_dates = []
+        for record in records.itertuples(index=False):
+            if str(record.table) != table:
+                continue
+            if str(record.calendar) != trading_calendar.name:
+                continue
+            day = _parse_yyyymmdd(str(record.trade_date))
+            if start_date <= day <= end_date and not _record_exists(record.exists):
+                candidate_dates.append(day)
         dates = [
             day
-            for day in _local_trading_dates(
-                self.lake,
-                "tushare",
-                trading_calendar,
-                start_date,
-                end_date,
-            )
-            if day not in existing_dates
+            for day in sorted(candidate_dates)
         ]
         jobs = tuple(
             TushareUpdateJob(
@@ -473,9 +580,9 @@ class DataLakeManager:
                 effective_start=dates[0] if dates else None,
                 pending_items=pending_items,
                 reason=(
-                    "missing local trade_date partitions"
+                    "missing update-record trade_date values"
                     if dates
-                    else "all requested trade_date values already exist locally"
+                    else "all requested trade_date values are marked complete"
                 ),
                 estimated_job_count=len(jobs),
                 status="pending" if jobs else "up_to_date",
@@ -492,7 +599,11 @@ class DataLakeManager:
         *,
         universe: TushareUniverseRef,
     ) -> tuple[TushareUpdatePlan, tuple[TushareUpdateJob, ...]]:
-        existing = _existing_table(self.lake, "tushare", table)
+        records = self._ensure_tushare_fundamental_update_records(
+            table,
+            start_date=start_date,
+            universe=universe,
+        )
         ts_codes = _local_tushare_codes(self.lake, universe=universe)
         if not ts_codes:
             return (
@@ -514,8 +625,17 @@ class DataLakeManager:
                 (),
             )
         jobs = []
+        table_records = records.loc[
+            (records["table"].astype(str) == table)
+            & (records["universe"].astype(str) == universe.name)
+        ]
+        by_asset = {
+            str(row.asset_id): row
+            for row in table_records.itertuples(index=False)
+        }
         for ts_code in ts_codes:
-            update_start = _incremental_start(existing, ts_code, start_date)
+            record = by_asset.get(ts_code)
+            update_start = _record_update_start(record, start_date)
             if update_start > end_date:
                 continue
             jobs.append(
@@ -550,10 +670,10 @@ class DataLakeManager:
                 effective_start=min(effective_starts) if effective_starts else None,
                 pending_items=pending_items,
                 reason=(
-                    "asset-level incremental requests from latest local f_ann_date"
+                    "asset-level incremental requests from update records"
                     if jobs
                     else (
-                        "all asset-level f_ann_date values are after requested "
+                        "all asset-level update-record dates are after requested "
                         "end date"
                     )
                 ),
@@ -607,6 +727,264 @@ class DataLakeManager:
                 status="pending" if jobs else "up_to_date",
             ),
             jobs,
+        )
+
+    def _ensure_tushare_price_update_records(
+        self,
+        table: str,
+        *,
+        start_date: date,
+        end_date: date,
+        trading_calendar: TushareTradingCalendarRef,
+        rebuild: bool = False,
+    ) -> pd.DataFrame:
+        records = (
+            _empty_price_update_records()
+            if rebuild
+            else _read_update_records(
+                self.lake,
+                TUSHARE_PRICE_UPDATE_RECORDS,
+                _empty_price_update_records(),
+            )
+        )
+        trading_dates = _local_trading_dates(
+            self.lake,
+            "tushare",
+            trading_calendar,
+            start_date,
+            end_date,
+        )
+        existing_keys = {
+            (
+                str(row.table),
+                str(row.calendar),
+                str(row.trade_date),
+            )
+            for row in records.itertuples(index=False)
+        }
+        missing_days = [
+            day
+            for day in trading_dates
+            if (table, trading_calendar.name, day.strftime("%Y%m%d"))
+            not in existing_keys
+        ]
+        existing_dates = (
+            _existing_dates(self.lake, "tushare", table) if missing_days else set()
+        )
+        rows = []
+        for day in missing_days:
+            trade_date = day.strftime("%Y%m%d")
+            rows.append(
+                {
+                    "source": "tushare",
+                    "table": table,
+                    "calendar": trading_calendar.name,
+                    "trade_date": trade_date,
+                    "exists": day in existing_dates,
+                    "last_snapshot_id": "",
+                    "last_updated_at": "",
+                }
+            )
+        if rows:
+            records = pd.concat(
+                [records, pd.DataFrame(rows)],
+                axis=0,
+                ignore_index=True,
+            )
+        records = _normalize_price_update_records(records)
+        _write_update_records(
+            self.lake,
+            TUSHARE_PRICE_UPDATE_RECORDS,
+            records,
+        )
+        return records
+
+    def _ensure_tushare_fundamental_update_records(
+        self,
+        table: str,
+        *,
+        start_date: date,
+        universe: TushareUniverseRef,
+        rebuild: bool = False,
+    ) -> pd.DataFrame:
+        records = (
+            _empty_fundamental_update_records()
+            if rebuild
+            else _read_update_records(
+                self.lake,
+                TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+                _empty_fundamental_update_records(),
+            )
+        )
+        ts_codes = _local_tushare_codes(self.lake, universe=universe)
+        existing_keys = {
+            (
+                str(row.table),
+                str(row.universe),
+                str(row.asset_id),
+            )
+            for row in records.itertuples(index=False)
+        }
+        missing_codes = [
+            ts_code
+            for ts_code in ts_codes
+            if (table, universe.name, ts_code) not in existing_keys
+        ]
+        existing_latest = (
+            _fundamental_latest_dates(self.lake, table) if missing_codes else {}
+        )
+        rows = []
+        for ts_code in missing_codes:
+            latest = existing_latest.get(ts_code)
+            rows.append(
+                {
+                    "source": "tushare",
+                    "table": table,
+                    "universe": universe.name,
+                    "asset_id": ts_code,
+                    "latest_date": latest.strftime("%Y%m%d") if latest else "",
+                    "exists": latest is not None and latest >= start_date,
+                    "last_snapshot_id": "",
+                    "last_updated_at": "",
+                }
+            )
+        if rows:
+            records = pd.concat(
+                [records, pd.DataFrame(rows)],
+                axis=0,
+                ignore_index=True,
+            )
+        records = _normalize_fundamental_update_records(records)
+        _write_update_records(
+            self.lake,
+            TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+            records,
+        )
+        return records
+
+    def _mark_tushare_update_record(
+        self,
+        job: TushareUpdateJob,
+        data: pd.DataFrame,
+        snapshot: SnapshotRef | None,
+    ) -> None:
+        if job.kind == "price":
+            self._mark_tushare_price_update_record(job, snapshot)
+        elif job.kind == "fundamental":
+            self._mark_tushare_fundamental_update_record(job, data, snapshot)
+
+    def _mark_tushare_price_update_record(
+        self,
+        job: TushareUpdateJob,
+        snapshot: SnapshotRef | None,
+    ) -> None:
+        trade_date = str(job.filters.get("trade_date") or "")
+        if not trade_date:
+            return
+        records = _read_update_records(
+            self.lake,
+            TUSHARE_PRICE_UPDATE_RECORDS,
+            _empty_price_update_records(),
+        )
+        calendar = job.trading_calendar or ""
+        if records.empty:
+            records = _empty_price_update_records()
+        mask = (
+            (records["table"].astype(str) == job.table)
+            & (records["calendar"].astype(str) == calendar)
+            & (records["trade_date"].astype(str) == trade_date)
+        )
+        if not mask.any():
+            records = pd.concat(
+                [
+                    records,
+                    pd.DataFrame(
+                        [
+                            {
+                                "source": "tushare",
+                                "table": job.table,
+                                "calendar": calendar,
+                                "trade_date": trade_date,
+                                "exists": True,
+                                "last_snapshot_id": "",
+                                "last_updated_at": "",
+                            }
+                        ]
+                    ),
+                ],
+                axis=0,
+                ignore_index=True,
+            )
+            mask = records.index == records.index[-1]
+        records.loc[mask, "exists"] = True
+        records.loc[mask, "last_snapshot_id"] = (
+            snapshot.snapshot_id if snapshot is not None else ""
+        )
+        records.loc[mask, "last_updated_at"] = datetime.now(UTC).isoformat()
+        _write_update_records(
+            self.lake,
+            TUSHARE_PRICE_UPDATE_RECORDS,
+            _normalize_price_update_records(records),
+        )
+
+    def _mark_tushare_fundamental_update_record(
+        self,
+        job: TushareUpdateJob,
+        data: pd.DataFrame,
+        snapshot: SnapshotRef | None,
+    ) -> None:
+        asset_id = str(job.filters.get("ts_code") or job.item or "")
+        if not asset_id:
+            return
+        records = _read_update_records(
+            self.lake,
+            TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+            _empty_fundamental_update_records(),
+        )
+        universe = job.universe or ""
+        if records.empty:
+            records = _empty_fundamental_update_records()
+        mask = (
+            (records["table"].astype(str) == job.table)
+            & (records["universe"].astype(str) == universe)
+            & (records["asset_id"].astype(str) == asset_id)
+        )
+        if not mask.any():
+            records = pd.concat(
+                [
+                    records,
+                    pd.DataFrame(
+                        [
+                            {
+                                "source": "tushare",
+                                "table": job.table,
+                                "universe": universe,
+                                "asset_id": asset_id,
+                                "latest_date": "",
+                                "exists": False,
+                                "last_snapshot_id": "",
+                                "last_updated_at": "",
+                            }
+                        ]
+                    ),
+                ],
+                axis=0,
+                ignore_index=True,
+            )
+            mask = records.index == records.index[-1]
+        latest_date = _latest_fundamental_job_date(data, job.end_date)
+        records.loc[mask, "latest_date"] = (
+            latest_date.strftime("%Y%m%d") if latest_date is not None else ""
+        )
+        records.loc[mask, "exists"] = True
+        records.loc[mask, "last_snapshot_id"] = (
+            snapshot.snapshot_id if snapshot is not None else ""
+        )
+        records.loc[mask, "last_updated_at"] = datetime.now(UTC).isoformat()
+        _write_update_records(
+            self.lake,
+            TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+            _normalize_fundamental_update_records(records),
         )
 
     def _update_tushare_price_table(
@@ -847,6 +1225,173 @@ def _parallel_iter(
             yield future.result()
 
 
+def _empty_price_update_records() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "source",
+            "table",
+            "calendar",
+            "trade_date",
+            "exists",
+            "last_snapshot_id",
+            "last_updated_at",
+        ]
+    )
+
+
+def _empty_fundamental_update_records() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "source",
+            "table",
+            "universe",
+            "asset_id",
+            "latest_date",
+            "exists",
+            "last_snapshot_id",
+            "last_updated_at",
+        ]
+    )
+
+
+def _read_update_records(
+    lake: LocalDataLake,
+    table: str,
+    empty: pd.DataFrame,
+) -> pd.DataFrame:
+    try:
+        data = lake.read("tushare", table)
+    except DatasetNotFoundError:
+        return empty.copy()
+    for column in empty.columns:
+        if column not in data.columns:
+            data[column] = empty[column]
+    return data.loc[:, list(empty.columns)].copy(deep=True)
+
+
+def _write_update_records(
+    lake: LocalDataLake,
+    table: str,
+    data: pd.DataFrame,
+) -> None:
+    if data.empty:
+        return
+    lake.write(
+        "tushare",
+        table,
+        data.reset_index(drop=True),
+        mode="overwrite",
+        metadata={
+            "system_table": True,
+            "update_records": True,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+        update_catalogs=False,
+    )
+
+
+def _normalize_price_update_records(data: pd.DataFrame) -> pd.DataFrame:
+    records = data.copy(deep=True)
+    for column in _empty_price_update_records().columns:
+        if column not in records.columns:
+            records[column] = ""
+    records["source"] = records["source"].astype(str)
+    records["table"] = records["table"].astype(str)
+    records["calendar"] = records["calendar"].astype(str)
+    records["trade_date"] = records["trade_date"].astype(str)
+    records["exists"] = records["exists"].map(_record_exists)
+    records["last_snapshot_id"] = records["last_snapshot_id"].fillna("").astype(str)
+    records["last_updated_at"] = records["last_updated_at"].fillna("").astype(str)
+    return records.drop_duplicates(
+        ["source", "table", "calendar", "trade_date"],
+        keep="last",
+    ).sort_values(
+        ["source", "table", "calendar", "trade_date"],
+        ignore_index=True,
+    )
+
+
+def _normalize_fundamental_update_records(data: pd.DataFrame) -> pd.DataFrame:
+    records = data.copy(deep=True)
+    for column in _empty_fundamental_update_records().columns:
+        if column not in records.columns:
+            records[column] = ""
+    records["source"] = records["source"].astype(str)
+    records["table"] = records["table"].astype(str)
+    records["universe"] = records["universe"].astype(str)
+    records["asset_id"] = records["asset_id"].astype(str)
+    records["latest_date"] = records["latest_date"].fillna("").astype(str)
+    records["exists"] = records["exists"].map(_record_exists)
+    records["last_snapshot_id"] = records["last_snapshot_id"].fillna("").astype(str)
+    records["last_updated_at"] = records["last_updated_at"].fillna("").astype(str)
+    return records.drop_duplicates(
+        ["source", "table", "universe", "asset_id"],
+        keep="last",
+    ).sort_values(
+        ["source", "table", "universe", "asset_id"],
+        ignore_index=True,
+    )
+
+
+def _record_exists(value: object) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "yes", "y"}
+
+
+def _record_update_start(record: object | None, default_start: date) -> date:
+    if record is None:
+        return default_start
+    latest = str(getattr(record, "latest_date", "") or "")
+    if not latest:
+        return default_start
+    return max(_parse_yyyymmdd(latest), default_start)
+
+
+def _fundamental_latest_dates(
+    lake: LocalDataLake,
+    table: str,
+) -> dict[str, date]:
+    try:
+        existing = lake.read("tushare", table, columns=("ts_code", "f_ann_date"))
+    except DatasetNotFoundError:
+        return {}
+    except Exception:
+        existing = _existing_table(lake, "tushare", table)
+    if (
+        existing is None
+        or existing.empty
+        or "ts_code" not in existing.columns
+        or "f_ann_date" not in existing.columns
+    ):
+        return {}
+    latest: dict[str, date] = {}
+    rows = existing[["ts_code", "f_ann_date"]].dropna().itertuples(index=False)
+    for ts_code, raw_date in rows:
+        parsed = _parse_yyyymmdd(str(raw_date))
+        asset_id = str(ts_code)
+        if asset_id not in latest or parsed > latest[asset_id]:
+            latest[asset_id] = parsed
+    return latest
+
+
+def _latest_fundamental_job_date(
+    data: pd.DataFrame,
+    fallback: date | None,
+) -> date | None:
+    if not data.empty and "f_ann_date" in data.columns:
+        raw_dates = [
+            str(value) for value in data["f_ann_date"].tolist() if pd.notna(value)
+        ]
+        dates = [_parse_yyyymmdd(value) for value in raw_dates]
+        if dates:
+            return max(dates)
+    return fallback
+
+
 def _validate_parallel(*, workers: int, parallel: ParallelMode) -> None:
     if workers < 1:
         raise ValueError("workers must be greater than or equal to 1")
@@ -887,20 +1432,28 @@ def _emit_progress(
     total: int,
     rows_written: int,
     snapshot: SnapshotRef | None,
+    status: str | None = None,
+    error: str | None = None,
+    filters: Mapping[str, Any] | None = None,
 ) -> None:
     if progress is None:
         return
-    progress(
-        {
-            "table": table,
-            "kind": kind,
-            "item": item,
-            "completed": completed,
-            "total": total,
-            "rows_written": rows_written,
-            "snapshot": snapshot,
-        }
-    )
+    event: dict[str, Any] = {
+        "table": table,
+        "kind": kind,
+        "item": item,
+        "completed": completed,
+        "total": total,
+        "rows_written": rows_written,
+        "snapshot": snapshot,
+    }
+    if status is not None:
+        event["status"] = status
+    if error is not None:
+        event["error"] = error
+    if filters is not None:
+        event["filters"] = dict(filters)
+    progress(event)
 
 
 def _catalog_entries(data: pd.DataFrame) -> tuple[set[str], set[str]]:
