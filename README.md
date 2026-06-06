@@ -180,7 +180,19 @@ refs = manager.execute_tushare_update_report(report, workers=4)
 
 `update_tushare_all(...)` remains available as a convenience wrapper for one
 table. New code should prefer `scan_tushare_updates(specs=...)` because it keeps
-table kind, update universe, and trading calendar bindings together.
+table kind, update universe, and trading calendar bindings together. The older
+`scan_tushare_updates(["daily"], kinds=..., universes=..., trading_calendars=...)`
+call shape is still accepted for migration.
+
+## Universes
+
+Each source's first configured table is the source universe-like reference
+table. For Tushare, that table is `stock_basic`.
+
+```python
+manager.update_tushare_stock_basic()
+lake.asset_ids("tushare")
+```
 
 Tushare `stock_basic` is refreshed from listed, delisted, and paused stocks to
 avoid survivorship bias. Price tables such as `daily` and `index_daily` are
