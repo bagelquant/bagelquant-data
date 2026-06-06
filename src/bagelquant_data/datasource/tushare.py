@@ -136,7 +136,7 @@ class TushareDataSource:
                 return call()
             except Exception as exc:
                 last_error = exc
-                if attempt >= self._retry.attempts or not self._transient(exc):
+                if attempt >= self._retry.attempts:
                     raise DataSourceError(f"Tushare request failed: {exc}") from exc
                 if _is_access_limit(exc):
                     time.sleep(self._retry.access_limit_sleep_seconds)

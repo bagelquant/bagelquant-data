@@ -233,6 +233,29 @@ def test_tushare_retry_wraps_failures() -> None:
         source.read(DataRequest(dataset="daily"))
 
 
+def test_tushare_retries_non_rate_limit_failures_three_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily(self, **params):
+            self.calls += 1
+            raise RuntimeError("permission denied")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("bagelquant_data.datasource.tushare.time.sleep", sleeps.append)
+    client = FailingClient()
+    source = TushareDataSource(token="token", client=client)
+
+    with pytest.raises(DataSourceError, match="permission denied"):
+        source.read(DataRequest(dataset="daily"))
+
+    assert client.calls == 3
+    assert sleeps == [0.5, 1.0]
+
+
 def test_tushare_access_limit_retries_after_one_minute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -59,15 +59,18 @@ instead of the default stock universe.
   stocks; `trade_cal` refreshes the source trading calendar.
 - Universes and trading calendars are updated as reference resources, separate
   from normal table scans and executions.
-- Updates can be scanned first from local lake state, producing a report of
-  pending tables, effective start dates, and executable jobs.
+- Updates can be scanned first from compact update-record system tables,
+  producing a report of pending tables, effective start dates, and executable
+  jobs.
 - `daily` and `index_daily` are fetched day by day over open trading dates from
   the associated trading calendar to avoid Tushare row limits.
-- Existing price dates are skipped before provider calls and stored at day
-  granularity, so appending a new trading day does not rewrite older days.
+- Existing price dates are skipped through `__tushare_price_update_records` and
+  stored at day granularity, so appending a new trading day does not rewrite
+  older days.
 - Fundamental tables create one job per code in the associated update universe table,
-  starting from that asset's latest local `f_ann_date`; boundary rows are
-  de-duplicated locally.
+  starting from that asset's latest date in
+  `__tushare_fundamental_update_records`; boundary rows are de-duplicated
+  locally.
 - VIP fundamental tables such as `income_vip` are fetched by reporting season
   with `period`, stored by year/quarter, and skipped when the quarter already
   exists locally.

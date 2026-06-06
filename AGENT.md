@@ -26,11 +26,11 @@ It does not own:
 
 - Do not import downstream repositories from package code.
 - In particular, do not import `bagelquant_core`.
-- Communicate with `bagelquant-core` through `PanelInputAgreement` payloads.
+- Communicate with `bagelquant-core` through plain `RetrievedPanel` payloads.
 - Keep provider data immutable at the raw layer.
 - Keep transformations stateless.
 
 ## Tooling
 
-Use `uv`, `ruff`, `pyright`, `pytest`, `mkdocs`, and `pre-commit`.
+Use `uv`, `ruff`, `pytest`, `mkdocs`, and `pre-commit`.
 Do not use Poetry.

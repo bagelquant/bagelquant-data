@@ -1,24 +1,27 @@
 # BagelQuant Data
 
-Unified data access for the BagelQuant ecosystem.
+Backend data access for the BagelQuant ecosystem.
 
 `bagelquant-data` ingests provider data into a local source-separated data lake,
-standardizes access, tracks metadata, and produces reproducible contracts for
-downstream systems. It is infrastructure, not a research library.
+standardizes reads, tracks metadata, and returns reproducible data objects for
+downstream systems. It is infrastructure, not a research library, and it does
+not ship a GUI.
 
 ## Mission
 
 - ingest data from multiple providers
-- provide a unified access interface
+- provide a unified backend API
+- manage local data lake snapshots and catalogs
+- orchestrate provider updates
 - manage metadata and data contracts
-- orchestrate loading and transformation
-- integrate with data lake backends through interfaces
-- serve standardized outputs to downstream systems
+- serve standardized pandas outputs to downstream systems
 
 This package does not define Panel internals, factor research, portfolio
 construction, graph execution, backtesting, or analytics.
 
 ## Install
+
+Install the package and development dependencies:
 
 ```bash
 uv sync --all-groups
@@ -30,23 +33,11 @@ Install Tushare support:
 uv sync --extra tushare
 ```
 
-Install the local data lake GUI:
-
-```bash
-uv sync --extra gui --extra tushare
-uv run streamlit run src/bagelquant_data/gui/app.py
-```
-
 ## Quick Start
 
 ```python
 from bagelquant_data.datasource import DataRequest, DataSourceRegistry, TushareDataSource
-from bagelquant_data.lake import (
-    DataLakeManager,
-    LocalDataLake,
-    TushareTableUpdateSpec,
-    TushareTradingCalendarRef,
-)
+from bagelquant_data.lake import DataLakeManager, LocalDataLake
 from bagelquant_data.loader import Loader
 
 registry = DataSourceRegistry()
@@ -72,66 +63,28 @@ daily = Loader(registry=registry, lake=lake).source("tushare").load(
     end_date="2024-01-31",
 )
 
-daily.data.head()
+print(daily.data.head())
 ```
 
-When a lake is configured, `Loader` reads the local lake first. Use
-`refresh=True` to fetch the provider and write a new local snapshot. Local lake
-reads support projection and date filters, so downstream workflows can avoid
-loading whole Parquet snapshots:
+When a lake is configured, `Loader` reads local snapshots first. Use
+`refresh=True` to fetch the provider and write a new local snapshot.
 
-```python
-lake.read(
-    "tushare",
-    "daily",
-    columns=("close",),
-    start_date="2024-01-01",
-    end_date="2024-01-31",
-)
-```
+## Module Responsibilities
 
-## Retrieved Panels
-
-`bagelquant-data` does not import `bagelquant-core`. For panel-shaped research
-inputs, loaders return plain data-layer objects: data, universe, and calendar.
-
-```python
-retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
-    dataset="daily",
-    field="close",
-    universe=["000001.SZ", "600000.SH"],
-    start_date="2024-01-01",
-    end_date="2024-12-31",
-)
-```
-
-Downstream code can use those plain objects explicitly:
-
-```python
-from bagelquant_core import Domain, Panel
-
-domain = Domain(calendar=retrieved.calendar, universe=retrieved.universe)
-panel = Panel.from_domain(
-    retrieved.data,
-    domain,
-    name=retrieved.dataset_name,
-    metadata=retrieved.metadata,
-)
-```
-
-## Tushare Tokens
-
-Token resolution order:
-
-1. `TushareDataSource(token=...)`
-2. `TUSHARE_TOKEN`
-3. `Settings(tushare_token=...)`
-
-Tokens are not returned by `describe()` and are redacted from `repr()`.
+- `bagelquant_data.datasource`: provider adapters, `DataRequest`, and source
+  registration.
+- `bagelquant_data.lake`: local storage, immutable snapshots, catalogs, direct
+  lake reads, and provider update planning/execution.
+- `bagelquant_data.loader`: lake-first retrieval, provider fallback, lineage
+  metadata, and panel-shaped outputs.
+- `bagelquant_data.metadata`: dataset identity, schemas, contracts, and lineage.
+- `bagelquant_data.transform`: stateless pandas transformation pipelines.
+- `bagelquant_data.cache`: optional cache interfaces that do not change dataset
+  identity.
 
 ## Lake Management
 
-The local lake is separated by source:
+The local lake is separated by source, table, partition, and snapshot:
 
 ```text
 .bagelquant-data-lake/
@@ -142,33 +95,69 @@ The local lake is separated by source:
         month=01/
           _catalog.json
           snapshots/
+            20240131T120000000000Z/
+              data.parquet
+              metadata.json
 ```
 
-Every table is normalized with:
+Every stored table receives lifecycle columns `create_time` and `delete_flag`.
+Panel-like data uses a `date` index. Reference tables that are not panel-like,
+such as `stock_basic`, keep their ordinary row index.
 
-- index name `date` for panel-like data
-- columns `create_time` and `delete_flag`
-- source asset ids in `__asset_ids`
-- source data item ids in `__data_item_ids`
-- Parquet snapshot files under each year/month partition
-
-Reference tables that are not panel-like, such as `stock_basic`, keep their
-ordinary row index.
-
-Manage datasets directly:
+Manage local datasets directly:
 
 ```python
 manager.add("custom", "prices", frame)
 manager.edit("custom", "prices", corrected_frame)
 manager.delete("custom", "prices")
-manager.list_sources()
-manager.list_tables("tushare")
-lake.read("tushare", "daily", year=2024, month=1)
+
+print(manager.list_sources())
+print(manager.list_tables("tushare"))
+print(manager.snapshots("tushare", "daily"))
 ```
 
-Run provider updates manually when you want a fresh snapshot:
+Read with projection and date filters:
 
 ```python
+close = lake.read(
+    "tushare",
+    "daily",
+    columns=("close",),
+    start_date="2024-01-01",
+    end_date="2024-01-31",
+)
+```
+
+Inspect source catalogs:
+
+```python
+asset_ids = lake.asset_ids("tushare")
+fields = lake.fields("tushare")
+panel_field_ids = lake.panel_field_ids("tushare")
+```
+
+## Tushare Updates
+
+Token resolution order:
+
+1. `TushareDataSource(token=...)`
+2. `TUSHARE_TOKEN`
+3. `Settings(tushare_token=...)`
+
+Tokens are not returned by `describe()` and are redacted from `repr()`.
+
+Refresh reference resources first:
+
+```python
+manager.update_tushare_stock_basic()
+manager.update_tushare_trading_calendar(start_date="2000-01-01")
+```
+
+Scan provider updates before execution:
+
+```python
+from bagelquant_data.lake import TushareTableUpdateSpec, TushareTradingCalendarRef
+
 report = manager.scan_tushare_updates(
     specs=(
         TushareTableUpdateSpec(
@@ -177,16 +166,16 @@ report = manager.scan_tushare_updates(
             trading_calendar=TushareTradingCalendarRef(
                 name="trade_cal",
                 table="trade_cal",
+                date_column="cal_date",
+                open_column="is_open",
             ),
         ),
     ),
-    start_date="2000-01-01",
+    start_date="2024-01-01",
     end_date="2024-12-31",
 )
-manager.execute_tushare_update_report(
-    report,
-    workers=4,
-)
+
+refs = manager.execute_tushare_update_report(report, workers=4)
 ```
 
 `update_tushare_all(...)` remains available as a convenience wrapper for one
@@ -206,60 +195,70 @@ lake.asset_ids("tushare")
 ```
 
 Tushare `stock_basic` is refreshed from listed, delisted, and paused stocks to
-avoid survivorship bias.
+avoid survivorship bias. Price tables such as `daily` and `index_daily` are
+planned from compact update-record rows and fetched day by day over open trading
+dates. Fundamental tables update per asset, and VIP fundamental tables update by
+reporting season.
 
-## Streamlit GUI
+## Retrieval
 
-The V1 GUI manages the local lake from a Streamlit app:
+Load a dataset with lake-first behavior:
 
-```bash
-uv run streamlit run src/bagelquant_data/gui/app.py
+```python
+loaded = Loader(registry=registry, lake=lake).source("tushare").load(
+    "daily",
+    fields=("open", "close"),
+    start_date="2024-01-01",
+    end_date="2024-01-31",
+)
 ```
 
-It stores settings in `.bagelquant-data-gui.yaml` by default:
+Retrieve a panel-shaped object without importing `bagelquant-core`:
 
-- lake root
-- configured sources and tables
-- shared update start date and worker count
-- Tushare token, when configured in the GUI
+```python
+retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
+    dataset="daily",
+    field="close",
+    universe=["000001.SZ", "600000.SH"],
+    start_date="2024-01-01",
+    end_date="2024-12-31",
+)
+```
 
-Token resolution order in the GUI is configured source token, `TUSHARE_TOKEN`,
-then Streamlit secrets. Updates are manual: use **Data Sources** to configure
-tables from the local Tushare catalog, click **Scan updates** to review the
-local-lake update report, then click **Confirm update** to run the reported
-jobs.
+Read a qualified lake field directly as a date-by-asset panel:
 
-## Tushare Updates
+```python
+panel = lake.read_panel_field(
+    "tushare_daily_close",
+    start_date="2024-01-01",
+    end_date="2024-12-31",
+)
+```
 
-Tushare `All` is built from `stock_basic`, including listed (`L`), delisted
-(`D`), and paused (`P`) stocks returned by the provider. Price-like tables such
-as `daily` and `index_daily` are scanned locally for missing trade dates, then
-fetched and written day by day to avoid provider row limits and resume
-incrementally. Fundamental tables create one confirmed job per `ts_code`, with
-each job starting from that asset's latest local `f_ann_date`. VIP fundamental
-tables such as `income_vip` are scanned and written by reporting season with
-`period`, so they do not loop through every stock. The GUI always scans first
-and executes only the confirmed report jobs.
+Downstream code can adapt `RetrievedPanel` explicitly:
 
-Defaults:
+```python
+from bagelquant_core import Domain, Panel
 
-- `start_date="2000-01-01"`
-- `end_date=today`
-- threaded provider reads through `workers`, defaulting to 8 in the GUI
+domain = Domain(calendar=retrieved.calendar, universe=retrieved.universe)
+panel = Panel.from_domain(
+    retrieved.data,
+    domain,
+    name=retrieved.dataset_name,
+    metadata=retrieved.metadata,
+)
+```
+
+See `examples/backend_data_lake_workflow.py` for a complete backend workflow.
 
 ## Development
 
 ```bash
-uv sync --all-groups --extra tushare --extra gui
+uv sync --all-groups --extra tushare
 uv run ruff check .
-uv run pyright
 uv run pytest
 uv run mkdocs build --strict
 ```
-
-On Windows, `pyright` may fail before analysis if the resolved `node.exe` is not
-executable by the current process. Confirm `where node` resolves to a usable
-Node runtime, then rerun `uv run pyright`.
 
 ## License
 
