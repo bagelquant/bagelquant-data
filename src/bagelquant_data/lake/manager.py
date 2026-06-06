@@ -120,6 +120,7 @@ class DataLakeManager:
         workers: int = 4,
         parallel: ParallelMode = "thread",
         progress: ProgressCallback | None = None,
+        write_batch_size: int = 20,
         universe: TushareUniverseRef | None = None,
         trading_calendar: TushareTradingCalendarRef | None = None,
     ) -> tuple[SnapshotRef, ...]:
@@ -149,6 +150,7 @@ class DataLakeManager:
             workers=workers,
             parallel=parallel,
             progress=progress,
+            write_batch_size=write_batch_size,
         )
 
     def scan_tushare_updates(
@@ -206,10 +208,13 @@ class DataLakeManager:
         workers: int = 4,
         parallel: ParallelMode = "thread",
         progress: ProgressCallback | None = None,
+        write_batch_size: int = 20,
     ) -> tuple[SnapshotRef, ...]:
         """Execute provider jobs from a confirmed Tushare update report."""
 
         _validate_parallel(workers=workers, parallel=parallel)
+        if write_batch_size < 1:
+            raise ValueError("write_batch_size must be greater than or equal to 1")
         source = self.registry.resolve("tushare")
         refs: list[SnapshotRef] = []
         catalog_assets: dict[str, set[str]] = {}
@@ -217,6 +222,36 @@ class DataLakeManager:
         completed = 0
         total = len(report.jobs)
         write_lock = Lock()
+        pending_writes: dict[
+            tuple[
+                str,
+                WriteMode,
+                str | None,
+                str,
+                tuple[str, ...],
+            ],
+            list[tuple[TushareUpdateJob, pd.DataFrame, int]],
+        ] = {}
+        price_records = (
+            _read_update_records(
+                self.lake,
+                TUSHARE_PRICE_UPDATE_RECORDS,
+                _empty_price_update_records(),
+            )
+            if any(job.kind == "price" for job in report.jobs)
+            else _empty_price_update_records()
+        )
+        fundamental_records = (
+            _read_update_records(
+                self.lake,
+                TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+                _empty_fundamental_update_records(),
+            )
+            if any(job.kind == "fundamental" for job in report.jobs)
+            else _empty_fundamental_update_records()
+        )
+        price_records_changed = False
+        fundamental_records_changed = False
         existing_fundamentals = {
             table: _existing_table(self.lake, "tushare", table)
             for table in {
@@ -253,6 +288,65 @@ class DataLakeManager:
             except Exception as exc:
                 return job, None, exc
 
+        def flush_batch(
+            key: tuple[str, WriteMode, str | None, str, tuple[str, ...]],
+        ) -> None:
+            nonlocal price_records
+            nonlocal price_records_changed
+            nonlocal fundamental_records
+            nonlocal fundamental_records_changed
+            batch = pending_writes.pop(key, [])
+            if not batch:
+                return
+            sample = batch[0][0]
+            batch_data = pd.concat(
+                [data for _, data, _ in batch],
+                axis=0,
+                ignore_index=False,
+            )
+            ref = self.lake.write(
+                "tushare",
+                sample.table,
+                batch_data,
+                mode=sample.mode,
+                partition_column=sample.partition_column,
+                partition_granularity=sample.partition_granularity,
+                metadata=_batch_metadata(batch),
+                update_catalogs=False,
+            )
+            refs.append(ref)
+            assets, fields = _catalog_entries(batch_data)
+            catalog_assets.setdefault(sample.table, set()).update(assets)
+            catalog_fields.setdefault(sample.table, set()).update(fields)
+            for job, data, completed_count in batch:
+                if job.kind == "price":
+                    price_records = _upsert_price_update_record(
+                        price_records,
+                        job,
+                        ref,
+                    )
+                    price_records_changed = True
+                elif job.kind == "fundamental":
+                    fundamental_records = _upsert_fundamental_update_record(
+                        fundamental_records,
+                        job,
+                        data,
+                        ref,
+                    )
+                    fundamental_records_changed = True
+                _emit_progress(
+                    progress,
+                    table=job.table,
+                    kind=job.kind,
+                    item=job.item,
+                    completed=completed_count,
+                    total=total,
+                    rows_written=len(data),
+                    snapshot=ref,
+                    status="succeeded",
+                    filters=job.filters,
+                )
+
         for job, data, error in _parallel_iter(
             read_job,
             report.jobs,
@@ -260,7 +354,6 @@ class DataLakeManager:
             parallel=parallel,
         ):
             with write_lock:
-                ref = None
                 if error is not None:
                     completed += 1
                     _emit_progress(
@@ -284,35 +377,54 @@ class DataLakeManager:
                         existing_fundamentals.get(job.table),
                         data,
                     )
-                if not data.empty:
-                    ref = self.lake.write(
-                        "tushare",
-                        job.table,
-                        data,
-                        mode=job.mode,
-                        partition_column=job.partition_column,
-                        partition_granularity=job.partition_granularity,
-                        metadata=job.metadata,
-                        update_catalogs=False,
-                    )
-                    refs.append(ref)
-                    assets, fields = _catalog_entries(data)
-                    catalog_assets.setdefault(job.table, set()).update(assets)
-                    catalog_fields.setdefault(job.table, set()).update(fields)
-                self._mark_tushare_update_record(job, data, ref)
                 completed += 1
-                _emit_progress(
-                    progress,
-                    table=job.table,
-                    kind=job.kind,
-                    item=job.item,
-                    completed=completed,
-                    total=total,
-                    rows_written=0 if data.empty else len(data),
-                    snapshot=ref,
-                    status="succeeded",
-                    filters=job.filters,
-                )
+                if data.empty:
+                    if job.kind == "price":
+                        price_records = _upsert_price_update_record(
+                            price_records,
+                            job,
+                            None,
+                        )
+                        price_records_changed = True
+                    elif job.kind == "fundamental":
+                        fundamental_records = _upsert_fundamental_update_record(
+                            fundamental_records,
+                            job,
+                            data,
+                            None,
+                        )
+                        fundamental_records_changed = True
+                    _emit_progress(
+                        progress,
+                        table=job.table,
+                        kind=job.kind,
+                        item=job.item,
+                        completed=completed,
+                        total=total,
+                        rows_written=0,
+                        snapshot=None,
+                        status="succeeded",
+                        filters=job.filters,
+                    )
+                    continue
+                key = _write_batch_key(job)
+                pending_writes.setdefault(key, []).append((job, data, completed))
+                if len(pending_writes[key]) >= write_batch_size:
+                    flush_batch(key)
+        for key in list(pending_writes):
+            flush_batch(key)
+        if price_records_changed:
+            _write_update_records(
+                self.lake,
+                TUSHARE_PRICE_UPDATE_RECORDS,
+                _normalize_price_update_records(price_records),
+            )
+        if fundamental_records_changed:
+            _write_update_records(
+                self.lake,
+                TUSHARE_FUNDAMENTAL_UPDATE_RECORDS,
+                _normalize_fundamental_update_records(fundamental_records),
+            )
         for table in sorted(set(catalog_assets).union(catalog_fields)):
             self.lake.update_catalog_entries(
                 "tushare",
@@ -1288,6 +1400,143 @@ def _write_update_records(
         },
         update_catalogs=False,
     )
+
+
+def _write_batch_key(
+    job: TushareUpdateJob,
+) -> tuple[str, WriteMode, str | None, str, tuple[str, ...]]:
+    return (
+        job.table,
+        job.mode,
+        job.partition_column,
+        job.partition_granularity,
+        tuple(sorted(str(key) for key in job.metadata)),
+    )
+
+
+def _batch_metadata(
+    batch: list[tuple[TushareUpdateJob, pd.DataFrame, int]],
+) -> Mapping[str, Any]:
+    if len(batch) == 1:
+        return batch[0][0].metadata
+    first = batch[0][0]
+    shared: dict[str, Any] = {
+        "update_strategy": first.metadata.get("update_strategy", "batch"),
+        "batch_size": len(batch),
+        "batched_update": True,
+        "jobs": [dict(job.metadata) for job, _, _ in batch],
+    }
+    for key in ("start_date", "end_date", "trading_calendar", "universe"):
+        values = {
+            job.metadata.get(key)
+            for job, _, _ in batch
+            if job.metadata.get(key) is not None
+        }
+        if len(values) == 1:
+            shared[key] = values.pop()
+    return shared
+
+
+def _upsert_price_update_record(
+    records: pd.DataFrame,
+    job: TushareUpdateJob,
+    snapshot: SnapshotRef | None,
+) -> pd.DataFrame:
+    trade_date = str(job.filters.get("trade_date") or "")
+    if not trade_date:
+        return records
+    updated = records.copy(deep=True)
+    for column in _empty_price_update_records().columns:
+        if column not in updated.columns:
+            updated[column] = ""
+    calendar = job.trading_calendar or ""
+    mask = (
+        (updated["table"].astype(str) == job.table)
+        & (updated["calendar"].astype(str) == calendar)
+        & (updated["trade_date"].astype(str) == trade_date)
+    )
+    if not mask.any():
+        updated = pd.concat(
+            [
+                updated,
+                pd.DataFrame(
+                    [
+                        {
+                            "source": "tushare",
+                            "table": job.table,
+                            "calendar": calendar,
+                            "trade_date": trade_date,
+                            "exists": True,
+                            "last_snapshot_id": "",
+                            "last_updated_at": "",
+                        }
+                    ]
+                ),
+            ],
+            axis=0,
+            ignore_index=True,
+        )
+        mask = updated.index == updated.index[-1]
+    updated.loc[mask, "exists"] = True
+    updated.loc[mask, "last_snapshot_id"] = (
+        snapshot.snapshot_id if snapshot is not None else ""
+    )
+    updated.loc[mask, "last_updated_at"] = datetime.now(UTC).isoformat()
+    return updated
+
+
+def _upsert_fundamental_update_record(
+    records: pd.DataFrame,
+    job: TushareUpdateJob,
+    data: pd.DataFrame,
+    snapshot: SnapshotRef | None,
+) -> pd.DataFrame:
+    asset_id = str(job.filters.get("ts_code") or job.item or "")
+    if not asset_id:
+        return records
+    updated = records.copy(deep=True)
+    for column in _empty_fundamental_update_records().columns:
+        if column not in updated.columns:
+            updated[column] = ""
+    universe = job.universe or ""
+    mask = (
+        (updated["table"].astype(str) == job.table)
+        & (updated["universe"].astype(str) == universe)
+        & (updated["asset_id"].astype(str) == asset_id)
+    )
+    if not mask.any():
+        updated = pd.concat(
+            [
+                updated,
+                pd.DataFrame(
+                    [
+                        {
+                            "source": "tushare",
+                            "table": job.table,
+                            "universe": universe,
+                            "asset_id": asset_id,
+                            "latest_date": "",
+                            "exists": False,
+                            "last_snapshot_id": "",
+                            "last_updated_at": "",
+                        }
+                    ]
+                ),
+            ],
+            axis=0,
+            ignore_index=True,
+        )
+        mask = updated.index == updated.index[-1]
+    latest_date = _latest_fundamental_job_date(data, job.end_date)
+    updated.loc[mask, "latest_date"] = (
+        latest_date.strftime("%Y%m%d") if latest_date is not None else ""
+    )
+    updated.loc[mask, "exists"] = True
+    updated.loc[mask, "last_snapshot_id"] = (
+        snapshot.snapshot_id if snapshot is not None else ""
+    )
+    updated.loc[mask, "last_updated_at"] = datetime.now(UTC).isoformat()
+    return updated
 
 
 def _normalize_price_update_records(data: pd.DataFrame) -> pd.DataFrame:

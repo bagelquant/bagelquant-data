@@ -197,6 +197,7 @@ class LocalDataLake:
             snapshot_id,
             created_at,
             metadata=_table_metadata(dataset, frame),
+            refs=refs,
         )
         if update_catalogs:
             self._update_main_tables(source, dataset, frame, created_at=created_at)
@@ -460,6 +461,9 @@ class LocalDataLake:
         table_dir = self._dataset_dir(source, dataset)
         if not table_dir.exists():
             return ()
+        indexed = self._indexed_snapshot_refs(source, dataset)
+        if indexed is not None:
+            return indexed
         refs = []
         for key, partition_dir in self._partition_dirs(source, dataset):
             snapshot_root = partition_dir / "snapshots"
@@ -481,9 +485,15 @@ class LocalDataLake:
             return None
         refs = [
             ref
-            for ref in self.snapshots(source, dataset)
+            for ref in self.latest_partitions(source, dataset)
             if ref.snapshot_id == snapshot_id
         ]
+        if not refs:
+            refs = [
+                ref
+                for ref in self.snapshots(source, dataset)
+                if ref.snapshot_id == snapshot_id
+            ]
         return refs[0] if refs else None
 
     def latest_partitions(
@@ -497,6 +507,9 @@ class LocalDataLake:
         table_dir = self._dataset_dir(source, dataset)
         if not table_dir.exists():
             return ()
+        indexed = self._indexed_latest_partition_refs(source, dataset)
+        if indexed is not None:
+            return indexed
         for key, partition_dir in self._partition_dirs(source, dataset):
             catalog_path = partition_dir / "_catalog.json"
             if not catalog_path.exists():
@@ -536,8 +549,8 @@ class LocalDataLake:
         start_date: pd.Timestamp | None,
         end_date: pd.Timestamp | None,
     ) -> tuple[SnapshotRef, ...]:
-        refs = self.snapshots(source, dataset)
         if snapshot is not None:
+            refs = self.snapshots(source, dataset)
             refs = tuple(ref for ref in refs if ref.snapshot_id == snapshot)
         else:
             refs = self.latest_partitions(source, dataset)
@@ -617,9 +630,11 @@ class LocalDataLake:
         created_at: datetime,
         *,
         metadata: Mapping[str, Any] | None = None,
+        refs: Sequence[SnapshotRef] = (),
     ) -> None:
         dataset_dir = self._dataset_dir(source, dataset)
         dataset_dir.mkdir(parents=True, exist_ok=True)
+        previous = self._table_catalog_metadata(source, dataset)
         payload = {
             "source": source,
             "table": dataset,
@@ -628,6 +643,13 @@ class LocalDataLake:
             "updated_at": created_at.isoformat(),
         }
         payload.update(dict(metadata or {}))
+        payload.update(
+            _merge_table_snapshot_index(
+                previous,
+                refs,
+                latest_snapshot=snapshot_id,
+            )
+        )
         self._table_catalog_path(source, dataset).write_text(
             json.dumps(payload, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -696,6 +718,54 @@ class LocalDataLake:
         key: _PartitionKey,
     ) -> Path:
         return self._partition_dir(source, dataset, key) / "_catalog.json"
+
+    def _indexed_snapshot_refs(
+        self,
+        source: str,
+        dataset: str,
+    ) -> tuple[SnapshotRef, ...] | None:
+        metadata = self._table_catalog_metadata(source, dataset)
+        entries = metadata.get("snapshots")
+        if not isinstance(entries, list):
+            return None
+        refs = [
+            self._snapshot_ref_from_index_entry(source, dataset, entry)
+            for entry in entries
+            if isinstance(entry, Mapping)
+        ]
+        return tuple(ref for ref in refs if ref is not None)
+
+    def _indexed_latest_partition_refs(
+        self,
+        source: str,
+        dataset: str,
+    ) -> tuple[SnapshotRef, ...] | None:
+        metadata = self._table_catalog_metadata(source, dataset)
+        entries = metadata.get("partitions")
+        if not isinstance(entries, list):
+            return None
+        refs = [
+            self._snapshot_ref_from_index_entry(source, dataset, entry)
+            for entry in entries
+            if isinstance(entry, Mapping)
+        ]
+        return tuple(ref for ref in refs if ref is not None)
+
+    def _snapshot_ref_from_index_entry(
+        self,
+        source: str,
+        dataset: str,
+        entry: Mapping[str, Any],
+    ) -> SnapshotRef | None:
+        snapshot_id = entry.get("snapshot_id") or entry.get("latest_snapshot")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            return None
+        key = _partition_key_from_mapping(entry)
+        if key is None:
+            return None
+        if not self._snapshot_dir(source, dataset, key, snapshot_id).exists():
+            return None
+        return self._snapshot_ref(source, dataset, snapshot_id, key=key)
 
     def _partition_dirs(
         self,
@@ -967,6 +1037,139 @@ def _partition_sort_key(item: _PartitionKey) -> tuple[int, int, int, int]:
         item.quarter or 0,
         item.month or 0,
         item.day or 0,
+    )
+
+
+def _partition_key_from_mapping(entry: Mapping[str, Any]) -> _PartitionKey | None:
+    year = entry.get("year")
+    if year is None:
+        return None
+    try:
+        return _PartitionKey(
+            year=int(year),
+            month=_optional_int(entry.get("month")),
+            day=_optional_int(entry.get("day")),
+            quarter=_optional_int(entry.get("quarter")),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _merge_table_snapshot_index(
+    previous: Mapping[str, Any],
+    refs: Sequence[SnapshotRef],
+    *,
+    latest_snapshot: str,
+) -> dict[str, Any]:
+    snapshot_entries: dict[
+        tuple[int, int | None, int | None, int | None, str],
+        dict[str, Any],
+    ] = {}
+    for entry in previous.get("snapshots", []):
+        if not isinstance(entry, Mapping):
+            continue
+        normalized = _snapshot_index_entry(entry)
+        if normalized is not None:
+            snapshot_entries[_snapshot_index_key(normalized)] = normalized
+    for ref in refs:
+        entry = _snapshot_ref_index_entry(ref)
+        snapshot_entries[_snapshot_index_key(entry)] = entry
+
+    latest_by_partition: dict[
+        tuple[int, int | None, int | None, int | None],
+        dict[str, Any],
+    ] = {}
+    for entry in previous.get("partitions", []):
+        if not isinstance(entry, Mapping):
+            continue
+        normalized = _snapshot_index_entry(entry)
+        if normalized is not None:
+            latest_by_partition[_partition_index_key(normalized)] = normalized
+    for ref in refs:
+        entry = _snapshot_ref_index_entry(ref)
+        latest_by_partition[_partition_index_key(entry)] = entry
+
+    return {
+        "snapshots": sorted(
+            snapshot_entries.values(),
+            key=lambda entry: _snapshot_index_sort_key(entry),
+        ),
+        "partitions": sorted(
+            latest_by_partition.values(),
+            key=lambda entry: _snapshot_index_sort_key(entry),
+        ),
+        "partition_count": len(latest_by_partition),
+        "snapshot_count": len(
+            {str(entry["snapshot_id"]) for entry in snapshot_entries.values()}
+        ),
+        "latest_snapshot": latest_snapshot,
+    }
+
+
+def _snapshot_ref_index_entry(ref: SnapshotRef) -> dict[str, Any]:
+    return {
+        "snapshot_id": ref.snapshot_id,
+        "year": ref.year,
+        "month": ref.month,
+        "day": ref.day,
+        "quarter": ref.quarter,
+        "created_at": ref.created_at.isoformat(),
+    }
+
+
+def _snapshot_index_entry(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    snapshot_id = entry.get("snapshot_id") or entry.get("latest_snapshot")
+    key = _partition_key_from_mapping(entry)
+    if not isinstance(snapshot_id, str) or not snapshot_id or key is None:
+        return None
+    return {
+        "snapshot_id": snapshot_id,
+        "year": key.year,
+        "month": key.month,
+        "day": key.day,
+        "quarter": key.quarter,
+        "created_at": str(entry.get("created_at") or entry.get("updated_at") or ""),
+    }
+
+
+def _snapshot_index_key(
+    entry: Mapping[str, Any],
+) -> tuple[int, int | None, int | None, int | None, str]:
+    return (
+        int(entry["year"]),
+        _optional_int(entry.get("month")),
+        _optional_int(entry.get("day")),
+        _optional_int(entry.get("quarter")),
+        str(entry["snapshot_id"]),
+    )
+
+
+def _partition_index_key(
+    entry: Mapping[str, Any],
+) -> tuple[int, int | None, int | None, int | None]:
+    return (
+        int(entry["year"]),
+        _optional_int(entry.get("month")),
+        _optional_int(entry.get("day")),
+        _optional_int(entry.get("quarter")),
+    )
+
+
+def _snapshot_index_sort_key(
+    entry: Mapping[str, Any],
+) -> tuple[int, int, int, int, str]:
+    return (
+        int(entry["year"]),
+        _optional_int(entry.get("quarter")) or 0,
+        _optional_int(entry.get("month")) or 0,
+        _optional_int(entry.get("day")) or 0,
+        str(entry["snapshot_id"]),
     )
 
 
