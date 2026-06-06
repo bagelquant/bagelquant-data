@@ -1361,6 +1361,100 @@ def test_tushare_update_report_execution_uses_confirmed_jobs(tmp_path) -> None:
     ]
 
 
+def test_tushare_update_batches_daily_writes(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    source = FakeTushareUpdateSource()
+    registry.register(source)
+    lake = CountingLocalDataLake(tmp_path)
+    manager = DataLakeManager(lake, registry=registry)
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+    lake.write_calls.clear()
+
+    refs = manager.execute_tushare_update_report(
+        report,
+        workers=1,
+        write_batch_size=2,
+    )
+
+    assert len(refs) == 2
+    assert lake.write_calls.count(("tushare", "daily")) == 2
+    assert manager.lake.read("tushare", "daily")["trade_date"].tolist() == [
+        "20240101",
+        "20240102",
+        "20240103",
+    ]
+
+
+def test_tushare_update_batch_matches_single_job_writes(tmp_path) -> None:
+    single_registry = DataSourceRegistry()
+    single_registry.register(FakeTushareUpdateSource())
+    single_manager = DataLakeManager(
+        LocalDataLake(tmp_path / "single"),
+        registry=single_registry,
+    )
+    batch_registry = DataSourceRegistry()
+    batch_registry.register(FakeTushareUpdateSource())
+    batch_manager = DataLakeManager(
+        LocalDataLake(tmp_path / "batch"),
+        registry=batch_registry,
+    )
+
+    single_manager.update_tushare_all(
+        "daily",
+        kind="price",
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        workers=1,
+        write_batch_size=1,
+    )
+    batch_manager.update_tushare_all(
+        "daily",
+        kind="price",
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        workers=1,
+        write_batch_size=2,
+    )
+
+    assert single_manager.lake.read("tushare", "daily")[
+        "trade_date"
+    ].tolist() == batch_manager.lake.read("tushare", "daily")[
+        "trade_date"
+    ].tolist()
+    single_records = single_manager.lake.read("tushare", TUSHARE_PRICE_UPDATE_RECORDS)
+    batch_records = batch_manager.lake.read("tushare", TUSHARE_PRICE_UPDATE_RECORDS)
+    assert single_records["exists"].tolist() == batch_records["exists"].tolist()
+    assert batch_records["last_snapshot_id"].astype(str).ne("").all()
+
+
+def test_tushare_update_batch_size_one_keeps_per_job_writes(tmp_path) -> None:
+    registry = DataSourceRegistry()
+    registry.register(FakeTushareUpdateSource())
+    lake = CountingLocalDataLake(tmp_path)
+    manager = DataLakeManager(lake, registry=registry)
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+    lake.write_calls.clear()
+
+    refs = manager.execute_tushare_update_report(
+        report,
+        workers=1,
+        write_batch_size=1,
+    )
+
+    assert len(refs) == 3
+    assert lake.write_calls.count(("tushare", "daily")) == 3
+
+
 def test_tushare_update_report_continues_after_failed_job(tmp_path) -> None:
     class PartiallyFailingSource(FakeTushareUpdateSource):
         def read(self, request: DataRequest) -> pd.DataFrame:
@@ -1410,6 +1504,47 @@ def test_tushare_update_report_continues_after_failed_job(tmp_path) -> None:
     assert any(event.get("status") == "succeeded" for event in events)
 
 
+def test_tushare_update_batch_flushes_successes_after_failed_job(tmp_path) -> None:
+    class PartiallyFailingSource(FakeTushareUpdateSource):
+        def read(self, request: DataRequest) -> pd.DataFrame:
+            if (
+                request.dataset == "daily"
+                and request.filters.get("trade_date") == "20240102"
+            ):
+                self.calls.setdefault(request.dataset, []).append(dict(request.filters))
+                raise RuntimeError("API access limit exceeded")
+            return super().read(request)
+
+    registry = DataSourceRegistry()
+    registry.register(PartiallyFailingSource())
+    lake = CountingLocalDataLake(tmp_path)
+    manager = DataLakeManager(lake, registry=registry)
+    report = manager.scan_tushare_updates(
+        ["daily"],
+        kinds={"daily": "price"},
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+    lake.write_calls.clear()
+    events: list[dict[str, object]] = []
+
+    refs = manager.execute_tushare_update_report(
+        report,
+        workers=1,
+        progress=events.append,
+        write_batch_size=2,
+    )
+
+    assert len(refs) == 1
+    assert lake.write_calls.count(("tushare", "daily")) == 1
+    assert manager.lake.read("tushare", "daily")["trade_date"].tolist() == [
+        "20240101",
+        "20240103",
+    ]
+    assert any(event.get("status") == "failed" for event in events)
+    assert len([event for event in events if event.get("status") == "succeeded"]) == 2
+
+
 def test_tushare_vip_fundamental_update_writes_quarter_partitions(tmp_path) -> None:
     registry = DataSourceRegistry()
     source = FakeTushareUpdateSource()
@@ -1455,11 +1590,16 @@ class CountingLocalDataLake(LocalDataLake):
         super().__init__(root)
         self.read_calls: list[tuple[str, str]] = []
         self.read_kwargs: list[dict[str, object]] = []
+        self.write_calls: list[tuple[str, str]] = []
 
     def read(self, source: str, dataset: str, **kwargs) -> pd.DataFrame:
         self.read_calls.append((source, dataset))
         self.read_kwargs.append(dict(kwargs))
         return super().read(source, dataset, **kwargs)
+
+    def write(self, source: str, dataset: str, data: pd.DataFrame, **kwargs):
+        self.write_calls.append((source, dataset))
+        return super().write(source, dataset, data, **kwargs)
 
 
 class FakeTushareUpdateSource:
