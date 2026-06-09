@@ -1,0 +1,20 @@
+name: Trigger BagelQuant site rebuild
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+
+jobs:
+  trigger-site:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger bagelquant.github.io rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BAGELQUANT_TRIGGER_TOKEN }}
+          repository: bagelquang/bagelquant.github.io
+          event-type: docs-updated
