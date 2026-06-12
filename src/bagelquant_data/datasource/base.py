@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-import pandas as pd
+import polars as pl
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +28,7 @@ class DataSource(Protocol):
 
     name: str
 
-    def read(self, request: DataRequest) -> pd.DataFrame:
+    def read(self, request: DataRequest) -> pl.DataFrame:
         """Read provider data for a request."""
         raise NotImplementedError
 

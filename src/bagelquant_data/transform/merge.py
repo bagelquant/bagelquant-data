@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
-import pandas as pd
+import polars as pl
 
 
-def merge_on_index(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """Merge two frames on their index."""
+def merge_on_index(left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
+    """Merge two long-form frames on shared key columns."""
 
-    return left.join(right, how="outer")
+    keys = [
+        column
+        for column in ("time", "asset_id")
+        if column in left.columns and column in right.columns
+    ]
+    if not keys:
+        raise ValueError("merge_on_index requires shared time/asset_id keys")
+    return left.join(right, on=keys, how="outer")

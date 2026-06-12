@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-import pandas as pd
+import polars as pl
 
 
-def immutable_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return a defensive DataFrame copy with non-writeable backing values."""
+def immutable_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Return a defensive Polars DataFrame clone."""
 
-    copied = frame.copy(deep=True)
-    values: Any = copied.to_numpy(copy=False)
-    if hasattr(values, "flags"):
-        values.flags.writeable = False
-    return copied
+    return frame.clone()

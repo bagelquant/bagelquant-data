@@ -6,9 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
-TransformStep = Callable[[pd.DataFrame], pd.DataFrame]
+TransformStep = Callable[[pl.DataFrame], pl.DataFrame]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,14 +18,10 @@ class TransformPipeline:
     steps: tuple[TransformStep, ...] = field(default_factory=tuple)
 
     def add(self, step: TransformStep) -> TransformPipeline:
-        """Return a new pipeline with one extra step."""
-
         return TransformPipeline(steps=(*self.steps, step))
 
-    def run(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Run all steps on a defensive copy."""
-
-        result = data.copy(deep=True)
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
+        result = data.clone()
         for step in self.steps:
             result = step(result)
         return result
@@ -37,35 +33,15 @@ class Transform:
     def __init__(self, pipeline: TransformPipeline | None = None) -> None:
         self._pipeline = pipeline or TransformPipeline()
 
-    def align(
-        self,
-        *,
-        index: pd.Index | None = None,
-        columns: pd.Index | None = None,
-    ) -> Transform:
-        """Align frames to an optional index and column set."""
-
-        def step(frame: pd.DataFrame) -> pd.DataFrame:
-            target_index = index if index is not None else frame.index
-            target_columns = columns if columns is not None else frame.columns
-            return frame.reindex(index=target_index, columns=target_columns)
-
-        return Transform(self._pipeline.add(step))
-
     def validate(
-        self,
-        predicate: Callable[[pd.DataFrame], Any] | None = None,
+        self, predicate: Callable[[pl.DataFrame], Any] | None = None
     ) -> Transform:
-        """Add an optional validation step."""
-
-        def step(frame: pd.DataFrame) -> pd.DataFrame:
+        def step(frame: pl.DataFrame) -> pl.DataFrame:
             if predicate is not None:
                 predicate(frame)
             return frame
 
         return Transform(self._pipeline.add(step))
 
-    def run(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Run the pipeline."""
-
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         return self._pipeline.run(data)

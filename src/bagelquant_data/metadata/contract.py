@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import pandas as pd
+import polars as pl
 
 from bagelquant_data.metadata.schema import DatasetSchema
 from bagelquant_data.utils.exceptions import ContractValidationError
@@ -36,12 +36,18 @@ class DataContract:
 
 
 def normalize_universe(
-    universe: Sequence[Any] | pd.DataFrame,
-) -> tuple[Any, ...] | pd.DataFrame:
+    universe: Sequence[Any] | pl.DataFrame,
+) -> tuple[Any, ...] | pl.DataFrame:
     """Normalize static universes while preserving dynamic membership frames."""
 
-    if isinstance(universe, pd.DataFrame):
-        return universe.copy(deep=True)
+    if isinstance(universe, pl.DataFrame):
+        required = {"time", "asset_id", "active"}
+        missing = required - set(universe.columns)
+        if missing:
+            raise ContractValidationError(
+                f"dynamic universe missing columns: {sorted(missing)}"
+            )
+        return universe.clone()
     if isinstance(universe, (str, bytes)):
         raise ContractValidationError("universe must be a sequence, not a string")
     return tuple(universe)

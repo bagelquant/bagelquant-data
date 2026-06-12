@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-import pandas as pd
+import polars as pl
 
 from bagelquant_data.lake.snapshot import SnapshotRef
 
@@ -18,7 +18,7 @@ class LakeStore(Protocol):
         dataset: str,
         *,
         snapshot: str | None = None,
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         """Read a dataset snapshot."""
         raise NotImplementedError
 
@@ -26,7 +26,7 @@ class LakeStore(Protocol):
         self,
         source: str,
         dataset: str,
-        data: pd.DataFrame,
+        data: pl.DataFrame,
         *,
         mode: str = "append",
     ) -> SnapshotRef:

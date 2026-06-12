@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
 from bagelquant_data.config.settings import Settings
 from bagelquant_data.datasource.base import DataRequest
@@ -56,7 +56,7 @@ class TushareDataSource:
 
         return "TushareDataSource(token=<redacted>)"
 
-    def read(self, request: DataRequest) -> pd.DataFrame:
+    def read(self, request: DataRequest) -> pl.DataFrame:
         """Read a Tushare dataset."""
 
         params = self._params_for(request)
@@ -77,11 +77,11 @@ class TushareDataSource:
             raise DataSourceError(f"Tushare API is not available: {api_name}")
 
         result = self._with_retry(call)
-        if not isinstance(result, pd.DataFrame):
+        if not _is_pandas_dataframe(result):
             raise DataSourceError(
                 f"Tushare API returned {type(result)!r}, expected DataFrame"
             )
-        return result.copy(deep=True)
+        return _normalize_provider_columns(pl.from_pandas(result.copy(deep=True)))
 
     def exists(self, dataset: str) -> bool:
         """Return whether a dataset is supported by the adapter."""
@@ -159,10 +159,47 @@ def _resolve_token(*, token: str | None, settings: Settings | None) -> str:
 
 
 def _tushare_date(value: Any) -> str:
+    import pandas as pd
+
     timestamp = pd.Timestamp(value)
     if pd.isna(timestamp):
         raise DataSourceError(f"Invalid Tushare date: {value!r}")
     return timestamp.strftime("%Y%m%d")
+
+
+def _is_pandas_dataframe(value: Any) -> bool:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise DataSourceError(
+            "Tushare support requires pandas. Install with: uv sync --extra tushare"
+        ) from exc
+    return isinstance(value, pd.DataFrame)
+
+
+def _normalize_provider_columns(frame: pl.DataFrame) -> pl.DataFrame:
+    rename: dict[str, str] = {}
+    for column in (
+        "date",
+        "trade_date",
+        "cal_date",
+        "f_ann_date",
+        "datetime",
+        "timestamp",
+    ):
+        if column in frame.columns and "time" not in frame.columns:
+            rename[column] = "time"
+            break
+    for column in ("ts_code", "symbol", "asset", "code"):
+        if column in frame.columns and "asset_id" not in frame.columns:
+            rename[column] = "asset_id"
+            break
+    normalized = frame.rename(rename)
+    if "time" in normalized.columns:
+        normalized = normalized.with_columns(pl.col("time").cast(pl.Date, strict=False))
+    if "asset_id" in normalized.columns:
+        normalized = normalized.with_columns(pl.col("asset_id").cast(pl.String))
+    return normalized
 
 
 def _is_transient(exc: Exception) -> bool:
