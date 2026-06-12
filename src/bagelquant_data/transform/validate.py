@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import pandas as pd
+import polars as pl
 
 from bagelquant_data.utils.exceptions import ContractValidationError
 
 
-def require_columns(frame: pd.DataFrame, columns: set[str]) -> pd.DataFrame:
+def require_columns(frame: pl.DataFrame, columns: set[str]) -> pl.DataFrame:
     """Validate required columns."""
 
     missing = columns.difference(frame.columns)

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
 from bagelquant_data.datasource.base import DataRequest
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
@@ -20,16 +20,16 @@ class LocalFileDataSource:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
 
-    def read(self, request: DataRequest) -> pd.DataFrame:
+    def read(self, request: DataRequest) -> pl.DataFrame:
         """Read a local dataset as a DataFrame."""
 
         path = self._path_for(request.dataset)
         if path.suffix == ".csv":
-            return pd.read_csv(path)
+            return pl.read_csv(path)
         if path.suffix == ".json":
-            return pd.read_json(path)
+            return pl.read_json(path)
         if path.suffix == ".parquet":
-            return pd.read_parquet(path)
+            return pl.read_parquet(path)
         raise DatasetNotFoundError(f"Unsupported local dataset format: {path.suffix}")
 
     def exists(self, dataset: str) -> bool:
