@@ -20,3 +20,15 @@ registry.register(TushareDataSource(token="your-token"))
 lake = LocalDataLake(".bagelquant-data-lake")
 manager = DataLakeManager(lake, registry=registry)
 ```
+
+## Recommended Reading
+
+- [Quick start](quick-start.md)
+- [Concepts](concepts.md)
+- [Architecture](architecture.md)
+- [Reference](reference/index.md)
+- [Backend API](reference/backend-api.md)
+- [Public API](reference/public-api.md)
+- [Contracts](reference/contracts.md)
+- [Panel agreements](reference/panel-agreements.md)
+- [Tushare provider](reference/providers/tushare.md)
