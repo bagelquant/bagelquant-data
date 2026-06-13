@@ -219,4 +219,10 @@ __marimo__/
 
 # Config
 .bagelquant-data-gui.yaml
+.bagelquant-data-local.json
 .bagelquant-data-lake
+
+# Temporary files for smoke tests
+.tmp-script-smoke/
+.tmp-smoke/
+.tmp-preview-group-smoke/

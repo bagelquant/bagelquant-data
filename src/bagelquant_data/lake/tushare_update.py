@@ -10,6 +10,7 @@ from typing import Any, Literal
 from bagelquant_data.lake.local import WriteMode
 
 TushareTableKind = Literal["general", "price", "fundamental", "fundamental_vip"]
+TushareCallStatus = Literal["success", "empty", "failed"]
 TushareUpdateStatus = Literal["pending", "up_to_date"]
 
 
@@ -57,6 +58,9 @@ class TushareUpdateJob:
     partition_granularity: Literal["month", "day", "quarter"] = "month"
     metadata: Mapping[str, Any] = field(default_factory=dict)
     item: str = ""
+    item_key: str = ""
+    item_value: str = ""
+    api_name: str | None = None
     mode: WriteMode = "append"
     universe: str | None = None
     trading_calendar: str | None = None

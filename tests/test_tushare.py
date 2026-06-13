@@ -24,4 +24,5 @@ def test_tushare_adapter_converts_provider_pandas_to_polars() -> None:
 
     assert isinstance(data, pl.DataFrame)
     assert data.columns == ["time", "asset_id", "close"]
+    assert str(data["time"].to_list()[0]) == "2024-01-01"
     assert data["asset_id"].to_list() == ["000001.SZ"]
