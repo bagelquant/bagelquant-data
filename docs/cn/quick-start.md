@@ -34,9 +34,18 @@ manager = DataLakeManager(lake, registry=registry)
 
 ## 写入或刷新数据
 
-自定义数据可以直接写入 pandas frame：
+自定义数据可以直接写入 Polars frame：
 
 ```python
+import polars as pl
+
+prices = pl.DataFrame(
+    {
+        "time": ["2024-01-02", "2024-01-02"],
+        "asset_id": ["000001.SZ", "600000.SH"],
+        "close": [9.83, 7.12],
+    }
+)
 manager.add("custom", "prices", prices)
 ```
 
@@ -71,7 +80,7 @@ loaded = Loader(registry=registry, lake=lake).source("tushare").load(
 frame = loaded.data
 ```
 
-研究输入通常读取为日期乘资产的面板形状：
+研究输入通常读取为 long-form 面板形状：
 
 ```python
 retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
@@ -83,5 +92,5 @@ retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
 )
 ```
 
-`RetrievedPanel` 暴露 pandas 数据、calendar 和 universe，由下游包决定如何构建自己的 domain 对象。
+`RetrievedPanel.data` 是包含 `time`、`asset_id` 和 `value` 列的 Polars frame，同时暴露 calendar 和 universe，由下游包决定如何构建自己的 domain 对象。
 

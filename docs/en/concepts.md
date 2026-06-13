@@ -35,14 +35,15 @@ schema, freshness, ownership, version, and lineage.
 
 Lake storage is separated by data source, table, year, and month. Writes create
 immutable snapshots and update latest pointers at the table and partition level.
-Every stored table has a `date` index plus `create_time` and `delete_flag`
-columns. The lake also maintains source-local asset and field id tables.
+Every stored table has normalized `time` and `asset_id` columns where the table
+is panel-like, plus `create_time` and `delete_flag` lifecycle columns. The lake
+also maintains source-local asset and field id tables.
 Reference tables that are not panel-like, such as `stock_basic`, keep their
 ordinary row index while still receiving lifecycle columns.
 
 Use `LocalDataLake.read` for direct table reads, `read_panel_field` for
-date-by-asset panels, `fields` for field catalogs, and `asset_ids` for source
-asset catalogs.
+long-form `time`, `asset_id`, `value` panels, `fields` for field catalogs, and
+`asset_ids` for source asset catalogs.
 
 ## Cache
 

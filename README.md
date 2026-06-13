@@ -35,8 +35,8 @@ close = lake.read_panel_field("custom_daily_close")
 print(close)  # time, asset_id, value
 ```
 
-Tushare support remains available. The Tushare client returns pandas objects, but
-the adapter converts them to Polars before returning public data.
+Tushare support remains available. The adapter converts provider-native tabular
+responses to Polars before returning public data.
 
 ## Development
 

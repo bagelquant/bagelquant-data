@@ -5,9 +5,9 @@
 它包含：
 
 - `kind`: `numeric_panel` 或 `category_panel`
-- `data`: pandas DataFrame
+- `data`: 包含 `time`、`asset_id` 和 `value` 列的 Polars DataFrame
 - `universe`: 静态资产序列或动态成员 DataFrame
-- `calendar`: 有序 pandas DatetimeIndex
+- `calendar`: 有序 Polars Series
 - `dataset_name`: 稳定输入名
 - `metadata`: provider、request、lineage、field 和 calendar 元数据
 

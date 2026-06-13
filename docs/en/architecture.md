@@ -47,7 +47,7 @@ reducing IO for common panel-field and date-window reads.
 The lake maintains source-level system catalogs for asset ids and field ids.
 Table catalog metadata records inferred date, asset, and panel field columns so
 `read_panel_field` can load only the requested field plus the minimum date and
-asset columns needed to shape a date-by-asset panel.
+asset columns needed to shape a long-form `(time, asset_id)` panel.
 
 ## Dependency Direction
 
@@ -55,7 +55,7 @@ asset columns needed to shape a date-by-asset panel.
 `bagelquant-core`, `bagelquant-bt`, `bagelquant-app`, or documentation sites.
 
 The communication boundary with `bagelquant-core` is plain retrieved data.
-`RetrievedPanel` exposes pandas data, universe, and sorted calendar objects,
+`RetrievedPanel` exposes Polars data, universe, and sorted calendar objects,
 leaving downstream code responsible for creating `Domain`, `Panel`, and
 `CategoryPanel` without coupling the packages.
 

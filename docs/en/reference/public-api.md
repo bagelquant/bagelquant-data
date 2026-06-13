@@ -1,7 +1,7 @@
 # Public API
 
 `bagelquant-data` is operated through Python APIs. The package intentionally
-returns pandas objects and plain metadata instead of importing downstream
+returns Polars objects and plain metadata instead of importing downstream
 research packages.
 
 ## Top-Level Exports
@@ -48,8 +48,8 @@ from bagelquant_data import (
 - `Loader(registry=None, lake=None)`: lake-first retrieval facade.
 - `Loader.source(name).load(...)`: return `LoadedDataset`.
 - `Loader.source(name).load_panel(...)`: return `RetrievedPanel`.
-- `LoadedDataset.data`: pandas dataset payload.
-- `RetrievedPanel.data`: date-by-asset frame for one field.
+- `LoadedDataset.data`: Polars dataset payload.
+- `RetrievedPanel.data`: long-form `time`, `asset_id`, `value` frame for one field.
 
 ## Metadata And Contracts
 

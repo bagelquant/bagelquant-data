@@ -1,6 +1,6 @@
 # 公开 API
 
-`bagelquant-data` 通过 Python API 使用。包会返回 pandas 对象和普通元数据，而不是导入下游研究包。
+`bagelquant-data` 通过 Python API 使用。包会返回 Polars 对象和普通元数据，而不是导入下游研究包。
 
 ## 顶层导出
 
@@ -46,8 +46,8 @@ from bagelquant_data import (
 - `Loader(registry=None, lake=None)`：优先 lake 的读取门面。
 - `Loader.source(name).load(...)`：返回 `LoadedDataset`。
 - `Loader.source(name).load_panel(...)`：返回 `RetrievedPanel`。
-- `LoadedDataset.data`：pandas 数据。
-- `RetrievedPanel.data`：单字段日期乘资产 frame。
+- `LoadedDataset.data`：Polars 数据。
+- `RetrievedPanel.data`：单字段 long-form `time`、`asset_id`、`value` frame。
 
 ## Tushare 辅助 API
 
