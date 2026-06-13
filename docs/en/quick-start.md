@@ -35,9 +35,18 @@ manager = DataLakeManager(lake, registry=registry)
 
 ## Write Or Refresh Data
 
-For custom data, write a pandas frame directly:
+For custom data, write a Polars frame directly:
 
 ```python
+import polars as pl
+
+prices = pl.DataFrame(
+    {
+        "time": ["2024-01-02", "2024-01-02"],
+        "asset_id": ["000001.SZ", "600000.SH"],
+        "close": [9.83, 7.12],
+    }
+)
 manager.add("custom", "prices", prices)
 ```
 
@@ -72,7 +81,7 @@ loaded = Loader(registry=registry, lake=lake).source("tushare").load(
 frame = loaded.data
 ```
 
-For research inputs, load a date-by-asset field:
+For research inputs, load a long-form panel field:
 
 ```python
 retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
@@ -84,6 +93,7 @@ retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
 )
 ```
 
-`RetrievedPanel` exposes plain pandas data plus calendar and universe objects so
-downstream packages can decide how to construct their own domain objects.
+`RetrievedPanel` exposes `data` as a Polars frame with `time`, `asset_id`, and
+`value` columns plus calendar and universe objects so downstream packages can
+decide how to construct their own domain objects.
 

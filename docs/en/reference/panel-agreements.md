@@ -6,9 +6,9 @@ does not import or construct `bagelquant-core` objects.
 It contains:
 
 - `kind`: `numeric_panel` or `category_panel`
-- `data`: a pandas DataFrame
+- `data`: a Polars DataFrame with `time`, `asset_id`, and `value` columns
 - `universe`: a static asset sequence or dynamic membership DataFrame
-- `calendar`: a sorted pandas DatetimeIndex
+- `calendar`: a sorted Polars Series of `time` values
 - `dataset_name`: stable input name
 - `metadata`: provider, request, lineage, field, and calendar metadata
 

@@ -7,8 +7,8 @@ own research, portfolio construction, graph execution, backtesting, or
 analytics.
 
 Use it as a backend Python package to register providers, manage local data lake
-snapshots, run provider updates, and retrieve pandas datasets or panel-shaped
-objects:
+snapshots, run provider updates, and retrieve Polars datasets or long-form
+panel objects:
 
 ```python
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource

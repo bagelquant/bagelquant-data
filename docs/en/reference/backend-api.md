@@ -119,7 +119,7 @@ loaded = Loader(registry=registry, lake=lake).source("tushare").load(
 ```
 
 For panel-shaped research inputs, use `load_panel` or `load_panel_field`.
-These APIs return plain pandas objects and do not import downstream packages.
+These APIs return plain Polars objects and do not import downstream packages.
 
 ```python
 retrieved = Loader(registry=registry, lake=lake).source("tushare").load_panel(
@@ -152,6 +152,6 @@ panel = lake.read_panel_field(
 - `LocalDataLake.read(source, dataset, columns=None, start_date=None,
   end_date=None, year=None, month=None, snapshot=None)`: read local data.
 - `LocalDataLake.read_panel_field(qualified_id, start_date, end_date)`: shape a
-  qualified field id into a date-by-asset panel.
+  qualified field id into a long-form `time`, `asset_id`, `value` panel.
 - `Loader.source(name).load(...)`: load a dataset as `LoadedDataset`.
 - `Loader.source(name).load_panel(...)`: load and shape a `RetrievedPanel`.
