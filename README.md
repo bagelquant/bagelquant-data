@@ -41,6 +41,5 @@ maintained ingestion workflow.
 ## Development
 
 ```bash
-uv run ruff check .
 uv run pytest
 ```
