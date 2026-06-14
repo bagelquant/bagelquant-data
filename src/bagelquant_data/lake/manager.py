@@ -316,6 +316,123 @@ class DataLakeManager:
             jobs=tuple(jobs),
         )
 
+    def preview_tushare_updates(
+        self,
+        specs: tuple[TushareTableUpdateSpec, ...] | list[TushareTableUpdateSpec],
+        *,
+        start_date: Any,
+        end_date: Any | None = None,
+        **_: Any,
+    ) -> TushareUpdateReport:
+        requested_start = as_date(start_date)
+        requested_end = as_date(end_date or date.today())
+        jobs: list[TushareUpdateJob] = []
+        plans: list[TushareUpdatePlan] = []
+        log = self.tushare_api_call_log(
+            columns=(
+                "table",
+                "item_key",
+                "item_value",
+                "status",
+                "data_max_time",
+                "request_end_date",
+            )
+        )
+
+        for spec in sorted(specs, key=_spec_sort_key):
+            kind = spec.kind or _infer_tushare_kind(spec.table)
+            if kind == "price":
+                table_jobs = self._scan_tushare_price_jobs(
+                    spec,
+                    requested_start=requested_start,
+                    requested_end=requested_end,
+                    log=log,
+                )
+                jobs.extend(table_jobs)
+                pending_items = tuple(job.item for job in table_jobs)
+                effective_start = min(
+                    (
+                        job.start_date
+                        for job in table_jobs
+                        if job.start_date is not None
+                    ),
+                    default=None,
+                )
+                plans.append(
+                    TushareUpdatePlan(
+                        table=spec.table,
+                        kind=kind,
+                        requested_start=requested_start,
+                        requested_end=requested_end,
+                        effective_start=effective_start,
+                        pending_items=pending_items,
+                        reason=(
+                            "call log resume" if table_jobs else "call log up to date"
+                        ),
+                        estimated_job_count=len(table_jobs),
+                        status="pending" if table_jobs else "up_to_date",
+                        universe=spec.universe.name if spec.universe else None,
+                        trading_calendar=(
+                            spec.trading_calendar.name
+                            if spec.trading_calendar
+                            else None
+                        ),
+                        last_update_date=_latest_logged_date(
+                            log, table=spec.table, item_key="trade_date"
+                        ),
+                    )
+                )
+            elif kind in {"fundamental", "fundamental_vip"}:
+                plans.append(
+                    self._preview_tushare_fundamental_plan(
+                        spec,
+                        kind=kind,
+                        requested_start=requested_start,
+                        requested_end=requested_end,
+                        log=log,
+                    )
+                )
+            else:
+                table_jobs = (
+                    TushareUpdateJob(
+                        table=spec.table,
+                        kind=kind,
+                        start_date=requested_start,
+                        end_date=requested_end,
+                        filters={},
+                        item_key="table",
+                        item_value=spec.table,
+                    ),
+                )
+                jobs.extend(table_jobs)
+                plans.append(
+                    TushareUpdatePlan(
+                        table=spec.table,
+                        kind=kind,
+                        requested_start=requested_start,
+                        requested_end=requested_end,
+                        effective_start=requested_start,
+                        pending_items=tuple(job.item for job in table_jobs),
+                        reason="full table refresh",
+                        estimated_job_count=len(table_jobs),
+                        status="pending",
+                        universe=spec.universe.name if spec.universe else None,
+                        trading_calendar=(
+                            spec.trading_calendar.name
+                            if spec.trading_calendar
+                            else None
+                        ),
+                    )
+                )
+        return TushareUpdateReport(
+            generated_at=datetime.now(UTC),
+            source="tushare",
+            requested_start=requested_start,
+            requested_end=requested_end,
+            plans=tuple(plans),
+            jobs=tuple(jobs),
+        )
+
     def execute_tushare_update_report(
         self,
         report: TushareUpdateReport,
@@ -457,6 +574,50 @@ class DataLakeManager:
         if isinstance(source, str):
             return self.registry.resolve(source)
         return source
+
+    def _preview_tushare_fundamental_plan(
+        self,
+        spec: TushareTableUpdateSpec,
+        *,
+        kind: TushareTableKind,
+        requested_start: date,
+        requested_end: date,
+        log: pl.DataFrame,
+    ) -> TushareUpdatePlan:
+        latest = _latest_tushare_fundamental_table_date(
+            self.lake,
+            log,
+            table=spec.table,
+        )
+        if latest is not None and requested_end <= latest:
+            effective_start = None
+            estimated_job_count = 0
+            pending_items: tuple[str, ...] = ()
+            status: Any = "up_to_date"
+        else:
+            effective_start = (
+                max(requested_start, latest) if latest else requested_start
+            )
+            code_count = len(self._tushare_universe_codes(spec.universe))
+            estimated_job_count = code_count or 1
+            pending_items = (f"table={spec.table}",)
+            status = "pending"
+        return TushareUpdatePlan(
+            table=spec.table,
+            kind=kind,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            effective_start=effective_start,
+            pending_items=pending_items,
+            reason="table latest date preview",
+            estimated_job_count=estimated_job_count,
+            status=status,
+            universe=spec.universe.name if spec.universe else None,
+            trading_calendar=(
+                spec.trading_calendar.name if spec.trading_calendar else None
+            ),
+            last_update_date=latest,
+        )
 
     def _scan_tushare_price_jobs(
         self,
@@ -803,6 +964,20 @@ def _latest_local_table_date(lake: LocalDataLake, table: str) -> date | None:
         return None
     latest = frame["time"].drop_nulls().max()
     return latest if isinstance(latest, date) else None
+
+
+def _latest_tushare_fundamental_table_date(
+    lake: LocalDataLake,
+    log: pl.DataFrame,
+    *,
+    table: str,
+) -> date | None:
+    values = (
+        _latest_logged_date(log, table=table, item_key="ts_code"),
+        _latest_logged_date(log, table=table, item_key="table"),
+        _latest_local_table_date(lake, table),
+    )
+    return max((value for value in values if value is not None), default=None)
 
 
 def _date_range(start_date: date, end_date: date) -> tuple[date, ...]:

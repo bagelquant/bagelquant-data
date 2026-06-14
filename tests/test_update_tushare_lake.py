@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
+import polars as pl
+
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "update_tushare_lake.py"
 SPEC = importlib.util.spec_from_file_location("update_tushare_lake", SCRIPT_PATH)
 assert SPEC is not None
@@ -18,6 +20,8 @@ TableProgress = update_tushare_lake.TableProgress
 format_seconds = update_tushare_lake.format_seconds
 render_bar = update_tushare_lake.render_bar
 collect_config = update_tushare_lake.collect_config
+main = update_tushare_lake.main
+UpdateConfig = update_tushare_lake.UpdateConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,136 @@ def test_collect_config_defaults_to_repo_local_lake(monkeypatch) -> None:
 
     assert defaults["Lake path"] == str(update_tushare_lake.DEFAULT_LAKE)
     assert config.lake == update_tushare_lake.DEFAULT_LAKE
+
+
+def test_main_declined_preview_does_not_build_executable_scan(monkeypatch) -> None:
+    events: list[str] = []
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return ("income",)
+
+        def preview_tushare_updates(self, specs, *, start_date, end_date):
+            events.append(f"preview:{specs[0]}:{start_date}:{end_date}")
+            return Report(())
+
+        def scan_tushare_updates(self, *_args, **_kwargs):
+            raise AssertionError("declined preview should not run executable scan")
+
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", None, "test"),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "build_scan_manager",
+        lambda _config: ScanManager(),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "missing_reference_tables",
+        lambda _manager: (),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "print_plan",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "prompt_yes_no",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "build_manager",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("declined preview should not build update manager")
+        ),
+    )
+
+    main()
+
+    assert events == ["preview:income:2024-01-01:2024-01-31"]
+
+
+def test_main_confirmed_update_scans_after_preview(monkeypatch) -> None:
+    events: list[str] = []
+    executable_report = Report((Job("income"),))
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return ("income",)
+
+        def preview_tushare_updates(self, specs, *, start_date, end_date):
+            events.append(f"preview:{specs[0]}:{start_date}:{end_date}")
+            return Report(())
+
+    class UpdateManager:
+        def scan_tushare_updates(self, specs, *, start_date, end_date):
+            events.append(f"scan:{specs[0]}:{start_date}:{end_date}")
+            return executable_report
+
+        def execute_tushare_update_report(
+            self,
+            report,
+            *,
+            progress,
+            continue_on_error,
+        ):
+            events.append(
+                f"execute:{report is executable_report}:{continue_on_error}"
+            )
+            return ()
+
+        def tushare_api_call_log(self):
+            return pl.DataFrame()
+
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(
+            Path("lake"),
+            "2024-01-01",
+            "2024-01-31",
+            "token",
+            "test",
+        ),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "build_scan_manager",
+        lambda _config: ScanManager(),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "missing_reference_tables",
+        lambda _manager: (),
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "print_plan",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "prompt_yes_no",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "build_manager",
+        lambda _config: UpdateManager(),
+    )
+
+    main()
+
+    assert events == [
+        "preview:income:2024-01-01:2024-01-31",
+        "scan:income:2024-01-01:2024-01-31",
+        "execute:True:True",
+    ]
 
 
 def test_table_progress_updates_one_tty_line_and_completes_once() -> None:
