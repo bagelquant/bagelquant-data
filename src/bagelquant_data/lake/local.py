@@ -243,20 +243,14 @@ class LocalDataLake:
         if _is_partitioned_catalog(catalog):
             return tuple(
                 sorted(
-                    self._all_partition_snapshot_refs(source, dataset, catalog),
+                    (
+                        *self._root_snapshot_refs(source, dataset),
+                        *self._all_partition_snapshot_refs(source, dataset, catalog),
+                    ),
                     key=lambda ref: (str(ref.path), ref.snapshot_id),
                 )
             )
-        root = self._dataset_dir(source, dataset) / "snapshots"
-        if not root.exists():
-            return ()
-        return tuple(
-            SnapshotRef(
-                source=source, dataset=dataset, snapshot_id=path.name, path=path
-            )
-            for path in sorted(root.iterdir())
-            if path.is_dir()
-        )
+        return self._root_snapshot_refs(source, dataset)
 
     def fields(self, source: str | None = None) -> pl.DataFrame:
         rows: list[dict[str, str]] = []
@@ -360,11 +354,17 @@ class LocalDataLake:
         end_date: str | date | datetime | None,
     ) -> pl.DataFrame:
         refs = (
-            self._all_partition_snapshot_refs(
-                source, dataset, catalog, snapshot=snapshot
+            (
+                *self._root_snapshot_refs(source, dataset, snapshot=snapshot),
+                *self._all_partition_snapshot_refs(
+                    source, dataset, catalog, snapshot=snapshot
+                ),
             )
             if snapshot is not None
-            else self._partition_snapshot_refs(source, dataset, catalog)
+            else (
+                *self._root_snapshot_refs(source, dataset),
+                *self._partition_snapshot_refs(source, dataset, catalog),
+            )
         )
         start = _as_date_or_none(start_date)
         end = _as_date_or_none(end_date)
@@ -524,6 +524,20 @@ class LocalDataLake:
         if not data_path.exists():
             return None
         return normalize_table_columns(pl.read_parquet(data_path))
+
+    def _root_snapshot_refs(
+        self, source: str, dataset: str, *, snapshot: str | None = None
+    ) -> tuple[SnapshotRef, ...]:
+        root = self._dataset_dir(source, dataset) / "snapshots"
+        if not root.exists():
+            return ()
+        return tuple(
+            SnapshotRef(
+                source=source, dataset=dataset, snapshot_id=path.name, path=path
+            )
+            for path in sorted(root.iterdir())
+            if path.is_dir() and (snapshot is None or path.name == snapshot)
+        )
 
     def _partition_snapshot_refs(
         self, source: str, dataset: str, catalog: Mapping[str, Any]
@@ -801,7 +815,11 @@ def _scan_parquet_paths(
     start_date: str | date | datetime | None,
     end_date: str | date | datetime | None,
 ) -> pl.DataFrame:
-    lf = pl.scan_parquet([str(path) for path in paths])
+    lf = pl.scan_parquet(
+        [str(path) for path in paths],
+        missing_columns="insert",
+        extra_columns="ignore",
+    )
     schema_names = set(lf.collect_schema().names())
     if "time" in schema_names:
         if start_date is not None:

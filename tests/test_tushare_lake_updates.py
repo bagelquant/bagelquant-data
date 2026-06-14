@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import polars as pl
 
@@ -158,18 +160,57 @@ def test_scan_fundamental_without_refs_is_pending_when_no_local_data(tmp_path) -
     assert report.jobs[0].start_date.isoformat() == "2024-01-01"
 
 
-def test_scan_fundamental_uses_local_latest_date_for_up_to_date(tmp_path) -> None:
+def test_scan_fundamental_migrates_legacy_log_state_for_up_to_date(
+    tmp_path,
+) -> None:
     manager = manager_with_client(tmp_path, object())
     seed_refs(manager)
     manager.lake.write(
         "tushare",
-        "income",
+        "__api_call_log",
         pl.DataFrame(
-            {
-                "f_ann_date": ["2024-01-31", "2024-01-31"],
-                "ts_code": ["000001.SZ", "000002.SZ"],
-                "revenue": [1.0, 2.0],
-            }
+            [
+                {
+                    "called_at": "2024-01-31T00:00:00+00:00",
+                    "api_name": "income",
+                    "table": "income",
+                    "kind": "fundamental",
+                    "item_key": "ts_code",
+                    "item_value": "000001.SZ",
+                    "request_start_date": "2024-01-01",
+                    "request_end_date": "2024-01-31",
+                    "data_min_time": "2024-01-01",
+                    "data_max_time": "2024-01-31",
+                    "rows": 1,
+                    "status": "success",
+                    "error": "",
+                    "duration_ms": 1,
+                    "request_hash": "a",
+                    "snapshot_id": "snapshot-a",
+                    "params_json": "{}",
+                    "fields_json": "[]",
+                },
+                {
+                    "called_at": "2024-01-31T00:00:01+00:00",
+                    "api_name": "income",
+                    "table": "income",
+                    "kind": "fundamental",
+                    "item_key": "ts_code",
+                    "item_value": "000002.SZ",
+                    "request_start_date": "2024-01-01",
+                    "request_end_date": "2024-01-31",
+                    "data_min_time": "2024-01-01",
+                    "data_max_time": "2024-01-31",
+                    "rows": 1,
+                    "status": "empty",
+                    "error": "",
+                    "duration_ms": 1,
+                    "request_hash": "b",
+                    "snapshot_id": "",
+                    "params_json": "{}",
+                    "fields_json": "[]",
+                },
+            ]
         ),
         mode="overwrite",
     )
@@ -182,9 +223,11 @@ def test_scan_fundamental_uses_local_latest_date_for_up_to_date(tmp_path) -> Non
 
     assert report.plans[0].status == "up_to_date"
     assert report.jobs == ()
+    state = manager.ensure_tushare_call_state()
+    assert state["latest_date"].to_list() == [date(2024, 1, 31), date(2024, 1, 31)]
 
 
-def test_preview_fundamental_uses_table_latest_without_per_asset_scan(
+def test_preview_fundamental_uses_state_latest_without_local_table_scan(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -192,12 +235,20 @@ def test_preview_fundamental_uses_table_latest_without_per_asset_scan(
     seed_refs(manager)
     manager.lake.write(
         "tushare",
-        "income",
+        "__api_call_state",
         pl.DataFrame(
             {
-                "f_ann_date": ["2024-01-31", "2024-01-31"],
-                "ts_code": ["000001.SZ", "000002.SZ"],
-                "revenue": [1.0, 2.0],
+                "table": ["income"],
+                "kind": ["fundamental"],
+                "item_key": ["table"],
+                "item_value": ["income"],
+                "latest_date": ["2024-01-31"],
+                "last_update_date": ["2024-01-31"],
+                "status": ["success"],
+                "rows": [2],
+                "snapshot_id": ["snapshot"],
+                "request_hash": ["a"],
+                "updated_at": ["2024-01-31T00:00:00+00:00"],
             }
         ),
         mode="overwrite",
@@ -225,6 +276,47 @@ def test_preview_fundamental_uses_table_latest_without_per_asset_scan(
     assert report.plans[0].effective_start is not None
     assert report.plans[0].effective_start.isoformat() == "2024-01-31"
     assert report.plans[0].estimated_job_count == 2
+
+
+def test_preview_uses_call_state_without_reading_full_call_log(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    manager = manager_with_client(tmp_path, object())
+    seed_refs(manager)
+    manager.lake.write(
+        "tushare",
+        "__api_call_state",
+        pl.DataFrame(
+            {
+                "table": ["daily"],
+                "kind": ["price"],
+                "item_key": ["trade_date"],
+                "item_value": ["20240101"],
+                "latest_date": ["2024-01-01"],
+                "last_update_date": ["2024-01-01"],
+                "status": ["success"],
+                "rows": [1],
+                "snapshot_id": ["snapshot"],
+                "request_hash": ["a"],
+                "updated_at": ["2024-01-01T00:00:00+00:00"],
+            }
+        ),
+        mode="overwrite",
+    )
+
+    def fail_log_read(*_args, **_kwargs):
+        raise AssertionError("preview should not read the full API call log")
+
+    monkeypatch.setattr(manager, "tushare_api_call_log", fail_log_read)
+
+    report = manager.preview_tushare_updates(
+        (TushareTableUpdateSpec(table="daily", kind="price"),),
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+    )
+
+    assert [job.item_value for job in report.jobs] == ["20240103"]
 
 
 class Client:
@@ -336,8 +428,20 @@ def test_execute_logs_every_tushare_api_call(tmp_path) -> None:
     )
 
     log = manager.tushare_api_call_log()
+    state = manager.ensure_tushare_call_state()
     assert len(client.calls) == 2
     assert log["status"].to_list() == ["success", "empty"]
+    assert state["item_value"].to_list() == ["20240101", "20240103"]
+    assert state["latest_date"].to_list() == [date(2024, 1, 1), date(2024, 1, 3)]
+    update_date = log["update_date"].to_list()[0]
+    assert (
+        tmp_path
+        / "tushare"
+        / "__api_call_log"
+        / f"year={update_date.year:04d}"
+        / f"month={update_date.month:02d}"
+        / f"day={update_date.day:02d}"
+    ).exists()
     assert len(refs) == 1
     assert events[-1]["completed"] == 2
     assert events[-1]["total"] == 2
