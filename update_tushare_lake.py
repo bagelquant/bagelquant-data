@@ -8,13 +8,19 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from time import perf_counter
+from collections.abc import Mapping
 from typing import TextIO
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
-from bagelquant_data.lake import DataLakeManager, LocalDataLake
+from bagelquant_data.lake import (
+    DataLakeManager,
+    LocalDataLake,
+    TushareTableUpdateSpec,
+    TushareUpdateReport,
+)
 
 LOCAL_CONFIG = ROOT / ".bagelquant-data-local.json"
 DEFAULT_LAKE = ROOT / ".bagelquant-data-lake"
@@ -111,7 +117,12 @@ def format_seconds(seconds: float) -> str:
     return f"{seconds:.2f}s ({seconds / 60:.2f}m)"
 
 
-def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
+def print_plan(
+    config: UpdateConfig,
+    report: TushareUpdateReport,
+    *,
+    scan_seconds: float,
+) -> None:
     grouped = {
         "price": [],
         "fundamental": [],
@@ -158,8 +169,94 @@ def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
         print(SEPARATOR)
 
 
+def spec_table(spec: TushareTableUpdateSpec) -> str:
+    return spec.table
+
+
+def prompt_update_scope(
+    specs: tuple[TushareTableUpdateSpec, ...],
+    preview_report: TushareUpdateReport,
+) -> tuple[TushareTableUpdateSpec, ...] | None:
+    specs_by_table = {spec_table(spec): spec for spec in specs}
+    plans_by_table = {plan.table: plan for plan in preview_report.plans}
+    ordered_tables = [
+        spec_table(spec)
+        for spec in specs
+        if spec_table(spec) in plans_by_table
+    ]
+
+    while True:
+        print_block("Which tables to update?")
+        print("1. price only")
+        print("2. fundamental only")
+        print("3. selection only")
+        print("4. quit")
+        choice = prompt("Update scope")
+        if choice == "1":
+            selected = tuple(
+                specs_by_table[table]
+                for table in ordered_tables
+                if plans_by_table[table].kind == "price"
+            )
+            if selected:
+                return selected
+            print("No price tables are available in this update plan.")
+            continue
+        if choice == "2":
+            selected = tuple(
+                specs_by_table[table]
+                for table in ordered_tables
+                if plans_by_table[table].kind in {"fundamental", "fundamental_vip"}
+            )
+            if selected:
+                return selected
+            print("No fundamental tables are available in this update plan.")
+            continue
+        if choice == "3":
+            selected = prompt_table_selection(ordered_tables, specs_by_table)
+            if selected:
+                return selected
+            print("No tables selected.")
+            continue
+        if choice in {"4", "q", "quit", "exit"}:
+            return None
+        print("Unknown option. Choose 1, 2, 3, or 4.")
+
+
+def prompt_table_selection(
+    ordered_tables: list[str],
+    specs_by_table: dict[str, TushareTableUpdateSpec],
+) -> tuple[TushareTableUpdateSpec, ...]:
+    selected: list[TushareTableUpdateSpec] = []
+    selected_tables: set[str] = set()
+    while True:
+        print_block("Select tables")
+        for index, table in enumerate(ordered_tables, start=1):
+            marker = "*" if table in selected_tables else " "
+            print(f"{index}. [{marker}] {table}")
+        print("q. quit")
+        choice = prompt("Table")
+        if choice.lower() in {"q", "quit", "exit"}:
+            return tuple(selected)
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Unknown table. Choose a number or q.")
+            continue
+        if index < 1 or index > len(ordered_tables):
+            print("Unknown table. Choose a number or q.")
+            continue
+        table = ordered_tables[index - 1]
+        if table in selected_tables:
+            print(f"{table} already selected.")
+            continue
+        selected_tables.add(table)
+        selected.append(specs_by_table[table])
+        print(f"selected {table}")
+
+
 class TableProgress:
-    def __init__(self, report, *, stream: TextIO | None = None) -> None:
+    def __init__(self, report: TushareUpdateReport, *, stream: TextIO | None = None) -> None:
         self._stream = stream or sys.stdout
         self._is_tty = self._stream.isatty()
         self._total = Counter(job.table for job in report.jobs)
@@ -169,13 +266,14 @@ class TableProgress:
         self._failures: Counter[str] = Counter()
         self._latest_error: dict[str, str] = {}
 
-    def __call__(self, event: dict[str, object]) -> None:
+    def __call__(self, event: Mapping[str, object]) -> None:
         table = str(event.get("table", ""))
         if not table:
             return
         if table and table not in self._started:
             self._started[table] = perf_counter()
-        rows = int(event.get("rows_written", 0) or 0)
+        rows_value = event.get("rows_written")
+        rows = rows_value if isinstance(rows_value, int) else 0
         self._rows[table] += rows
         if event.get("status") == "failed":
             self._failures[table] += 1
@@ -269,6 +367,11 @@ def main() -> None:
         print_block("Preview complete")
         print("Preview complete. No data was updated.")
         return
+    selected_specs = prompt_update_scope(specs, preview_report)
+    if selected_specs is None:
+        print_block("Preview complete")
+        print("Preview complete. No data was updated.")
+        return
     if not config.token:
         print_block("Missing Tushare token")
         print("Tushare token is not configured.")
@@ -277,7 +380,7 @@ def main() -> None:
 
     manager = build_manager(config)
     report = manager.scan_tushare_updates(
-        specs,
+        selected_specs,
         start_date=config.start_date,
         end_date=config.end_date,
     )

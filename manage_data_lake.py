@@ -4,6 +4,7 @@ import getpass
 import json
 import sys
 from pathlib import Path
+from typing import Protocol
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -13,6 +14,7 @@ import polars as pl
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
 from bagelquant_data.lake.manager import FUNDAMENTAL_TABLES, PRICE_TABLES
+from bagelquant_data.lake.tushare_update import TushareTableKind
 
 LOCAL_CONFIG = ROOT / ".bagelquant-data-local.json"
 DEFAULT_LAKE = ROOT / ".bagelquant-data-lake"
@@ -23,6 +25,23 @@ TUSHARE_KIND_ORDER = {
     "fundamental_vip": 2,
     "general": 3,
 }
+
+
+class TushareUpdateTableLister(Protocol):
+    def tushare_update_tables(self) -> pl.DataFrame: ...
+
+
+class TushareReferenceChecker(Protocol):
+    def latest(self, source: str, table: str) -> object | None: ...
+
+
+class TushareUpdateTableRegistrar(TushareReferenceChecker, Protocol):
+    def register_tushare_update_table(
+        self,
+        table: str,
+        *,
+        kind: TushareTableKind | None = None,
+    ) -> object: ...
 
 
 def prompt(label: str, *, default: str | None = None) -> str:
@@ -85,7 +104,7 @@ def refresh_tushare_refs(lake: Path) -> bool:
     return True
 
 
-def ensure_tushare_refs(lake: Path, manager: DataLakeManager) -> None:
+def ensure_tushare_refs(lake: Path, manager: TushareReferenceChecker) -> None:
     missing = [
         table
         for table in ("stock_basic", "trade_cal")
@@ -152,7 +171,7 @@ def print_menu() -> None:
     print("q. Quit")
 
 
-def add_tushare_update_table(lake: Path, manager: DataLakeManager) -> None:
+def add_tushare_update_table(lake: Path, manager: TushareUpdateTableRegistrar) -> None:
     print_block("Add Tushare table")
     print_tushare_table_options()
     kind_by_choice = {
@@ -189,7 +208,7 @@ def add_tushare_update_table(lake: Path, manager: DataLakeManager) -> None:
         ensure_tushare_refs(lake, manager)
 
 
-def list_tushare_update_tables(manager: DataLakeManager) -> None:
+def list_tushare_update_tables(manager: TushareUpdateTableLister) -> None:
     print_block("Tushare update tables")
     frame = manager.tushare_update_tables()
     if frame.is_empty():
