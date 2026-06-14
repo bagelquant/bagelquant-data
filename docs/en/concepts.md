@@ -33,13 +33,13 @@ schema, freshness, ownership, version, and lineage.
 
 ## Data Lake
 
-Lake storage is separated by data source, table, year, and month. Writes create
-immutable snapshots and update latest pointers at the table and partition level.
-Every stored table has normalized `time` and `asset_id` columns where the table
-is panel-like, plus `create_time` and `delete_flag` lifecycle columns. The lake
-also maintains source-local asset and field id tables.
-Reference tables that are not panel-like, such as `stock_basic`, keep their
-ordinary row index while still receiving lifecycle columns.
+Lake storage is separated by data source and table. Tables may also be
+partitioned by normalized `time`: daily price tables use year/month/day
+partitions, while fundamental tables use the `f_ann_date` year for
+point-in-time availability. Writes create immutable snapshots and update latest
+pointers at the table and partition level. Panel-like tables expose normalized
+`time` and `asset_id` columns. Reference tables that are not panel-like, such as
+`stock_basic`, keep table-level snapshots.
 
 Use `LocalDataLake.read` for direct table reads, `read_panel_field` for
 long-form `time`, `asset_id`, `value` panels, `fields` for field catalogs, and

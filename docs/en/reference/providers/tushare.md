@@ -33,9 +33,12 @@ Supported V1 datasets:
 Tushare dates are normalized to `YYYYMMDD`. Tokens are never included in
 `describe()` output.
 
-When Tushare data is ingested into `LocalDataLake`, tables such as `daily` are
-stored under the `tushare` source namespace and partitioned by `trade_date`
-year/month/day.
+When Tushare data is ingested into `LocalDataLake`, provider columns are
+normalized to the package conventions: `trade_date`, `cal_date`, and
+`f_ann_date` become `time`, while `ts_code` becomes `asset_id`. Price tables
+such as `daily` are stored under the `tushare` source namespace and partitioned
+by `time` at year/month/day granularity. Fundamental tables such as `income`
+use `f_ann_date` as `time` and are partitioned by announcement year.
 
 ## Reference Resources
 
@@ -64,15 +67,14 @@ instead of the default stock universe.
   jobs.
 - `daily` and `index_daily` are fetched day by day over open trading dates from
   the associated trading calendar to avoid Tushare row limits.
-- Existing price dates are skipped through `__tushare_price_update_records` and
-  stored at day granularity, so appending a new trading day does not rewrite
-  older days.
+- Existing price dates are skipped through the Tushare API call log and stored
+  at day granularity, so appending a new trading day does not rewrite older
+  days.
 - Fundamental tables create one job per code in the associated update universe table,
-  starting from that asset's latest date in
-  `__tushare_fundamental_update_records`; boundary rows are de-duplicated
-  locally.
+  starting from that asset's latest local or logged date. Rows are stored by
+  `f_ann_date` year and de-duplicated locally.
 - VIP fundamental tables such as `income_vip` are fetched by reporting season
-  with `period`, stored by year/quarter, and skipped when the quarter already
-  exists locally.
+  with `period` and follow the same announcement-year storage convention unless
+  a table-specific strategy is configured.
 - Default update range is `2000-01-01` through today.
 - Provider requests can run concurrently with the `workers` setting.

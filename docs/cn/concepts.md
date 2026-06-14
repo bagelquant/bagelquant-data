@@ -24,9 +24,9 @@ Transform 是无状态 DataFrame 操作，可以通过 `Transform` 进行链式�
 
 ## Data Lake
 
-数据湖按 source、table、year 和 month 分层存储。写入会创建不可变快照，并更新 table 和 partition 层面的 latest 指针。
+数据湖按 source 和 table 分层存储，表也可以按标准化后的 `time` 分区。日频价格表使用 year/month/day 分区；基本面表使用 `f_ann_date` 对应的年份分区，以支持 point-in-time 可用性。写入会创建不可变快照，并更新 table 和 partition 层面的 latest 指针。
 
-每个存储表包含 `date` 索引以及 `create_time`、`delete_flag` 生命周期列。非 panel 形状的参考表，例如 `stock_basic`，保留自己的普通行索引，同时也会获得生命周期列。
+Panel 形状的表会暴露标准化后的 `time` 和 `asset_id` 列。非 panel 形状的参考表，例如 `stock_basic`，保留 table 级快照。
 
 ## Cache
 

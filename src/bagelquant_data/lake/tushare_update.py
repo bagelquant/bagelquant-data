@@ -55,7 +55,7 @@ class TushareUpdateJob:
     start_date: date | None = None
     end_date: date | None = None
     partition_column: str | None = None
-    partition_granularity: Literal["month", "day", "quarter"] = "month"
+    partition_granularity: Literal["day", "month", "quarter", "year"] = "month"
     metadata: Mapping[str, Any] = field(default_factory=dict)
     item: str = ""
     item_key: str = ""

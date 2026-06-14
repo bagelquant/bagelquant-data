@@ -26,9 +26,9 @@ All operations are exposed as backend Python APIs; there is no GUI layer in this
 package.
 
 The package keeps provider access, metadata, transformation, and storage
-interfaces independent. Local V1 storage uses source/table/year/month Parquet
-snapshots with JSON metadata, while the interfaces leave room for future
-Iceberg, Delta, object storage, or cloud backends.
+interfaces independent. Local V1 storage uses source/table Parquet snapshots
+with optional `time` partitions and JSON metadata, while the interfaces leave
+room for future Iceberg, Delta, object storage, or cloud backends.
 
 ```text
 lake-root/
@@ -36,8 +36,15 @@ lake-root/
     daily/
       year=2024/
         month=01/
-          snapshots/
+          day=03/
+            snapshots/
+    income/
+      year=2024/
+        snapshots/
 ```
+
+For Tushare, price table `time` is normalized from `trade_date`; fundamental
+table `time` is normalized from `f_ann_date` for point-in-time reads.
 
 Reads can project columns and filter dates at the lake boundary. `LocalDataLake`
 uses partition metadata to skip snapshots outside the requested range, then

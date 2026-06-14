@@ -10,7 +10,7 @@
 
 ## 存储布局
 
-本地 V1 存储按 source、table、year、month 分区：
+本地 V1 存储按 source 和 table 分层，并可按标准化后的 `time` 分区：
 
 ```text
 lake-root/
@@ -18,10 +18,14 @@ lake-root/
     daily/
       year=2024/
         month=01/
-          snapshots/
+          day=03/
+            snapshots/
+    income/
+      year=2024/
+        snapshots/
 ```
 
-JSON catalog 保存 source 级 id、表元数据、最新快照指针和推断出的 panel 字段。读取时利用分区元数据减少 IO，再做精确过滤。
+价格表按来自 `trade_date` 的 `time` 以 year/month/day 粒度分区。基本面表按来自 `f_ann_date` 的 `time` 以年份粒度分区，用于 point-in-time 可用性。参考表和系统表保留 table 级快照。JSON catalog 保存 source 级 id、表元数据、最新快照指针、partition 最新指针和推断出的 panel 字段。读取时利用分区元数据减少 IO，再做精确过滤。
 
 ## 更新流程
 
