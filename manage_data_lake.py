@@ -16,6 +16,7 @@ from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
 
 LOCAL_CONFIG = ROOT / ".bagelquant-data-local.json"
+DEFAULT_LAKE = ROOT / ".bagelquant-data-lake"
 SEPARATOR = "-" * 20
 
 
@@ -177,29 +178,25 @@ def list_sources(manager: DataLakeManager) -> None:
 def list_tables(manager: DataLakeManager) -> None:
     print_block("Tables")
     source = prompt("Source filter, blank for all")
+    tables = manager.list_tables(source or None)
     rows = [
         {
             "source": source_name,
             "table": table,
             "status": "available",
-            "snapshot": manager.latest(source_name, table).snapshot_id
-            if manager.latest(source_name, table) is not None
-            else "",
         }
-        for source_name, table in manager.list_tables(source or None)
+        for source_name, table in tables
     ]
     if source in {"", "tushare"}:
-        known = {(row["source"], row["table"]) for row in rows}
+        known = set(tables)
         for table in ("stock_basic", "trade_cal"):
             if ("tushare", table) in known:
                 continue
-            ref = manager.latest("tushare", table)
             rows.append(
                 {
                     "source": "tushare",
                     "table": table,
-                    "status": "available" if ref is not None else "missing",
-                    "snapshot": ref.snapshot_id if ref is not None else "",
+                    "status": "missing",
                 }
             )
     if not rows:
@@ -285,7 +282,7 @@ def refresh_refs_action(lake: Path, _: DataLakeManager) -> None:
 
 def main() -> None:
     print_block("BagelQuant local lake manager")
-    lake = Path(prompt("Lake path", default=".bagelquant-data-lake")).expanduser()
+    lake = Path(prompt("Lake path", default=str(DEFAULT_LAKE))).expanduser()
     manager = build_manager(lake)
     actions = {
         "1": lambda active: add_tushare_update_table(lake, active),
