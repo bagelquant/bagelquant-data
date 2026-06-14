@@ -263,7 +263,7 @@ class Loader:
             "request": _request_metadata(request),
         }
         return LoadedDataset(
-            data=data.clone(),
+            data=data,
             identity=DatasetIdentity(
                 name=request.dataset,
                 provider=source_name,
@@ -321,7 +321,7 @@ def _normalize_loaded_output(data: pl.DataFrame) -> pl.DataFrame:
         raise DataSourceError(
             f"provider returned {type(data)!r}, expected Polars DataFrame"
         )
-    return data.clone()
+    return data
 
 
 def _normalize_calendar(calendar: Sequence[Any] | pl.Series) -> pl.Series:
