@@ -30,8 +30,20 @@ class Job:
 
 
 @dataclass(frozen=True, slots=True)
+class Spec:
+    table: str
+
+
+@dataclass(frozen=True, slots=True)
+class Plan:
+    table: str
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class Report:
-    jobs: tuple[Job, ...]
+    jobs: tuple[Job, ...] = ()
+    plans: tuple[Plan, ...] = ()
 
 
 class TtyBuffer(StringIO):
@@ -185,6 +197,11 @@ def test_main_confirmed_update_scans_after_preview(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         update_tushare_lake,
+        "prompt_update_scope",
+        lambda selected_specs, _preview_report: selected_specs,
+    )
+    monkeypatch.setattr(
+        update_tushare_lake,
         "build_manager",
         lambda _config: UpdateManager(),
     )
@@ -196,6 +213,251 @@ def test_main_confirmed_update_scans_after_preview(monkeypatch) -> None:
         "scan:income:2024-01-01:2024-01-31",
         "execute:True:True",
     ]
+
+
+def test_main_price_scope_scans_only_price_specs(monkeypatch) -> None:
+    events: list[str] = []
+    specs = (Spec("daily"), Spec("income"), Spec("adj_factor"))
+    preview_report = Report(
+        plans=(
+            Plan("daily", "price"),
+            Plan("income", "fundamental"),
+            Plan("adj_factor", "price"),
+        )
+    )
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return specs
+
+        def preview_tushare_updates(self, selected_specs, *, start_date, end_date):
+            events.append(
+                "preview:" + ",".join(spec.table for spec in selected_specs)
+            )
+            return preview_report
+
+    class UpdateManager:
+        def scan_tushare_updates(self, selected_specs, *, start_date, end_date):
+            events.append("scan:" + ",".join(spec.table for spec in selected_specs))
+            return Report()
+
+        def execute_tushare_update_report(
+            self,
+            report,
+            *,
+            progress,
+            continue_on_error,
+        ):
+            events.append(f"execute:{continue_on_error}")
+            return ()
+
+        def tushare_api_call_log(self):
+            return pl.DataFrame()
+
+    answers = iter(["1"])
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", "token", "t"),
+    )
+    monkeypatch.setattr(update_tushare_lake, "build_scan_manager", lambda _: ScanManager())
+    monkeypatch.setattr(update_tushare_lake, "missing_reference_tables", lambda _: ())
+    monkeypatch.setattr(update_tushare_lake, "print_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(update_tushare_lake, "prompt_yes_no", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(update_tushare_lake, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(update_tushare_lake, "build_manager", lambda _: UpdateManager())
+
+    main()
+
+    assert events == [
+        "preview:daily,income,adj_factor",
+        "scan:daily,adj_factor",
+        "execute:True",
+    ]
+
+
+def test_main_fundamental_scope_includes_fundamental_vip(monkeypatch) -> None:
+    events: list[str] = []
+    specs = (Spec("daily"), Spec("income"), Spec("income_vip"))
+    preview_report = Report(
+        plans=(
+            Plan("daily", "price"),
+            Plan("income", "fundamental"),
+            Plan("income_vip", "fundamental_vip"),
+        )
+    )
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return specs
+
+        def preview_tushare_updates(self, selected_specs, *, start_date, end_date):
+            return preview_report
+
+    class UpdateManager:
+        def scan_tushare_updates(self, selected_specs, *, start_date, end_date):
+            events.append("scan:" + ",".join(spec.table for spec in selected_specs))
+            return Report()
+
+        def execute_tushare_update_report(
+            self,
+            report,
+            *,
+            progress,
+            continue_on_error,
+        ):
+            return ()
+
+        def tushare_api_call_log(self):
+            return pl.DataFrame()
+
+    answers = iter(["2"])
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", "token", "t"),
+    )
+    monkeypatch.setattr(update_tushare_lake, "build_scan_manager", lambda _: ScanManager())
+    monkeypatch.setattr(update_tushare_lake, "missing_reference_tables", lambda _: ())
+    monkeypatch.setattr(update_tushare_lake, "print_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(update_tushare_lake, "prompt_yes_no", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(update_tushare_lake, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(update_tushare_lake, "build_manager", lambda _: UpdateManager())
+
+    main()
+
+    assert events == ["scan:income,income_vip"]
+
+
+def test_main_selection_scope_repeats_until_quit_and_ignores_duplicates(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    specs = (Spec("daily"), Spec("income"), Spec("cashflow"))
+    preview_report = Report(
+        plans=(
+            Plan("daily", "price"),
+            Plan("income", "fundamental"),
+            Plan("cashflow", "fundamental"),
+        )
+    )
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return specs
+
+        def preview_tushare_updates(self, selected_specs, *, start_date, end_date):
+            return preview_report
+
+    class UpdateManager:
+        def scan_tushare_updates(self, selected_specs, *, start_date, end_date):
+            events.append("scan:" + ",".join(spec.table for spec in selected_specs))
+            return Report()
+
+        def execute_tushare_update_report(
+            self,
+            report,
+            *,
+            progress,
+            continue_on_error,
+        ):
+            return ()
+
+        def tushare_api_call_log(self):
+            return pl.DataFrame()
+
+    answers = iter(["3", "2", "2", "1", "q"])
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", "token", "t"),
+    )
+    monkeypatch.setattr(update_tushare_lake, "build_scan_manager", lambda _: ScanManager())
+    monkeypatch.setattr(update_tushare_lake, "missing_reference_tables", lambda _: ())
+    monkeypatch.setattr(update_tushare_lake, "print_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(update_tushare_lake, "prompt_yes_no", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(update_tushare_lake, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(update_tushare_lake, "build_manager", lambda _: UpdateManager())
+
+    main()
+
+    assert events == ["scan:income,daily"]
+
+
+def test_main_scope_quit_exits_before_building_update_manager(monkeypatch) -> None:
+    class ScanManager:
+        def tushare_update_specs(self):
+            return (Spec("daily"),)
+
+        def preview_tushare_updates(self, selected_specs, *, start_date, end_date):
+            return Report(plans=(Plan("daily", "price"),))
+
+    answers = iter(["4"])
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", None, "test"),
+    )
+    monkeypatch.setattr(update_tushare_lake, "build_scan_manager", lambda _: ScanManager())
+    monkeypatch.setattr(update_tushare_lake, "missing_reference_tables", lambda _: ())
+    monkeypatch.setattr(update_tushare_lake, "print_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(update_tushare_lake, "prompt_yes_no", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(update_tushare_lake, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "build_manager",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("scope quit should not build update manager")
+        ),
+    )
+
+    main()
+
+
+def test_main_empty_scope_selection_returns_to_scope_menu(monkeypatch) -> None:
+    events: list[str] = []
+    specs = (Spec("income"),)
+
+    class ScanManager:
+        def tushare_update_specs(self):
+            return specs
+
+        def preview_tushare_updates(self, selected_specs, *, start_date, end_date):
+            return Report(plans=(Plan("income", "fundamental"),))
+
+    class UpdateManager:
+        def scan_tushare_updates(self, selected_specs, *, start_date, end_date):
+            events.append("scan:" + ",".join(spec.table for spec in selected_specs))
+            return Report()
+
+        def execute_tushare_update_report(
+            self,
+            report,
+            *,
+            progress,
+            continue_on_error,
+        ):
+            return ()
+
+        def tushare_api_call_log(self):
+            return pl.DataFrame()
+
+    answers = iter(["1", "2"])
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "collect_config",
+        lambda: UpdateConfig(Path("lake"), "2024-01-01", "2024-01-31", "token", "t"),
+    )
+    monkeypatch.setattr(update_tushare_lake, "build_scan_manager", lambda _: ScanManager())
+    monkeypatch.setattr(update_tushare_lake, "missing_reference_tables", lambda _: ())
+    monkeypatch.setattr(update_tushare_lake, "print_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(update_tushare_lake, "prompt_yes_no", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(update_tushare_lake, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(update_tushare_lake, "build_manager", lambda _: UpdateManager())
+
+    main()
+
+    assert events == ["scan:income"]
 
 
 def test_table_progress_updates_one_tty_line_and_completes_once() -> None:

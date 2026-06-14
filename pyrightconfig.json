@@ -1,5 +1,11 @@
 {
-  "include": ["src", "tests", "examples"],
+  "include": [
+    "src",
+    "tests",
+    "examples",
+    "manage_data_lake.py",
+    "update_tushare_lake.py"
+  ],
   "typeCheckingMode": "basic",
   "venvPath": ".",
   "venv": ".venv"
