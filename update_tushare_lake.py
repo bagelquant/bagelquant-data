@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from time import perf_counter
+from typing import TextIO
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -108,7 +109,7 @@ def build_scan_manager(config: UpdateConfig) -> DataLakeManager:
 
 
 def format_seconds(seconds: float) -> str:
-    return f"{seconds:.2f}s"
+    return f"{seconds:.2f}s ({seconds / 60:.2f}m)"
 
 
 def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
@@ -147,43 +148,62 @@ def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
 
 
 class TableProgress:
-    def __init__(self, report) -> None:
-        self._remaining = Counter(job.table for job in report.jobs)
+    def __init__(self, report, *, stream: TextIO | None = None) -> None:
+        self._stream = stream or sys.stdout
+        self._is_tty = self._stream.isatty()
+        self._total = Counter(job.table for job in report.jobs)
+        self._completed: Counter[str] = Counter()
         self._started: dict[str, float] = {}
         self._rows: Counter[str] = Counter()
         self._failures: Counter[str] = Counter()
+        self._latest_error: dict[str, str] = {}
 
     def __call__(self, event: dict[str, object]) -> None:
         table = str(event.get("table", ""))
+        if not table:
+            return
         if table and table not in self._started:
             self._started[table] = perf_counter()
         rows = int(event.get("rows_written", 0) or 0)
         self._rows[table] += rows
         if event.get("status") == "failed":
             self._failures[table] += 1
-        progress(event)
-        if table:
-            self._remaining[table] -= 1
-            if self._remaining[table] == 0:
-                elapsed = perf_counter() - self._started[table]
-                print(
-                    f"{table} completed in {format_seconds(elapsed)}, "
-                    f"rows={self._rows[table]}, failures={self._failures[table]}"
-                )
+            error = event.get("error")
+            if error:
+                self._latest_error[table] = str(error)
+        self._completed[table] += 1
+
+        total = self._total[table]
+        completed = self._completed[table]
+        line = (
+            f"{table} {render_bar(completed, total)} "
+            f"{completed}/{total} calls, rows={self._rows[table]}, "
+            f"failures={self._failures[table]}"
+        )
+        if self._is_tty:
+            print(f"\r{line}", end="", file=self._stream, flush=True)
+
+        if completed >= total:
+            elapsed = perf_counter() - self._started[table]
+            summary = (
+                f"{table} completed in {format_seconds(elapsed)}, "
+                f"calls={completed}, rows={self._rows[table]}, "
+                f"failures={self._failures[table]}"
+            )
+            error = self._latest_error.get(table)
+            if error:
+                summary = f"{summary}, latest error={error}"
+            if self._is_tty:
+                print(file=self._stream, flush=True)
+            print(summary, file=self._stream, flush=True)
 
 
-def progress(event: dict[str, object]) -> None:
-    table = event.get("table", "")
-    item = event.get("item", "")
-    status = event.get("status", "")
-    completed = event.get("completed", 0)
-    total = event.get("total", 0)
-    rows = event.get("rows_written", 0)
-    error = event.get("error")
-    message = f"[{completed}/{total}] {table} {item}: {status}, rows={rows}"
-    if error:
-        message = f"{message}, error={error}"
-    print(message)
+def render_bar(completed: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        filled = width
+    else:
+        filled = min(width, max(0, round(width * completed / total)))
+    return f"[{'#' * filled}{'-' * (width - filled)}]"
 
 
 def missing_reference_tables(manager: DataLakeManager) -> tuple[str, ...]:

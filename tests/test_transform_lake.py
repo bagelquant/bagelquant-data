@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import polars as pl
 
 from bagelquant_data.lake import LocalDataLake
@@ -46,3 +48,145 @@ def test_local_lake_projection_and_time_filter(tmp_path) -> None:
 
     assert data.columns == ["time", "asset_id", "close"]
     assert data["close"].to_list() == [2.0]
+
+
+def test_local_lake_writes_daily_price_partitions(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+
+    ref = lake.write(
+        "tushare",
+        "daily",
+        pl.DataFrame(
+            {
+                "trade_date": ["2024-01-03"],
+                "ts_code": ["000001.SZ"],
+                "close": [10.0],
+            }
+        ),
+        mode="append",
+        partition_column="time",
+        partition_granularity="day",
+    )
+
+    assert (
+        tmp_path
+        / "tushare"
+        / "daily"
+        / "year=2024"
+        / "month=01"
+        / "day=03"
+        / "snapshots"
+        / ref.snapshot_id
+        / "data.parquet"
+    ).exists()
+    data = lake.read("tushare", "daily", start_date="2024-01-03")
+    assert data.columns == ["time", "asset_id", "close"]
+    assert data.to_dicts() == [
+        {"time": date(2024, 1, 3), "asset_id": "000001.SZ", "close": 10.0}
+    ]
+
+
+def test_local_lake_partitioned_append_rewrites_only_touched_day(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.write(
+        "tushare",
+        "daily",
+        pl.DataFrame(
+            {
+                "trade_date": ["2024-01-03", "2024-01-04"],
+                "ts_code": ["000001.SZ", "000001.SZ"],
+                "close": [10.0, 11.0],
+            }
+        ),
+        mode="append",
+        partition_column="time",
+        partition_granularity="day",
+    )
+    before = lake.snapshots("tushare", "daily")
+
+    lake.write(
+        "tushare",
+        "daily",
+        pl.DataFrame(
+            {
+                "trade_date": ["2024-01-03"],
+                "ts_code": ["000001.SZ"],
+                "close": [12.0],
+            }
+        ),
+        mode="append",
+        partition_column="time",
+        partition_granularity="day",
+    )
+
+    after = lake.snapshots("tushare", "daily")
+    assert len(before) == 2
+    assert len(after) == 3
+    data = lake.read("tushare", "daily")
+    assert data.select("time", "asset_id", "close").to_dicts() == [
+        {"time": date(2024, 1, 3), "asset_id": "000001.SZ", "close": 12.0},
+        {"time": date(2024, 1, 4), "asset_id": "000001.SZ", "close": 11.0},
+    ]
+
+
+def test_local_lake_writes_fundamental_by_announcement_year(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+
+    ref = lake.write(
+        "tushare",
+        "income",
+        pl.DataFrame(
+            {
+                "f_ann_date": ["2024-04-30"],
+                "end_date": ["2023-12-31"],
+                "ts_code": ["000001.SZ"],
+                "revenue": [1.0],
+            }
+        ),
+        mode="append",
+        partition_column="time",
+        partition_granularity="year",
+    )
+
+    assert (
+        tmp_path
+        / "tushare"
+        / "income"
+        / "year=2024"
+        / "snapshots"
+        / ref.snapshot_id
+        / "data.parquet"
+    ).exists()
+    data = lake.read("tushare", "income")
+    assert data.columns == ["time", "end_date", "asset_id", "revenue"]
+    assert data.to_dicts() == [
+        {
+            "time": date(2024, 4, 30),
+            "end_date": "2023-12-31",
+            "asset_id": "000001.SZ",
+            "revenue": 1.0,
+        }
+    ]
+
+
+def test_local_lake_fundamental_append_deduplicates_with_end_date(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    for revenue in (1.0, 2.0):
+        lake.write(
+            "tushare",
+            "income",
+            pl.DataFrame(
+                {
+                    "f_ann_date": ["2024-04-30"],
+                    "end_date": ["2023-12-31"],
+                    "ts_code": ["000001.SZ"],
+                    "revenue": [revenue],
+                }
+            ),
+            mode="append",
+            partition_column="time",
+            partition_granularity="year",
+        )
+
+    data = lake.read("tushare", "income")
+    assert data["revenue"].to_list() == [2.0]

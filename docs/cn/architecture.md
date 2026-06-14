@@ -29,7 +29,7 @@ LocalDataLake
 
 ## 数据湖结构
 
-本地 V1 存储使用 source/table/year/month 分区的 Parquet 快照，并维护 JSON 元数据。
+本地 V1 存储使用 source/table 下的 Parquet 快照，可以按标准化后的 `time` 分区，并维护 JSON 元数据。
 
 ```text
 lake-root/
@@ -37,8 +37,14 @@ lake-root/
     daily/
       year=2024/
         month=01/
-          snapshots/
+          day=03/
+            snapshots/
+    income/
+      year=2024/
+        snapshots/
 ```
+
+对 Tushare，价格表的 `time` 来自 `trade_date`；基本面表的 `time` 来自 `f_ann_date`，用于 point-in-time 读取。
 
 读取时可以投影列并过滤日期。`LocalDataLake` 先使用分区元数据跳过不相关快照，再在读取后做精确日期过滤。
 

@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
@@ -18,6 +18,7 @@ from bagelquant_data.lake.snapshot import SnapshotRef
 from bagelquant_data.lake.tushare_update import (
     TushareCallStatus,
     TushareTableUpdateSpec,
+    TushareTableKind,
     TushareTradingCalendarRef,
     TushareUniverseRef,
     TushareUpdateJob,
@@ -434,7 +435,7 @@ class DataLakeManager:
         specs: list[TushareTableUpdateSpec] = []
         for row in tables.filter(pl.col("enabled")).iter_rows(named=True):
             table = str(row["table"])
-            kind = str(row["kind"] or _infer_tushare_kind(table))
+            kind = cast(TushareTableKind, row["kind"] or _infer_tushare_kind(table))
             specs.append(
                 TushareTableUpdateSpec(
                     table=table,
@@ -527,7 +528,7 @@ class DataLakeManager:
                     item_key="table",
                     item_value=spec.table,
                     partition_column="time",
-                    partition_granularity="quarter",
+                    partition_granularity="year",
                     universe=spec.universe.name if spec.universe else None,
                 ),
             )
@@ -569,7 +570,7 @@ class DataLakeManager:
                     item_key="ts_code",
                     item_value=code,
                     partition_column="time",
-                    partition_granularity="quarter",
+                    partition_granularity="year",
                     universe=spec.universe.name if spec.universe else None,
                     trading_calendar=(
                         spec.trading_calendar.name if spec.trading_calendar else None
@@ -666,6 +667,10 @@ class DataLakeManager:
                     data,
                     mode=mode or job.mode,
                     metadata={"request": _request_payload(request)},
+                    partition_column=job.partition_column,
+                    partition_granularity=job.partition_granularity
+                    if job.partition_column
+                    else None,
                 )
                 refs = (ref,)
                 snapshot_id = ref.snapshot_id
@@ -733,7 +738,7 @@ def _as_date(value: Any) -> date:
     return datetime.fromisoformat(str(value)).date()
 
 
-def _infer_tushare_kind(table: str) -> str:
+def _infer_tushare_kind(table: str) -> TushareTableKind:
     if table in PRICE_TABLES:
         return "price"
     if table in FUNDAMENTAL_TABLES:
@@ -849,12 +854,15 @@ def _call_log_row(
     max_time: date | None = None
     rows = 0
     if data is not None:
+        data = _normalize_call_log_data(data)
         rows = data.height
         if "time" in data.columns and data.height:
             times = data["time"].drop_nulls()
             if not times.is_empty():
-                min_time = times.min()
-                max_time = times.max()
+                time_min = times.min()
+                time_max = times.max()
+                min_time = time_min if isinstance(time_min, date) else None
+                max_time = time_max if isinstance(time_max, date) else None
     params = dict(request.filters)
     if request.start_date is not None:
         params["start_date"] = _tushare_date(request.start_date)
@@ -893,3 +901,23 @@ def _call_log_row(
         "params_json": json.dumps(params, sort_keys=True, default=str),
         "fields_json": json.dumps(list(request.fields), sort_keys=True),
     }
+
+
+def _normalize_call_log_data(data: pl.DataFrame) -> pl.DataFrame:
+    rename: dict[str, str] = {}
+    if "time" not in data.columns:
+        for column in ("f_ann_date", "trade_date", "cal_date", "date"):
+            if column in data.columns:
+                rename[column] = "time"
+                break
+    frame = data.rename(rename)
+    if "time" in frame.columns:
+        text = pl.col("time").cast(pl.String)
+        frame = frame.with_columns(
+            pl.coalesce(
+                text.str.strptime(pl.Date, "%Y%m%d", strict=False),
+                text.str.strptime(pl.Date, "%Y-%m-%d", strict=False),
+                pl.col("time").cast(pl.Date, strict=False),
+            ).alias("time")
+        )
+    return frame

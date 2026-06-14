@@ -137,6 +137,8 @@ def test_scan_fundamental_updates_resume_per_asset(tmp_path) -> None:
     )
 
     starts = {job.item_value: job.start_date for job in report.jobs}
+    assert starts["000001.SZ"] is not None
+    assert starts["000002.SZ"] is not None
     assert starts["000001.SZ"].isoformat() == "2024-01-10"
     assert starts["000002.SZ"].isoformat() == "2024-01-01"
 
@@ -152,6 +154,7 @@ def test_scan_fundamental_without_refs_is_pending_when_no_local_data(tmp_path) -
 
     assert report.plans[0].status == "pending"
     assert report.jobs[0].item == "table=income"
+    assert report.jobs[0].start_date is not None
     assert report.jobs[0].start_date.isoformat() == "2024-01-01"
 
 
@@ -194,6 +197,22 @@ class Client:
                 "trade_date": [kwargs["trade_date"]],
                 "ts_code": ["000001.SZ"],
                 "close": [10.0],
+            }
+        )
+
+
+class IncomeClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def income(self, **kwargs):
+        self.calls.append(kwargs)
+        return pd.DataFrame(
+            {
+                "f_ann_date": [kwargs["start_date"]],
+                "end_date": ["20231231"],
+                "ts_code": [kwargs["ts_code"]],
+                "revenue": [1.0],
             }
         )
 
@@ -279,6 +298,62 @@ def test_execute_logs_every_tushare_api_call(tmp_path) -> None:
     assert len(refs) == 1
     assert events[-1]["completed"] == 2
     assert events[-1]["total"] == 2
+
+
+def test_tushare_price_update_writes_day_partition(tmp_path) -> None:
+    client = Client()
+    manager = manager_with_client(tmp_path, client)
+    seed_refs(manager)
+    report = manager.scan_tushare_updates(
+        (TushareTableUpdateSpec(table="daily", kind="price"),),
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+    )
+
+    refs = manager.execute_tushare_update_report(report)
+
+    assert report.jobs[0].partition_column == "time"
+    assert report.jobs[0].partition_granularity == "day"
+    assert (
+        tmp_path
+        / "tushare"
+        / "daily"
+        / "year=2024"
+        / "month=01"
+        / "day=01"
+        / "snapshots"
+        / refs[0].snapshot_id
+        / "data.parquet"
+    ).exists()
+
+
+def test_tushare_fundamental_update_writes_announcement_year_partition(
+    tmp_path,
+) -> None:
+    client = IncomeClient()
+    manager = manager_with_client(tmp_path, client)
+    seed_refs(manager)
+    report = manager.scan_tushare_updates(
+        (TushareTableUpdateSpec(table="income", kind="fundamental"),),
+        start_date="2024-04-30",
+        end_date="2024-04-30",
+    )
+
+    refs = manager.execute_tushare_update_report(report)
+
+    assert report.jobs[0].partition_column == "time"
+    assert report.jobs[0].partition_granularity == "year"
+    assert (
+        tmp_path
+        / "tushare"
+        / "income"
+        / "year=2024"
+        / "snapshots"
+        / refs[0].snapshot_id
+        / "data.parquet"
+    ).exists()
+    data = manager.lake.read("tushare", "income")
+    assert data.columns == ["time", "end_date", "asset_id", "revenue"]
 
 
 def test_tushare_update_table_registry_builds_specs(tmp_path) -> None:

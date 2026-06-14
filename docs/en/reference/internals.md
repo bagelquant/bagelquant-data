@@ -14,7 +14,8 @@ and `Panel` objects itself.
 
 ## Storage Layout
 
-Local V1 storage is partitioned by source, table, year, and month:
+Local V1 storage is separated by source and table, with optional `time`
+partitions:
 
 ```text
 lake-root/
@@ -22,12 +23,21 @@ lake-root/
     daily/
       year=2024/
         month=01/
-          snapshots/
+          day=03/
+            snapshots/
+    income/
+      year=2024/
+        snapshots/
 ```
 
-JSON catalogs track source-level ids, table metadata, latest snapshot pointers,
-and inferred panel fields. Reads use partition metadata to skip snapshots
-outside the requested date range, then apply exact filtering after loading.
+Price tables are partitioned by normalized `trade_date` as `time` at
+year/month/day granularity. Fundamental tables are partitioned by normalized
+`f_ann_date` as `time` at year granularity for point-in-time availability.
+Reference and system tables keep table-level snapshots. JSON catalogs track
+source-level ids, table metadata, latest snapshot pointers, partition latest
+pointers, and inferred panel fields. Reads use partition metadata to skip
+snapshots outside the requested date range, then apply exact filtering after
+loading.
 
 ## Update Flow
 
