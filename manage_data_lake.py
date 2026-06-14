@@ -14,10 +14,17 @@ import polars as pl
 
 from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
+from bagelquant_data.lake.manager import FUNDAMENTAL_TABLES, PRICE_TABLES
 
 LOCAL_CONFIG = ROOT / ".bagelquant-data-local.json"
 DEFAULT_LAKE = ROOT / ".bagelquant-data-lake"
 SEPARATOR = "-" * 20
+TUSHARE_KIND_ORDER = {
+    "price": 0,
+    "fundamental": 1,
+    "fundamental_vip": 2,
+    "general": 3,
+}
 
 
 def prompt(label: str, *, default: str | None = None) -> str:
@@ -33,6 +40,10 @@ def prompt_int(label: str, *, default: int) -> int:
     except ValueError:
         print(f"Invalid number, using {default}.")
         return default
+
+
+def is_quit(value: str) -> bool:
+    return value.lower() in {"q", "quit", "exit"}
 
 
 def read_local_config() -> dict[str, str]:
@@ -101,6 +112,30 @@ def print_frame(frame: pl.DataFrame) -> None:
         print(frame)
 
 
+def print_tushare_table_options() -> None:
+    print("Tushare table options")
+    print(SEPARATOR)
+    print(f"price: {', '.join(sorted(PRICE_TABLES))}")
+    print(f"fundamental: {', '.join(sorted(FUNDAMENTAL_TABLES))}")
+    print("fundamental_vip: tables ending in _vip")
+    print("general: any other valid Tushare API table")
+    print()
+
+
+def sort_tushare_update_tables(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame
+    rows = sorted(
+        frame.iter_rows(named=True),
+        key=lambda row: (
+            TUSHARE_KIND_ORDER.get(str(row.get("kind") or ""), 99),
+            str(row.get("kind") or ""),
+            str(row.get("table") or ""),
+        ),
+    )
+    return pl.DataFrame(rows, schema=frame.schema)
+
+
 def print_menu() -> None:
     print_block("Choose an action")
     print("1. Add Tushare table to update list")
@@ -121,19 +156,7 @@ def print_menu() -> None:
 
 def add_tushare_update_table(lake: Path, manager: DataLakeManager) -> None:
     print_block("Add Tushare table")
-    table = prompt("Tushare table, for example daily")
-    if not table:
-        print("No table entered.")
-        return
-    print()
-    print("Table type")
-    print(SEPARATOR)
-    print("1. Infer automatically")
-    print("2. Price")
-    print("3. Fundamental")
-    print("4. Fundamental VIP")
-    print("5. General")
-    kind_choice = prompt("Type", default="1")
+    print_tushare_table_options()
     kind_by_choice = {
         "1": None,
         "2": "price",
@@ -141,13 +164,31 @@ def add_tushare_update_table(lake: Path, manager: DataLakeManager) -> None:
         "4": "fundamental_vip",
         "5": "general",
     }
-    if kind_choice not in kind_by_choice:
-        print("Unknown type. Choose 1, 2, 3, 4, or 5.")
-        return
-    manager.register_tushare_update_table(table, kind=kind_by_choice[kind_choice])
-    print(SEPARATOR)
-    print(f"registered tushare/{table}")
-    ensure_tushare_refs(lake, manager)
+    while True:
+        table = prompt("Tushare table, for example daily; q to return")
+        if is_quit(table):
+            return
+        if not table:
+            print("No table entered.")
+            continue
+        print()
+        print("Table type")
+        print(SEPARATOR)
+        print("1. Infer automatically")
+        print("2. Price")
+        print("3. Fundamental")
+        print("4. Fundamental VIP")
+        print("5. General")
+        kind_choice = prompt("Type", default="1")
+        if is_quit(kind_choice):
+            return
+        if kind_choice not in kind_by_choice:
+            print("Unknown type. Choose 1, 2, 3, 4, or 5.")
+            continue
+        manager.register_tushare_update_table(table, kind=kind_by_choice[kind_choice])
+        print(SEPARATOR)
+        print(f"registered tushare/{table}")
+        ensure_tushare_refs(lake, manager)
 
 
 def list_tushare_update_tables(manager: DataLakeManager) -> None:
@@ -156,7 +197,7 @@ def list_tushare_update_tables(manager: DataLakeManager) -> None:
     if frame.is_empty():
         print("No Tushare update tables registered.")
         return
-    print_frame(frame)
+    print_frame(sort_tushare_update_tables(frame))
 
 
 def remove_tushare_update_table(manager: DataLakeManager) -> None:
