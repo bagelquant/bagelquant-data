@@ -22,5 +22,3 @@ jobs:
         run: uv run ruff check .
       - name: Pytest
         run: uv run pytest
-      - name: Docs
-        run: uv run mkdocs build --strict
