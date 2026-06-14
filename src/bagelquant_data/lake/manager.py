@@ -35,11 +35,13 @@ from bagelquant_data.utils.normalize import (
 )
 
 TUSHARE_CALL_LOG_TABLE = "__api_call_log"
+TUSHARE_CALL_STATE_TABLE = "__api_call_state"
 TUSHARE_UPDATE_TABLES = "__update_tables"
 PRICE_TABLES = {"daily", "adj_factor", "index_daily"}
 FUNDAMENTAL_TABLES = {"balancesheet", "income", "cashflow"}
 CALL_LOG_SCHEMA = {
     "called_at": pl.String,
+    "update_date": pl.Date,
     "api_name": pl.String,
     "table": pl.String,
     "kind": pl.String,
@@ -49,6 +51,7 @@ CALL_LOG_SCHEMA = {
     "request_end_date": pl.Date,
     "data_min_time": pl.Date,
     "data_max_time": pl.Date,
+    "latest_date": pl.Date,
     "rows": pl.Int64,
     "status": pl.String,
     "error": pl.String,
@@ -57,6 +60,19 @@ CALL_LOG_SCHEMA = {
     "snapshot_id": pl.String,
     "params_json": pl.String,
     "fields_json": pl.String,
+}
+CALL_STATE_SCHEMA = {
+    "table": pl.String,
+    "kind": pl.String,
+    "item_key": pl.String,
+    "item_value": pl.String,
+    "latest_date": pl.Date,
+    "last_update_date": pl.Date,
+    "status": pl.String,
+    "rows": pl.Int64,
+    "snapshot_id": pl.String,
+    "request_hash": pl.String,
+    "updated_at": pl.String,
 }
 UPDATE_TABLE_SCHEMA = {
     "table": pl.String,
@@ -245,14 +261,13 @@ class DataLakeManager:
         requested_end = as_date(end_date or date.today())
         jobs: list[TushareUpdateJob] = []
         plans: list[TushareUpdatePlan] = []
-        log = self.tushare_api_call_log(
+        log = self.ensure_tushare_call_state(
             columns=(
                 "table",
                 "item_key",
                 "item_value",
                 "status",
-                "data_max_time",
-                "request_end_date",
+                "latest_date",
             )
         )
 
@@ -328,14 +343,13 @@ class DataLakeManager:
         requested_end = as_date(end_date or date.today())
         jobs: list[TushareUpdateJob] = []
         plans: list[TushareUpdatePlan] = []
-        log = self.tushare_api_call_log(
+        log = self.ensure_tushare_call_state(
             columns=(
                 "table",
                 "item_key",
                 "item_value",
                 "status",
-                "data_max_time",
-                "request_end_date",
+                "latest_date",
             )
         )
 
@@ -479,7 +493,7 @@ class DataLakeManager:
         self, columns: tuple[str, ...] | None = None
     ) -> pl.DataFrame:
         try:
-            return self.lake.read("tushare", TUSHARE_CALL_LOG_TABLE, columns=columns)
+            frame = self.lake.read("tushare", TUSHARE_CALL_LOG_TABLE, columns=columns)
         except DatasetNotFoundError:
             if columns is None:
                 return pl.DataFrame(schema=CALL_LOG_SCHEMA)
@@ -490,6 +504,35 @@ class DataLakeManager:
                     if column in columns
                 }
             )
+        return _normalize_call_log_frame(frame, columns=columns)
+
+    def ensure_tushare_call_state(
+        self, columns: tuple[str, ...] | None = None
+    ) -> pl.DataFrame:
+        try:
+            state = self.lake.read(
+                "tushare", TUSHARE_CALL_STATE_TABLE, columns=columns
+            )
+        except DatasetNotFoundError:
+            state = self._rebuild_tushare_call_state()
+            if columns is not None:
+                state = state.select(
+                    [column for column in columns if column in state.columns]
+                )
+        return _normalize_call_state_frame(state, columns=columns)
+
+    def _rebuild_tushare_call_state(self) -> pl.DataFrame:
+        log = self.tushare_api_call_log()
+        state = _call_state_from_log(log)
+        if not state.is_empty():
+            self.lake.write(
+                "tushare",
+                TUSHARE_CALL_STATE_TABLE,
+                state,
+                mode="overwrite",
+                metadata={"system": "tushare_api_call_state"},
+            )
+        return state
 
     def tushare_update_tables(self) -> pl.DataFrame:
         try:
@@ -585,7 +628,6 @@ class DataLakeManager:
         log: pl.DataFrame,
     ) -> TushareUpdatePlan:
         latest = _latest_tushare_fundamental_table_date(
-            self.lake,
             log,
             table=spec.table,
         )
@@ -667,21 +709,8 @@ class DataLakeManager:
         log: pl.DataFrame,
     ) -> tuple[TushareUpdateJob, ...]:
         codes = self._tushare_universe_codes(spec.universe)
-        local_latest_by_code = self._latest_local_dates_by_asset(spec.table)
         if not codes:
-            latest = max(
-                (
-                    value
-                    for value in (
-                        _latest_logged_date(
-                            log, table=spec.table, item_key="table"
-                        ),
-                        _latest_local_table_date(self.lake, spec.table),
-                    )
-                    if value is not None
-                ),
-                default=None,
-            )
+            latest = _latest_logged_date(log, table=spec.table, item_key="table")
             if latest is not None and requested_end <= latest:
                 return ()
             start = max(requested_start, latest) if latest else requested_start
@@ -712,7 +741,6 @@ class DataLakeManager:
                             item_key="ts_code",
                             item_value=code,
                         ),
-                        local_latest_by_code.get(code),
                     )
                     if value is not None
                 ),
@@ -876,12 +904,31 @@ class DataLakeManager:
             raise
 
     def _append_tushare_call_log(self, row: Mapping[str, Any]) -> None:
+        frame = pl.DataFrame([dict(row)], schema=CALL_LOG_SCHEMA)
         self.lake.write(
             "tushare",
             TUSHARE_CALL_LOG_TABLE,
-            pl.DataFrame([dict(row)], schema=CALL_LOG_SCHEMA),
+            frame,
             mode="append",
             metadata={"system": "tushare_api_call_log"},
+            partition_column="update_date",
+            partition_granularity="day",
+        )
+        self._merge_tushare_call_state(frame)
+
+    def _merge_tushare_call_state(self, frame: pl.DataFrame) -> None:
+        update = _call_state_from_log(frame)
+        if update.is_empty():
+            return
+        existing = self.ensure_tushare_call_state()
+        combined = pl.concat([existing, update], how="diagonal_relaxed")
+        state = _latest_call_state_rows(combined)
+        self.lake.write(
+            "tushare",
+            TUSHARE_CALL_STATE_TABLE,
+            state,
+            mode="overwrite",
+            metadata={"system": "tushare_api_call_state"},
         )
 
 
@@ -937,7 +984,12 @@ def _latest_logged_date(
         filtered = filtered.filter(pl.col("item_value") == item_value)
     if filtered.is_empty():
         return None
-    if item_key == "trade_date":
+    if "latest_date" in filtered.columns:
+        values = [
+            parse_date(value)
+            for value in filtered["latest_date"].drop_nulls().to_list()
+        ]
+    elif item_key == "trade_date":
         values = [
             parse_tushare_date(value) for value in filtered["item_value"].to_list()
         ]
@@ -967,7 +1019,6 @@ def _latest_local_table_date(lake: LocalDataLake, table: str) -> date | None:
 
 
 def _latest_tushare_fundamental_table_date(
-    lake: LocalDataLake,
     log: pl.DataFrame,
     *,
     table: str,
@@ -975,7 +1026,6 @@ def _latest_tushare_fundamental_table_date(
     values = (
         _latest_logged_date(log, table=table, item_key="ts_code"),
         _latest_logged_date(log, table=table, item_key="table"),
-        _latest_local_table_date(lake, table),
     )
     return max((value for value in values if value is not None), default=None)
 
@@ -1015,6 +1065,13 @@ def _call_log_row(
                 time_max = times.max()
                 min_time = time_min if isinstance(time_min, date) else None
                 max_time = time_max if isinstance(time_max, date) else None
+    update_date = called_at.date()
+    latest_date = _call_log_latest_date(
+        item_key=job.item_key,
+        item_value=job.item_value,
+        data_max_time=max_time,
+        request_end_date=parse_date(request.end_date),
+    )
     params = dict(request.filters)
     if request.start_date is not None:
         params["start_date"] = _tushare_date(request.start_date)
@@ -1035,6 +1092,7 @@ def _call_log_row(
     ).hexdigest()
     return {
         "called_at": called_at.isoformat(),
+        "update_date": update_date,
         "api_name": job.api_name or job.table,
         "table": job.table,
         "kind": job.kind,
@@ -1044,6 +1102,7 @@ def _call_log_row(
         "request_end_date": parse_date(request.end_date),
         "data_min_time": min_time,
         "data_max_time": max_time,
+        "latest_date": latest_date,
         "rows": rows,
         "status": status,
         "error": error,
@@ -1057,3 +1116,116 @@ def _call_log_row(
 
 def _normalize_call_log_data(data: pl.DataFrame) -> pl.DataFrame:
     return normalize_table_columns(data)
+
+
+def _normalize_call_log_frame(
+    frame: pl.DataFrame, *, columns: tuple[str, ...] | None = None
+) -> pl.DataFrame:
+    normalized = _with_schema_columns(frame, CALL_LOG_SCHEMA)
+    normalized = normalized.with_columns(
+        pl.coalesce(
+            pl.col("update_date"),
+            pl.col("called_at").cast(pl.String).str.slice(0, 10).str.strptime(
+                pl.Date, "%Y-%m-%d", strict=False
+            ),
+        ).alias("update_date"),
+        pl.coalesce(
+            pl.col("latest_date"),
+            pl.col("data_max_time"),
+            pl.col("request_end_date"),
+            pl.when(pl.col("item_key") == "trade_date")
+            .then(
+                pl.col("item_value")
+                .cast(pl.String)
+                .str.strptime(pl.Date, "%Y%m%d", strict=False)
+            )
+            .otherwise(None),
+        ).alias("latest_date"),
+    )
+    if columns is not None:
+        return normalized.select(
+            [column for column in columns if column in normalized.columns]
+        )
+    return normalized.select(list(CALL_LOG_SCHEMA))
+
+
+def _normalize_call_state_frame(
+    frame: pl.DataFrame, *, columns: tuple[str, ...] | None = None
+) -> pl.DataFrame:
+    normalized = _with_schema_columns(frame, CALL_STATE_SCHEMA)
+    if columns is not None:
+        return normalized.select(
+            [column for column in columns if column in normalized.columns]
+        )
+    return normalized.select(list(CALL_STATE_SCHEMA))
+
+
+def _with_schema_columns(
+    frame: pl.DataFrame, schema: Mapping[str, pl.DataType]
+) -> pl.DataFrame:
+    if frame.is_empty() and not frame.columns:
+        return pl.DataFrame(schema=schema)
+    enriched = frame
+    for column, dtype in schema.items():
+        if column not in enriched.columns:
+            enriched = enriched.with_columns(pl.lit(None, dtype=dtype).alias(column))
+    return enriched.with_columns([
+        pl.col(column).cast(dtype, strict=False).alias(column)
+        for column, dtype in schema.items()
+    ])
+
+
+def _call_log_latest_date(
+    *,
+    item_key: str,
+    item_value: str,
+    data_max_time: date | None,
+    request_end_date: date | None,
+) -> date | None:
+    if data_max_time is not None:
+        return data_max_time
+    if request_end_date is not None:
+        return request_end_date
+    if item_key == "trade_date":
+        return parse_tushare_date(item_value)
+    return None
+
+
+def _call_state_from_log(log: pl.DataFrame) -> pl.DataFrame:
+    normalized = _normalize_call_log_frame(log)
+    if normalized.is_empty():
+        return pl.DataFrame(schema=CALL_STATE_SCHEMA)
+    state = normalized.filter(
+        pl.col("status").is_in(["success", "empty"])
+        & pl.col("latest_date").is_not_null()
+    )
+    if state.is_empty():
+        return pl.DataFrame(schema=CALL_STATE_SCHEMA)
+    state = state.select(
+        "table",
+        "kind",
+        "item_key",
+        "item_value",
+        "latest_date",
+        pl.col("update_date").alias("last_update_date"),
+        "status",
+        "rows",
+        "snapshot_id",
+        "request_hash",
+        pl.col("called_at").alias("updated_at"),
+    )
+    return _latest_call_state_rows(state)
+
+
+def _latest_call_state_rows(state: pl.DataFrame) -> pl.DataFrame:
+    normalized = _normalize_call_state_frame(state)
+    if normalized.is_empty():
+        return normalized
+    return (
+        normalized.sort(
+            ["table", "item_key", "item_value", "latest_date", "updated_at"],
+            nulls_last=True,
+        )
+        .unique(subset=["table", "item_key", "item_value"], keep="last")
+        .sort(["table", "item_key", "item_value"])
+    )

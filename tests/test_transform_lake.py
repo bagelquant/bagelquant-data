@@ -105,6 +105,32 @@ def test_local_lake_system_table_append_writes_one_snapshot_per_append(
     assert data["rows"].to_list() == [1, 2]
 
 
+def test_local_lake_reads_legacy_root_snapshots_after_partition_migration(
+    tmp_path,
+) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.write(
+        "tushare",
+        "__api_call_log",
+        pl.DataFrame({"called_at": ["2024-01-01"], "rows": [1]}),
+        mode="append",
+    )
+    lake.write(
+        "tushare",
+        "__api_call_log",
+        pl.DataFrame({"update_date": ["2024-01-02"], "rows": [2]}),
+        mode="append",
+        partition_column="update_date",
+        partition_granularity="day",
+    )
+
+    snapshots = lake.snapshots("tushare", "__api_call_log")
+    data = lake.read("tushare", "__api_call_log")
+
+    assert len(snapshots) == 2
+    assert data["rows"].to_list() == [1, 2]
+
+
 def test_local_lake_writes_daily_price_partitions(tmp_path) -> None:
     lake = LocalDataLake(tmp_path)
 
