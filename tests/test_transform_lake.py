@@ -50,6 +50,61 @@ def test_local_lake_projection_and_time_filter(tmp_path) -> None:
     assert data["close"].to_list() == [2.0]
 
 
+def test_local_lake_partitioned_projection_and_time_filter(tmp_path) -> None:
+    lake = LocalDataLake(tmp_path)
+    lake.write(
+        "tushare",
+        "daily",
+        pl.DataFrame(
+            {
+                "trade_date": ["2024-01-03", "2024-01-04"],
+                "ts_code": ["000001.SZ", "000001.SZ"],
+                "close": [10.0, 11.0],
+                "open": [9.5, 10.5],
+            }
+        ),
+        mode="append",
+        partition_column="time",
+        partition_granularity="day",
+    )
+
+    data = lake.read(
+        "tushare",
+        "daily",
+        columns=("close",),
+        start_date="2024-01-04",
+        end_date="2024-01-04",
+    )
+
+    assert data.columns == ["time", "asset_id", "close"]
+    assert data["close"].to_list() == [11.0]
+
+
+def test_local_lake_system_table_append_writes_one_snapshot_per_append(
+    tmp_path,
+) -> None:
+    lake = LocalDataLake(tmp_path)
+    for rows in (1, 2):
+        lake.write(
+            "tushare",
+            "__api_call_log",
+            pl.DataFrame({"called_at": [f"2024-01-0{rows}"], "rows": [rows]}),
+            mode="append",
+        )
+
+    snapshots = lake.snapshots("tushare", "__api_call_log")
+    snapshot_rows = [
+        pl.read_parquet(ref.path / "data.parquet").height
+        for ref in snapshots
+        if ref.path is not None
+    ]
+    data = lake.read("tushare", "__api_call_log")
+
+    assert len(snapshots) == 2
+    assert snapshot_rows == [1, 1]
+    assert data["rows"].to_list() == [1, 2]
+
+
 def test_local_lake_writes_daily_price_partitions(tmp_path) -> None:
     lake = LocalDataLake(tmp_path)
 

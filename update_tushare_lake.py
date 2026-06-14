@@ -19,6 +19,7 @@ from bagelquant_data.datasource import DataSourceRegistry, TushareDataSource
 from bagelquant_data.lake import DataLakeManager, LocalDataLake
 
 LOCAL_CONFIG = ROOT / ".bagelquant-data-local.json"
+DEFAULT_LAKE = ROOT / ".bagelquant-data-lake"
 SEPARATOR = "-" * 20
 
 
@@ -84,7 +85,7 @@ def collect_config() -> UpdateConfig:
     print_block("BagelQuant Tushare lake updater")
     print("Press Enter to accept the default shown in brackets.")
     print(SEPARATOR)
-    lake = Path(prompt("Lake path", default=".bagelquant-data-lake")).expanduser()
+    lake = Path(prompt("Lake path", default=str(DEFAULT_LAKE))).expanduser()
     start = prompt("Start date", default="2000-01-01")
     end = prompt("End date", default=date.today().isoformat())
     token, token_source = resolve_tushare_token()

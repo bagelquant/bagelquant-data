@@ -1,6 +1,5 @@
 """Metadata contracts."""
 
-from bagelquant_data.metadata.catalog import InMemoryMetadataCatalog
 from bagelquant_data.metadata.contract import (
     DataContract,
     DatasetIdentity,
@@ -14,7 +13,6 @@ __all__ = [
     "DatasetIdentity",
     "DatasetSchema",
     "FieldSchema",
-    "InMemoryMetadataCatalog",
     "LineageRecord",
     "PanelKind",
 ]

@@ -14,21 +14,16 @@ import polars as pl
 from bagelquant_data.datasource.base import DataRequest, DataSource
 from bagelquant_data.lake.snapshot import SnapshotRef
 from bagelquant_data.utils.exceptions import DatasetNotFoundError, LakeError
+from bagelquant_data.utils.normalize import (
+    as_date,
+    date_column,
+    normalize_table_columns,
+)
 
 WriteMode = Literal["append", "overwrite"]
 PartitionGranularity = Literal["day", "month", "quarter", "year"]
 FIELD_CATALOG_TABLE = "__fields"
 LEGACY_DATA_ITEM_CATALOG_TABLE = "__data_item_ids"
-TIME_COLUMNS = (
-    "time",
-    "f_ann_date",
-    "trade_date",
-    "cal_date",
-    "date",
-    "datetime",
-    "timestamp",
-)
-ASSET_COLUMNS = ("asset_id", "ts_code", "symbol", "asset", "code")
 
 
 class LocalDataLake:
@@ -55,27 +50,30 @@ class LocalDataLake:
                 dataset,
                 catalog=catalog,
                 snapshot=snapshot,
+                columns=columns,
                 start_date=start_date,
                 end_date=end_date,
             )
         else:
-            ref = self._snapshot_ref(source, dataset, snapshot=snapshot)
-            data_path = ref.path / "data.parquet" if ref.path is not None else None
-            if data_path is None or not data_path.exists():
+            refs = (
+                self.snapshots(source, dataset)
+                if catalog.get("append_only") and snapshot is None
+                else (self._snapshot_ref(source, dataset, snapshot=snapshot),)
+            )
+            paths = tuple(
+                ref.path / "data.parquet"
+                for ref in refs
+                if ref.path is not None and (ref.path / "data.parquet").exists()
+            )
+            if not paths:
                 raise DatasetNotFoundError(f"No local lake table: {source}/{dataset}")
-            frame = pl.read_parquet(data_path)
-            frame = _normalize_table_columns(frame)
-        if columns is not None:
-            helpers = [
-                column for column in ("time", "asset_id") if column in frame.columns
-            ]
-            projected = list(
-                dict.fromkeys([*helpers, *(str(column) for column in columns)])
+            frame = _scan_parquet_paths(
+                paths,
+                columns=columns,
+                start_date=start_date,
+                end_date=end_date,
             )
-            frame = frame.select(
-                [column for column in projected if column in frame.columns]
-            )
-        return _filter_time(frame, start_date=start_date, end_date=end_date)
+        return frame
 
     def write(
         self,
@@ -99,7 +97,7 @@ class LocalDataLake:
             )
         created_at = datetime.now(UTC)
         snapshot_id = created_at.strftime("%Y%m%dT%H%M%S%fZ")
-        frame = _normalize_table_columns(data)
+        frame = normalize_table_columns(data)
         if partition_column is not None:
             return self._write_partitioned(
                 source,
@@ -113,14 +111,16 @@ class LocalDataLake:
                 created_at=created_at,
             )
         if mode == "append":
-            try:
-                previous = self.read(source, dataset)
-            except DatasetNotFoundError:
-                previous = None
-            if previous is not None:
-                frame = _deduplicate(
-                    pl.concat([previous, frame], how="diagonal_relaxed")
-                )
+            catalog = self._table_catalog_metadata(source, dataset)
+            if not _append_only_dataset(dataset, catalog):
+                try:
+                    previous = self.read(source, dataset)
+                except DatasetNotFoundError:
+                    previous = None
+                if previous is not None:
+                    frame = _deduplicate(
+                        pl.concat([previous, frame], how="diagonal_relaxed")
+                    )
 
         snapshot_dir = self._dataset_dir(source, dataset) / "snapshots" / snapshot_id
         snapshot_dir.mkdir(parents=True, exist_ok=False)
@@ -141,10 +141,14 @@ class LocalDataLake:
             json.dumps(payload, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
         )
+        append_only = mode == "append" and _append_only_dataset(
+            dataset, self._table_catalog_metadata(source, dataset)
+        )
         catalog = {
             "source": source,
             "dataset": dataset,
             "latest_snapshot": snapshot_id,
+            "append_only": append_only,
             "partition_column": None,
             "partition_granularity": None,
             "partitions": {},
@@ -351,11 +355,14 @@ class LocalDataLake:
         *,
         catalog: Mapping[str, Any],
         snapshot: str | None,
+        columns: Sequence[str] | None,
         start_date: str | date | datetime | None,
         end_date: str | date | datetime | None,
     ) -> pl.DataFrame:
         refs = (
-            self._all_partition_snapshot_refs(source, dataset, catalog, snapshot=snapshot)
+            self._all_partition_snapshot_refs(
+                source, dataset, catalog, snapshot=snapshot
+            )
             if snapshot is not None
             else self._partition_snapshot_refs(source, dataset, catalog)
         )
@@ -373,14 +380,19 @@ class LocalDataLake:
         ]
         if not selected:
             raise DatasetNotFoundError(f"No local lake table: {source}/{dataset}")
-        frames = []
-        for ref in selected:
-            data_path = ref.path / "data.parquet" if ref.path is not None else None
-            if data_path is not None and data_path.exists():
-                frames.append(_normalize_table_columns(pl.read_parquet(data_path)))
-        if not frames:
+        paths = tuple(
+            ref.path / "data.parquet"
+            for ref in selected
+            if ref.path is not None and (ref.path / "data.parquet").exists()
+        )
+        if not paths:
             raise DatasetNotFoundError(f"No local lake table: {source}/{dataset}")
-        return pl.concat(frames, how="diagonal_relaxed")
+        return _scan_parquet_paths(
+            paths,
+            columns=columns,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
     def _write_partitioned(
         self,
@@ -398,10 +410,14 @@ class LocalDataLake:
         if partition_granularity is None:
             raise LakeError("partition_granularity is required")
         if partition_column not in frame.columns:
-            raise LakeError(f"partition column is missing from data: {partition_column}")
-        frame = frame.with_columns(_date_column(partition_column))
+            raise LakeError(
+                f"partition column is missing from data: {partition_column}"
+            )
+        frame = frame.with_columns(date_column(partition_column))
         if frame.filter(pl.col(partition_column).is_null()).height:
-            raise LakeError(f"partition column has null or invalid dates: {partition_column}")
+            raise LakeError(
+                f"partition column has null or invalid dates: {partition_column}"
+            )
 
         catalog = self._table_catalog_metadata(source, dataset)
         partitions = dict(catalog.get("partitions") or {})
@@ -507,7 +523,7 @@ class LocalDataLake:
         )
         if not data_path.exists():
             return None
-        return _normalize_table_columns(pl.read_parquet(data_path))
+        return normalize_table_columns(pl.read_parquet(data_path))
 
     def _partition_snapshot_refs(
         self, source: str, dataset: str, catalog: Mapping[str, Any]
@@ -521,7 +537,9 @@ class LocalDataLake:
             values = entry.get("partition") or {}
             if not isinstance(snapshot, str) or not isinstance(path, str):
                 continue
-            snapshot_dir = self._dataset_dir(source, dataset) / path / "snapshots" / snapshot
+            snapshot_dir = (
+                self._dataset_dir(source, dataset) / path / "snapshots" / snapshot
+            )
             if snapshot_dir.exists():
                 refs.append(
                     SnapshotRef(
@@ -575,50 +593,15 @@ class LocalDataLake:
 
 
 def shape_panel_field(data: pl.DataFrame, *, field: str) -> pl.DataFrame:
-    frame = _normalize_table_columns(data)
+    frame = normalize_table_columns(data)
     if field not in frame.columns:
         raise LakeError(f"Panel field is missing from data: {field}")
     if "time" not in frame.columns or "asset_id" not in frame.columns:
         raise LakeError("Panel data requires time and asset_id columns")
     return (
         frame.select("time", "asset_id", pl.col(field).alias("value"))
-        .with_columns(
-            pl.col("time").cast(pl.Date, strict=False),
-            pl.col("asset_id").cast(pl.String),
-        )
+        .with_columns(date_column("time"), pl.col("asset_id").cast(pl.String))
         .sort(["time", "asset_id"])
-    )
-
-
-def _normalize_table_columns(frame: pl.DataFrame) -> pl.DataFrame:
-    rename: dict[str, str] = {}
-    if "time" not in frame.columns:
-        for column in TIME_COLUMNS:
-            if column in frame.columns:
-                rename[column] = "time"
-                break
-    if "asset_id" not in frame.columns:
-        for column in ASSET_COLUMNS:
-            if column in frame.columns:
-                rename[column] = "asset_id"
-                break
-    normalized = frame.rename(rename)
-    if "time" in normalized.columns:
-        normalized = normalized.with_columns(_date_column("time"))
-    if "asset_id" in normalized.columns:
-        normalized = normalized.with_columns(pl.col("asset_id").cast(pl.String))
-    return normalized
-
-
-def _date_column(column: str) -> pl.Expr:
-    text = pl.col(column).cast(pl.String)
-    return (
-        pl.coalesce(
-            text.str.strptime(pl.Date, "%Y%m%d", strict=False),
-            text.str.strptime(pl.Date, "%Y-%m-%d", strict=False),
-            pl.col(column).cast(pl.Date, strict=False),
-        )
-        .alias(column)
     )
 
 
@@ -642,7 +625,13 @@ def _filter_time(
 
 
 def _is_partitioned_catalog(catalog: Mapping[str, Any]) -> bool:
-    return bool(catalog.get("partition_column") and catalog.get("partition_granularity"))
+    return bool(
+        catalog.get("partition_column") and catalog.get("partition_granularity")
+    )
+
+
+def _append_only_dataset(dataset: str, catalog: Mapping[str, Any]) -> bool:
+    return bool(catalog.get("append_only")) or dataset.startswith("__")
 
 
 def _as_date_or_none(value: str | date | datetime | None) -> date | None:
@@ -652,7 +641,7 @@ def _as_date_or_none(value: str | date | datetime | None) -> date | None:
         return value.date()
     if isinstance(value, date):
         return value
-    return datetime.fromisoformat(str(value)).date()
+    return as_date(value)
 
 
 def _partition_frames(
@@ -663,20 +652,19 @@ def _partition_frames(
 ) -> list[tuple[dict[str, int], pl.DataFrame]]:
     enriched = frame.with_columns(_partition_exprs(column, granularity))
     key_columns = _partition_key_columns(granularity)
-    groups = (
-        enriched.select(key_columns)
-        .unique(maintain_order=True)
-        .sort(key_columns)
-        .iter_rows(named=True)
-    )
     partitions: list[tuple[dict[str, int], pl.DataFrame]] = []
-    for row in groups:
-        values = {key: int(row[key]) for key in key_columns}
-        predicate = pl.all_horizontal(
-            [pl.col(key) == value for key, value in values.items()]
+    groups = enriched.partition_by(
+        key_columns,
+        maintain_order=True,
+        include_key=True,
+        as_dict=True,
+    )
+    for key, partition_frame in sorted(groups.items()):
+        key_values = key if isinstance(key, tuple) else (key,)
+        values = dict(
+            zip(key_columns, (int(value) for value in key_values), strict=True)
         )
-        partition_frame = enriched.filter(predicate).drop(key_columns)
-        partitions.append((values, partition_frame))
+        partitions.append((values, partition_frame.drop(key_columns)))
     return partitions
 
 
@@ -701,7 +689,9 @@ def _partition_key_columns(granularity: PartitionGranularity) -> list[str]:
     return ["year"]
 
 
-def _partition_path(values: Mapping[str, int], *, granularity: PartitionGranularity) -> str:
+def _partition_path(
+    values: Mapping[str, int], *, granularity: PartitionGranularity
+) -> str:
     parts = [f"year={values['year']:04d}"]
     if granularity in {"month", "day"}:
         parts.append(f"month={values['month']:02d}")
@@ -802,3 +792,38 @@ def _table_metadata(frame: pl.DataFrame) -> dict[str, Any]:
         "columns": frame.columns,
         "panel_fields": panel_fields,
     }
+
+
+def _scan_parquet_paths(
+    paths: Sequence[Path],
+    *,
+    columns: Sequence[str] | None,
+    start_date: str | date | datetime | None,
+    end_date: str | date | datetime | None,
+) -> pl.DataFrame:
+    lf = pl.scan_parquet([str(path) for path in paths])
+    schema_names = set(lf.collect_schema().names())
+    if "time" in schema_names:
+        if start_date is not None:
+            lf = lf.filter(pl.col("time") >= pl.lit(start_date).cast(pl.Date))
+        if end_date is not None:
+            lf = lf.filter(pl.col("time") <= pl.lit(end_date).cast(pl.Date))
+    if columns is not None:
+        projected = _projected_columns(schema_names, columns)
+        if projected:
+            lf = lf.select(projected)
+    frame = normalize_table_columns(lf.collect())
+    return _filter_time(frame, start_date=start_date, end_date=end_date)
+
+
+def _projected_columns(
+    schema_names: set[str],
+    columns: Sequence[str],
+) -> list[str]:
+    helpers = [column for column in ("time", "asset_id") if column in schema_names]
+    requested = [str(column) for column in columns]
+    return [
+        column
+        for column in dict.fromkeys([*helpers, *requested])
+        if column in schema_names
+    ]

@@ -14,6 +14,7 @@ import polars as pl
 from bagelquant_data.config.settings import Settings
 from bagelquant_data.datasource.base import DataRequest
 from bagelquant_data.utils.exceptions import DataSourceAuthError, DataSourceError
+from bagelquant_data.utils.normalize import normalize_table_columns
 
 TransientPredicate = Callable[[Exception], bool]
 
@@ -81,7 +82,7 @@ class TushareDataSource:
             raise DataSourceError(
                 f"Tushare API returned {type(result)!r}, expected DataFrame"
             )
-        return _normalize_provider_columns(pl.from_pandas(result.copy(deep=True)))
+        return normalize_table_columns(pl.from_pandas(result.copy(deep=True)))
 
     def exists(self, dataset: str) -> bool:
         """Return whether a dataset is supported by the adapter."""
@@ -179,43 +180,6 @@ def _is_pandas_dataframe(value: Any) -> bool:
             "Tushare support requires pandas. Install with: uv sync --extra tushare"
         ) from exc
     return isinstance(value, pd.DataFrame)
-
-
-def _normalize_provider_columns(frame: pl.DataFrame) -> pl.DataFrame:
-    rename: dict[str, str] = {}
-    for column in (
-        "date",
-        "trade_date",
-        "cal_date",
-        "f_ann_date",
-        "datetime",
-        "timestamp",
-    ):
-        if column in frame.columns and "time" not in frame.columns:
-            rename[column] = "time"
-            break
-    for column in ("ts_code", "symbol", "asset", "code"):
-        if column in frame.columns and "asset_id" not in frame.columns:
-            rename[column] = "asset_id"
-            break
-    normalized = frame.rename(rename)
-    if "time" in normalized.columns:
-        normalized = normalized.with_columns(_date_column("time"))
-    if "asset_id" in normalized.columns:
-        normalized = normalized.with_columns(pl.col("asset_id").cast(pl.String))
-    return normalized
-
-
-def _date_column(column: str) -> pl.Expr:
-    text = pl.col(column).cast(pl.String)
-    return (
-        pl.coalesce(
-            text.str.strptime(pl.Date, "%Y%m%d", strict=False),
-            text.str.strptime(pl.Date, "%Y-%m-%d", strict=False),
-            pl.col(column).cast(pl.Date, strict=False),
-        )
-        .alias(column)
-    )
 
 
 def _is_transient(exc: Exception) -> bool:

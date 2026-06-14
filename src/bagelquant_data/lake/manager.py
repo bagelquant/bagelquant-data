@@ -17,8 +17,8 @@ from bagelquant_data.lake.local import LocalDataLake, WriteMode
 from bagelquant_data.lake.snapshot import SnapshotRef
 from bagelquant_data.lake.tushare_update import (
     TushareCallStatus,
-    TushareTableUpdateSpec,
     TushareTableKind,
+    TushareTableUpdateSpec,
     TushareTradingCalendarRef,
     TushareUniverseRef,
     TushareUpdateJob,
@@ -26,6 +26,13 @@ from bagelquant_data.lake.tushare_update import (
     TushareUpdateReport,
 )
 from bagelquant_data.utils.exceptions import DatasetNotFoundError
+from bagelquant_data.utils.normalize import (
+    as_date,
+    normalize_table_columns,
+    parse_date,
+    parse_tushare_date,
+    tushare_date,
+)
 
 TUSHARE_CALL_LOG_TABLE = "__api_call_log"
 TUSHARE_UPDATE_TABLES = "__update_tables"
@@ -234,8 +241,8 @@ class DataLakeManager:
         end_date: Any | None = None,
         **_: Any,
     ) -> TushareUpdateReport:
-        requested_start = _as_date(start_date)
-        requested_end = _as_date(end_date or date.today())
+        requested_start = as_date(start_date)
+        requested_end = as_date(end_date or date.today())
         jobs: list[TushareUpdateJob] = []
         plans: list[TushareUpdatePlan] = []
         log = self.tushare_api_call_log(
@@ -474,12 +481,12 @@ class DataLakeManager:
             TushareUpdateJob(
                 table=spec.table,
                 kind="price",
-                filters={"trade_date": _tushare_date(value)},
+                filters={"trade_date": tushare_date(value)},
                 start_date=value,
                 end_date=value,
-                item=f"trade_date={_tushare_date(value)}",
+                item=f"trade_date={tushare_date(value)}",
                 item_key="trade_date",
-                item_value=_tushare_date(value),
+                item_value=tushare_date(value),
                 partition_column="time",
                 partition_granularity="day",
                 universe=spec.universe.name if spec.universe else None,
@@ -730,14 +737,6 @@ def _request_payload(request: DataRequest) -> dict[str, Any]:
     }
 
 
-def _as_date(value: Any) -> date:
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    return datetime.fromisoformat(str(value)).date()
-
-
 def _infer_tushare_kind(table: str) -> TushareTableKind:
     if table in PRICE_TABLES:
         return "price"
@@ -779,16 +778,16 @@ def _latest_logged_date(
         return None
     if item_key == "trade_date":
         values = [
-            _parse_tushare_date(value) for value in filtered["item_value"].to_list()
+            parse_tushare_date(value) for value in filtered["item_value"].to_list()
         ]
     else:
         values = [
-            _parse_date(value)
+            parse_date(value)
             for value in filtered["data_max_time"].drop_nulls().to_list()
         ]
         if not values:
             values = [
-                _parse_date(value)
+                parse_date(value)
                 for value in filtered["request_end_date"].drop_nulls().to_list()
             ]
     dates = [value for value in values if isinstance(value, date)]
@@ -814,29 +813,7 @@ def _date_range(start_date: date, end_date: date) -> tuple[date, ...]:
 
 
 def _tushare_date(value: Any) -> str:
-    return _as_date(value).strftime("%Y%m%d")
-
-
-def _parse_tushare_date(value: Any) -> date | None:
-    text = str(value)
-    try:
-        return datetime.strptime(text, "%Y%m%d").date()
-    except ValueError:
-        try:
-            return _as_date(text)
-        except ValueError:
-            return None
-
-
-def _parse_date(value: Any) -> date | None:
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    try:
-        return _as_date(value)
-    except ValueError:
-        return None
+    return tushare_date(value)
 
 
 def _call_log_row(
@@ -888,8 +865,8 @@ def _call_log_row(
         "kind": job.kind,
         "item_key": job.item_key,
         "item_value": job.item_value,
-        "request_start_date": _parse_date(request.start_date),
-        "request_end_date": _parse_date(request.end_date),
+        "request_start_date": parse_date(request.start_date),
+        "request_end_date": parse_date(request.end_date),
         "data_min_time": min_time,
         "data_max_time": max_time,
         "rows": rows,
@@ -904,20 +881,4 @@ def _call_log_row(
 
 
 def _normalize_call_log_data(data: pl.DataFrame) -> pl.DataFrame:
-    rename: dict[str, str] = {}
-    if "time" not in data.columns:
-        for column in ("f_ann_date", "trade_date", "cal_date", "date"):
-            if column in data.columns:
-                rename[column] = "time"
-                break
-    frame = data.rename(rename)
-    if "time" in frame.columns:
-        text = pl.col("time").cast(pl.String)
-        frame = frame.with_columns(
-            pl.coalesce(
-                text.str.strptime(pl.Date, "%Y%m%d", strict=False),
-                text.str.strptime(pl.Date, "%Y-%m-%d", strict=False),
-                pl.col("time").cast(pl.Date, strict=False),
-            ).alias("time")
-        )
-    return frame
+    return normalize_table_columns(data)

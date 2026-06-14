@@ -17,6 +17,7 @@ SPEC.loader.exec_module(update_tushare_lake)
 TableProgress = update_tushare_lake.TableProgress
 format_seconds = update_tushare_lake.format_seconds
 render_bar = update_tushare_lake.render_bar
+collect_config = update_tushare_lake.collect_config
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,26 @@ def test_render_bar_scales_completed_calls() -> None:
 
 def test_format_seconds_includes_minutes() -> None:
     assert format_seconds(90) == "90.00s (1.50m)"
+
+
+def test_collect_config_defaults_to_repo_local_lake(monkeypatch) -> None:
+    defaults: dict[str, str | None] = {}
+
+    def fake_prompt(label: str, *, default: str | None = None, **_):
+        defaults[label] = default
+        return default or ""
+
+    monkeypatch.setattr(update_tushare_lake, "prompt", fake_prompt)
+    monkeypatch.setattr(
+        update_tushare_lake,
+        "resolve_tushare_token",
+        lambda: (None, "not configured"),
+    )
+
+    config = collect_config()
+
+    assert defaults["Lake path"] == str(update_tushare_lake.DEFAULT_LAKE)
+    assert config.lake == update_tushare_lake.DEFAULT_LAKE
 
 
 def test_table_progress_updates_one_tty_line_and_completes_once() -> None:
