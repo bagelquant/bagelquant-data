@@ -22,7 +22,6 @@ dev = [
     "pandas>=3.0.0",
     "pre-commit>=4.5.0",
     "pytest>=9.0.0",
-    "ruff>=0.14.0",
 ]
 
 [build-system]
@@ -32,14 +31,4 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-
-[tool.ruff]
-line-length = 88
-src = ["src", "tests", "examples"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "RUF"]
-
-[tool.ruff.lint.per-file-ignores]
-"examples/*.py" = ["B018"]
 
