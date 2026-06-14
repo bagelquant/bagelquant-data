@@ -114,7 +114,6 @@ def format_seconds(seconds: float) -> str:
 
 
 def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
-    counts = Counter(job.table for job in report.jobs)
     grouped = {
         "price": [],
         "fundamental": [],
@@ -129,7 +128,8 @@ def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
     print(f"tables: {', '.join(plan.table for plan in report.plans)}")
     print("reference refreshes: only if local stock_basic or trade_cal is missing")
     print(f"scan preview time: {format_seconds(scan_seconds)}")
-    print(f"total api calls: {len(report.jobs)}")
+    estimated_calls = sum(plan.estimated_job_count for plan in report.plans)
+    print(f"estimated api calls: {estimated_calls}")
     print(SEPARATOR)
     for kind, plans in grouped.items():
         if not plans:
@@ -137,12 +137,24 @@ def print_plan(config: UpdateConfig, report, *, scan_seconds: float) -> None:
         print(f"{kind}")
         for plan in plans:
             preview = ""
-            if plan.pending_items:
+            if kind in {"fundamental", "fundamental_vip"}:
+                last = (
+                    plan.last_update_date.isoformat()
+                    if plan.last_update_date
+                    else "none"
+                )
+                effective = (
+                    plan.effective_start.isoformat()
+                    if plan.effective_start
+                    else "none"
+                )
+                preview = f", last_update={last}, effective_start={effective}"
+            elif plan.pending_items:
                 first = plan.pending_items[0]
                 last = plan.pending_items[-1]
                 preview = f", first={first}, last={last}"
             print(
-                f"- {plan.table}: {counts[plan.table]} call(s), "
+                f"- {plan.table}: {plan.estimated_job_count} call(s), "
                 f"status={plan.status}{preview}"
             )
         print(SEPARATOR)
@@ -248,13 +260,13 @@ def main() -> None:
     scan_manager = build_scan_manager(config)
     specs = scan_manager.tushare_update_specs()
     scan_started = perf_counter()
-    report = scan_manager.scan_tushare_updates(
+    preview_report = scan_manager.preview_tushare_updates(
         specs,
         start_date=config.start_date,
         end_date=config.end_date,
     )
     scan_seconds = perf_counter() - scan_started
-    print_plan(config, report, scan_seconds=scan_seconds)
+    print_plan(config, preview_report, scan_seconds=scan_seconds)
     if not prompt_yes_no("Proceed with this update", default=True):
         print_block("Preview complete")
         print("Preview complete. No data was updated.")
@@ -266,6 +278,11 @@ def main() -> None:
         return
 
     manager = build_manager(config)
+    report = manager.scan_tushare_updates(
+        specs,
+        start_date=config.start_date,
+        end_date=config.end_date,
+    )
     update_started = perf_counter()
     refs = manager.execute_tushare_update_report(
         report,

@@ -81,6 +81,7 @@ class TushareUpdatePlan:
     status: TushareUpdateStatus
     universe: str | None = None
     trading_calendar: str | None = None
+    last_update_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)

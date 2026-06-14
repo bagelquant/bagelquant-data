@@ -184,6 +184,49 @@ def test_scan_fundamental_uses_local_latest_date_for_up_to_date(tmp_path) -> Non
     assert report.jobs == ()
 
 
+def test_preview_fundamental_uses_table_latest_without_per_asset_scan(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    manager = manager_with_client(tmp_path, object())
+    seed_refs(manager)
+    manager.lake.write(
+        "tushare",
+        "income",
+        pl.DataFrame(
+            {
+                "f_ann_date": ["2024-01-31", "2024-01-31"],
+                "ts_code": ["000001.SZ", "000002.SZ"],
+                "revenue": [1.0, 2.0],
+            }
+        ),
+        mode="overwrite",
+    )
+
+    def fail_per_asset_scan(*_args, **_kwargs):
+        raise AssertionError("preview should not scan latest dates per asset")
+
+    monkeypatch.setattr(
+        DataLakeManager,
+        "_latest_local_dates_by_asset",
+        fail_per_asset_scan,
+    )
+
+    report = manager.preview_tushare_updates(
+        (TushareTableUpdateSpec(table="income", kind="fundamental"),),
+        start_date="2024-01-01",
+        end_date="2024-02-29",
+    )
+
+    assert report.jobs == ()
+    assert report.plans[0].status == "pending"
+    assert report.plans[0].last_update_date is not None
+    assert report.plans[0].last_update_date.isoformat() == "2024-01-31"
+    assert report.plans[0].effective_start is not None
+    assert report.plans[0].effective_start.isoformat() == "2024-01-31"
+    assert report.plans[0].estimated_job_count == 2
+
+
 class Client:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
