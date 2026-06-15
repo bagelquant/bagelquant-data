@@ -17,6 +17,7 @@ source = { editable = "." }
 dependencies = [
     { name = "polars" },
     { name = "pyarrow" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -38,6 +39,7 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'tushare'", specifier = ">=3.0.0" },
     { name = "polars", specifier = ">=1.35.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },
+    { name = "tqdm", specifier = ">=4.67.0" },
     { name = "tushare", marker = "extra == 'tushare'", specifier = ">=1.4.21" },
 ]
 provides-extras = ["tushare"]

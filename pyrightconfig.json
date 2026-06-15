@@ -2,9 +2,7 @@
   "include": [
     "src",
     "tests",
-    "examples",
-    "manage_data_lake.py",
-    "update_tushare_lake.py"
+    "scripts"
   ],
   "typeCheckingMode": "basic",
   "venvPath": ".",
