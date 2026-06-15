@@ -1,0 +1,9 @@
+[lake]
+root = "data"
+
+[parquet]
+compression = "zstd"
+compression_level = 3
+small_file_mb = 32
+target_file_mb = 256
+oversized_file_mb = 1024

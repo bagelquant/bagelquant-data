@@ -1,0 +1,18 @@
+name: adj_factor
+source: tushare
+source_dataset: adj_factor
+category: market
+field_mapping:
+  ts_code: ts_code
+  trade_date: trade_date
+required_columns: [asset_id, time]
+primary_key: [asset_id, time]
+asset_column: ts_code
+time_column: trade_date
+request_planner: snapshot
+normalizer: standard
+deduplication: primary_key_last
+partition_strategy: year_month
+update_mode: upsert
+sort_columns: [time, asset_id]
+reference: false

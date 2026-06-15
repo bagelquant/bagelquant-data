@@ -1,38 +1,32 @@
-"""Unified data access interfaces for BagelQuant."""
+"""Source-agnostic data lake framework for BagelQuant research."""
 
-from bagelquant_data.datasource.base import DataRequest, DataSource
-from bagelquant_data.datasource.registry import DataSourceRegistry, default_registry
-from bagelquant_data.lake import (
-    DataLakeManager,
-    LocalDataLake,
-    TushareTableUpdateSpec,
-    TushareTradingCalendarRef,
-    TushareUniverseRef,
-    TushareUpdateJob,
-    TushareUpdatePlan,
-    TushareUpdateReport,
+from bagelquant_data.core import (
+    BagelQuantDataError,
+    DataSource,
+    DatasetNotFoundError,
+    DatasetSpec,
+    DatasetSpecError,
+    DuplicateResolutionError,
+    SourceNotFoundError,
+    ValidationError,
+    stable_bucket,
 )
-from bagelquant_data.loader.loader import LoadedDataset, Loader, RetrievedPanel
-from bagelquant_data.metadata.contract import DataContract
-from bagelquant_data.metadata.schema import DatasetSchema, FieldSchema
+from bagelquant_data.finance import FinancialFieldKind, FinancialFieldSpec
+from bagelquant_data.management import DataLake
+from bagelquant_data.sources.tushare import TushareSource
 
 __all__ = [
-    "DataContract",
-    "DataLakeManager",
-    "DataRequest",
+    "BagelQuantDataError",
+    "DataLake",
     "DataSource",
-    "DataSourceRegistry",
-    "DatasetSchema",
-    "FieldSchema",
-    "LoadedDataset",
-    "Loader",
-    "LocalDataLake",
-    "RetrievedPanel",
-    "TushareTableUpdateSpec",
-    "TushareTradingCalendarRef",
-    "TushareUniverseRef",
-    "TushareUpdateJob",
-    "TushareUpdatePlan",
-    "TushareUpdateReport",
-    "default_registry",
+    "DatasetNotFoundError",
+    "DatasetSpec",
+    "DatasetSpecError",
+    "DuplicateResolutionError",
+    "FinancialFieldKind",
+    "FinancialFieldSpec",
+    "SourceNotFoundError",
+    "TushareSource",
+    "ValidationError",
+    "stable_bucket",
 ]

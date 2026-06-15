@@ -1,26 +1,39 @@
 # BagelQuant Data
 
-`bagelquant-data` is the lean Polars-native data package for local BagelQuant
-research workflows. Its current core is intentionally small:
+`bagelquant-data` is a Polars-native, source-agnostic data lake framework for
+quantitative research.
 
-- read provider data into `polars.DataFrame` objects
-- normalize provider columns to `time` and `asset_id`
-- write/read local parquet lake snapshots
-- plan and execute resumable Tushare lake updates
-- load long-form panel fields as `time`, `asset_id`, `value`
-
-Provider-specific names such as `trade_date`, `cal_date`, `f_ann_date`, and
-`ts_code` are normalized at provider and lake boundaries.
+- Polars is the dataframe engine.
+- Parquet is the canonical analytical storage format.
+- SQLite stores mutable metadata, manifests, run state, and source/dataset
+  registration.
+- Tushare is implemented as the first source adapter under
+  `bagelquant_data.sources.tushare`.
+- Non-reference research extraction returns one field at a time as
+  `time | asset_id | value`.
 
 ```python
 import polars as pl
 
-from bagelquant_data.lake import LocalDataLake
+from bagelquant_data import DataLake, DatasetSpec
 
-lake = LocalDataLake(".bagelquant-data-lake")
-lake.write(
-    "custom",
-    "daily",
+lake = DataLake.open("data")
+spec = DatasetSpec(
+    name="daily",
+    source="custom",
+    source_dataset="daily",
+    category="market",
+    field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
+    required_columns=("asset_id", "time"),
+    primary_key=("asset_id", "time"),
+    asset_column="ts_code",
+    time_column="trade_date",
+    partition_strategy="year_month",
+    deduplication="primary_key_last",
+    sort_columns=("time", "asset_id"),
+)
+lake.ingest_frame(
+    spec,
     pl.DataFrame(
         {
             "trade_date": ["2024-01-02"],
@@ -28,15 +41,16 @@ lake.write(
             "close": [100.0],
         }
     ),
-    mode="overwrite",
 )
 
-close = lake.read_panel_field("custom_daily_close")
-print(close)  # time, asset_id, value
+close = lake.query.field("daily", "close", source="custom", collect=True)
+print(close)  # time, asset_id, close
 ```
 
-See [docs/tushare-lake-workflow.md](docs/tushare-lake-workflow.md) for the
-maintained ingestion workflow.
+Documentation is available in two languages:
+
+- English: `docs/en/index.md`
+- Chinese: `docs/cn/index.md`
 
 ## Development
 
