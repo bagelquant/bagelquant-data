@@ -110,10 +110,10 @@ def index_weight_spec() -> DatasetSpec:
         source="tushare",
         source_dataset="index_weight",
         category="market",
-        field_mapping={"index_code": "index_code", "trade_date": "trade_date"},
+        field_mapping={"index_code": "index_code", "con_code": "con_code", "trade_date": "trade_date"},
         required_columns=("asset_id", "time"),
-        primary_key=("asset_id", "time"),
-        asset_column="index_code",
+        primary_key=("index_code", "asset_id", "time"),
+        asset_column="con_code",
         time_column="trade_date",
         request_planner="by_asset_date_range",
         request_options={
@@ -124,6 +124,7 @@ def index_weight_spec() -> DatasetSpec:
         },
         partition_strategy="ten_year_range",
         deduplication="primary_key_last",
+        sort_columns=("time", "index_code", "asset_id"),
     )
 
 
@@ -276,10 +277,10 @@ class FakeTushareSource:
         if source_dataset == "index_weight":
             return pl.DataFrame(
                 {
-                    "index_code": [request["index_code"]],
-                    "trade_date": [request["start_date"]],
-                    "con_code": ["000001.SZ"],
-                    "weight": [1.0],
+                    "index_code": [request["index_code"], request["index_code"]],
+                    "trade_date": [request["start_date"], request["start_date"]],
+                    "con_code": ["000001.SZ", "000002.SZ"],
+                    "weight": [1.0, 2.0],
                 }
             )
         return pl.DataFrame(
@@ -661,6 +662,56 @@ def test_index_weight_derives_assets_with_configured_request_param(tmp_path) -> 
         {"index_code": "000300.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
         {"index_code": "000852.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
         {"index_code": "000905.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+    ]
+
+
+def test_index_weight_preserves_multiple_constituents_for_same_index_date(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    frame = pl.DataFrame(
+        {
+            "index_code": ["000300.SH", "000300.SH"],
+            "trade_date": ["20240102", "20240102"],
+            "con_code": ["000001.SZ", "000002.SZ"],
+            "weight": [1.0, 2.0],
+        }
+    )
+
+    lake.ingest_frame(index_weight_spec(), frame)
+
+    result = lake.query.raw(
+        "index_weight",
+        source="tushare",
+        columns=["index_code", "asset_id", "time", "weight"],
+    ).collect()
+    rows = sorted((row["index_code"], row["asset_id"], str(row["time"]), row["weight"]) for row in result.to_dicts())
+    assert rows == [
+        ("000300.SH", "000001.SZ", "2024-01-02", 1.0),
+        ("000300.SH", "000002.SZ", "2024-01-02", 2.0),
+    ]
+
+
+def test_index_weight_allows_same_constituent_in_multiple_indexes(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    frame = pl.DataFrame(
+        {
+            "index_code": ["000300.SH", "000905.SH"],
+            "trade_date": ["20240102", "20240102"],
+            "con_code": ["000001.SZ", "000001.SZ"],
+            "weight": [1.0, 0.5],
+        }
+    )
+
+    lake.ingest_frame(index_weight_spec(), frame)
+
+    result = lake.query.raw(
+        "index_weight",
+        source="tushare",
+        columns=["index_code", "asset_id", "time", "weight"],
+    ).collect()
+    rows = sorted((row["index_code"], row["asset_id"], str(row["time"]), row["weight"]) for row in result.to_dicts())
+    assert rows == [
+        ("000300.SH", "000001.SZ", "2024-01-02", 1.0),
+        ("000905.SH", "000001.SZ", "2024-01-02", 0.5),
     ]
 
 

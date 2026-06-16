@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import polars as pl
 from bagelquant_data import DataLake
 
 
@@ -11,7 +10,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Example Tushare extraction queries.")
     parser.add_argument("--root", type=Path, default=Path("data"), help="Data lake root directory.")
     parser.add_argument("--start", default="2000-01-01")
-    parser.add_argument("--end", default="2026-06-17")
+    parser.add_argument("--end", default="2026-06-15")
     parser.add_argument("--asset", default="000001.SZ")
     args = parser.parse_args(argv)
 
@@ -21,15 +20,16 @@ def main(argv: list[str] | None = None) -> int:
         "close",
         source="tushare",
         start=args.start,
-        assets=[args.asset],
+        # assets=[args.asset],
         end=args.end,
         collect=True,
     )
-    print(close.tail())
+    print(close.head())
 
-    index_basic = lake.query.reference("index_basic", source="tushare", collect=True)
-    # select is_open = 1 and sort by date
-    print(index_basic.head())
+    # trade_cal = lake.query.reference("trade_cal", source="tushare", collect=True)
+    # # select is_open = 1 and sort by date
+    # trade_cal = trade_cal.filter(pl.col("is_open") == 1).sort("cal_date")
+    # print(trade_cal.head())
 
     # ohlcv = lake.query.fields(
     #     "daily",

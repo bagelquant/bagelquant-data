@@ -4,10 +4,11 @@ source_dataset: index_weight
 category: market
 field_mapping:
   index_code: index_code
+  con_code: con_code
   trade_date: trade_date
 required_columns: [asset_id, time]
-primary_key: [asset_id, time]
-asset_column: index_code
+primary_key: [index_code, asset_id, time]
+asset_column: con_code
 time_column: trade_date
 request_planner: by_asset_date_range
 request_options:
@@ -19,6 +20,6 @@ normalizer: standard
 deduplication: primary_key_last
 partition_strategy: ten_year_range
 update_mode: upsert
-sort_columns: [time, asset_id]
+sort_columns: [time, index_code, asset_id]
 point_in_time: false
 reference: false
