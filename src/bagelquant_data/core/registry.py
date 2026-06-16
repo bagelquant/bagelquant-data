@@ -16,7 +16,6 @@ from bagelquant_data.core.partitioning import (
     YearBucketPartition,
     YearMonthPartition,
 )
-from bagelquant_data.core.request import AssetPlanner, SnapshotPlanner
 from bagelquant_data.core.validation import FrameworkValidator
 
 T = TypeVar("T")
@@ -46,7 +45,6 @@ class FrameworkRegistries:
     """All extension registries used by the framework."""
 
     sources: Registry[object] = field(default_factory=lambda: Registry[object]())
-    request_planners: Registry[object] = field(default_factory=lambda: Registry[object]())
     normalizers: Registry[object] = field(default_factory=lambda: Registry[object]())
     validators: Registry[object] = field(default_factory=lambda: Registry[object]())
     partition_strategies: Registry[object] = field(default_factory=lambda: Registry[object]())
@@ -58,8 +56,6 @@ def default_registries() -> FrameworkRegistries:
     """Return registries with built-in plugins installed."""
 
     registries = FrameworkRegistries()
-    registries.request_planners.register("snapshot", SnapshotPlanner())
-    registries.request_planners.register("by_asset", AssetPlanner())
     registries.normalizers.register("standard", StandardNormalizer())
     registries.validators.register("framework", FrameworkValidator())
     registries.partition_strategies.register("single_file", SingleFilePartition())

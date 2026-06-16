@@ -374,6 +374,15 @@ def test_financial_update_without_assets_requires_stock_basic(tmp_path) -> None:
         lake.update.dataset("income", source="tushare", progress=False)
 
 
+def test_update_rejects_removed_noop_options(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.sources.register(FakeTushareSource())
+    lake.datasets.add(stock_basic_spec())
+
+    with pytest.raises(ConfigurationError, match="force"):
+        lake.update.dataset("stock_basic", source="tushare", force=True)
+
+
 def test_retry_succeeds_after_temporary_failure(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = FlakySource()

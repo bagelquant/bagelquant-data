@@ -33,9 +33,6 @@ request planning
 - `start`
 - `end`
 - `assets`
-- `force`
-- `repair`
-- `validate`
 - `workers`
 - `batch_size`
 - `source_options`
@@ -102,19 +99,6 @@ request_options:
 - 更丰富的数据集校验器
 
 现有 API 已为这些能力预留空间，不需要改变用户侧方法名。
-
-## 回填
-
-回填是带明确日期边界的数据集更新：
-
-```python
-lake.update.backfill(
-    "daily",
-    source="tushare",
-    start="2000-01-01",
-    end="2026-06-15",
-)
-```
 
 ## 更新后状态
 

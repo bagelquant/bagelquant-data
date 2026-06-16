@@ -21,3 +21,9 @@ def test_legacy_top_level_exports_are_removed() -> None:
 
     for name in removed:
         assert not hasattr(bagelquant_data, name)
+
+
+def test_update_backfill_api_is_removed(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+
+    assert not hasattr(lake.update, "backfill")

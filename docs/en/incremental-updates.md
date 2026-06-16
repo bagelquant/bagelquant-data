@@ -33,9 +33,6 @@ The public update API accepts:
 - `start`
 - `end`
 - `assets`
-- `force`
-- `repair`
-- `validate`
 - `workers`
 - `batch_size`
 - `source_options`
@@ -101,19 +98,6 @@ The current implementation provides the new API and storage foundation. It suppo
 - compaction thresholds and repair operations
 
 The API already leaves room for those features without changing user-facing method names.
-
-## Backfill
-
-Backfill is a dataset update with explicit date boundaries:
-
-```python
-lake.update.backfill(
-    "daily",
-    source="tushare",
-    start="2000-01-01",
-    end="2026-06-15",
-)
-```
 
 ## Status After Updates
 
