@@ -13,7 +13,6 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError, DatasetNotFoundError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
-from bagelquant_data.core.types import DateLike
 from bagelquant_data.finance import FinanceFacade
 from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
@@ -90,9 +89,6 @@ class UpdateManager:
         names = [row["name"] for row in self.lake.datasets.list(source) if row["enabled"]]
         return self.datasets(names, source=source, **kwargs)
 
-    def backfill(self, dataset: str, *, source: str, start: DateLike, end: DateLike, **kwargs: Any) -> IngestionReport:
-        return self.dataset(dataset, source=source, start=start, end=end, **kwargs)
-
     def _default_assets(self, source: str) -> list[str]:
         if source != "tushare":
             raise ConfigurationError("assets=... is required for by_asset dataset updates")
@@ -148,10 +144,7 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
         "start": kwargs.pop("start", None),
         "end": kwargs.pop("end", None),
         "assets": kwargs.pop("assets", None),
-        "force": bool(kwargs.pop("force", False)),
-        "repair": bool(kwargs.pop("repair", False)),
     }
-    validate = kwargs.pop("validate", None)
     workers = kwargs.pop("workers", None)
     batch_size = kwargs.pop("batch_size", None)
     source_options = kwargs.pop("source_options", None)
@@ -159,9 +152,10 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
     max_retries = kwargs.pop("max_retries", None)
     retry_backoff_seconds = kwargs.pop("retry_backoff_seconds", None)
     trade_dates = kwargs.pop("trade_dates", None)
-    options = dict(kwargs)
-    if validate is not None:
-        options["validate"] = validate
+    if kwargs:
+        keys = ", ".join(sorted(kwargs))
+        raise ConfigurationError(f"Unsupported update option(s): {keys}")
+    options: dict[str, Any] = {}
     if workers is not None:
         options["workers"] = workers
     if batch_size is not None:

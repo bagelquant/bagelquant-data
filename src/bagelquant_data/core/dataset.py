@@ -27,7 +27,6 @@ class DatasetSpec:
     request_planner: str = "snapshot"
     request_options: dict[str, Any] = field(default_factory=dict)
     normalizer: str = "standard"
-    validator: str | None = None
     deduplication: str = "exact_record_hash"
     partition_strategy: str = "single_file"
     partition_options: dict[str, Any] = field(default_factory=dict)
@@ -60,7 +59,6 @@ class DatasetSpec:
             request_planner=str(value.get("request_planner") or "snapshot"),
             request_options=dict(value.get("request_options") or {}),
             normalizer=str(value.get("normalizer") or "standard"),
-            validator=_optional_str(value.get("validator")),
             deduplication=str(value.get("deduplication") or "exact_record_hash"),
             partition_strategy=str(value.get("partition_strategy") or "single_file"),
             partition_options=dict(value.get("partition_options") or {}),
