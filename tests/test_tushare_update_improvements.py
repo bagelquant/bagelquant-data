@@ -242,6 +242,40 @@ class EmptyDailySource(FakeTushareSource):
         )
 
 
+class EmptyStringDailySource(FakeTushareSource):
+    def fetch(self, source_dataset: str, request: dict[str, Any]) -> pl.DataFrame:
+        with self._lock:
+            self.requests.append(dict(request))
+        return pl.DataFrame(
+            {
+                "ts_code": pl.Series([], dtype=pl.String),
+                "trade_date": pl.Series([], dtype=pl.String),
+                "close": pl.Series([], dtype=pl.String),
+            }
+        )
+
+
+class DailyWithEmptyStringSource(FakeTushareSource):
+    def fetch(self, source_dataset: str, request: dict[str, Any]) -> pl.DataFrame:
+        with self._lock:
+            self.requests.append(dict(request))
+        if request["trade_date"] == "2024-01-03":
+            return pl.DataFrame(
+                {
+                    "ts_code": pl.Series([], dtype=pl.String),
+                    "trade_date": pl.Series([], dtype=pl.String),
+                    "close": pl.Series([], dtype=pl.String),
+                }
+            )
+        return pl.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": [request["trade_date"]],
+                "close": [12.0],
+            }
+        )
+
+
 class IncomeByAssetSource(FakeTushareSource):
     def fetch(self, source_dataset: str, request: dict[str, Any]) -> pl.DataFrame:
         with self._lock:
@@ -526,6 +560,31 @@ def test_upsert_incremental_update_preserves_existing_partition_rows(tmp_path) -
     ]
 
 
+def test_empty_string_market_page_does_not_widen_numeric_batch(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.ingest_frame(
+        daily_spec(),
+        pl.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20240101"], "close": [10.0]}),
+    )
+    source = DailyWithEmptyStringSource()
+    lake.sources.register(source)
+    seed_trade_cal(lake, ["20240102", "20240103"], [1, 1])
+
+    report = lake.update.dataset("daily", source="tushare", start="2024-01-02", end="2024-01-03", progress=False)
+
+    assert report.status == "success"
+    assert report.request_count == 2
+    assert report.success_count == 2
+    assert report.rows_downloaded == 1
+    frame = lake.query.raw("daily", source="tushare", columns=["asset_id", "time", "close"]).collect()
+    assert frame.schema["close"] == pl.Float64
+    rows = sorted((row["asset_id"], str(row["time"]), row["close"]) for row in frame.to_dicts())
+    assert rows == [
+        ("000001.SZ", "2024-01-01", 10.0),
+        ("000001.SZ", "2024-01-02", 12.0),
+    ]
+
+
 def test_market_update_commits_one_run_across_month_batches(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = DailyByRequestSource()
@@ -617,3 +676,24 @@ def test_empty_successful_update_is_noop_for_existing_data(tmp_path) -> None:
     assert report.status == "success"
     assert report.rows_downloaded == 0
     assert lake.query.raw("daily", source="tushare").collect().height == 1
+
+
+def test_empty_string_successful_update_is_noop_for_existing_data(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.ingest_frame(
+        daily_spec(),
+        pl.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20240102"], "close": [10.0]}),
+    )
+    source = EmptyStringDailySource()
+    lake.sources.register(source)
+    seed_trade_cal(lake, ["20240103"], [1])
+
+    report = lake.update.dataset("daily", source="tushare", start="2024-01-03", end="2024-01-03", progress=False)
+
+    assert report.status == "success"
+    assert report.request_count == 1
+    assert report.success_count == 1
+    assert report.rows_downloaded == 0
+    frame = lake.query.raw("daily", source="tushare").collect()
+    assert frame.height == 1
+    assert frame.schema["close"] == pl.Float64
