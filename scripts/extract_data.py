@@ -11,11 +11,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Example Tushare extraction queries.")
     parser.add_argument("--root", type=Path, default=Path("data"), help="Data lake root directory.")
     parser.add_argument("--start", default="2000-01-01")
-    parser.add_argument("--end", default="2026-06-15")
+    parser.add_argument("--end", default="2026-06-17")
     parser.add_argument("--asset", default="000001.SZ")
     args = parser.parse_args(argv)
 
-    lake = DataLake.open("/Users/eric/data")
+    lake = DataLake.open("C:/Users/ericy/data")
     close = lake.query.field(
         "daily",
         "close",
@@ -25,12 +25,11 @@ def main(argv: list[str] | None = None) -> int:
         end=args.end,
         collect=True,
     )
-    print(close.head())
+    print(close.tail())
 
-    trade_cal = lake.query.reference("trade_cal", source="tushare", collect=True)
+    index_basic = lake.query.reference("index_basic", source="tushare", collect=True)
     # select is_open = 1 and sort by date
-    trade_cal = trade_cal.filter(pl.col("is_open") == 1).sort("cal_date")
-    print(trade_cal.head())
+    print(index_basic.head())
 
     # ohlcv = lake.query.fields(
     #     "daily",

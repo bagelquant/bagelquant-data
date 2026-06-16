@@ -11,6 +11,10 @@ asset_column: ts_code
 time_column: ann_date
 period_column: end_date
 request_planner: by_asset
+request_options:
+  reference_dataset: stock_basic
+  reference_column: ts_code
+  request_param: ts_code
 normalizer: standard
 deduplication: exact_record_hash
 partition_strategy: year_bucket

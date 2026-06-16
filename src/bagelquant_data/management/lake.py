@@ -74,9 +74,9 @@ class UpdateManager:
     def dataset(self, dataset: str, *, source: str, **kwargs: Any) -> IngestionReport:
         spec = self.lake.datasets.get(dataset, source=source)
         adapter = self.lake.sources.get(source)
-        if spec.request_planner == "by_asset" and not kwargs.get("assets"):
-            kwargs["assets"] = self._default_assets(source)
-        if spec.source == "tushare" and spec.category == "market":
+        if _planner_needs_assets(spec) and not kwargs.get("assets"):
+            kwargs["assets"] = self._reference_assets(spec)
+        if spec.source == "tushare" and spec.category == "market" and _planner_needs_trade_dates(spec):
             kwargs["trade_dates"] = self._trade_dates(source, start=kwargs.get("start"), end=kwargs.get("end"))
         context = _request_context(source=source, dataset=dataset, kwargs=kwargs)
         return update_dataset(spec=spec, source_adapter=adapter, pipeline=self.lake._pipeline, context=context)
@@ -89,23 +89,36 @@ class UpdateManager:
         names = [row["name"] for row in self.lake.datasets.list(source) if row["enabled"]]
         return self.datasets(names, source=source, **kwargs)
 
-    def _default_assets(self, source: str) -> list[str]:
-        if source != "tushare":
-            raise ConfigurationError("assets=... is required for by_asset dataset updates")
+    def _reference_assets(self, spec: DatasetSpec) -> list[str]:
+        source = spec.source
+        reference_dataset = spec.request_options.get("reference_dataset")
+        reference_column = spec.request_options.get("reference_column")
+        if not reference_dataset and spec.request_planner == "by_asset" and source == "tushare":
+            reference_dataset = "stock_basic"
+            reference_column = "ts_code"
+        if not reference_dataset:
+            raise ConfigurationError(
+                f"assets=... or request_options.reference_dataset is required for {source}/{spec.name}"
+            )
+        reference_dataset = str(reference_dataset)
         try:
-            frame = self.lake.query.reference("stock_basic", source=source, collect=True)
+            frame = self.lake.query.reference(reference_dataset, source=source, collect=True)
         except DatasetNotFoundError as exc:
             raise ConfigurationError(
-                "Tushare by_asset updates require an asset universe. "
-                "Update/register stock_basic first or pass assets=[...] explicitly."
+                f"{source}/{spec.name} requires reference dataset {source}/{reference_dataset}. "
+                f"Update/register {reference_dataset} first or pass assets=[...] explicitly."
             ) from exc
         if isinstance(frame, pl.LazyFrame):
             frame = frame.collect()
-        columns = frame.columns
-        column = "asset_id" if "asset_id" in columns else "ts_code" if "ts_code" in columns else None
-        if column is None:
-            raise ConfigurationError("tushare/stock_basic does not contain asset_id or ts_code")
-        return [str(value) for value in frame.get_column(column).drop_nulls().unique().sort().to_list()]
+        if frame.is_empty():
+            raise ConfigurationError(f"{source}/{reference_dataset} is empty; update it before {spec.name}")
+        column = str(reference_column) if reference_column else _default_reference_column(frame)
+        if column not in frame.columns:
+            raise ConfigurationError(f"{source}/{reference_dataset} does not contain {column}")
+        assets = [str(value) for value in frame.get_column(column).drop_nulls().unique().sort().to_list()]
+        if not assets:
+            raise ConfigurationError(f"{source}/{reference_dataset}.{column} has no values for {spec.name}")
+        return assets
 
     def _trade_dates(self, source: str, *, start: Any, end: Any) -> list[str]:
         try:
@@ -171,6 +184,21 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
     if trade_dates is not None:
         options["trade_dates"] = trade_dates
     return RequestContext(source=source, dataset=dataset, options=options, **known)
+
+
+def _planner_needs_assets(spec: DatasetSpec) -> bool:
+    return spec.request_planner in {"by_asset", "by_asset_trade_date", "by_asset_date_range"}
+
+
+def _planner_needs_trade_dates(spec: DatasetSpec) -> bool:
+    return spec.request_planner != "by_asset_date_range"
+
+
+def _default_reference_column(frame: pl.DataFrame) -> str:
+    for column in ("asset_id", "ts_code"):
+        if column in frame.columns:
+            return column
+    raise ConfigurationError("reference dataset does not contain asset_id or ts_code")
 
 
 def _calendar_date_expr(column: str) -> pl.Expr:

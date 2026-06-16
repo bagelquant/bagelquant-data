@@ -13,6 +13,7 @@ from bagelquant_data.core.deduplication import (
 from bagelquant_data.core.normalization import StandardNormalizer
 from bagelquant_data.core.partitioning import (
     SingleFilePartition,
+    TenYearRangePartition,
     YearBucketPartition,
     YearMonthPartition,
 )
@@ -61,6 +62,7 @@ def default_registries() -> FrameworkRegistries:
     registries.partition_strategies.register("single_file", SingleFilePartition())
     registries.partition_strategies.register("year_month", YearMonthPartition())
     registries.partition_strategies.register("year_bucket", YearBucketPartition())
+    registries.partition_strategies.register("ten_year_range", TenYearRangePartition())
     registries.deduplication_strategies.register("none", NoDeduplication())
     registries.deduplication_strategies.register("exact_record_hash", ExactRecordHashDeduplication())
     registries.deduplication_strategies.register("primary_key_last", PrimaryKeyLastDeduplication())

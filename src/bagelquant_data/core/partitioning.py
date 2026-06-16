@@ -74,3 +74,22 @@ class YearBucketPartition:
 
     def path_for_values(self, spec: DatasetSpec, values: dict[str, object]) -> Path:
         return Path(f"year={values['year']}") / f"bucket={int(str(values['bucket'])):02d}" / "data.parquet"
+
+
+class TenYearRangePartition:
+    """Partition by 10-year ranges of canonical time."""
+
+    def derive_columns(self, frame: pl.LazyFrame, spec: DatasetSpec) -> pl.LazyFrame:
+        chunk_years = int(spec.partition_options.get("chunk_years", 10))
+        year = pl.col("time").dt.year()
+        start_year = (year // chunk_years) * chunk_years
+        end_year = start_year + chunk_years - 1
+        return frame.with_columns(
+            pl.format("{}-{}", start_year.cast(pl.String), end_year.cast(pl.String)).alias("year_range")
+        )
+
+    def paths_for_query(self, spec: DatasetSpec, query: object) -> list[Path]:
+        return []
+
+    def path_for_values(self, spec: DatasetSpec, values: dict[str, object]) -> Path:
+        return Path(f"year_range={values['year_range']}") / "data.parquet"

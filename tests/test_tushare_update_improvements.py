@@ -61,6 +61,72 @@ def daily_spec() -> DatasetSpec:
     )
 
 
+def index_basic_spec() -> DatasetSpec:
+    return DatasetSpec(
+        name="index_basic",
+        source="tushare",
+        source_dataset="index_basic",
+        category="reference",
+        field_mapping={"ts_code": "ts_code"},
+        required_columns=(),
+        partition_strategy="single_file",
+        update_mode="snapshot_replace",
+        reference=True,
+        request_options={
+            "row_filter": {
+                "column": "ts_code",
+                "in": ["000300.SH", "000905.SH", "000852.SH"],
+            }
+        },
+    )
+
+
+def index_daily_spec() -> DatasetSpec:
+    return DatasetSpec(
+        name="index_daily",
+        source="tushare",
+        source_dataset="index_daily",
+        category="market",
+        field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
+        required_columns=("asset_id", "time"),
+        primary_key=("asset_id", "time"),
+        asset_column="ts_code",
+        time_column="trade_date",
+        request_planner="by_asset_date_range",
+        request_options={
+            "reference_dataset": "index_basic",
+            "reference_column": "ts_code",
+            "request_param": "ts_code",
+            "date_chunk_years": 10,
+        },
+        partition_strategy="ten_year_range",
+        deduplication="primary_key_last",
+    )
+
+
+def index_weight_spec() -> DatasetSpec:
+    return DatasetSpec(
+        name="index_weight",
+        source="tushare",
+        source_dataset="index_weight",
+        category="market",
+        field_mapping={"index_code": "index_code", "trade_date": "trade_date"},
+        required_columns=("asset_id", "time"),
+        primary_key=("asset_id", "time"),
+        asset_column="index_code",
+        time_column="trade_date",
+        request_planner="by_asset_date_range",
+        request_options={
+            "reference_dataset": "index_basic",
+            "reference_column": "ts_code",
+            "request_param": "index_code",
+            "date_chunk_years": 10,
+        },
+        partition_strategy="ten_year_range",
+        deduplication="primary_key_last",
+    )
+
+
 def income_spec(**overrides: Any) -> DatasetSpec:
     values = {
         "name": "income",
@@ -157,10 +223,28 @@ class FakeTushareSource:
         self.options = options
 
     def plan_requests(self, dataset: DatasetSpec, context: Any) -> list[dict[str, Any]]:
+        if dataset.request_planner == "by_asset_date_range":
+            request_param = str(dataset.request_options.get("request_param") or "ts_code")
+            return [
+                {
+                    request_param: asset,
+                    "start_date": context.start,
+                    "end_date": context.end,
+                }
+                for asset in context.assets or []
+            ]
+        if dataset.request_planner == "by_asset_trade_date":
+            request_param = str(dataset.request_options.get("request_param") or "ts_code")
+            return [
+                {request_param: asset, "trade_date": trade_date}
+                for asset in context.assets or []
+                for trade_date in context.options.get("trade_dates", [])
+            ]
         if dataset.category == "market":
             return [{"trade_date": trade_date} for trade_date in context.options.get("trade_dates", [])]
         if dataset.request_planner == "by_asset":
-            return [{"ts_code": asset} for asset in context.assets or []]
+            request_param = str(dataset.request_options.get("request_param") or "ts_code")
+            return [{request_param: asset} for asset in context.assets or []]
         request: dict[str, Any] = {}
         if context.start is not None:
             request["start_date"] = context.start
@@ -174,6 +258,30 @@ class FakeTushareSource:
         if source_dataset == "daily":
             assert set(request) == {"trade_date"}
             return pl.DataFrame({"ts_code": ["000001.SZ"], "trade_date": [request["trade_date"]], "close": [10.0]})
+        if source_dataset == "index_basic":
+            return pl.DataFrame(
+                {
+                    "ts_code": ["000300.SH", "000905.SH", "000852.SH", "399001.SZ"],
+                    "name": ["沪深300", "中证500", "中证1000", "深证成指"],
+                }
+            )
+        if source_dataset == "index_daily":
+            return pl.DataFrame(
+                {
+                    "ts_code": [request["ts_code"]],
+                    "trade_date": [request["start_date"]],
+                    "close": [10.0],
+                }
+            )
+        if source_dataset == "index_weight":
+            return pl.DataFrame(
+                {
+                    "index_code": [request["index_code"]],
+                    "trade_date": [request["start_date"]],
+                    "con_code": ["000001.SZ"],
+                    "weight": [1.0],
+                }
+            )
         return pl.DataFrame(
             {
                 "ts_code": [request["ts_code"]],
@@ -398,6 +506,205 @@ def test_tushare_market_planning_uses_trade_dates_only() -> None:
     assert requests == [{"trade_date": "2024-01-02"}, {"trade_date": "2024-01-03"}]
 
 
+def test_index_yaml_preserves_reference_request_options() -> None:
+    spec = DatasetSpec.from_yaml("datasets/tushare/index_daily.yaml")
+
+    assert spec.request_planner == "by_asset_date_range"
+    assert spec.request_options["reference_dataset"] == "index_basic"
+    assert spec.request_options["reference_column"] == "ts_code"
+    assert spec.request_options["request_param"] == "ts_code"
+    assert spec.request_options["date_chunk_years"] == 10
+    assert spec.partition_strategy == "ten_year_range"
+
+
+def test_tushare_yaml_specs_declare_reference_universes() -> None:
+    expected = {
+        "adj_factor": ("stock_basic", "ts_code", "ts_code"),
+        "daily": ("stock_basic", "ts_code", "ts_code"),
+        "daily_basic": ("stock_basic", "ts_code", "ts_code"),
+        "balancesheet": ("stock_basic", "ts_code", "ts_code"),
+        "cashflow": ("stock_basic", "ts_code", "ts_code"),
+        "express": ("stock_basic", "ts_code", "ts_code"),
+        "forecast": ("stock_basic", "ts_code", "ts_code"),
+        "income": ("stock_basic", "ts_code", "ts_code"),
+        "index_daily": ("index_basic", "ts_code", "ts_code"),
+        "index_weight": ("index_basic", "ts_code", "index_code"),
+    }
+
+    for dataset, (reference_dataset, reference_column, request_param) in expected.items():
+        spec = DatasetSpec.from_yaml(f"datasets/tushare/{dataset}.yaml")
+
+        assert spec.request_options["reference_dataset"] == reference_dataset
+        assert spec.request_options["reference_column"] == reference_column
+        assert spec.request_options["request_param"] == request_param
+
+
+def test_tushare_asset_date_range_planner_splits_long_ranges() -> None:
+    source = TushareSource(client=object())
+    requests = list(
+        source.plan_requests(
+            index_daily_spec(),
+            RequestContext(
+                source="tushare",
+                dataset="index_daily",
+                start="2000-01-01",
+                end="2026-06-16",
+                assets=["000300.SH"],
+            ),
+        )
+    )
+
+    assert requests == [
+        {"ts_code": "000300.SH", "start_date": "2000-01-01", "end_date": "2009-12-31"},
+        {"ts_code": "000300.SH", "start_date": "2010-01-01", "end_date": "2019-12-31"},
+        {"ts_code": "000300.SH", "start_date": "2020-01-01", "end_date": "2026-06-16"},
+    ]
+
+
+def test_tushare_asset_date_range_planner_uses_configured_request_param() -> None:
+    source = TushareSource(client=object())
+    requests = list(
+        source.plan_requests(
+            index_weight_spec(),
+            RequestContext(
+                source="tushare",
+                dataset="index_weight",
+                start="2020-01-01",
+                end="2026-06-16",
+                assets=["000300.SH", "000905.SH"],
+            ),
+        )
+    )
+
+    assert requests == [
+        {"index_code": "000300.SH", "start_date": "2020-01-01", "end_date": "2026-06-16"},
+        {"index_code": "000905.SH", "start_date": "2020-01-01", "end_date": "2026-06-16"},
+    ]
+
+
+def test_tushare_asset_date_range_planner_splits_per_asset() -> None:
+    source = TushareSource(client=object())
+    requests = list(
+        source.plan_requests(
+            index_daily_spec(),
+            RequestContext(
+                source="tushare",
+                dataset="index_daily",
+                start="2008-01-01",
+                end="2012-01-01",
+                assets=["000300.SH", "000905.SH"],
+            ),
+        )
+    )
+
+    assert requests == [
+        {"ts_code": "000300.SH", "start_date": "2008-01-01", "end_date": "2009-12-31"},
+        {"ts_code": "000300.SH", "start_date": "2010-01-01", "end_date": "2012-01-01"},
+        {"ts_code": "000905.SH", "start_date": "2008-01-01", "end_date": "2009-12-31"},
+        {"ts_code": "000905.SH", "start_date": "2010-01-01", "end_date": "2012-01-01"},
+    ]
+
+
+def test_index_basic_row_filter_limits_reference_universe(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.sources.register(FakeTushareSource())
+    lake.datasets.add(index_basic_spec())
+
+    report = lake.update.dataset("index_basic", source="tushare", progress=False)
+
+    assert report.status == "success"
+    frame = lake.query.reference("index_basic", source="tushare", collect=True)
+    assert isinstance(frame, pl.DataFrame)
+    assert sorted(frame.get_column("ts_code").to_list()) == ["000300.SH", "000852.SH", "000905.SH"]
+
+
+def test_index_daily_derives_assets_from_index_basic(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = FakeTushareSource()
+    lake.sources.register(source)
+    lake.ingest_frame(index_basic_spec(), pl.DataFrame({"ts_code": ["000300.SH", "000905.SH", "000852.SH"]}))
+    lake.datasets.add(index_daily_spec())
+
+    report = lake.update.dataset(
+        "index_daily",
+        source="tushare",
+        start="2024-01-02",
+        end="2024-01-02",
+        progress=False,
+    )
+
+    assert report.status == "success"
+    assert sorted(source.requests, key=lambda item: item["ts_code"]) == [
+        {"ts_code": "000300.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+        {"ts_code": "000852.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+        {"ts_code": "000905.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+    ]
+
+
+def test_index_weight_derives_assets_with_configured_request_param(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = FakeTushareSource()
+    lake.sources.register(source)
+    lake.ingest_frame(index_basic_spec(), pl.DataFrame({"ts_code": ["000300.SH", "000905.SH", "000852.SH"]}))
+    lake.datasets.add(index_weight_spec())
+
+    report = lake.update.dataset(
+        "index_weight",
+        source="tushare",
+        start="2024-01-02",
+        end="2024-01-02",
+        progress=False,
+    )
+
+    assert report.status == "success"
+    assert sorted(source.requests, key=lambda item: item["index_code"]) == [
+        {"index_code": "000300.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+        {"index_code": "000852.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+        {"index_code": "000905.SH", "start_date": "2024-01-02", "end_date": "2024-01-02"},
+    ]
+
+
+def test_index_market_data_uses_ten_year_range_partitions(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    frame = pl.DataFrame(
+        {
+            "ts_code": ["000300.SH", "000300.SH", "000300.SH"],
+            "trade_date": ["20000104", "20100104", "20200102"],
+            "close": [1.0, 2.0, 3.0],
+        }
+    )
+
+    lake.ingest_frame(index_daily_spec(), frame)
+
+    root = lake.paths.dataset_root("tushare", "index_daily")
+    assert (root / "year_range=2000-2009" / "data.parquet").exists()
+    assert (root / "year_range=2010-2019" / "data.parquet").exists()
+    assert (root / "year_range=2020-2029" / "data.parquet").exists()
+    result = lake.query.raw(
+        "index_daily",
+        source="tushare",
+        start="2010-01-01",
+        end="2020-12-31",
+        assets=["000300.SH"],
+    ).collect()
+    assert result.select("close").to_series().to_list() == [2.0, 3.0]
+
+
+def test_reference_planner_requires_configured_reference_dataset(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.sources.register(FakeTushareSource())
+    lake.datasets.add(index_daily_spec())
+
+    with pytest.raises(ConfigurationError, match="index_basic"):
+        lake.update.dataset(
+            "index_daily",
+            source="tushare",
+            start="2024-01-02",
+            end="2024-01-02",
+            progress=False,
+        )
+
+
 def test_update_lake_groups_enabled_market_datasets(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     lake.datasets.add(daily_spec())
@@ -425,17 +732,36 @@ def test_update_lake_prompt_selects_financial_datasets(tmp_path, monkeypatch, ca
     lake.datasets.add(income_spec())
     lake.datasets.add(forecast_spec())
     lake.datasets.add(express_spec())
-    monkeypatch.setattr("builtins.input", lambda _: "3")
+    monkeypatch.setattr("builtins.input", lambda _: "4")
 
     datasets = _prompt_for_datasets(lake)
 
     assert datasets == ["income", "forecast", "express"]
     output = capsys.readouterr().out
     assert "1. update all" in output
-    assert "2. update market datasets:" in output
+    assert "2. update reference datasets:" in output
+    assert "3. update market datasets:" in output
     assert "  - daily" in output
-    assert "3. update financial datasets:" in output
+    assert "4. update financial datasets:" in output
     assert "  - income" in output
+
+
+def test_update_lake_prompt_selects_reference_datasets(tmp_path, monkeypatch, capsys) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.datasets.add(stock_basic_spec())
+    lake.datasets.add(trade_cal_spec())
+    lake.datasets.add(index_basic_spec())
+    lake.datasets.add(daily_spec())
+    monkeypatch.setattr("builtins.input", lambda _: "2")
+
+    datasets = _prompt_for_datasets(lake)
+
+    assert datasets == ["stock_basic", "trade_cal", "index_basic"]
+    output = capsys.readouterr().out
+    assert "2. update reference datasets:" in output
+    assert "  - stock_basic" in output
+    assert "  - trade_cal" in output
+    assert "  - index_basic" in output
 
 
 def test_financial_update_sends_ts_code_for_explicit_assets(tmp_path) -> None:
