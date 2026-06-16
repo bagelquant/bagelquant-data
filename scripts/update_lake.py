@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from time import perf_counter
@@ -23,6 +24,8 @@ DEFAULT_ORDER = (
     "forecast",
     "express",
 )
+MARKET_CATEGORIES = {"market"}
+FINANCIAL_CATEGORIES = {"financial_statement", "financial_event"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 
     lake = DataLake.open(args.root)
     lake.sources.register(TushareSource())
-    datasets = args.datasets or _enabled_tushare_datasets(lake)
+    datasets = args.datasets or _prompt_for_datasets(lake)
     start = perf_counter()
     reports = []
     for dataset in datasets:
@@ -95,6 +98,54 @@ def _enabled_tushare_datasets(lake: DataLake) -> list[str]:
     ordered = [dataset for dataset in DEFAULT_ORDER if dataset in enabled]
     extras = sorted(enabled - set(ordered))
     return ordered + extras
+
+
+def _enabled_tushare_datasets_by_category(lake: DataLake, categories: set[str]) -> list[str]:
+    enabled = {
+        row["name"]
+        for row in lake.datasets.list("tushare")
+        if row["enabled"] and row.get("category") in categories
+    }
+    ordered = [dataset for dataset in DEFAULT_ORDER if dataset in enabled]
+    extras = sorted(enabled - set(ordered))
+    return ordered + extras
+
+
+def _prompt_for_datasets(lake: DataLake) -> list[str]:
+    all_datasets = _enabled_tushare_datasets(lake)
+    market_datasets = _enabled_tushare_datasets_by_category(lake, MARKET_CATEGORIES)
+    financial_datasets = _enabled_tushare_datasets_by_category(lake, FINANCIAL_CATEGORIES)
+    choices = {
+        "1": ("update all", all_datasets),
+        "2": ("update market datasets", market_datasets),
+        "3": ("update financial datasets", financial_datasets),
+    }
+
+    print("Select datasets to update:")
+    print("1. update all")
+    print("2. update market datasets:")
+    _print_dataset_list(market_datasets)
+    print("3. update financial datasets:")
+    _print_dataset_list(financial_datasets)
+
+    while True:
+        choice = input("Enter choice [1-3]: ").strip()
+        if choice in choices:
+            label, datasets = choices[choice]
+            if not datasets:
+                print(f"No enabled datasets found for: {label}")
+                continue
+            print(f"Selected {label}: {', '.join(datasets)}")
+            return datasets
+        print("Invalid choice. Enter 1, 2, or 3.", file=sys.stderr)
+
+
+def _print_dataset_list(datasets: list[str]) -> None:
+    if not datasets:
+        print("  (none)")
+        return
+    for dataset in datasets:
+        print(f"  - {dataset}")
 
 
 def _effective_start(lake: DataLake, dataset: str, *, source: str, fallback_start: str) -> str:
