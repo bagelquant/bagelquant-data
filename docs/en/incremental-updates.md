@@ -42,6 +42,7 @@ The public update API accepts:
 
 These values are passed through `RequestContext`. Source adapters may use them to plan requests.
 Fetches are parallelized across planned requests/pages, but canonical Parquet commits remain serial per dataset.
+The default retry backoff is 60 seconds so Tushare's per-minute limit can reset before the next attempt. Shorten it only when the source is not minute-rate-limited.
 
 Example:
 

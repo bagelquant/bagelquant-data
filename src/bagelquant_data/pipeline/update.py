@@ -54,7 +54,7 @@ def update_dataset(
     workers = max(1, int(context.options.get("workers", 4)))
     progress_enabled = bool(context.options.get("progress", True))
     max_retries = max(1, int(context.options.get("max_retries", 3)))
-    retry_backoff_seconds = float(context.options.get("retry_backoff_seconds", 2.0))
+    retry_backoff_seconds = float(context.options.get("retry_backoff_seconds", 60.0))
     request_options = _request_options(spec, context)
     batches = _request_batches(spec, requests, context)
     errors: list[str] = []
