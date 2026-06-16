@@ -8,8 +8,13 @@ from time import perf_counter
 
 from bagelquant_data import DataLake, TushareSource
 
+try:
+    from scripts.lake_paths import default_lake_root
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from lake_paths import default_lake_root
 
-DEFAULT_ROOT = Path("C:/Users/ericy/data")
+
+DEFAULT_ROOT = default_lake_root()
 DEFAULT_START = "2000-01-01"
 INCREMENTAL_CATEGORIES = {"market", "financial_statement", "financial_event"}
 DEFAULT_ORDER = (
@@ -56,8 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--retry-backoff-seconds",
         type=float,
-        default=2.0,
-        help="Base retry backoff in seconds.",
+        default=60.0,
+        help="Base retry backoff in seconds. Defaults to Tushare's per-minute limit reset window.",
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable per-dataset progress bars.")
     args = parser.parse_args(argv)

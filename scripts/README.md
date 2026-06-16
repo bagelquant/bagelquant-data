@@ -57,8 +57,10 @@ uv run python scripts/update_lake.py --root data --datasets income balancesheet 
 Tune parallel API fetching and retry behavior:
 
 ```bash
-uv run python scripts/update_lake.py --root data --workers 2 --max-retries 3 --retry-backoff-seconds 5
+uv run python scripts/update_lake.py --root data --workers 2 --max-retries 3 --retry-backoff-seconds 60
 ```
+
+The default retry backoff is 60 seconds so Tushare's per-minute limit can reset before the next attempt. Shorten it only for sources or accounts where a shorter retry window is safe.
 
 Disable progress bars for logs or CI:
 

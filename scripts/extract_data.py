@@ -5,16 +5,21 @@ from pathlib import Path
 
 from bagelquant_data import DataLake
 
+try:
+    from scripts.lake_paths import default_lake_root
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from lake_paths import default_lake_root
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Example Tushare extraction queries.")
-    parser.add_argument("--root", type=Path, default=Path("data"), help="Data lake root directory.")
+    parser.add_argument("--root", type=Path, default=default_lake_root(), help="Data lake root directory.")
     parser.add_argument("--start", default="2000-01-01")
     parser.add_argument("--end", default="2026-06-15")
     parser.add_argument("--asset", default="000001.SZ")
     args = parser.parse_args(argv)
 
-    lake = DataLake.open("C:/Users/ericy/data")
+    lake = DataLake.open(args.root)
     close = lake.query.field(
         "daily",
         "close",
