@@ -141,7 +141,7 @@ def update_dataset(
                     error_message=page.error_message,
                     asset_id=page.asset_id,
                 )
-                if page.status == "success" and page.frame is not None:
+                if page.status == "success" and page.frame is not None and page.frame.height > 0:
                     if not (spec.update_mode == "replace_asset" and page.asset_id in failed_assets):
                         frames.append(page.frame)  # type: ignore[arg-type]
                 elif page.error_message:
