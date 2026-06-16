@@ -6,7 +6,7 @@ from pathlib import Path
 from bagelquant_data import DataLake, TushareSource
 
 
-DEFAULT_ROOT = Path("/Users/eric/data")
+DEFAULT_ROOT = Path("C:/Users/ericy/data")
 DEFAULT_DATASET_DIR = Path(__file__).resolve().parents[1] / "datasets" / "tushare"
 
 

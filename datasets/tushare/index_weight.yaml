@@ -1,22 +1,24 @@
-name: daily_basic
+name: index_weight
 source: tushare
-source_dataset: daily_basic
+source_dataset: index_weight
 category: market
 field_mapping:
-  ts_code: ts_code
+  index_code: index_code
   trade_date: trade_date
 required_columns: [asset_id, time]
 primary_key: [asset_id, time]
-asset_column: ts_code
+asset_column: index_code
 time_column: trade_date
-request_planner: snapshot
+request_planner: by_asset_date_range
 request_options:
-  reference_dataset: stock_basic
+  reference_dataset: index_basic
   reference_column: ts_code
-  request_param: ts_code
+  request_param: index_code
+  date_chunk_years: 10
 normalizer: standard
 deduplication: primary_key_last
-partition_strategy: year_month
+partition_strategy: ten_year_range
 update_mode: upsert
 sort_columns: [time, asset_id]
+point_in_time: false
 reference: false

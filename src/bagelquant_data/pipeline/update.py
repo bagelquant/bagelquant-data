@@ -141,9 +141,9 @@ def update_dataset(
                     error_message=page.error_message,
                     asset_id=page.asset_id,
                 )
-                if page.status == "success" and page.frame is not None and page.frame.height > 0:
+                if page.status == "success" and isinstance(page.frame, pl.DataFrame) and page.frame.height > 0:
                     if not (spec.update_mode == "replace_asset" and page.asset_id in failed_assets):
-                        frames.append(page.frame)  # type: ignore[arg-type]
+                        frames.append(page.frame)
                 elif page.error_message:
                     errors.append(f"{page.request_key}: {page.error_message}")
 
@@ -218,6 +218,8 @@ def _request_batches(
     context: RequestContext,
 ) -> list[list[tuple[int, dict[str, Any]]]]:
     indexed = list(enumerate(requests))
+    if spec.request_planner == "by_asset_date_range":
+        return [indexed]
     if spec.category == "market":
         groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         for item in indexed:
@@ -332,7 +334,7 @@ def _request_options(spec: DatasetSpec, context: RequestContext) -> dict[str, An
 
 
 def _request_asset(request: dict[str, Any]) -> str | None:
-    value = request.get("ts_code") or request.get("asset_id")
+    value = request.get("ts_code") or request.get("index_code") or request.get("asset_id")
     return None if value is None else str(value)
 
 

@@ -9,15 +9,18 @@ from time import perf_counter
 from bagelquant_data import DataLake, TushareSource
 
 
-DEFAULT_ROOT = Path("/Users/eric/data")
+DEFAULT_ROOT = Path("C:/Users/ericy/data")
 DEFAULT_START = "2000-01-01"
 INCREMENTAL_CATEGORIES = {"market", "financial_statement", "financial_event"}
 DEFAULT_ORDER = (
     "stock_basic",
     "trade_cal",
+    "index_basic",
     "daily",
     "daily_basic",
     "adj_factor",
+    "index_daily",
+    "index_weight",
     "income",
     "balancesheet",
     "cashflow",
@@ -26,6 +29,7 @@ DEFAULT_ORDER = (
 )
 MARKET_CATEGORIES = {"market"}
 FINANCIAL_CATEGORIES = {"financial_statement", "financial_event"}
+REFERENCE_CATEGORIES = {"reference"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,23 +117,27 @@ def _enabled_tushare_datasets_by_category(lake: DataLake, categories: set[str]) 
 
 def _prompt_for_datasets(lake: DataLake) -> list[str]:
     all_datasets = _enabled_tushare_datasets(lake)
+    reference_datasets = _enabled_tushare_datasets_by_category(lake, REFERENCE_CATEGORIES)
     market_datasets = _enabled_tushare_datasets_by_category(lake, MARKET_CATEGORIES)
     financial_datasets = _enabled_tushare_datasets_by_category(lake, FINANCIAL_CATEGORIES)
     choices = {
         "1": ("update all", all_datasets),
-        "2": ("update market datasets", market_datasets),
-        "3": ("update financial datasets", financial_datasets),
+        "2": ("update reference datasets", reference_datasets),
+        "3": ("update market datasets", market_datasets),
+        "4": ("update financial datasets", financial_datasets),
     }
 
     print("Select datasets to update:")
     print("1. update all")
-    print("2. update market datasets:")
+    print("2. update reference datasets:")
+    _print_dataset_list(reference_datasets)
+    print("3. update market datasets:")
     _print_dataset_list(market_datasets)
-    print("3. update financial datasets:")
+    print("4. update financial datasets:")
     _print_dataset_list(financial_datasets)
 
     while True:
-        choice = input("Enter choice [1-3]: ").strip()
+        choice = input("Enter choice [1-4]: ").strip()
         if choice in choices:
             label, datasets = choices[choice]
             if not datasets:
@@ -137,7 +145,7 @@ def _prompt_for_datasets(lake: DataLake) -> list[str]:
                 continue
             print(f"Selected {label}: {', '.join(datasets)}")
             return datasets
-        print("Invalid choice. Enter 1, 2, or 3.", file=sys.stderr)
+        print("Invalid choice. Enter 1, 2, 3, or 4.", file=sys.stderr)
 
 
 def _print_dataset_list(datasets: list[str]) -> None:

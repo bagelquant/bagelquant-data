@@ -40,6 +40,7 @@ def commit_frame(
             data,
             spec,
             parquet,
+            partitioner,
             ("year", "month"),
             deduper=deduper,
             mode=mode,
@@ -52,7 +53,21 @@ def commit_frame(
             data,
             spec,
             parquet,
+            partitioner,
             ("year", "bucket"),
+            deduper=deduper,
+            mode=mode,
+            update_start=update_start,
+            update_end=update_end,
+            replace_assets=replace_assets,
+        )
+    if spec.partition_strategy == "ten_year_range":
+        return _write_grouped(
+            data,
+            spec,
+            parquet,
+            partitioner,
+            ("year_range",),
             deduper=deduper,
             mode=mode,
             update_start=update_start,
@@ -78,6 +93,7 @@ def _write_grouped(
     data: pl.DataFrame,
     spec: DatasetSpec,
     parquet: ParquetStore,
+    partitioner: PartitionStrategy,
     group_columns: tuple[str, ...],
     *,
     deduper: DeduplicationStrategy,
@@ -90,11 +106,8 @@ def _write_grouped(
     for values, group in data.group_by(group_columns, maintain_order=True):
         if not isinstance(values, tuple):
             values = (values,)
-        partition_values = dict(zip(group_columns, values, strict=True))
-        if group_columns == ("year", "month"):
-            path = Path(f"year={partition_values['year']}") / f"month={int(partition_values['month']):02d}" / "data.parquet"
-        else:
-            path = Path(f"year={partition_values['year']}") / f"bucket={int(partition_values['bucket']):02d}" / "data.parquet"
+        partition_values: dict[str, object] = dict(zip(group_columns, values, strict=True))
+        path = partitioner.path_for_values(spec, partition_values)
         final = _merge_partition(
             existing=_read_existing(parquet, spec, path),
             incoming=group,

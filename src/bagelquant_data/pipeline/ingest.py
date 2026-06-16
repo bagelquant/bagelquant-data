@@ -9,6 +9,7 @@ from uuid import uuid4
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.normalization import NormalizeContext, Normalizer
 from bagelquant_data.core.registry import FrameworkRegistries
 from bagelquant_data.core.types import DateLike
@@ -118,6 +119,7 @@ class IngestionPipeline:
     ) -> int:
         """Commit a frame as part of an existing logical run."""
 
+        frame = _apply_row_filter(spec, frame)
         self.staging.write(spec.source, spec.name, frame, run_id)
         normalizer = cast(Normalizer, self.registries.normalizers.get(spec.normalizer))
         result = normalizer.normalize(
@@ -140,3 +142,23 @@ class IngestionPipeline:
         )
         self.staging.cleanup(spec.source, spec.name, run_id)
         return committed
+
+
+def _apply_row_filter(spec: DatasetSpec, frame: pl.DataFrame) -> pl.DataFrame:
+    row_filter = spec.request_options.get("row_filter")
+    if row_filter is None:
+        return frame
+    if not isinstance(row_filter, dict):
+        raise ConfigurationError(f"{spec.source}/{spec.name} request_options.row_filter must be a mapping")
+    column = row_filter.get("column")
+    values = row_filter.get("in")
+    if column is None or values is None:
+        raise ConfigurationError(
+            f"{spec.source}/{spec.name} request_options.row_filter requires column and in"
+        )
+    column = str(column)
+    if column not in frame.columns:
+        raise ConfigurationError(f"{spec.source}/{spec.name} row_filter column is missing: {column}")
+    if isinstance(values, str) or not isinstance(values, list):
+        raise ConfigurationError(f"{spec.source}/{spec.name} request_options.row_filter.in must be a list")
+    return frame.filter(pl.col(column).cast(pl.String).is_in([str(value) for value in values]))

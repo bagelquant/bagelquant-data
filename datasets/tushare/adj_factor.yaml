@@ -10,6 +10,10 @@ primary_key: [asset_id, time]
 asset_column: ts_code
 time_column: trade_date
 request_planner: snapshot
+request_options:
+  reference_dataset: stock_basic
+  reference_column: ts_code
+  request_param: ts_code
 normalizer: standard
 deduplication: primary_key_last
 partition_strategy: year_month
