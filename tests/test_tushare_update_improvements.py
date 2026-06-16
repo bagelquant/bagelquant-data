@@ -9,7 +9,12 @@ import pytest
 from bagelquant_data import DataLake, DatasetSpec, TushareSource
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.request import RequestContext
-from scripts.update_lake import _date_after, _effective_start
+from scripts.update_lake import (
+    _date_after,
+    _effective_start,
+    _enabled_tushare_datasets_by_category,
+    _prompt_for_datasets,
+)
 
 
 def stock_basic_spec() -> DatasetSpec:
@@ -83,6 +88,27 @@ def forecast_spec(**overrides: Any) -> DatasetSpec:
         "name": "forecast",
         "source": "tushare",
         "source_dataset": "forecast",
+        "category": "financial_event",
+        "field_mapping": {"ts_code": "ts_code", "ann_date": "ann_date", "end_date": "end_date"},
+        "required_columns": ("asset_id", "time", "period"),
+        "asset_column": "ts_code",
+        "time_column": "ann_date",
+        "period_column": "end_date",
+        "request_planner": "by_asset",
+        "partition_strategy": "year_bucket",
+        "deduplication": "exact_record_hash",
+        "update_mode": "replace_asset",
+        "point_in_time": True,
+    }
+    values.update(overrides)
+    return DatasetSpec(**values)
+
+
+def express_spec(**overrides: Any) -> DatasetSpec:
+    values = {
+        "name": "express",
+        "source": "tushare",
+        "source_dataset": "express",
         "category": "financial_event",
         "field_mapping": {"ts_code": "ts_code", "ann_date": "ann_date", "end_date": "end_date"},
         "required_columns": ("asset_id", "time", "period"),
@@ -370,6 +396,46 @@ def test_tushare_market_planning_uses_trade_dates_only() -> None:
     )
 
     assert requests == [{"trade_date": "2024-01-02"}, {"trade_date": "2024-01-03"}]
+
+
+def test_update_lake_groups_enabled_market_datasets(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.datasets.add(daily_spec())
+    lake.datasets.add(
+        DatasetSpec(
+            name="daily_basic",
+            source="tushare",
+            source_dataset="daily_basic",
+            category="market",
+            field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
+            required_columns=("asset_id", "time"),
+        )
+    )
+    lake.datasets.add(income_spec())
+    lake.datasets.add(forecast_spec())
+
+    datasets = _enabled_tushare_datasets_by_category(lake, {"market"})
+
+    assert datasets == ["daily", "daily_basic"]
+
+
+def test_update_lake_prompt_selects_financial_datasets(tmp_path, monkeypatch, capsys) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.datasets.add(daily_spec())
+    lake.datasets.add(income_spec())
+    lake.datasets.add(forecast_spec())
+    lake.datasets.add(express_spec())
+    monkeypatch.setattr("builtins.input", lambda _: "3")
+
+    datasets = _prompt_for_datasets(lake)
+
+    assert datasets == ["income", "forecast", "express"]
+    output = capsys.readouterr().out
+    assert "1. update all" in output
+    assert "2. update market datasets:" in output
+    assert "  - daily" in output
+    assert "3. update financial datasets:" in output
+    assert "  - income" in output
 
 
 def test_financial_update_sends_ts_code_for_explicit_assets(tmp_path) -> None:
