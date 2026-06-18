@@ -842,6 +842,65 @@ def test_financial_update_derives_assets_from_stock_basic(tmp_path) -> None:
     assert sorted(request["ts_code"] for request in source.requests) == ["000001.SZ", "600000.SH"]
 
 
+def test_financial_update_records_api_calls_once_per_batch(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = IncomeByAssetSource()
+    lake.sources.register(source)
+    lake.datasets.add(income_spec())
+    original_record_api_calls = lake.metadata.record_api_calls
+    original_upsert_manifests = lake.metadata.upsert_manifests
+    batch_sizes: list[int] = []
+    manifest_batch_sizes: list[int] = []
+
+    def record_api_calls_spy(calls: Any) -> None:
+        rows = list(calls)
+        batch_sizes.append(len(rows))
+        original_record_api_calls(rows)
+
+    def upsert_manifests_spy(manifests: Any) -> None:
+        rows = list(manifests)
+        manifest_batch_sizes.append(len(rows))
+        original_upsert_manifests(rows)
+
+    lake.metadata.record_api_calls = record_api_calls_spy  # type: ignore[method-assign]
+    lake.metadata.upsert_manifests = upsert_manifests_spy  # type: ignore[method-assign]
+
+    report = lake.update.dataset(
+        "income",
+        source="tushare",
+        assets=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ", "000005.SZ"],
+        batch_size=2,
+        workers=2,
+        progress=False,
+        max_retries=1,
+    )
+
+    api_calls = lake.metadata._rows("select asset_id, status from api_calls where dataset = ? order by asset_id", ("income",))
+    run = lake.status.runs(limit=1)[0]
+    committed = lake.query.raw("income", source="tushare").collect()
+
+    assert batch_sizes == [2, 2, 1]
+    assert len(manifest_batch_sizes) == 3
+    assert all(size > 0 for size in manifest_batch_sizes)
+    assert report.status == "partial"
+    assert report.request_count == 5
+    assert run["dataset"] == "income"
+    assert run["status"] == "partial"
+    assert api_calls == [
+        {"asset_id": "000001.SZ", "status": "success"},
+        {"asset_id": "000002.SZ", "status": "failed"},
+        {"asset_id": "000003.SZ", "status": "success"},
+        {"asset_id": "000004.SZ", "status": "success"},
+        {"asset_id": "000005.SZ", "status": "success"},
+    ]
+    assert sorted(committed.get_column("asset_id").unique().to_list()) == [
+        "000001.SZ",
+        "000003.SZ",
+        "000004.SZ",
+        "000005.SZ",
+    ]
+
+
 def test_financial_update_without_assets_requires_stock_basic(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     lake.sources.register(FakeTushareSource())

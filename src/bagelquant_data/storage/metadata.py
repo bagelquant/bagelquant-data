@@ -16,6 +16,8 @@ from bagelquant_data.core.dataset import DatasetSpec
 class MetadataStore:
     """SQLite metadata store using WAL mode."""
 
+    _BUSY_TIMEOUT_MS = 30_000
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -24,7 +26,7 @@ class MetadataStore:
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
@@ -143,8 +145,29 @@ class MetadataStore:
         content_hash: str,
         schema_hash: str,
     ) -> None:
+        self.upsert_manifests(
+            [
+                {
+                    "source": source,
+                    "dataset": dataset,
+                    "partition_path": partition_path,
+                    "partition_values": partition_values,
+                    "row_count": row_count,
+                    "file_size_bytes": file_size_bytes,
+                    "min_time": min_time,
+                    "max_time": max_time,
+                    "content_hash": content_hash,
+                    "schema_hash": schema_hash,
+                }
+            ]
+        )
+
+    def upsert_manifests(self, manifests: Iterable[dict[str, Any]]) -> None:
+        rows = list(manifests)
+        if not rows:
+            return
         with self.connect() as db:
-            db.execute(
+            db.executemany(
                 """
                 insert into partition_manifest(
                     source, dataset, partition_path, partition_values, row_count,
@@ -161,19 +184,22 @@ class MetadataStore:
                     schema_hash=excluded.schema_hash,
                     updated_at=excluded.updated_at
                 """,
-                (
-                    source,
-                    dataset,
-                    partition_path,
-                    json.dumps(partition_values, sort_keys=True, default=str),
-                    row_count,
-                    file_size_bytes,
-                    min_time,
-                    max_time,
-                    content_hash,
-                    schema_hash,
-                    _now(),
-                ),
+                [
+                    (
+                        row["source"],
+                        row["dataset"],
+                        str(row["partition_path"]),
+                        json.dumps(row["partition_values"], sort_keys=True, default=str),
+                        int(row["row_count"]),
+                        int(row["file_size_bytes"]),
+                        row.get("min_time"),
+                        row.get("max_time"),
+                        row["content_hash"],
+                        row["schema_hash"],
+                        _now(),
+                    )
+                    for row in rows
+                ],
             )
 
     def manifest(self, source: str | None = None, dataset: str | None = None) -> list[dict[str, Any]]:
@@ -248,9 +274,30 @@ class MetadataStore:
         error_message: str | None = None,
         asset_id: str | None = None,
     ) -> None:
+        self.record_api_calls(
+            [
+                {
+                    "run_id": run_id,
+                    "source": source,
+                    "dataset": dataset,
+                    "request_key": request_key,
+                    "request_params": request_params,
+                    "status": status,
+                    "row_count": row_count,
+                    "retry_count": retry_count,
+                    "error_message": error_message,
+                    "asset_id": asset_id,
+                }
+            ]
+        )
+
+    def record_api_calls(self, calls: Iterable[dict[str, Any]]) -> None:
+        rows = list(calls)
+        if not rows:
+            return
         now = _now()
         with self.connect() as db:
-            db.execute(
+            db.executemany(
                 """
                 insert into api_calls(
                     run_id, source, dataset, request_key, asset_id, request_params,
@@ -258,20 +305,23 @@ class MetadataStore:
                 )
                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    run_id,
-                    source,
-                    dataset,
-                    request_key,
-                    asset_id,
-                    json.dumps(request_params, sort_keys=True, default=str),
-                    status,
-                    row_count,
-                    retry_count,
-                    now,
-                    now,
-                    error_message,
-                ),
+                [
+                    (
+                        row["run_id"],
+                        row["source"],
+                        row["dataset"],
+                        str(row["request_key"]),
+                        row.get("asset_id"),
+                        json.dumps(row["request_params"], sort_keys=True, default=str),
+                        row["status"],
+                        int(row.get("row_count", 0)),
+                        int(row.get("retry_count", 0)),
+                        now,
+                        now,
+                        row.get("error_message"),
+                    )
+                    for row in rows
+                ],
             )
 
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -286,6 +336,7 @@ class MetadataStore:
 
     def _initialize(self) -> None:
         with self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript(
                 """
                 create table if not exists sources (

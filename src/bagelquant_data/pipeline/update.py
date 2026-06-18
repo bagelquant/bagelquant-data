@@ -128,19 +128,22 @@ def update_dataset(
                 for page in pages
                 if page.status != "success" and page.asset_id is not None
             }
+            pipeline.metadata.record_api_calls(
+                {
+                    "run_id": run_id,
+                    "source": spec.source,
+                    "dataset": spec.name,
+                    "request_key": page.request_key,
+                    "request_params": page.request_params,
+                    "status": page.status,
+                    "row_count": page.row_count,
+                    "retry_count": page.retry_count,
+                    "error_message": page.error_message,
+                    "asset_id": page.asset_id,
+                }
+                for page in pages
+            )
             for page in pages:
-                pipeline.metadata.record_api_call(
-                    run_id=run_id,
-                    source=spec.source,
-                    dataset=spec.name,
-                    request_key=page.request_key,
-                    request_params=page.request_params,
-                    status=page.status,
-                    row_count=page.row_count,
-                    retry_count=page.retry_count,
-                    error_message=page.error_message,
-                    asset_id=page.asset_id,
-                )
                 if page.status == "success" and isinstance(page.frame, pl.DataFrame) and page.frame.height > 0:
                     if not (spec.update_mode == "replace_asset" and page.asset_id in failed_assets):
                         frames.append(page.frame)

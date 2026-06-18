@@ -103,6 +103,7 @@ def _write_grouped(
     replace_assets: set[str] | None,
 ) -> int:
     row_count = 0
+    manifests: list[dict[str, Any]] = []
     for values, group in data.group_by(group_columns, maintain_order=True):
         if not isinstance(values, tuple):
             values = (values,)
@@ -119,8 +120,10 @@ def _write_grouped(
             replace_assets=replace_assets,
         )
         final = _sort(final, spec)
-        parquet.write_partition(spec, final, path, partition_values)
+        _, manifest = parquet.write_partition_file(spec, final, path, partition_values)
+        manifests.append(manifest)
         row_count += final.height
+    parquet.metadata.upsert_manifests(manifests)
     return row_count
 
 
