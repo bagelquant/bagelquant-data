@@ -29,6 +29,17 @@ class ParquetStore:
         relative_path: Path,
         partition_values: dict[str, Any] | None = None,
     ) -> Path:
+        path, manifest = self.write_partition_file(spec, frame, relative_path, partition_values)
+        self.metadata.upsert_manifest(**manifest)
+        return path
+
+    def write_partition_file(
+        self,
+        spec: DatasetSpec,
+        frame: pl.DataFrame,
+        relative_path: Path,
+        partition_values: dict[str, Any] | None = None,
+    ) -> tuple[Path, dict[str, Any]]:
         path = self.paths.dataset_root(spec.source, spec.name) / relative_path
         atomic_write_parquet(frame, path)
         time_values = (
@@ -36,19 +47,18 @@ class ParquetStore:
             if "time" in frame.columns and frame.height
             else (None, None)
         )
-        self.metadata.upsert_manifest(
-            source=spec.source,
-            dataset=spec.name,
-            partition_path=str(relative_path),
-            partition_values=partition_values or {},
-            row_count=frame.height,
-            file_size_bytes=path.stat().st_size,
-            min_time=str(time_values[0]) if time_values[0] is not None else None,
-            max_time=str(time_values[1]) if time_values[1] is not None else None,
-            content_hash=frame_content_hash(frame),
-            schema_hash=_schema_hash(frame),
-        )
-        return path
+        return path, {
+            "source": spec.source,
+            "dataset": spec.name,
+            "partition_path": str(relative_path),
+            "partition_values": partition_values or {},
+            "row_count": frame.height,
+            "file_size_bytes": path.stat().st_size,
+            "min_time": str(time_values[0]) if time_values[0] is not None else None,
+            "max_time": str(time_values[1]) if time_values[1] is not None else None,
+            "content_hash": frame_content_hash(frame),
+            "schema_hash": _schema_hash(frame),
+        }
 
     def scan_dataset(self, source: str, dataset: str, paths: list[Path] | None = None) -> pl.LazyFrame:
         root = self.paths.dataset_root(source, dataset)
