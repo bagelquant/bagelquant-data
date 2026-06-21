@@ -518,6 +518,60 @@ def test_index_yaml_preserves_reference_request_options() -> None:
     assert spec.partition_strategy == "ten_year_range"
 
 
+def test_namechange_yaml_supports_universe_st_reconstruction() -> None:
+    spec = DatasetSpec.from_yaml("datasets/tushare/namechange.yaml")
+
+    assert spec.name == "namechange"
+    assert spec.source == "tushare"
+    assert spec.source_dataset == "namechange"
+    assert spec.category == "reference"
+    assert spec.field_mapping["ts_code"] == "ts_code"
+    assert spec.field_mapping["start_date"] == "start_date"
+    assert spec.field_mapping["end_date"] == "end_date"
+    assert spec.request_planner == "snapshot"
+    assert spec.partition_strategy == "single_file"
+    assert spec.update_mode == "snapshot_replace"
+    assert spec.reference is True
+
+
+def test_stock_st_yaml_supports_enhanced_st_reconstruction() -> None:
+    spec = DatasetSpec.from_yaml("datasets/tushare/stock_st.yaml")
+
+    assert spec.name == "stock_st"
+    assert spec.source == "tushare"
+    assert spec.source_dataset == "stock_st"
+    assert spec.category == "reference"
+    assert spec.field_mapping["ts_code"] == "ts_code"
+    assert spec.field_mapping["name"] == "name"
+    assert spec.field_mapping["start_date"] == "start_date"
+    assert spec.field_mapping["end_date"] == "end_date"
+    assert spec.request_planner == "snapshot"
+    assert spec.partition_strategy == "single_file"
+    assert spec.update_mode == "snapshot_replace"
+    assert spec.reference is True
+
+
+def test_fina_audit_yaml_supports_point_in_time_financial_events() -> None:
+    spec = DatasetSpec.from_yaml("datasets/tushare/fina_audit.yaml")
+
+    assert spec.name == "fina_audit"
+    assert spec.source == "tushare"
+    assert spec.source_dataset == "fina_audit"
+    assert spec.category == "financial_event"
+    assert spec.required_columns == ("asset_id", "time", "period")
+    assert spec.asset_column == "ts_code"
+    assert spec.time_column == "ann_date"
+    assert spec.period_column == "end_date"
+    assert spec.request_planner == "by_asset"
+    assert spec.request_options["reference_dataset"] == "stock_basic"
+    assert spec.request_options["reference_column"] == "ts_code"
+    assert spec.request_options["request_param"] == "ts_code"
+    assert spec.partition_strategy == "year_bucket"
+    assert spec.update_mode == "replace_asset"
+    assert spec.point_in_time is True
+    assert spec.reference is False
+
+
 def test_tushare_yaml_specs_declare_reference_universes() -> None:
     expected = {
         "adj_factor": ("stock_basic", "ts_code", "ts_code"),
@@ -526,6 +580,7 @@ def test_tushare_yaml_specs_declare_reference_universes() -> None:
         "balancesheet": ("stock_basic", "ts_code", "ts_code"),
         "cashflow": ("stock_basic", "ts_code", "ts_code"),
         "express": ("stock_basic", "ts_code", "ts_code"),
+        "fina_audit": ("stock_basic", "ts_code", "ts_code"),
         "forecast": ("stock_basic", "ts_code", "ts_code"),
         "income": ("stock_basic", "ts_code", "ts_code"),
         "index_daily": ("index_basic", "ts_code", "ts_code"),
@@ -813,6 +868,34 @@ def test_update_lake_prompt_selects_reference_datasets(tmp_path, monkeypatch, ca
     assert "  - stock_basic" in output
     assert "  - trade_cal" in output
     assert "  - index_basic" in output
+
+
+def test_update_lake_prompt_selects_single_dataset_after_confirmation(tmp_path, monkeypatch, capsys) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.datasets.add(stock_basic_spec())
+    lake.datasets.add(daily_spec())
+    answers = iter(["5", "1", "n", "daily", "yes"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    datasets = _prompt_for_datasets(lake)
+
+    assert datasets == ["daily"]
+    output = capsys.readouterr().out
+    assert "5. update a dataset" in output
+    assert "Selection not confirmed. Choose again." in output
+    assert "Selected update a dataset: daily" in output
+
+
+def test_update_lake_prompt_quits(tmp_path, monkeypatch, capsys) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.datasets.add(daily_spec())
+    monkeypatch.setattr("builtins.input", lambda _: "6")
+
+    datasets = _prompt_for_datasets(lake)
+
+    assert datasets == []
+    output = capsys.readouterr().out
+    assert "6. quit" in output
 
 
 def test_financial_update_sends_ts_code_for_explicit_assets(tmp_path) -> None:

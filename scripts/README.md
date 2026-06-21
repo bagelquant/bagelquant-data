@@ -33,12 +33,15 @@ For each dataset, the script reads the local `maximum_time` from the lake manife
 By default the update order is:
 
 ```text
-stock_basic, trade_cal, daily, daily_basic, adj_factor,
-income, balancesheet, cashflow, forecast, express
+stock_basic, trade_cal, namechange, stock_st, index_basic, daily, daily_basic,
+adj_factor, index_daily, index_weight, income, balancesheet, cashflow,
+forecast, express, fina_audit
 ```
 
 `stock_basic` is updated before financial datasets so the updater can derive the asset universe for APIs that require `ts_code`.
 `trade_cal` is updated before market datasets so `lake.update` can expand market date ranges into one API call per open trading day.
+`namechange` is included for point-in-time ST / risk-warning reconstruction.
+For the current universe builder, the core V1 inputs are `trade_cal`, `stock_basic`, `daily`, `daily_basic`, and `namechange`; `stock_st`, `balancesheet`, and `fina_audit` are enhanced inputs for later filters.
 
 ## Common Update Examples
 

@@ -1,0 +1,15 @@
+name: namechange
+source: tushare
+source_dataset: namechange
+category: reference
+field_mapping:
+  ts_code: ts_code
+  start_date: start_date
+  end_date: end_date
+required_columns: []
+request_planner: snapshot
+normalizer: standard
+deduplication: exact_record_hash
+partition_strategy: single_file
+update_mode: snapshot_replace
+reference: true

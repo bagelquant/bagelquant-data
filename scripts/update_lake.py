@@ -20,6 +20,8 @@ INCREMENTAL_CATEGORIES = {"market", "financial_statement", "financial_event"}
 DEFAULT_ORDER = (
     "stock_basic",
     "trade_cal",
+    "namechange",
+    "stock_st",
     "index_basic",
     "daily",
     "daily_basic",
@@ -31,6 +33,7 @@ DEFAULT_ORDER = (
     "cashflow",
     "forecast",
     "express",
+    "fina_audit",
 )
 MARKET_CATEGORIES = {"market"}
 FINANCIAL_CATEGORIES = {"financial_statement", "financial_event"}
@@ -70,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     lake = DataLake.open(args.root)
     lake.sources.register(TushareSource())
     datasets = args.datasets or _prompt_for_datasets(lake)
+    if not datasets:
+        print("No datasets selected.")
+        return 0
     start = perf_counter()
     reports = []
     for dataset in datasets:
@@ -140,9 +146,11 @@ def _prompt_for_datasets(lake: DataLake) -> list[str]:
     _print_dataset_list(market_datasets)
     print("4. update financial datasets:")
     _print_dataset_list(financial_datasets)
+    print("5. update a dataset")
+    print("6. quit")
 
     while True:
-        choice = input("Enter choice [1-4]: ").strip()
+        choice = input("Enter choice [1-6]: ").strip()
         if choice in choices:
             label, datasets = choices[choice]
             if not datasets:
@@ -150,7 +158,54 @@ def _prompt_for_datasets(lake: DataLake) -> list[str]:
                 continue
             print(f"Selected {label}: {', '.join(datasets)}")
             return datasets
-        print("Invalid choice. Enter 1, 2, 3, or 4.", file=sys.stderr)
+        if choice == "5":
+            dataset = _prompt_for_single_dataset(all_datasets)
+            if dataset is None:
+                return []
+            return [dataset]
+        if choice == "6":
+            return []
+        print("Invalid choice. Enter 1, 2, 3, 4, 5, or 6.", file=sys.stderr)
+
+
+def _prompt_for_single_dataset(datasets: list[str]) -> str | None:
+    if not datasets:
+        print("No enabled datasets found.")
+        return None
+
+    while True:
+        print("Select one dataset to update:")
+        for index, dataset in enumerate(datasets, start=1):
+            print(f"{index}. {dataset}")
+        print("q. quit")
+
+        selection = input(f"Enter dataset [1-{len(datasets)} or name, q to quit]: ").strip()
+        if selection.lower() in {"q", "quit"}:
+            return None
+
+        dataset = _resolve_dataset_selection(selection, datasets)
+        if dataset is None:
+            print("Invalid dataset selection.", file=sys.stderr)
+            continue
+
+        confirmation = input(f"Update {dataset}? [y/N/q]: ").strip().lower()
+        if confirmation in {"q", "quit"}:
+            return None
+        if confirmation in {"y", "yes"}:
+            print(f"Selected update a dataset: {dataset}")
+            return dataset
+        print("Selection not confirmed. Choose again.")
+
+
+def _resolve_dataset_selection(selection: str, datasets: list[str]) -> str | None:
+    if selection.isdigit():
+        index = int(selection)
+        if 1 <= index <= len(datasets):
+            return datasets[index - 1]
+        return None
+    if selection in datasets:
+        return selection
+    return None
 
 
 def _print_dataset_list(datasets: list[str]) -> None:
