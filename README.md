@@ -52,6 +52,14 @@ Documentation is available in two languages:
 - English: `docs/en/index.md`
 - Chinese: `docs/cn/index.md`
 
+## Repository Boundary
+
+This repo contains reusable data-lake APIs, storage/query/source adapters, and
+minimal API examples. Operational lake workflows such as configuring a local
+Tushare lake, running incremental updates, and monitoring long jobs live in the
+separate `manage-data-lake` repo. Factor creation, archiving, and testing live
+in `factor-model`.
+
 ## Development
 
 ```bash

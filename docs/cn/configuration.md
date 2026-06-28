@@ -97,7 +97,7 @@ uv run bagelquant-data --root data source-list
 uv run bagelquant-data --root data dataset-list --source tushare
 ```
 
-可复用的 setup/update 脚本文档见 `scripts/README.md`。
+可复用的 setup/update/monitoring 工作流已迁移到独立的 `manage-data-lake` 仓库。本包只保留可复用的数据湖 API。
 
 ## 不需要配置的内容
 
