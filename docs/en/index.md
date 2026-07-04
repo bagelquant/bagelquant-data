@@ -72,6 +72,19 @@ time        asset_id    close
 
 BagelQuant Data does not preserve old lake layouts or old public APIs. The current framework is a clean API and storage design. It also does not provide hardcoded financial indicators such as `eps_ttm()` or `roe_ttm()`. Instead, it provides generic building blocks such as trailing aggregation, ratio calculation, stock averaging, and point-in-time alignment.
 
+Operational workflows are intentionally outside this package. Use `manage-data-lake` to configure or update a lake and use `factor-model` for factor lifecycle and testing workflows. This package should remain a reusable library with source adapters, storage/query APIs, and small API examples only.
+
+## Module Reference
+
+- `bagelquant_data.core`: dataset specs, request context, validation, hashing, registries, and source protocols.
+- `bagelquant_data.storage`: atomic Parquet writes, metadata/manifests, lake paths, rejected rows, and staging files.
+- `bagelquant_data.pipeline`: ingestion, canonical commit, and incremental update orchestration.
+- `bagelquant_data.management`: the `DataLake` facade and source/dataset/status managers.
+- `bagelquant_data.query`: raw, records, field, reference, and observation-grid query services.
+- `bagelquant_data.finance`: point-in-time alignment and reusable financial transforms.
+- `bagelquant_data.sources.tushare`: Tushare authentication, client construction, and source adapter.
+- `bagelquant_data.cli`: a thin status/list wrapper around the Python API.
+
 ## Development Checks
 
 Run the local verification suite with:

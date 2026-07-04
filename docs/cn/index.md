@@ -72,6 +72,19 @@ time        asset_id    close
 
 BagelQuant Data 不保留旧数据湖布局，也不兼容旧公开 API。当前框架是一次干净的新 API 和新存储设计。它也不提供 `eps_ttm()` 或 `roe_ttm()` 这类硬编码财务指标，而是提供滚动聚合、比率、存量平均和 point-in-time 对齐等通用积木。
 
+运行类工作流不放在本包中。配置或更新本地数据湖请使用 `manage-data-lake`，因子创建、归档和测试请放在 `factor-model`。本包只保留可复用的数据源、存储、查询 API 和小型 API 示例。
+
+## 模块参考
+
+- `bagelquant_data.core`：数据集规格、请求上下文、校验、哈希、注册表和数据源协议。
+- `bagelquant_data.storage`：原子 Parquet 写入、元数据/manifest、数据湖路径、拒收数据和暂存文件。
+- `bagelquant_data.pipeline`：摄取、标准提交和增量更新编排。
+- `bagelquant_data.management`：`DataLake` 门面以及数据源、数据集、状态管理器。
+- `bagelquant_data.query`：raw、records、field、reference 和 observation-grid 查询服务。
+- `bagelquant_data.finance`：point-in-time 对齐和通用财务变换。
+- `bagelquant_data.sources.tushare`：Tushare 凭证、客户端构造和数据源适配器。
+- `bagelquant_data.cli`：围绕 Python API 的轻量 status/list CLI。
+
 ## 开发检查
 
 ```bash

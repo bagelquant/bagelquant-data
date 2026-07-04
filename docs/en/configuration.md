@@ -97,7 +97,8 @@ uv run bagelquant-data --root data source-list
 uv run bagelquant-data --root data dataset-list --source tushare
 ```
 
-Reusable setup and update scripts are documented in `scripts/README.md`.
+Reusable setup, update, and monitoring workflows now live in the separate
+`manage-data-lake` repo. Keep this package focused on reusable lake APIs.
 
 ## What Not To Configure
 
