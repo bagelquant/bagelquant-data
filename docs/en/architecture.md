@@ -1,23 +1,36 @@
 # Architecture
 
-BagelQuant Data is organized as a source-agnostic framework. Tushare is the first bundled source, but the core modules do not import Tushare-specific code.
+BagelQuant Data is a source-agnostic data lake package. Source adapters fetch provider data, while dataset specs control normalization, validation, deduplication, update type, and query contracts.
 
-## Layer Overview
+## Layers
 
-The package is split into clear layers:
+- `core`: dataset specs, source protocols, registries, request context, normalization contracts, deduplication, validation, hashing, and exceptions.
+- `sources`: source adapters. `sources/tushare` is the bundled implementation.
+- `storage`: lake paths, atomic Parquet writes, SQLite metadata, staging files, rejected records, and manifests.
+- `pipeline`: ingestion, update orchestration, validation, and canonical commits.
+- `management`: `DataLake`, `LakeAdmin`, `LakeUpdater`, and source/dataset/status managers.
+- `query`: `LakeQuery`, raw records, panels, prices, fundamentals, events, references, and observation grids.
+- `finance`: PIT and financial transforms used by `LakeQuery`.
+- `cli`: status and list commands around the Python API.
 
-- `core`: dataset specifications, source protocols, registries, request context, normalization contracts, partitioning, deduplication, validation, hashing, and exceptions.
-- `sources`: source adapters. `sources/tushare` is the first implementation.
-- `storage`: local filesystem layout, Parquet writes, atomic replacement, SQLite metadata, staging, rejected records, and manifests.
-- `pipeline`: ingestion, update orchestration, validation, and commit logic.
-- `query`: raw canonical records, single-field panels, reference data, records inspection, and observation grids.
-- `finance`: generic point-in-time and financial transformations.
-- `management`: public `DataLake` facade and managers for sources, datasets, status, and updates.
-- `cli`: a thin command-line wrapper around the Python API.
+## Public Root
+
+```python
+from bagelquant_data import DataLake
+
+lake = DataLake.open("data")
+lake.admin.summary()
+lake.update.dataset("daily", source="tushare")
+lake.query.price("daily", "close", source="tushare")
+```
+
+The three primary surfaces are:
+
+- `lake.admin` for data lake management.
+- `lake.update` for update execution.
+- `lake.query` for research access.
 
 ## Storage Zones
-
-Opening a lake creates the following layout:
 
 ```text
 data/
@@ -29,109 +42,79 @@ data/
     tmp/
 ```
 
-`data/lake` contains validated canonical Parquet files. Only canonical lake data is exposed through `lake.query` and `lake.finance`.
+`lake/` contains validated canonical Parquet files.
 
-`data/staging` contains temporary source responses written during ingestion. Staging files are allowed to be small because they are not the analytical storage format. Successful commits remove staging fragments for the run.
+`staging/` contains temporary source responses during ingestion. Staging is cleaned after commit attempts.
 
-`data/rejected` contains records that cannot safely enter canonical storage. Examples include missing canonical identifiers, invalid dates, or malformed source responses.
+`rejected/` contains records rejected during normalization.
 
-`data/metadata/lake.db` is SQLite operational state. It stores registered sources, registered datasets, ingestion runs, partition manifests, rejected summaries, asset state, and partition locks. WAL mode is enabled by the metadata store.
+`metadata/lake.db` stores sources, datasets, runs, API calls, partition manifests, and rejected summaries.
 
-`data/tmp` is reserved for future build fragments, compaction work, validation, and partition replacement tasks.
+`tmp/` is reserved for local working files owned by the package.
 
 ## Canonical Records
 
-Canonical Parquet records are row-oriented. They may contain many fields from the source response, plus canonical fields added by normalization.
-
-All non-reference datasets must have:
+Canonical records are row-oriented. Non-reference datasets must expose:
 
 - `asset_id`: canonical asset identifier.
-- `time`: the observation time or the information availability time.
+- `time`: observation time or information availability time.
 
-Point-in-time financial datasets also use:
+Point-in-time fundamental datasets also use:
 
-- `period`: the economic or accounting period represented by the record.
+- `period`: economic or accounting period represented by the record.
 
-Operational fields may include:
+Normalizers preserve source columns when possible and add canonical fields such as `source`, `source_dataset`, `asset_id`, `time`, and `period`.
 
-- `source`
-- `source_dataset`
-- `ingested_at`
-- `record_hash`
+## Dataset Kinds
 
-The original source columns are preserved when possible. For example, financial statement records may keep `ann_date`, `f_ann_date`, and `end_date` while also exposing canonical `time` and `period`.
+`DatasetSpec.data_kind` declares the intended query behavior:
 
-## Public Output Contract
+- `price`: price or market panel data.
+- `fundamental`: PIT financial/fundamental records.
+- `event`: append-only event records.
+- `reference`: row-oriented reference data.
+- `generic`: other canonical records.
 
-Canonical storage is not the same as public research output.
+## Query Contracts
 
-`lake.query.raw(...)` returns canonical row-oriented records. This is useful for inspection, debugging, and advanced workflows.
+`lake.query.raw(...)` returns canonical row-oriented records.
 
-`lake.query.field(...)` returns one research field at a time as a long panel:
+`lake.query.field(...)`, `lake.query.panel(...)`, and `lake.query.price(...)` return one value field as:
 
 ```text
-time | asset_id | requested_value_column
+time | asset_id | value_column
 ```
 
-The API does not pivot into wide tables. A multi-field request returns a dictionary of independent long panels:
+`lake.query.fundamental(...)` returns PIT fundamental events, or latest available values when an observation grid is supplied.
 
-```python
-ohlcv = lake.query.fields(
-    "daily",
-    ["open", "high", "low", "close", "vol"],
-    source="tushare",
-)
-```
+`lake.query.events(...)` returns event-style canonical records and can filter by `event_type`.
 
-Each returned frame has exactly three columns.
+`lake.query.reference(...)` returns row-oriented reference data.
 
 ## Point-In-Time Semantics
 
-`time` and `period` are intentionally separate.
+`time` and `period` are separate.
 
 `time` is when information became available to a researcher.
 
 `period` is the economic or accounting period represented by the record.
 
-For daily market data, `time` is usually the trade date. For financial statements, `time` is usually the announcement or final announcement date, while `period` is the statement end date.
+PIT alignment never exposes a record at an observation date earlier than its canonical `time`.
 
-The finance API must never expose a financial record at an observation date earlier than its canonical `time`.
+## Update Types And Layout
 
-## Partitioning
+`DatasetSpec.update_type` selects both update planning and canonical layout:
 
-Partitioning is dataset-driven. Initial built-in strategies are:
+- `general`: whole-dataset replacement in `data.parquet`.
+- `by_daily`: calendar-driven missing-date updates in `year=YYYY/month=MM/data.parquet`.
+- `by_id`: reference-ID updates in `year=YYYY/batch=BB/data.parquet`.
 
-- `single_file`: one canonical file for the dataset.
-- `year_month`: `year=YYYY/month=MM/data.parquet`.
-- `year_bucket`: `year=YYYY/bucket=BB/data.parquet`, where bucket is a stable hash of `asset_id`.
+`by_id` stable batches use Blake2b so batch assignment is deterministic across Python processes.
 
-The stable bucket algorithm uses Blake2b rather than Python's built-in `hash()`, because Python hash values are intentionally process-randomized.
+## Manifests And Atomic Writes
 
-## Metadata Manifest
+Every canonical write updates SQLite manifest rows with partition path, partition values, row count, file size, min/max time, content hash, schema hash, and update time.
 
-Every canonical partition write updates SQLite manifest rows with:
+Canonical file replacement writes a temporary Parquet file, reads it back, validates row count, atomically replaces the destination path, and then updates the manifest.
 
-- source
-- dataset
-- partition path
-- partition values
-- row count
-- file size
-- minimum and maximum `time`
-- content hash
-- schema hash
-- update time
-
-Normal status calls use the manifest and avoid rescanning every Parquet file.
-
-## Atomic Writes
-
-Canonical Parquet replacement follows this pattern:
-
-1. Write a temporary file on the same filesystem.
-2. Read it back with Polars.
-3. Validate the row count.
-4. Atomically replace the destination path.
-5. Update the partition manifest.
-
-This prevents incomplete files from becoming visible through the query API.
+Manifest status calls use SQLite metadata. `lake.admin.rebuild_manifest(...)` can reconstruct manifest rows from canonical Parquet files.

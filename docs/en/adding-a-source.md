@@ -1,19 +1,16 @@
 # Adding A Source
 
-A source adapter fetches external data and optionally plans source-specific requests. It must not force changes in storage, query, finance, or management modules.
+A source adapter fetches provider data. Update planning belongs to the data lake, so adapters stay small and do not decide storage layout, calendar gaps, ID lists, or merge behavior.
 
-## Source Protocol
+## Protocol
 
-Implement the `DataSource` protocol:
+Implement the source methods used by the updater:
 
 ```python
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import polars as pl
-
-from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.request import RequestContext
 
 
 class MySource:
@@ -27,88 +24,47 @@ class MySource:
     def test_connection(self) -> None:
         ...
 
-    def fetch(
-        self,
-        source_dataset: str,
-        request: Mapping[str, Any],
-    ) -> pl.DataFrame:
-        ...
-
-    def plan_requests(
-        self,
-        dataset: DatasetSpec,
-        context: RequestContext,
-    ) -> Iterable[Mapping[str, Any]]:
+    def fetch(self, source_dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
         ...
 ```
 
-## Register The Source
+`request` is planned by `lake.update`. Adapters may translate generic request keys such as `start`, `end`, `date`, and `id` into provider-specific parameters before calling the SDK.
+
+## Register
 
 ```python
 from bagelquant_data import DataLake
 
 lake = DataLake.open("data")
-lake.sources.register(MySource())
-lake.sources.configure("my_source", token="...")
-lake.sources.test("my_source")
+lake.admin.sources.add(MySource())
+lake.admin.sources.edit("my_source", token="...")
+lake.admin.sources.test("my_source")
 ```
 
-## Credential Rules
+## Credentials
 
-Credentials should be accepted through:
+Accept credentials through runtime configuration or environment variables. Do not store secrets in dataset YAML, committed config, docs, or Parquet files.
 
-- environment variables
-- runtime configuration
-- local untracked configuration
-- future secret-provider integrations
-
-Do not store secrets in:
-
-- dataset YAML
-- Parquet files
-- committed docs
-- committed TOML files
-- SQLite metadata rows
-
-## Request Planning
-
-`plan_requests` receives a `DatasetSpec` and `RequestContext`.
-
-For a snapshot API, emit one request:
-
-```python
-yield {"start_date": context.start, "end_date": context.end}
-```
-
-For an asset-oriented API, emit one request per asset:
-
-```python
-for asset in context.assets or []:
-    yield {"asset_id": asset}
-```
-
-For paged APIs, emit page parameters. The core update pipeline should not know about the provider's pagination details.
+Source options persisted in SQLite are redacted from source listings when keys contain `token`, `secret`, or `password`.
 
 ## Fetching
 
-`fetch` returns a Polars `DataFrame`. If a provider SDK returns pandas, convert inside the adapter:
+`fetch` returns a Polars `DataFrame`.
 
 ```python
 return pl.from_pandas(response.copy(deep=True))
 ```
 
-## Normalization Boundary
+## Boundary
 
-Source adapters should preserve source fields as much as possible. Canonical naming happens through the dataset spec and normalizer.
+Adapters should preserve provider fields and economically meaningful records. Canonical naming, validation, deduplication, update planning, partitioning, and manifest management belong to the lake.
 
-Do not hide economically meaningful records in the adapter. Valid revisions, restatements, repeated forecasts, and multiple point-in-time records belong in canonical storage unless validation proves they are malformed.
+## Tests
 
-## Testing A Source
-
-Recommended tests:
+Recommended coverage:
 
 - token-safe `repr`
-- `configure` does not persist secrets
+- `configure` updates runtime options
 - `test_connection` raises useful errors
-- `fetch` converts provider responses to Polars
-- `plan_requests` respects `start`, `end`, `assets`, and `source_options`
+- `fetch` returns Polars data
+- provider parameter mapping preserves `start`, `end`, `date`, and `id` semantics

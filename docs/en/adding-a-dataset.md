@@ -1,143 +1,94 @@
 # Adding A Dataset
 
-Datasets are defined by `DatasetSpec` or YAML. A normal dataset should not require changes to the core framework.
+Datasets are registered with a compact lifecycle declaration:
 
-## Minimal YAML Shape
+```python
+lake.admin.datasets.add(name, update_type, reference=None, **kwargs)
+```
+
+Only `name` and `update_type` are required. `reference` is optional, and unknown keyword arguments are saved as source API static parameters.
+
+## Minimal YAML
 
 ```yaml
 name: daily
-source: tushare
-source_dataset: daily
-category: market
-field_mapping:
-  ts_code: ts_code
-  trade_date: trade_date
-required_columns: [asset_id, time]
-primary_key: [asset_id, time]
-asset_column: ts_code
-time_column: trade_date
-request_planner: snapshot
-normalizer: standard
-deduplication: primary_key_last
-partition_strategy: year_month
-update_mode: upsert
-sort_columns: [time, asset_id]
-reference: false
+update_type: by_daily
+reference: trade_cal
+request_date_param: date
 ```
 
 Register it:
 
 ```python
-lake.datasets.add_from_yaml("path/to/dataset.yaml")
+lake.admin.datasets.add_from_yaml("datasets/examples/custom_daily.yaml")
 ```
 
-## Required Fields
+Or register directly:
 
-Every spec needs:
-
-- `name`: canonical dataset name.
-- `source`: registered source name.
-- `source_dataset`: provider endpoint or table name.
-- `category`: descriptive group such as `market`, `financial_statement`, `financial_event`, or `reference`.
-- `field_mapping`: source-to-canonical rename map used by the normalizer.
-- `required_columns`: columns that must exist after normalization.
-
-## Canonical Time Mapping
-
-For non-reference datasets, set:
-
-- `asset_column`
-- `time_column`
-
-For point-in-time financial datasets, also set:
-
-- `period_column`
-- `point_in_time: true`
-
-Example:
-
-```yaml
-asset_column: ts_code
-time_column: f_ann_date
-period_column: end_date
-point_in_time: true
+```python
+lake.admin.datasets.add("daily", "by_daily", reference="trade_cal", request_date_param="date")
 ```
 
-## Keys
+## Update Types
 
-Use `primary_key` when records should be unique by a specific set of columns.
+- `general`: fetch the whole dataset and replace the canonical dataset with one `data.parquet` file. Pass `reference=True` for reference data.
+- `by_daily`: use a calendar reference dataset, fetch missing open dates through `today`, and store `year=YYYY/month=MM/data.parquet`.
+- `by_id`: use an ID-list reference dataset, fetch each ID from its latest stored date through `today`, and store `year=YYYY/batch=NN/data.parquet`.
 
-Use `business_key` when records may have revisions or multiple valid versions, but still share a logical business identity.
+`by_daily` defaults to `reference="trade_cal"` when omitted.
 
-Do not assume `asset_id + time` is always unique.
+`by_id` defaults to `reference="asset_list"` when omitted. `batch_count` defaults to `32` stable hash buckets.
 
-## Request Planner
+## Source API Kwargs
 
-Initial planners:
+Unknown kwargs become static source API parameters:
 
-- `snapshot`: one request for the dataset or date range.
-- `by_asset`: one request per asset when assets are supplied.
-
-Future planners may include `by_trade_date`, `by_period`, `by_date_range`, `paged`, or custom registered planners.
-
-## Normalizer
-
-`standard` maps configured fields and derives canonical columns:
-
-- `asset_id`
-- `time`
-- `period` when configured
-- `source`
-- `source_dataset`
-
-Use a custom normalizer only when a source response needs specialized parsing.
-
-## Deduplication
-
-Initial strategies:
-
-- `none`
-- `exact_record_hash`
-- `primary_key_last`
-
-Choose `primary_key_last` for daily market data where the latest record should replace the old row for the same key.
-
-Choose `exact_record_hash` for financial records where multiple versions can be valid and only exact duplicates should be dropped.
-
-## Partition Strategy
-
-Initial strategies:
-
-- `single_file`: reference or small datasets.
-- `year_month`: dense market time series.
-- `year_bucket`: financial statements and sparse event records.
-
-For `year_bucket`, configure `bucket_count`:
-
-```yaml
-partition_strategy: year_bucket
-partition_options:
-  bucket_count: 32
+```python
+lake.admin.datasets.add(
+    "stock_basic",
+    "general",
+    reference=True,
+    exchange="SSE",
+    list_status="L",
+)
 ```
 
-## Reference Datasets
+The updater sends those values with every request for that dataset.
 
-Reference datasets set:
+Known framework kwargs, such as `source_dataset`, `id_column`, `request_id_param`, `start_date`, `calendar_date_column`, `calendar_open_column`, and `batch_count`, configure lake behavior instead.
 
-```yaml
-reference: true
-partition_strategy: single_file
+## Canonical Columns
+
+The standard normalizer infers canonical `asset_id` and `time` from common source columns:
+
+- IDs: `asset_id`, `ts_code`, `symbol`, `code`, `ticker`
+- Dates: `time`, `date`, `trade_date`, `ann_date`, `cal_date`
+
+Advanced specs may still pass explicit normalizer fields such as `field_mapping`, `asset_column`, `time_column`, `period_column`, `primary_key`, and `deduplication`.
+
+## Examples
+
+Reference dataset:
+
+```python
+lake.admin.datasets.add("stock_basic", "general", reference=True)
 ```
 
-They are read with `lake.query.reference(...)` and are exempt from the single-value panel contract.
+Daily market dataset:
 
-## Validation Checklist
+```python
+lake.admin.datasets.add("daily", "by_daily", reference="trade_cal", request_date_param="date")
+```
 
-Before adding a dataset, confirm:
+Asset-oriented dataset:
 
-- canonical `asset_id` and `time` can be derived for non-reference data
-- `period` is present for point-in-time financial data
-- required source columns are preserved
-- the partition strategy matches access patterns
-- deduplication does not discard meaningful revisions
-- sort order supports common scans
+```python
+lake.admin.datasets.add(
+    "income",
+    "by_id",
+    reference="stock_basic",
+    id_column="ts_code",
+    request_id_param="id",
+    start_date="2010-01-01",
+)
+```

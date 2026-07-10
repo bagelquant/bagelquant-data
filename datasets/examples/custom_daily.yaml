@@ -1,14 +1,4 @@
 name: daily
-source: custom
-source_dataset: daily
-category: market
-field_mapping:
-  ts_code: ts_code
-  trade_date: trade_date
-required_columns: [asset_id, time]
-primary_key: [asset_id, time]
-asset_column: ts_code
-time_column: trade_date
-partition_strategy: year_month
-deduplication: primary_key_last
-sort_columns: [time, asset_id]
+update_type: by_daily
+reference: trade_cal
+request_date_param: date

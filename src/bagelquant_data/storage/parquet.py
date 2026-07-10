@@ -50,7 +50,7 @@ class ParquetStore:
         return path, {
             "source": spec.source,
             "dataset": spec.name,
-            "partition_path": str(relative_path),
+            "partition_path": relative_path.as_posix(),
             "partition_values": partition_values or {},
             "row_count": frame.height,
             "file_size_bytes": path.stat().st_size,

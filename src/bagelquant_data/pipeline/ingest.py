@@ -12,7 +12,6 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.normalization import NormalizeContext, Normalizer
 from bagelquant_data.core.registry import FrameworkRegistries
-from bagelquant_data.core.types import DateLike
 from bagelquant_data.pipeline.commit import commit_frame
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.parquet import ParquetStore
@@ -66,19 +65,12 @@ class IngestionPipeline:
         success_count: int = 0,
         failure_count: int = 0,
         error_message: str | None = None,
-        update_start: DateLike | None = None,
-        update_end: DateLike | None = None,
-        replace_assets: set[str] | None = None,
     ) -> IngestionReport:
         run_id = run_id or uuid4().hex
         committed = self.commit_frame(
             spec,
             frame,
             run_id=run_id,
-            mode=mode,
-            update_start=update_start,
-            update_end=update_end,
-            replace_assets=replace_assets,
         )
         self.metadata.record_run(
             run_id=run_id,
@@ -112,36 +104,36 @@ class IngestionPipeline:
         frame: pl.DataFrame,
         *,
         run_id: str,
-        mode: str = "upsert",
-        update_start: DateLike | None = None,
-        update_end: DateLike | None = None,
-        replace_assets: set[str] | None = None,
     ) -> int:
         """Commit a frame as part of an existing logical run."""
 
         frame = _apply_row_filter(spec, frame)
         self.staging.write(spec.source, spec.name, frame, run_id)
-        normalizer = cast(Normalizer, self.registries.normalizers.get(spec.normalizer))
-        result = normalizer.normalize(
-            frame.lazy(),
-            spec,
-            NormalizeContext(source=spec.source, dataset=spec.name, run_id=run_id),
-        )
-        rejected = result.rejected.collect()
-        if rejected.height:
-            self.rejected.write(spec.source, spec.name, run_id, "normalization", rejected)
-        committed = commit_frame(
-            spec=spec,
-            frame=result.accepted,
-            registries=self.registries,
-            parquet=self.parquet,
-            mode=mode,
-            update_start=update_start,
-            update_end=update_end,
-            replace_assets=replace_assets,
-        )
-        self.staging.cleanup(spec.source, spec.name, run_id)
-        return committed
+        try:
+            normalizer = cast(Normalizer, self.registries.normalizers.get(spec.normalizer))
+            result = normalizer.normalize(
+                frame.lazy(),
+                spec,
+                NormalizeContext(source=spec.source, dataset=spec.name, run_id=run_id),
+            )
+            rejected = result.rejected.collect()
+            if rejected.height:
+                self.rejected.write(spec.source, spec.name, run_id, "normalization", rejected)
+                self.metadata.record_rejected(
+                    run_id=run_id,
+                    source=spec.source,
+                    dataset=spec.name,
+                    reason="normalization",
+                    row_count=rejected.height,
+                )
+            return commit_frame(
+                spec=spec,
+                frame=result.accepted,
+                registries=self.registries,
+                parquet=self.parquet,
+            )
+        finally:
+            self.staging.cleanup(spec.source, spec.name, run_id)
 
 
 def _apply_row_filter(spec: DatasetSpec, frame: pl.DataFrame) -> pl.DataFrame:

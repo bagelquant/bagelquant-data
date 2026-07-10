@@ -1,192 +1,113 @@
 # Management API
 
-The management API is exposed from `DataLake.open(...)`.
+The management surface lives under `lake.admin`.
 
 ```python
 from bagelquant_data import DataLake
 
 lake = DataLake.open("data")
+admin = lake.admin
 ```
 
-The facade exposes:
+`lake.admin` groups source management, dataset management, status inspection, rejected-row summaries, and manifest repair.
 
-- `lake.sources`
-- `lake.datasets`
-- `lake.update`
-- `lake.query`
-- `lake.finance`
-- `lake.status`
+## Sources
 
-## Source Management
-
-Register a source adapter:
+Register and configure a source adapter:
 
 ```python
 from bagelquant_data.sources.tushare import TushareSource
 
-lake.sources.register(TushareSource(name="tushare"))
+lake.admin.sources.add(TushareSource(name="tushare"))
+lake.admin.sources.edit("tushare", token="...")
 ```
 
-Configure a source:
+Inspect and test sources:
 
 ```python
-lake.sources.configure("tushare", token="...")
+sources = lake.admin.sources.list()
+tushare = lake.admin.sources.get("tushare")
+lake.admin.sources.test("tushare")
 ```
 
-The Tushare convenience method delegates to the generic configuration method:
+Enable, disable, or delete a source registration:
 
 ```python
-lake.sources.configure_tushare(token="...")
+lake.admin.sources.disable("tushare")
+lake.admin.sources.enable("tushare")
+lake.admin.sources.delete("tushare")
 ```
 
-List registered sources:
+Deleting a source registration does not delete canonical data.
+
+## Datasets
+
+Dataset behavior is declared with the compact registration API or YAML files.
 
 ```python
-sources = lake.sources.list()
+spec = lake.admin.datasets.add("daily", "by_daily", reference="trade_cal")
 ```
 
-Get a registered adapter:
+Load a YAML spec:
 
 ```python
-tushare = lake.sources.get("tushare")
+lake.admin.datasets.add_from_yaml("datasets/examples/custom_daily.yaml")
 ```
 
-Test a source connection:
+Inspect, edit, enable, disable, or delete dataset registrations:
 
 ```python
-lake.sources.test("tushare")
+spec = lake.admin.datasets.get("daily", source="custom")
+datasets = lake.admin.datasets.list("custom")
+
+lake.admin.datasets.edit(updated_spec)
+lake.admin.datasets.disable("daily", source="custom")
+lake.admin.datasets.enable("daily", source="custom")
+lake.admin.datasets.delete("daily", source="custom")
 ```
 
-Remove a source registration:
+Canonical data is deleted only when explicitly requested and confirmed:
 
 ```python
-lake.sources.remove("tushare")
-```
-
-Removing a source registration does not delete canonical data.
-
-## Dataset Management
-
-Dataset behavior is declared by `DatasetSpec` objects or YAML files.
-
-Add a spec object:
-
-```python
-from bagelquant_data import DatasetSpec
-
-spec = DatasetSpec(
-    name="daily",
-    source="custom",
-    source_dataset="daily",
-    category="market",
-    field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
-    required_columns=("asset_id", "time"),
-    primary_key=("asset_id", "time"),
-    asset_column="ts_code",
-    time_column="trade_date",
-    partition_strategy="year_month",
-    deduplication="primary_key_last",
-    sort_columns=("time", "asset_id"),
-)
-
-lake.datasets.add(spec)
-```
-
-Add a YAML spec:
-
-```python
-lake.datasets.add_from_yaml(
-    "src/bagelquant_data/sources/tushare/datasets/daily.yaml"
-)
-```
-
-Get a dataset:
-
-```python
-spec = lake.datasets.get("daily", source="tushare")
-```
-
-List datasets:
-
-```python
-all_datasets = lake.datasets.list()
-tushare_datasets = lake.datasets.list("tushare")
-```
-
-Enable or disable a dataset:
-
-```python
-lake.datasets.enable("daily", source="tushare")
-lake.datasets.disable("daily", source="tushare")
-```
-
-Remove a dataset registration without deleting data:
-
-```python
-lake.datasets.remove("daily", source="tushare")
-```
-
-Delete canonical data only with explicit confirmation:
-
-```python
-lake.datasets.remove(
+lake.admin.datasets.delete(
     "daily",
-    source="tushare",
+    source="custom",
     delete_data=True,
     confirm=True,
 )
 ```
 
-## Status And Inspection
+## Status
 
-Summary:
-
-```python
-summary = lake.status.summary()
-```
-
-Dataset status:
+Status reads SQLite metadata and manifests by default.
 
 ```python
-status = lake.status.dataset("income", source="tushare")
+summary = lake.admin.summary()
+runs = lake.admin.runs(limit=20)
+failures = lake.admin.failures(dataset="daily", source="custom")
+rejected = lake.admin.rejected("daily", source="custom")
 ```
 
-Partition manifest:
+Dataset and file-level status is available through the focused status manager:
 
 ```python
-partitions = lake.status.partitions("income", source="tushare")
+dataset_status = lake.admin.status.dataset("daily", source="custom")
+partitions = lake.admin.status.partitions("daily", source="custom")
+files = lake.admin.status.files("daily", source="custom")
 ```
 
-Recent ingestion runs:
+## Manifest Repair
+
+Validate that manifest rows point to existing files:
 
 ```python
-runs = lake.status.runs(limit=20)
+validation = lake.admin.validate_manifest("daily", source="custom")
 ```
 
-Failed runs:
+Rebuild a dataset manifest from canonical Parquet files:
 
 ```python
-failures = lake.status.failures(dataset="income", source="tushare")
+rebuilt = lake.admin.rebuild_manifest("daily", source="custom")
 ```
 
-Files known to the manifest:
-
-```python
-files = lake.status.files("income", source="tushare")
-```
-
-Normal status calls use SQLite manifest metadata. They are designed to be cheap and do not need to scan every Parquet file.
-
-## Canonical Record Inspection
-
-Use `lake.query.records(...)` for human inspection:
-
-```python
-records = lake.query.records(
-    "income",
-    source="tushare",
-    limit=10,
-)
-```
-
-This is not the main research extraction API. Use `lake.query.field(...)` for single-value panels.
+`rebuild_manifest` scans canonical files and replaces only that dataset's manifest rows. It does not rewrite canonical Parquet data.
