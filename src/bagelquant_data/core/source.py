@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 import polars as pl
-
-from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.request import RequestContext
-
 
 class DataSource(Protocol):
     """Generic external source adapter."""
@@ -29,10 +25,4 @@ class DataSource(Protocol):
 
     def fetch(self, source_dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
         """Fetch one source response."""
-        ...
-
-    def plan_requests(
-        self, dataset: DatasetSpec, context: RequestContext
-    ) -> Iterable[Mapping[str, Any]]:
-        """Plan source requests for a dataset."""
         ...

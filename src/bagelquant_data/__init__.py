@@ -12,7 +12,8 @@ from bagelquant_data.core import (
     stable_bucket,
 )
 from bagelquant_data.finance import FinancialFieldKind, FinancialFieldSpec
-from bagelquant_data.management import DataLake
+from bagelquant_data.management import DataLake, LakeAdmin, LakeUpdater
+from bagelquant_data.query import LakeQuery
 from bagelquant_data.sources.tushare import TushareSource
 
 __all__ = [
@@ -25,6 +26,9 @@ __all__ = [
     "DuplicateResolutionError",
     "FinancialFieldKind",
     "FinancialFieldSpec",
+    "LakeAdmin",
+    "LakeQuery",
+    "LakeUpdater",
     "SourceNotFoundError",
     "TushareSource",
     "ValidationError",

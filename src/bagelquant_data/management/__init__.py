@@ -1,5 +1,5 @@
 """Management API."""
 
-from bagelquant_data.management.lake import DataLake
+from bagelquant_data.management.lake import DataLake, LakeAdmin, LakeUpdater
 
-__all__ = ["DataLake"]
+__all__ = ["DataLake", "LakeAdmin", "LakeUpdater"]

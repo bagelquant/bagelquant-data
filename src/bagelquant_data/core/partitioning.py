@@ -60,7 +60,7 @@ class YearBucketPartition:
     """Partition by year(time) and stable asset bucket."""
 
     def derive_columns(self, frame: pl.LazyFrame, spec: DatasetSpec) -> pl.LazyFrame:
-        bucket_count = int(spec.partition_options.get("bucket_count", 32))
+        bucket_count = spec.batch_count
         return frame.with_columns(
             pl.col("time").dt.year().cast(pl.Int16).alias("year"),
             pl.col("asset_id")
@@ -80,7 +80,7 @@ class TenYearRangePartition:
     """Partition by 10-year ranges of canonical time."""
 
     def derive_columns(self, frame: pl.LazyFrame, spec: DatasetSpec) -> pl.LazyFrame:
-        chunk_years = int(spec.partition_options.get("chunk_years", 10))
+        chunk_years = int(spec.request_options.get("chunk_years", 10))
         year = pl.col("time").dt.year()
         start_year = (year // chunk_years) * chunk_years
         end_year = start_year + chunk_years - 1

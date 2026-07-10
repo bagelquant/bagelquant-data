@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -44,19 +43,20 @@ def update_dataset(
     source_adapter: object,
     pipeline: IngestionPipeline,
     context: RequestContext,
+    requests: Sequence[dict[str, object]],
 ) -> IngestionReport:
     """Fetch requests for a dataset and commit bounded batches."""
 
     import polars as pl
 
     run_id = uuid4().hex
-    requests = [dict(request) for request in source_adapter.plan_requests(spec, context)]  # type: ignore[attr-defined]
     workers = max(1, int(context.options.get("workers", 4)))
     progress_enabled = bool(context.options.get("progress", True))
     max_retries = max(1, int(context.options.get("max_retries", 3)))
     retry_backoff_seconds = float(context.options.get("retry_backoff_seconds", 60.0))
     request_options = _request_options(spec, context)
-    batches = _request_batches(spec, requests, context)
+    planned_requests = [dict(request) for request in requests]
+    batches = _request_batches(planned_requests, context)
     errors: list[str] = []
     request_count = 0
     success_count = 0
@@ -65,7 +65,7 @@ def update_dataset(
     rows_committed = 0
     any_committed_frame = False
 
-    progress = _progress_bar(spec.name, len(requests), enabled=progress_enabled)
+    progress = _progress_bar(spec.name, len(planned_requests), enabled=progress_enabled)
     progress_lock = None
     if progress is not None:
         from threading import Lock
@@ -123,11 +123,6 @@ def update_dataset(
                     for future in as_completed(futures):
                         pages.extend(future.result())
 
-            failed_assets = {
-                str(page.asset_id)
-                for page in pages
-                if page.status != "success" and page.asset_id is not None
-            }
             pipeline.metadata.record_api_calls(
                 {
                     "run_id": run_id,
@@ -145,8 +140,9 @@ def update_dataset(
             )
             for page in pages:
                 if page.status == "success" and isinstance(page.frame, pl.DataFrame) and page.frame.height > 0:
-                    if not (spec.update_mode == "replace_asset" and page.asset_id in failed_assets):
-                        frames.append(page.frame)
+                    frames.append(page.frame)
+                elif page.status == "success" and spec.update_type == "general" and isinstance(page.frame, pl.DataFrame):
+                    frames.append(page.frame)
                 elif page.error_message:
                     errors.append(f"{page.request_key}: {page.error_message}")
 
@@ -156,20 +152,11 @@ def update_dataset(
             failure_count += len(pages) - batch_success_count
             rows_downloaded += sum(page.row_count for page in pages if page.status == "success")
             if frames:
-                replace_assets = {
-                    str(page.asset_id)
-                    for page in pages
-                    if page.status == "success" and page.asset_id is not None
-                } - failed_assets
                 frame = pl.concat(frames, how="diagonal_relaxed")
                 rows_committed += pipeline.commit_frame(
                     spec,
                     frame,
                     run_id=run_id,
-                    mode=spec.update_mode,
-                    update_start=context.start,
-                    update_end=context.end,
-                    replace_assets=replace_assets or None,
                 )
                 any_committed_frame = True
             elif pages and all(page.status == "success" for page in pages):
@@ -188,7 +175,7 @@ def update_dataset(
         run_id=run_id,
         source=spec.source,
         dataset=spec.name,
-        mode=spec.update_mode,
+        mode=spec.update_type,
         status=status,
         request_count=request_count,
         success_count=success_count,
@@ -216,22 +203,14 @@ def combine_reports(source: str, reports: Sequence[IngestionReport]) -> UpdateRe
 
 
 def _request_batches(
-    spec: DatasetSpec,
     requests: list[dict[str, Any]],
     context: RequestContext,
 ) -> list[list[tuple[int, dict[str, Any]]]]:
     indexed = list(enumerate(requests))
-    if spec.request_planner == "by_asset_date_range":
+    batch_size = max(1, int(context.options.get("batch_size", len(indexed) or 1)))
+    if len(indexed) <= batch_size:
         return [indexed]
-    if spec.category == "market":
-        groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
-        for item in indexed:
-            groups[_request_year_month(item[1])].append(item)
-        return [groups[key] for key in sorted(groups)]
-    if spec.update_mode == "replace_asset":
-        batch_size = max(1, int(context.options.get("batch_size", 250)))
-        return [indexed[index : index + batch_size] for index in range(0, len(indexed), batch_size)]
-    return [indexed]
+    return [indexed[index : index + batch_size] for index in range(0, len(indexed), batch_size)]
 
 
 def _fetch_request_pages(
@@ -337,13 +316,8 @@ def _request_options(spec: DatasetSpec, context: RequestContext) -> dict[str, An
 
 
 def _request_asset(request: dict[str, Any]) -> str | None:
-    value = request.get("ts_code") or request.get("index_code") or request.get("asset_id")
+    value = request.get("id") or request.get("ts_code") or request.get("index_code") or request.get("asset_id")
     return None if value is None else str(value)
-
-
-def _request_year_month(request: dict[str, Any]) -> str:
-    value = str(request.get("trade_date", ""))
-    return value[:7] if len(value) >= 7 and value[4] == "-" else value[:6]
 
 
 def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:

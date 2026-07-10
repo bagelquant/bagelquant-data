@@ -3,6 +3,12 @@
 `bagelquant-data` is a Polars-native, source-agnostic data lake framework for
 quantitative research.
 
+- `lake.admin` manages sources, dataset specs, manifests, health, repair, and
+  deletion.
+- `lake.update` plans and runs dataset updates with retries, batching,
+  pagination, and run observability.
+- `lake.query` reads price panels, PIT fundamentals, events, reference data,
+  and raw canonical records.
 - Polars is the dataframe engine.
 - Parquet is the canonical analytical storage format.
 - SQLite stores mutable metadata, manifests, run state, and source/dataset
@@ -15,23 +21,10 @@ quantitative research.
 ```python
 import polars as pl
 
-from bagelquant_data import DataLake, DatasetSpec
+from bagelquant_data import DataLake
 
 lake = DataLake.open("data")
-spec = DatasetSpec(
-    name="daily",
-    source="custom",
-    source_dataset="daily",
-    category="market",
-    field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
-    required_columns=("asset_id", "time"),
-    primary_key=("asset_id", "time"),
-    asset_column="ts_code",
-    time_column="trade_date",
-    partition_strategy="year_month",
-    deduplication="primary_key_last",
-    sort_columns=("time", "asset_id"),
-)
+spec = lake.admin.datasets.add("daily", "by_daily", reference="trade_cal")
 lake.ingest_frame(
     spec,
     pl.DataFrame(
@@ -43,25 +36,17 @@ lake.ingest_frame(
     ),
 )
 
-close = lake.query.field("daily", "close", source="custom", collect=True)
+print(lake.admin.summary())
+close = lake.query.price("daily", "close", source="custom", collect=True)
 print(close)  # time, asset_id, close
 ```
 
-Documentation is available in two languages:
-
-- English: `docs/en/index.md`
-- Chinese: `docs/cn/index.md`
-
-## Repository Boundary
-
-This repo contains reusable data-lake APIs, storage/query/source adapters, and
-minimal API examples. Operational lake workflows such as configuring a local
-Tushare lake, running incremental updates, and monitoring long jobs live in the
-separate `manage-data-lake` repo. Factor creation, archiving, and testing live
-in `factor-model`.
+Documentation starts at `docs/en/index.md`.
 
 ## Development
 
 ```bash
 uv run pytest
+uv run pyright
+uv run ruff check .
 ```

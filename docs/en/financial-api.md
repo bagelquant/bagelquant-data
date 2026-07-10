@@ -1,29 +1,11 @@
-# Financial API
+# Financial And PIT Helpers
 
-The financial API lives under `lake.finance`. It provides generic operations that users compose into indicators. It intentionally avoids hardcoded metrics such as `eps_ttm()` or `roe_ttm()`.
+Financial records are queried through `lake.query.fundamental(...)`. Generic financial transforms are available under `lake.query.fundamentals`.
 
-## Event-Level Field Extraction
-
-Financial source records are event-level data. The canonical event output is:
-
-```text
-asset_id | time | period | value
-```
-
-Example:
+## Event-Level Fundamentals
 
 ```python
-events = lake.finance.field(
-    "income",
-    "n_income_attr_p",
-    source="tushare",
-)
-```
-
-You can rename the value column:
-
-```python
-earnings = lake.finance.field(
+earnings_ytd = lake.query.fundamental(
     "income",
     "n_income_attr_p",
     source="tushare",
@@ -31,15 +13,15 @@ earnings = lake.finance.field(
 )
 ```
 
-## Point-In-Time Alignment
-
-`asof` aligns event records to an observation grid. It guarantees:
+The event-level output is:
 
 ```text
-event.time <= observation.time
+asset_id | time | period | earnings_ytd
 ```
 
-Example:
+`time` is the information availability date. `period` is the accounting or economic period.
+
+## Latest Available Values
 
 ```python
 observations = lake.query.observations(
@@ -49,55 +31,33 @@ observations = lake.query.observations(
     assets=["000001.SZ"],
 )
 
-aligned = lake.finance.asof(
-    earnings,
-    observations,
-    value_column="earnings_ytd",
-    output_name="earnings_ytd",
-    collect=True,
-)
-```
-
-The final aligned output is:
-
-```text
-time | asset_id | earnings_ytd
-```
-
-## Latest Available Field
-
-`latest` combines field extraction and point-in-time alignment.
-
-```python
-total_assets = lake.finance.latest(
-    "balancesheet",
-    "total_assets",
+latest = lake.query.fundamental(
+    "income",
+    "n_income_attr_p",
     source="tushare",
     observations=observations,
-    value_name="total_assets",
+    value_name="earnings_ytd",
     collect=True,
 )
+```
+
+Latest-value alignment guarantees:
+
+```text
+event.time <= observation.time
 ```
 
 ## YTD To Period Flow
 
-Many statement flow fields are cumulative year-to-date values. Use `ytd_to_period` to convert them into period values.
-
 ```python
-earnings_ytd = lake.finance.field(
-    "income",
-    "n_income_attr_p",
-    source="tushare",
-)
-
-earnings_quarter = lake.finance.ytd_to_period(
+earnings_quarter = lake.query.fundamentals.ytd_to_period(
     earnings_ytd,
-    value_column="value",
+    value_column="earnings_ytd",
     output_name="earnings_quarter",
 )
 ```
 
-For quarterly data, the conceptual conversion is:
+For quarterly data:
 
 ```text
 Q1 = YTD_Q1
@@ -108,10 +68,8 @@ Q4 = YTD_FY - YTD_Q3
 
 ## Trailing Aggregation
 
-Use `trailing` for rolling operations over event periods.
-
 ```python
-earnings_ttm = lake.finance.trailing(
+earnings_ttm = lake.query.fundamentals.trailing(
     earnings_quarter,
     value_column="earnings_quarter",
     periods=4,
@@ -131,11 +89,15 @@ Supported operations:
 
 ## Average Stock Variables
 
-Use `average_stock` for balance-sheet style stock variables:
-
 ```python
-avg_assets = lake.finance.average_stock(
-    total_assets_events,
+total_assets = lake.query.fundamental(
+    "balancesheet",
+    "total_assets",
+    source="tushare",
+)
+
+avg_assets = lake.query.fundamentals.average_stock(
+    total_assets,
     value_column="value",
     periods=4,
     method="endpoint",
@@ -143,17 +105,15 @@ avg_assets = lake.finance.average_stock(
 )
 ```
 
-Initial methods:
+Supported methods:
 
 - `endpoint`
 - `period_mean`
 
 ## Weighted Average
 
-`weighted_average` is generic. Weighted-average shares are one application, but the primitive is not tied to shares.
-
 ```python
-weighted = lake.finance.weighted_average(
+weighted = lake.query.fundamentals.weighted_average(
     share_events,
     value_column="shares",
     effective_time_column="effective_time",
@@ -165,10 +125,8 @@ weighted = lake.finance.weighted_average(
 
 ## Generic Ratio
 
-`ratio` joins numerator and denominator frames and computes a generic ratio.
-
 ```python
-eps_like = lake.finance.ratio(
+ratio = lake.query.fundamentals.ratio(
     numerator=earnings_ttm,
     denominator=weighted,
     numerator_column="earnings_ttm",
@@ -182,5 +140,3 @@ Zero denominator policies:
 - `null`
 - `nan`
 - `raise`
-
-The framework provides primitives; users name and validate business-specific indicators in their own research layer.

@@ -20,7 +20,8 @@ def daily_spec() -> DatasetSpec:
         primary_key=("asset_id", "time"),
         asset_column="ts_code",
         time_column="trade_date",
-        partition_strategy="year_month",
+        update_type="by_daily",
+        calendar_dataset="trade_cal",
         deduplication="primary_key_last",
         sort_columns=("time", "asset_id"),
     )

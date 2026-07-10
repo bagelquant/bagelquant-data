@@ -1,16 +1,14 @@
 # Tushare Source
 
-Tushare is the first bundled source adapter. It lives under:
+Tushare is the bundled source adapter under:
 
 ```text
 bagelquant_data.sources.tushare
 ```
 
-The core framework does not import Tushare-specific code.
+The adapter implements source registration, token configuration, provider parameter mapping, API fetching, and pandas-to-Polars conversion.
 
 ## Installation
-
-Install optional dependencies:
 
 ```bash
 uv sync --extra tushare
@@ -24,125 +22,68 @@ Use an environment variable:
 export TUSHARE_TOKEN="..."
 ```
 
-Or configure at runtime:
+Or configure the source in the lake:
 
 ```python
 from bagelquant_data import DataLake
 from bagelquant_data.sources.tushare import TushareSource
 
 lake = DataLake.open("data")
-lake.sources.register(TushareSource())
-lake.sources.configure_tushare(token="...")
+lake.admin.sources.add(TushareSource())
+lake.admin.sources.edit("tushare", token="...")
 ```
 
-`configure_tushare` persists the token in the local lake metadata DB for future runs. Tokens are not included in `repr` output or source listings and should not be committed.
+Saved source options live in the lake metadata DB and are redacted from source listings.
 
-## Register Dataset Specs
+## Register Datasets
 
-Bundled specs live in:
-
-```text
-src/bagelquant_data/sources/tushare/datasets/
-```
-
-Register examples:
+Tushare datasets use the same compact registration path as any other source. The source is selected when updating or querying.
 
 ```python
-lake.datasets.add_from_yaml(
-    "src/bagelquant_data/sources/tushare/datasets/daily.yaml"
-)
-lake.datasets.add_from_yaml(
-    "src/bagelquant_data/sources/tushare/datasets/income.yaml"
-)
+lake.admin.datasets.add("trade_cal", "general", reference=True)
+lake.admin.datasets.add("daily", "by_daily", reference="trade_cal", request_date_param="date")
+lake.admin.datasets.add("income", "by_id", reference="stock_basic", id_column="ts_code")
 ```
 
-## Initial Dataset Set
+## Parameter Mapping
 
-Reference:
+The lake plans requests from each dataset's `update_type`. The Tushare adapter maps generic request keys to Tushare parameters:
 
-- `stock_basic`
-- `trade_cal`
+- `start` -> `start_date`
+- `end` -> `end_date`
+- `date` -> `trade_date`
+- `id` -> `ts_code`
 
-Market:
+Date values are formatted as Tushare `YYYYMMDD` strings.
 
-- `daily`
-- `daily_basic`
-- `adj_factor`
-
-Financial statements:
-
-- `income`
-- `balancesheet`
-- `cashflow`
-
-Financial events:
-
-- `forecast`
-- `express`
-
-## Canonical Time Mapping
-
-Market datasets:
-
-```text
-daily:       asset_id = ts_code, time = trade_date
-daily_basic: asset_id = ts_code, time = trade_date
-adj_factor:  asset_id = ts_code, time = trade_date
-```
-
-Financial statement datasets:
-
-```text
-income:       asset_id = ts_code, time = f_ann_date, period = end_date
-balancesheet: asset_id = ts_code, time = f_ann_date, period = end_date
-cashflow:     asset_id = ts_code, time = f_ann_date, period = end_date
-```
-
-Financial event datasets:
-
-```text
-forecast: asset_id = ts_code, time = ann_date, period = end_date
-express:  asset_id = ts_code, time = ann_date, period = end_date
-```
-
-Original source columns are preserved where possible.
-
-## Updating Tushare Data
+## Updating
 
 ```python
 lake.update.dataset("daily", source="tushare")
 
-lake.update.datasets(
-    ["daily", "daily_basic", "adj_factor"],
-    source="tushare",
-)
-
 lake.update.dataset(
     "income",
     source="tushare",
-    assets=["000001.SZ", "600000.SH"],
-    start="2020-01-01",
-    end="2026-06-15",
+    ids=["000001.SZ", "600000.SH"],
+    today="2026-06-15",
 )
 ```
 
-Financial statement/event datasets call Tushare once per asset because the API requires `ts_code`. If `assets` is omitted, the updater derives the universe from `stock_basic`, so update/register `stock_basic` first.
+For `by_id` datasets, pass `ids` explicitly or register/update the configured ID reference dataset first.
 
-## Querying Tushare Data
+## Querying
 
 ```python
-close = lake.query.field(
+close = lake.query.price(
     "daily",
     "close",
     source="tushare",
     collect=True,
 )
 
-income = lake.query.raw(
+earnings = lake.query.fundamental(
     "income",
+    "n_income_attr_p",
     source="tushare",
-    columns=["asset_id", "time", "period", "n_income_attr_p"],
 )
 ```
-
-Use `lake.finance` for point-in-time financial transformations.

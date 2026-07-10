@@ -1,6 +1,6 @@
 # Configuration
 
-The primary configuration is the lake root path passed to `DataLake.open(...)`.
+The main configuration value is the lake root path passed to `DataLake.open(...)`.
 
 ```python
 from bagelquant_data import DataLake
@@ -8,9 +8,9 @@ from bagelquant_data import DataLake
 lake = DataLake.open("data")
 ```
 
-Opening the lake creates the storage zones under that root if they do not already exist.
+Opening a lake creates the local storage layout if it does not already exist.
 
-## Default Local Layout
+## Local Layout
 
 ```text
 data/
@@ -21,13 +21,7 @@ data/
     tmp/
 ```
 
-The repository also includes a sample configuration file:
-
-```text
-config/bagelquant-data.toml
-```
-
-At this stage, the Python API is the source of truth. The TOML file documents intended local defaults and can be used by future CLI or application integration.
+The repository includes `config/bagelquant-data.toml` as an example local configuration file. Runtime behavior is controlled by the Python API and persisted lake metadata.
 
 ## Dependencies
 
@@ -35,13 +29,14 @@ Core dependencies:
 
 - `polars`
 - `pyarrow`
+- `tqdm`
 
 Optional Tushare dependencies:
 
 - `pandas`
 - `tushare`
 
-Install or sync with the project tooling:
+Install with:
 
 ```bash
 uv sync
@@ -50,56 +45,37 @@ uv sync --extra tushare
 
 ## Credentials
 
-Credentials are configured at runtime. They should not be written into dataset YAML, Parquet files, committed configuration files, or documentation examples.
+Credentials are configured at runtime. Do not put secrets in dataset YAML, Parquet files, committed TOML files, or docs examples.
 
-For Tushare, either pass a token:
+For Tushare, pass a token when constructing the source:
 
 ```python
 from bagelquant_data.sources.tushare import TushareSource
 
-source = TushareSource(token="...")
+lake.admin.sources.add(TushareSource(token="..."))
 ```
 
-Or configure after registration. This saves the token into the local lake metadata DB so future runs can register `TushareSource()` and update without passing the token again:
+Or configure a registered source:
 
 ```python
-lake.sources.register(TushareSource())
-lake.sources.configure_tushare(token="...")
+lake.admin.sources.add(TushareSource())
+lake.admin.sources.edit("tushare", token="...")
 ```
 
-Or set an environment variable:
+Source options are saved in `metadata/lake.db` and redacted from source listings.
 
-```bash
-export TUSHARE_TOKEN="..."
-```
-
-Saved source options are local to the lake root, stored under `data/metadata/lake.db`, and redacted from source listings.
-
-## Local Development
-
-Run tests:
+## Local Checks
 
 ```bash
 uv run pytest
-```
-
-Run static checking:
-
-```bash
 uv run pyright
+uv run ruff check .
 ```
 
-Run the thin CLI:
+The CLI is a thin wrapper around the Python API:
 
 ```bash
 uv run bagelquant-data --root data status
 uv run bagelquant-data --root data source-list
 uv run bagelquant-data --root data dataset-list --source tushare
 ```
-
-Reusable setup, update, and monitoring workflows now live in the separate
-`manage-data-lake` repo. Keep this package focused on reusable lake APIs.
-
-## What Not To Configure
-
-Do not configure old lake layouts, legacy migration paths, or backward compatibility switches. The framework intentionally targets the new canonical design only.

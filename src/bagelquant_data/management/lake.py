@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.exceptions import ConfigurationError, DatasetNotFoundError
+from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.finance import FinanceFacade
@@ -18,8 +17,9 @@ from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
+from bagelquant_data.pipeline.planner import plan_update
 from bagelquant_data.pipeline.update import UpdateReport, combine_reports, update_dataset
-from bagelquant_data.query import QueryFacade
+from bagelquant_data.query import LakeQuery
 from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.parquet import ParquetStore
@@ -39,11 +39,12 @@ class DataLake:
         self.parquet = ParquetStore(self.paths, self.metadata)
         self.sources = SourceManager(self.registries, self.metadata)
         self.datasets = DatasetManager(self.metadata, self.paths)
-        self.status = StatusManager(self.metadata)
+        self.status = StatusManager(self.metadata, self.paths)
         raw = RawQueryService(self.parquet, self.metadata)
-        self.query = QueryFacade(raw)
         self.finance = FinanceFacade(raw)
-        self.update = UpdateManager(self)
+        self.query = LakeQuery(raw, finance=self.finance)
+        self.admin = LakeAdmin(self.sources, self.datasets, self.status)
+        self.update = LakeUpdater(self)
         self._pipeline = IngestionPipeline(
             registries=self.registries,
             parquet=self.parquet,
@@ -62,24 +63,62 @@ class DataLake:
         """Convenience method for tests and local file adapters."""
 
         self.datasets.add(spec)
-        return self._pipeline.ingest_frame(spec, frame, mode=spec.update_mode)
+        return self._pipeline.ingest_frame(spec, frame, mode=spec.update_type)
 
 
 @dataclass
-class UpdateManager:
-    """Public update API."""
+class LakeAdmin:
+    """Public data-lake management API."""
+
+    sources: SourceManager
+    datasets: DatasetManager
+    status: StatusManager
+
+    def summary(self) -> dict[str, Any]:
+        return self.status.summary()
+
+    def rebuild_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
+        return self.status.rebuild_manifest(dataset, source=source)
+
+    def validate_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
+        return self.status.validate_manifest(dataset, source=source)
+
+    def runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.status.runs(limit)
+
+    def failures(self, dataset: str | None = None, source: str | None = None) -> list[dict[str, Any]]:
+        return self.status.failures(dataset=dataset, source=source)
+
+    def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
+        return self.status.rejected(dataset, source=source)
+
+
+@dataclass
+class LakeUpdater:
+    """Public dataset update API."""
 
     lake: DataLake
 
     def dataset(self, dataset: str, *, source: str, **kwargs: Any) -> IngestionReport:
         spec = self.lake.datasets.get(dataset, source=source)
         adapter = self.lake.sources.get(source)
-        if _planner_needs_assets(spec) and not kwargs.get("assets"):
-            kwargs["assets"] = self._reference_assets(spec)
-        if spec.source == "tushare" and spec.category == "market" and _planner_needs_trade_dates(spec):
-            kwargs["trade_dates"] = self._trade_dates(source, start=kwargs.get("start"), end=kwargs.get("end"))
         context = _request_context(source=source, dataset=dataset, kwargs=kwargs)
-        return update_dataset(spec=spec, source_adapter=adapter, pipeline=self.lake._pipeline, context=context)
+        planned = plan_update(
+            spec=spec,
+            raw=RawQueryService(self.lake.parquet, self.lake.metadata),
+            references=self.lake.query,
+            start=context.start,
+            end=context.end,
+            today=context.options.get("today"),
+            ids=context.options.get("ids"),
+        )
+        return update_dataset(
+            spec=spec,
+            source_adapter=adapter,
+            pipeline=self.lake._pipeline,
+            context=context,
+            requests=planned.requests,
+        )
 
     def datasets(self, datasets: list[str], *, source: str, **kwargs: Any) -> UpdateReport:
         reports = [self.dataset(dataset, source=source, **kwargs) for dataset in datasets]
@@ -87,76 +126,16 @@ class UpdateManager:
 
     def source(self, source: str, **kwargs: Any) -> UpdateReport:
         names = [row["name"] for row in self.lake.datasets.list(source) if row["enabled"]]
+        if not names and source != "custom":
+            names = [row["name"] for row in self.lake.datasets.list("custom") if row["enabled"]]
         return self.datasets(names, source=source, **kwargs)
-
-    def _reference_assets(self, spec: DatasetSpec) -> list[str]:
-        source = spec.source
-        reference_dataset = spec.request_options.get("reference_dataset")
-        reference_column = spec.request_options.get("reference_column")
-        if not reference_dataset and spec.request_planner == "by_asset" and source == "tushare":
-            reference_dataset = "stock_basic"
-            reference_column = "ts_code"
-        if not reference_dataset:
-            raise ConfigurationError(
-                f"assets=... or request_options.reference_dataset is required for {source}/{spec.name}"
-            )
-        reference_dataset = str(reference_dataset)
-        try:
-            frame = self.lake.query.reference(reference_dataset, source=source, collect=True)
-        except DatasetNotFoundError as exc:
-            raise ConfigurationError(
-                f"{source}/{spec.name} requires reference dataset {source}/{reference_dataset}. "
-                f"Update/register {reference_dataset} first or pass assets=[...] explicitly."
-            ) from exc
-        if isinstance(frame, pl.LazyFrame):
-            frame = frame.collect()
-        if frame.is_empty():
-            raise ConfigurationError(f"{source}/{reference_dataset} is empty; update it before {spec.name}")
-        column = str(reference_column) if reference_column else _default_reference_column(frame)
-        if column not in frame.columns:
-            raise ConfigurationError(f"{source}/{reference_dataset} does not contain {column}")
-        assets = [str(value) for value in frame.get_column(column).drop_nulls().unique().sort().to_list()]
-        if not assets:
-            raise ConfigurationError(f"{source}/{reference_dataset}.{column} has no values for {spec.name}")
-        return assets
-
-    def _trade_dates(self, source: str, *, start: Any, end: Any) -> list[str]:
-        try:
-            frame = self.lake.query.reference("trade_cal", source=source, collect=True)
-        except DatasetNotFoundError as exc:
-            raise ConfigurationError(
-                "Tushare market updates require trade_cal. Update/register trade_cal first."
-            ) from exc
-        if isinstance(frame, pl.LazyFrame):
-            frame = frame.collect()
-        if frame.is_empty():
-            raise ConfigurationError("tushare/trade_cal is empty; update trade_cal before market datasets")
-        column = "time" if "time" in frame.columns else "cal_date" if "cal_date" in frame.columns else None
-        if column is None:
-            raise ConfigurationError("tushare/trade_cal does not contain time or cal_date")
-        dates = frame.with_columns(_calendar_date_expr(column).alias("_calendar_date"))
-        if start is not None:
-            dates = dates.filter(pl.col("_calendar_date") >= _date_literal(start))
-        if end is not None:
-            dates = dates.filter(pl.col("_calendar_date") <= _date_literal(end))
-        if "is_open" in dates.columns:
-            dates = dates.filter(pl.col("is_open").cast(pl.Int8, strict=False) == 1)
-        result = [
-            value.strftime("%Y-%m-%d")
-            for value in dates.select("_calendar_date").drop_nulls().unique().sort("_calendar_date").to_series().to_list()
-        ]
-        if not result:
-            raise ConfigurationError(
-                f"tushare/trade_cal has no open trading days between {start} and {end}"
-            )
-        return result
 
 
 def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> RequestContext:
     known = {
         "start": kwargs.pop("start", None),
         "end": kwargs.pop("end", None),
-        "assets": kwargs.pop("assets", None),
+        "assets": None,
     }
     workers = kwargs.pop("workers", None)
     batch_size = kwargs.pop("batch_size", None)
@@ -164,7 +143,8 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
     progress = kwargs.pop("progress", None)
     max_retries = kwargs.pop("max_retries", None)
     retry_backoff_seconds = kwargs.pop("retry_backoff_seconds", None)
-    trade_dates = kwargs.pop("trade_dates", None)
+    today = kwargs.pop("today", None)
+    ids = kwargs.pop("ids", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -181,38 +161,8 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
         options["max_retries"] = max_retries
     if retry_backoff_seconds is not None:
         options["retry_backoff_seconds"] = retry_backoff_seconds
-    if trade_dates is not None:
-        options["trade_dates"] = trade_dates
+    if today is not None:
+        options["today"] = today
+    if ids is not None:
+        options["ids"] = ids
     return RequestContext(source=source, dataset=dataset, options=options, **known)
-
-
-def _planner_needs_assets(spec: DatasetSpec) -> bool:
-    return spec.request_planner in {"by_asset", "by_asset_trade_date", "by_asset_date_range"}
-
-
-def _planner_needs_trade_dates(spec: DatasetSpec) -> bool:
-    return spec.request_planner != "by_asset_date_range"
-
-
-def _default_reference_column(frame: pl.DataFrame) -> str:
-    for column in ("asset_id", "ts_code"):
-        if column in frame.columns:
-            return column
-    raise ConfigurationError("reference dataset does not contain asset_id or ts_code")
-
-
-def _calendar_date_expr(column: str) -> pl.Expr:
-    return (
-        pl.when(pl.col(column).cast(pl.String).str.len_chars() == 8)
-        .then(pl.col(column).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False))
-        .otherwise(pl.col(column).cast(pl.Date, strict=False))
-    )
-
-
-def _date_literal(value: Any) -> pl.Expr:
-    if hasattr(value, "strftime"):
-        return pl.lit(value).cast(pl.Date, strict=False)
-    text = str(value)
-    if "T" in text:
-        text = text.split("T", maxsplit=1)[0]
-    return pl.lit(datetime.strptime(text[:10], "%Y-%m-%d").date())

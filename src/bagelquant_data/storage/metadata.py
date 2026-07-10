@@ -35,6 +35,7 @@ class MetadataStore:
         name: str,
         adapter: str,
         configured: bool = False,
+        enabled: bool = True,
         options: dict[str, Any] | None = None,
     ) -> None:
         now = _now()
@@ -42,15 +43,16 @@ class MetadataStore:
         with self.connect() as db:
             db.execute(
                 """
-                insert into sources(name, adapter, configured, options_json, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?)
+                insert into sources(name, adapter, configured, enabled, options_json, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?)
                 on conflict(name) do update set
                     adapter=excluded.adapter,
                     configured=excluded.configured,
+                    enabled=excluded.enabled,
                     options_json=coalesce(excluded.options_json, sources.options_json),
                     updated_at=excluded.updated_at
                 """,
-                (name, adapter, int(configured), options_json, now, now),
+                (name, adapter, int(configured), int(enabled), options_json, now, now),
             )
 
     def source_options(self, name: str) -> dict[str, Any]:
@@ -62,6 +64,13 @@ class MetadataStore:
     def remove_source(self, name: str) -> None:
         with self.connect() as db:
             db.execute("delete from sources where name = ?", (name,))
+
+    def set_source_enabled(self, name: str, enabled: bool) -> None:
+        with self.connect() as db:
+            db.execute(
+                "update sources set enabled = ?, updated_at = ? where name = ?",
+                (int(enabled), _now(), name),
+            )
 
     def list_sources(self) -> list[dict[str, Any]]:
         rows = self._rows("select * from sources order by name")
@@ -202,6 +211,41 @@ class MetadataStore:
                 ],
             )
 
+    def replace_manifests(self, source: str, dataset: str, manifests: Iterable[dict[str, Any]]) -> None:
+        rows = list(manifests)
+        now = _now()
+        with self.connect() as db:
+            db.execute(
+                "delete from partition_manifest where source = ? and dataset = ?",
+                (source, dataset),
+            )
+            if rows:
+                db.executemany(
+                    """
+                    insert into partition_manifest(
+                        source, dataset, partition_path, partition_values, row_count,
+                        file_size_bytes, min_time, max_time, content_hash, schema_hash, updated_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            row["source"],
+                            row["dataset"],
+                            str(row["partition_path"]),
+                            json.dumps(row["partition_values"], sort_keys=True, default=str),
+                            int(row["row_count"]),
+                            int(row["file_size_bytes"]),
+                            row.get("min_time"),
+                            row.get("max_time"),
+                            row["content_hash"],
+                            row["schema_hash"],
+                            now,
+                        )
+                        for row in rows
+                    ],
+                )
+
     def manifest(self, source: str | None = None, dataset: str | None = None) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -259,6 +303,39 @@ class MetadataStore:
                     error_message,
                 ),
             )
+
+    def record_rejected(
+        self,
+        *,
+        run_id: str,
+        source: str,
+        dataset: str,
+        reason: str,
+        row_count: int,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                insert into rejected_summary(run_id, source, dataset, reason, row_count, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, source, dataset, reason, int(row_count), _now()),
+            )
+
+    def rejected(self, source: str | None = None, dataset: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if dataset is not None:
+            clauses.append("dataset = ?")
+            params.append(dataset)
+        where = f" where {' and '.join(clauses)}" if clauses else ""
+        return self._rows(
+            f"select * from rejected_summary{where} order by created_at desc",
+            params,
+        )
 
     def record_api_call(
         self,
@@ -343,6 +420,7 @@ class MetadataStore:
                     name text primary key,
                     adapter text not null,
                     configured integer not null default 0,
+                    enabled integer not null default 1,
                     options_json text,
                     created_at text not null,
                     updated_at text not null
@@ -388,18 +466,6 @@ class MetadataStore:
                     finished_at text,
                     error_message text
                 );
-                create table if not exists asset_state (
-                    source text not null,
-                    dataset text not null,
-                    asset_id text not null,
-                    row_count integer not null,
-                    min_time text,
-                    max_time text,
-                    content_hash text not null,
-                    last_success_at text not null,
-                    last_changed_at text not null,
-                    primary key(source, dataset, asset_id)
-                );
                 create table if not exists partition_manifest (
                     source text not null,
                     dataset text not null,
@@ -422,18 +488,10 @@ class MetadataStore:
                     row_count integer not null,
                     created_at text not null
                 );
-                create table if not exists partition_locks (
-                    source text not null,
-                    dataset text not null,
-                    partition_path text not null,
-                    owner text not null,
-                    acquired_at text not null,
-                    expires_at text not null,
-                    primary key(source, dataset, partition_path)
-                );
                 """
             )
             _ensure_column(db, "sources", "options_json", "text")
+            _ensure_column(db, "sources", "enabled", "integer not null default 1")
 
 
 def _now() -> str:

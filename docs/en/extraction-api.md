@@ -1,6 +1,6 @@
-# Extraction API
+# Query API
 
-The extraction API lives under `lake.query`.
+The query API lives under `lake.query`.
 
 ```python
 from bagelquant_data import DataLake
@@ -8,7 +8,7 @@ from bagelquant_data import DataLake
 lake = DataLake.open("data")
 ```
 
-## Raw Canonical Records
+## Raw Records
 
 `raw` returns canonical row-oriented records as a Polars `LazyFrame`.
 
@@ -19,24 +19,22 @@ records = lake.query.raw(
     start="2020-01-01",
     end="2026-06-15",
     assets=["000001.SZ"],
-    columns=[
-        "asset_id",
-        "time",
-        "period",
-        "report_type",
-        "n_income_attr_p",
-    ],
+    columns=["asset_id", "time", "period", "report_type", "n_income_attr_p"],
 )
 ```
 
-Raw records preserve multiple point-in-time versions. The raw API must not silently collapse financial statement revisions or repeated records.
+Raw queries preserve repeated records, revisions, and PIT versions.
 
-## Single-Field Long Panels
+## Panels And Prices
 
-`field` is the main research extraction method for non-reference data.
+`field`, `panel`, and `price` return one value field as a long panel:
+
+```text
+time | asset_id | value_column
+```
 
 ```python
-close = lake.query.field(
+close = lake.query.price(
     "daily",
     "close",
     source="tushare",
@@ -44,24 +42,8 @@ close = lake.query.field(
     end="2025-12-31",
     collect=True,
 )
-```
 
-The output has exactly three columns:
-
-```text
-time | asset_id | close
-```
-
-The result is sorted by:
-
-```text
-time, asset_id
-```
-
-By default the value column keeps the requested field name. You can rename it:
-
-```python
-panel = lake.query.field(
+value_panel = lake.query.panel(
     "daily",
     "close",
     source="tushare",
@@ -70,41 +52,26 @@ panel = lake.query.field(
 )
 ```
 
-## Multiple Fields
-
-`fields` returns a dictionary of separate long panels.
+`fields` returns a dictionary of independent long panels:
 
 ```python
 ohlcv = lake.query.fields(
     "daily",
     ["open", "high", "low", "close", "vol"],
     source="tushare",
-    start="2025-01-01",
-    end="2025-12-31",
     collect=True,
 )
-
-close = ohlcv["close"]
-volume = ohlcv["vol"]
 ```
-
-Each value in the dictionary is an independent frame with exactly three columns.
 
 ## Duplicate Resolution
 
-Some datasets are not unique by `(time, asset_id)`. Financial statements may contain multiple records for the same availability date and asset because different periods, report types, or revisions are economically meaningful.
-
-The default rule is `error_on_multiple`. If duplicates exist, `field` raises instead of silently choosing one row.
-
-Supported resolution rules:
+If a dataset has multiple records for the same `(time, asset_id)`, `field` raises by default. Supported resolution rules are:
 
 - `error_on_multiple`
 - `latest_period`
 - `latest_revision`
 - `first`
 - `last`
-
-Example:
 
 ```python
 latest = lake.query.field(
@@ -115,11 +82,60 @@ latest = lake.query.field(
 )
 ```
 
-For financial statements, prefer `lake.finance`, because it is explicit about event-time data and point-in-time alignment.
+## PIT Fundamentals
+
+Without observations, `fundamental` returns event-level PIT records:
+
+```python
+earnings = lake.query.fundamental(
+    "income",
+    "n_income_attr_p",
+    source="tushare",
+    value_name="earnings_ytd",
+)
+```
+
+With an observation grid, it returns the latest available value at each observation:
+
+```python
+observations = lake.query.observations(
+    start="2025-01-01",
+    end="2025-12-31",
+    frequency="month_end",
+    assets=["000001.SZ"],
+)
+
+latest = lake.query.fundamental(
+    "income",
+    "n_income_attr_p",
+    source="tushare",
+    observations=observations,
+    value_name="earnings_ytd",
+    collect=True,
+)
+```
+
+PIT alignment uses `event.time <= observation.time`.
+
+## Events
+
+Append-only event datasets are queried with `events`:
+
+```python
+earnings_events = lake.query.events(
+    "events",
+    source="custom",
+    event_type="earnings",
+    start="2025-01-01",
+    collect=True,
+)
+```
+
+The event query preserves canonical records and can filter by time range, assets, and `event_type`.
 
 ## Reference Data
 
-Reference datasets are exempt from the three-column panel contract.
+Reference datasets are row-oriented:
 
 ```python
 stock_basic = lake.query.reference(
@@ -128,8 +144,6 @@ stock_basic = lake.query.reference(
     collect=True,
 )
 ```
-
-Reference data remains row-oriented.
 
 ## Record Inspection
 
@@ -141,11 +155,9 @@ preview = lake.query.records(
 )
 ```
 
-Use this for debugging and quick inspection.
-
 ## Observation Grids
 
-Observation grids are generic `(time, asset_id)` frames used for point-in-time alignment.
+Observation grids are `(time, asset_id)` frames used for PIT alignment.
 
 ```python
 observations = lake.query.observations(
@@ -156,16 +168,10 @@ observations = lake.query.observations(
 )
 ```
 
-Supported initial frequencies include:
+Supported frequencies:
 
 - `daily`
 - `week_end`
 - `month_end`
 - `quarter_end`
-- custom Polars date interval strings
-
-The output has two columns:
-
-```text
-time | asset_id
-```
+- Polars date interval strings
