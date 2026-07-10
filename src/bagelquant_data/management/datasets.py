@@ -1,74 +1,45 @@
-"""Dataset management API."""
+"""Minimal dataset registration API."""
 
 from __future__ import annotations
 
+import json
 import shutil
+import tomllib
 from pathlib import Path
 from typing import Any
 
-from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.dataset import DatasetSpec, dataset_key
 from bagelquant_data.core.exceptions import DatasetNotFoundError, DatasetSpecError, DestructiveOperationError
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
 
 
 class DatasetManager:
-    """Register and inspect dataset specifications."""
+    """Register and inspect plain TOML-backed dataset specifications."""
 
     def __init__(self, metadata: MetadataStore, paths: LakePaths) -> None:
         self.metadata = metadata
         self.paths = paths
         self._specs: dict[tuple[str, str], DatasetSpec] = {}
 
-    def add(
-        self,
-        spec: DatasetSpec | str,
-        update_type: str | None = None,
-        reference: str | bool | None = None,
-        **kwargs: Any,
-    ) -> DatasetSpec:
-        if isinstance(spec, str):
-            spec = DatasetSpec(spec, update_type or "general", reference, **kwargs)
-        elif update_type is not None or reference is not None or kwargs:
-            raise DatasetSpecError("Pass either a DatasetSpec or compact dataset registration arguments")
+    def register(self, spec: DatasetSpec) -> DatasetSpec:
         self.validate_spec(spec)
-        self._specs[spec.key] = spec
+        self._specs[dataset_key(spec)] = spec
         self.metadata.upsert_dataset(spec)
         return spec
 
-    def register(
-        self,
-        name: str,
-        update_type: str,
-        reference: str | bool | None = None,
-        **kwargs: Any,
-    ) -> DatasetSpec:
-        """Register a dataset with the compact public API."""
-
-        return self.add(name, update_type, reference, **kwargs)
-
-    def edit(self, spec: DatasetSpec) -> None:
-        """Replace a registered dataset specification."""
-
-        self.add(spec)
-
-    def add_from_yaml(self, path: str | Path) -> DatasetSpec:
-        spec = DatasetSpec.from_yaml(path)
-        self.add(spec)
-        return spec
+    def register_toml(self, path: str | Path) -> DatasetSpec:
+        with Path(path).open("rb") as file:
+            return self.register(_spec_from_mapping(tomllib.load(file)))
 
     def get(self, dataset: str, *, source: str) -> DatasetSpec:
         key = (source, dataset)
         if key in self._specs:
             return self._specs[key]
         row = self.metadata.get_dataset(source, dataset)
-        if row is None and source != "custom":
-            row = self.metadata.get_dataset("custom", dataset)
         if row is None:
             raise DatasetNotFoundError(f"Dataset is not registered: {source}/{dataset}")
-        payload = __import__("json").loads(row["spec_json"])
-        payload["source"] = source
-        spec = DatasetSpec.from_mapping(payload)
+        spec = _spec_from_mapping(json.loads(row["spec_json"]))
         self._specs[key] = spec
         return spec
 
@@ -82,21 +53,12 @@ class DatasetManager:
         self.metadata.set_dataset_enabled(source, dataset, False)
 
     def validate_spec(self, spec: DatasetSpec) -> None:
-        if spec.update_type in {"by_daily", "by_id"} and (
-            "asset_id" not in spec.required_columns or "time" not in spec.required_columns
-        ):
-            raise DatasetSpecError(f"{spec.source}/{spec.name} non-reference datasets require asset_id and time")
-        if spec.update_type not in {"general", "by_daily", "by_id"}:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} unsupported update_type: {spec.update_type}")
-        if spec.update_type == "by_daily" and not spec.calendar_dataset:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} by_daily datasets require calendar_dataset")
-        if spec.update_type == "by_id":
-            if not spec.id_dataset:
-                raise DatasetSpecError(f"{spec.source}/{spec.name} by_id datasets require id_dataset")
-            if spec.batch_count < 1:
-                raise DatasetSpecError(f"{spec.source}/{spec.name} batch_count must be positive")
-        if spec.data_kind not in {"generic", "price", "fundamental", "event", "reference"}:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} unsupported data_kind: {spec.data_kind}")
+        if spec.update_type not in {"general", "by_daily", "by_asset"}:
+            raise DatasetSpecError(f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}")
+        if spec.update_type == "by_daily" and not spec.calendar:
+            raise DatasetSpecError(f"{spec.source}/{spec.name} by_daily requires calendar")
+        if spec.update_type == "by_asset" and not spec.asset_list:
+            raise DatasetSpecError(f"{spec.source}/{spec.name} by_asset requires asset_list")
 
     def remove(self, dataset: str, *, source: str, delete_data: bool = False, confirm: bool = False) -> None:
         if delete_data and not confirm:
@@ -106,7 +68,23 @@ class DatasetManager:
         if delete_data:
             shutil.rmtree(self.paths.dataset_root(source, dataset), ignore_errors=True)
 
-    def delete(self, dataset: str, *, source: str, delete_data: bool = False, confirm: bool = False) -> None:
-        """Delete a dataset registration, optionally deleting canonical data."""
 
-        self.remove(dataset, source=source, delete_data=delete_data, confirm=confirm)
+def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
+    allowed = {"name", "update_type", "source", "calendar", "asset_list", "primary_key_extra"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise DatasetSpecError(f"Unsupported dataset fields: {', '.join(unknown)}")
+    missing = [field for field in ("name", "update_type") if field not in value]
+    if missing:
+        raise DatasetSpecError(f"Dataset declaration is missing fields: {', '.join(missing)}")
+    extra = value.get("primary_key_extra", ())
+    if isinstance(extra, str):
+        extra = (extra,)
+    return DatasetSpec(
+        name=str(value["name"]),
+        update_type=str(value["update_type"]),
+        source=str(value.get("source", "custom")),
+        calendar=None if value.get("calendar") is None else str(value["calendar"]),
+        asset_list=None if value.get("asset_list") is None else str(value["asset_list"]),
+        primary_key_extra=tuple(str(field) for field in extra),
+    )

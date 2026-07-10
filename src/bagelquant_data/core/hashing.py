@@ -23,10 +23,10 @@ def stable_record_hash(values: dict[str, object]) -> str:
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def frame_content_hash(frame: pl.DataFrame, columns: Iterable[str] | None = None) -> str:
-    """Hash a dataframe deterministically after sorting selected columns."""
+def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None) -> str:
+    """Hash a dataframe deterministically after sorting selected fields."""
 
-    selected = list(columns or frame.columns)
+    selected = list(fields or frame.columns)
     rows = frame.select(selected).sort(selected).to_dicts()
     payload = json.dumps(rows, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()

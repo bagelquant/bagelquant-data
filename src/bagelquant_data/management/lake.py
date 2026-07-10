@@ -12,7 +12,6 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
-from bagelquant_data.finance import FinanceFacade
 from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
@@ -37,13 +36,12 @@ class DataLake:
         self.registries = registries or default_registries()
         self.metadata = MetadataStore(self.paths.database)
         self.parquet = ParquetStore(self.paths, self.metadata)
-        self.sources = SourceManager(self.registries, self.metadata)
-        self.datasets = DatasetManager(self.metadata, self.paths)
-        self.status = StatusManager(self.metadata, self.paths)
+        sources = SourceManager(self.registries, self.metadata)
+        datasets = DatasetManager(self.metadata, self.paths)
+        status = StatusManager(self.metadata, self.paths)
         raw = RawQueryService(self.parquet, self.metadata)
-        self.finance = FinanceFacade(raw)
-        self.query = LakeQuery(raw, finance=self.finance)
-        self.admin = LakeAdmin(self.sources, self.datasets, self.status)
+        self.query = LakeQuery(raw, datasets)
+        self.admin = LakeAdmin(sources, datasets, status)
         self.update = LakeUpdater(self)
         self._pipeline = IngestionPipeline(
             registries=self.registries,
@@ -59,10 +57,10 @@ class DataLake:
 
         return cls(root)
 
-    def ingest_frame(self, spec: DatasetSpec, frame: pl.DataFrame) -> IngestionReport:
-        """Convenience method for tests and local file adapters."""
+    def ingest(self, spec: DatasetSpec, frame: pl.DataFrame) -> IngestionReport:
+        """Register and ingest a local frame."""
 
-        self.datasets.add(spec)
+        self.admin.datasets.register(spec)
         return self._pipeline.ingest_frame(spec, frame, mode=spec.update_type)
 
 
@@ -100,17 +98,17 @@ class LakeUpdater:
     lake: DataLake
 
     def dataset(self, dataset: str, *, source: str, **kwargs: Any) -> IngestionReport:
-        spec = self.lake.datasets.get(dataset, source=source)
-        adapter = self.lake.sources.get(source)
+        spec = self.lake.admin.datasets.get(dataset, source=source)
+        adapter = self.lake.admin.sources.get(source)
         context = _request_context(source=source, dataset=dataset, kwargs=kwargs)
         planned = plan_update(
             spec=spec,
             raw=RawQueryService(self.lake.parquet, self.lake.metadata),
-            references=self.lake.query,
             start=context.start,
             end=context.end,
             today=context.options.get("today"),
             ids=context.options.get("ids"),
+            params=context.options.get("params"),
         )
         return update_dataset(
             spec=spec,
@@ -125,9 +123,7 @@ class LakeUpdater:
         return combine_reports(source, reports)
 
     def source(self, source: str, **kwargs: Any) -> UpdateReport:
-        names = [row["name"] for row in self.lake.datasets.list(source) if row["enabled"]]
-        if not names and source != "custom":
-            names = [row["name"] for row in self.lake.datasets.list("custom") if row["enabled"]]
+        names = [row["name"] for row in self.lake.admin.datasets.list(source) if row["enabled"]]
         return self.datasets(names, source=source, **kwargs)
 
 
@@ -145,6 +141,7 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
     retry_backoff_seconds = kwargs.pop("retry_backoff_seconds", None)
     today = kwargs.pop("today", None)
     ids = kwargs.pop("ids", None)
+    params = kwargs.pop("params", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -165,4 +162,6 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
         options["today"] = today
     if ids is not None:
         options["ids"] = ids
+    if params is not None:
+        options["params"] = params
     return RequestContext(source=source, dataset=dataset, options=options, **known)

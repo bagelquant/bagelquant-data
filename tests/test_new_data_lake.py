@@ -1,76 +1,39 @@
 from __future__ import annotations
 
-from typing import cast
+from dataclasses import fields
 
 import polars as pl
 import pytest
 
 from bagelquant_data import DataLake, DatasetSpec
-from bagelquant_data.core import DuplicateResolutionError, stable_bucket
+from bagelquant_data.core import DatasetSpecError, ValidationError, incremental_key
 
 
-def daily_spec() -> DatasetSpec:
-    return DatasetSpec(
-        name="daily",
-        source="custom",
-        source_dataset="daily",
-        category="market",
-        field_mapping={"ts_code": "ts_code", "trade_date": "trade_date"},
-        required_columns=("asset_id", "time"),
-        primary_key=("asset_id", "time"),
-        asset_column="ts_code",
-        time_column="trade_date",
-        update_type="by_daily",
-        calendar_dataset="trade_cal",
-        deduplication="primary_key_last",
-        sort_columns=("time", "asset_id"),
-    )
+def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
+    spec = DatasetSpec("balancesheet", "by_asset", asset_list="stock_basic", primary_key_extra=("period",))
+
+    assert [field.name for field in fields(DatasetSpec)] == ["name", "update_type", "source", "calendar", "asset_list", "primary_key_extra"]
+    assert incremental_key(spec) == ("time", "asset_id", "period")
+    assert not hasattr(spec, "primary_key")
+    assert not hasattr(DatasetSpec, "from_mapping")
 
 
-def test_ingest_and_extract_single_value_panel(tmp_path) -> None:
+def test_manager_validates_references_and_toml(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
-    lake.ingest_frame(
-        daily_spec(),
-        pl.DataFrame(
-            {
-                "trade_date": ["20250103", "20250102"],
-                "ts_code": ["000001.SZ", "000002.SZ"],
-                "close": [11.37, 18.40],
-                "open": [11.20, 18.10],
-            }
-        ),
-    )
+    with pytest.raises(DatasetSpecError, match="calendar"):
+        lake.admin.datasets.register(DatasetSpec("daily", "by_daily"))
+    with pytest.raises(DatasetSpecError, match="asset_list"):
+        lake.admin.datasets.register(DatasetSpec("income", "by_asset"))
 
-    close = cast(pl.DataFrame, lake.query.field("daily", "close", source="custom", collect=True))
-
-    assert close.columns == ["time", "asset_id", "close"]
-    assert close["asset_id"].to_list() == ["000002.SZ", "000001.SZ"]
-    assert lake.status.dataset("daily", source="custom")["row_count"] == 2
+    path = tmp_path / "daily.toml"
+    path.write_text('name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n')
+    assert lake.admin.datasets.register_toml(path).calendar == "trade_cal"
 
 
-def test_duplicate_field_requires_resolution(tmp_path) -> None:
+def test_general_and_incremental_ingestion(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
-    spec = daily_spec()
-    spec = DatasetSpec(
-        **{
-            **{field: getattr(spec, field) for field in spec.__dataclass_fields__},
-            "deduplication": "none",
-        }
-    )
-    lake.ingest_frame(
-        spec,
-        pl.DataFrame(
-            {
-                "trade_date": ["20250103", "20250103"],
-                "ts_code": ["000001.SZ", "000001.SZ"],
-                "close": [11.37, 11.38],
-            }
-        ),
-    )
+    lake.ingest(DatasetSpec("stock_basic", "general"), pl.DataFrame({"code": ["A", "A", "B"]}))
+    assert lake.query.query_general("stock_basic", source="custom", fields=["code"]).collect()["code"].to_list() == ["A", "B"]
 
-    with pytest.raises(DuplicateResolutionError):
-        lake.query.field("daily", "close", source="custom", collect=True)
-
-
-def test_stable_bucket_is_deterministic() -> None:
-    assert stable_bucket("000001.SZ", 32) == stable_bucket("000001.SZ", 32)
+    with pytest.raises(ValidationError, match="asset_id"):
+        lake.ingest(DatasetSpec("daily", "by_daily", calendar="trade_cal"), pl.DataFrame({"time": ["2025-01-01"]}))

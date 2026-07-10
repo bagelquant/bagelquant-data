@@ -30,19 +30,9 @@ class SourceManager:
             configured=bool(saved_options),
         )
 
-    def add(self, source: object) -> None:
-        """Register a source adapter."""
-
-        self.register(source)
-
     def remove(self, name: str) -> None:
         self.registries.sources._items.pop(name, None)
         self.metadata.remove_source(name)
-
-    def delete(self, name: str) -> None:
-        """Delete a source registration."""
-
-        self.remove(name)
 
     def list(self) -> list[dict[str, Any]]:
         return self.metadata.list_sources()
@@ -60,19 +50,11 @@ class SourceManager:
         saved.update(options)
         self.metadata.upsert_source(name, type(source).__name__, configured=True, options=saved)
 
-    def edit(self, name: str, **options: Any) -> None:
-        """Edit persisted source configuration."""
-
-        self.configure(name, **options)
-
     def enable(self, name: str) -> None:
         self.metadata.set_source_enabled(name, True)
 
     def disable(self, name: str) -> None:
         self.metadata.set_source_enabled(name, False)
-
-    def configure_tushare(self, token: str) -> None:
-        self.configure("tushare", token=token)
 
     def test(self, name: str) -> None:
         self.get(name).test_connection()  # type: ignore[attr-defined]
