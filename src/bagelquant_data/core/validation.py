@@ -6,7 +6,7 @@ from typing import Protocol
 
 import polars as pl
 
-from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.dataset import DatasetSpec, incremental_key
 from bagelquant_data.core.exceptions import ValidationError
 
 
@@ -22,11 +22,7 @@ class FrameworkValidator:
 
     def validate(self, frame: pl.LazyFrame, spec: DatasetSpec) -> None:
         names = set(frame.collect_schema().names())
-        required = set(spec.required_columns)
-        if not spec.reference:
-            required.update({"asset_id", "time"})
+        required = set(incremental_key(spec) or ())
         missing = sorted(required - names)
         if missing:
-            raise ValidationError(f"{spec.source}/{spec.name} missing columns: {missing}")
-        if spec.point_in_time and "period" not in names:
-            raise ValidationError(f"{spec.source}/{spec.name} PIT dataset requires period")
+            raise ValidationError(f"{spec.source}/{spec.name} missing fields: {missing}")

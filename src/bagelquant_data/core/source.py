@@ -23,6 +23,6 @@ class DataSource(Protocol):
         """Raise when the source cannot be reached."""
         ...
 
-    def fetch(self, source_dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
+    def fetch(self, dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
         """Fetch one source response."""
         ...

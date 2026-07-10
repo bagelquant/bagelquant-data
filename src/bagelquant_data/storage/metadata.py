@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.exceptions import ConfigurationError
 
 
 class MetadataStore:
@@ -89,14 +90,10 @@ class MetadataStore:
             db.execute(
                 """
                 insert into datasets(
-                    name, source, source_dataset, category, enabled, spec_hash,
-                    spec_json, created_at, updated_at
+                    name, source, enabled, spec_hash, spec_json, created_at, updated_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?)
                 on conflict(source, name) do update set
-                    source_dataset=excluded.source_dataset,
-                    category=excluded.category,
-                    enabled=excluded.enabled,
                     spec_hash=excluded.spec_hash,
                     spec_json=excluded.spec_json,
                     updated_at=excluded.updated_at
@@ -104,9 +101,7 @@ class MetadataStore:
                 (
                     spec.name,
                     spec.source,
-                    spec.source_dataset,
-                    spec.category,
-                    int(spec.enabled),
+                    1,
                     spec_hash,
                     payload,
                     now,
@@ -414,6 +409,11 @@ class MetadataStore:
     def _initialize(self) -> None:
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
+            existing_columns = {row["name"] for row in db.execute("pragma table_info(datasets)").fetchall()}
+            if "category" in existing_columns or "source_dataset" in existing_columns:
+                raise ConfigurationError(
+                    "This lake uses the pre-simplification dataset schema. Delete and recreate the lake root."
+                )
             db.executescript(
                 """
                 create table if not exists sources (
@@ -428,8 +428,6 @@ class MetadataStore:
                 create table if not exists datasets (
                     name text not null,
                     source text not null,
-                    source_dataset text not null,
-                    category text not null,
                     enabled integer not null default 1,
                     spec_hash text not null,
                     spec_json text not null,
@@ -505,10 +503,10 @@ def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:
     }
 
 
-def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in db.execute(f"pragma table_info({table})").fetchall()}
-    if column not in columns:
-        db.execute(f"alter table {table} add column {column} {definition}")
+def _ensure_column(db: sqlite3.Connection, table: str, field: str, definition: str) -> None:
+    fields = {row["name"] for row in db.execute(f"pragma table_info({table})").fetchall()}
+    if field not in fields:
+        db.execute(f"alter table {table} add column {field} {definition}")
 
 
 def _redact_options(options: dict[str, Any]) -> dict[str, Any]:

@@ -40,17 +40,17 @@ class TushareSource:
         if not any(callable(getattr(client, name, None)) for name in ("trade_cal", "stock_basic")):
             raise DataSourceError("Tushare client has no callable API methods")
 
-    def fetch(self, source_dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
+    def fetch(self, dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
         client = self._ensure_client()
         params = _to_tushare_params(request)
-        method = getattr(client, source_dataset, None)
+        method = getattr(client, dataset, None)
         if callable(method):
             result = method(**params)
         else:
             query = getattr(client, "query", None)
             if not callable(query):
-                raise DataSourceError(f"Tushare API is not available: {source_dataset}")
-            result = query(source_dataset, **params)
+                raise DataSourceError(f"Tushare API is not available: {dataset}")
+            result = query(dataset, **params)
         return _from_pandas(result)
 
     def _ensure_client(self) -> Any:

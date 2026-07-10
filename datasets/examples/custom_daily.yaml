@@ -1,4 +1,0 @@
-name: daily
-update_type: by_daily
-reference: trade_cal
-request_date_param: date

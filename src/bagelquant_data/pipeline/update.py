@@ -54,7 +54,7 @@ def update_dataset(
     progress_enabled = bool(context.options.get("progress", True))
     max_retries = max(1, int(context.options.get("max_retries", 3)))
     retry_backoff_seconds = float(context.options.get("retry_backoff_seconds", 60.0))
-    request_options = _request_options(spec, context)
+    request_options = _request_options(context)
     planned_requests = [dict(request) for request in requests]
     batches = _request_batches(planned_requests, context)
     errors: list[str] = []
@@ -278,7 +278,7 @@ def _fetch_one(
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            frame = source_adapter.fetch(spec.source_dataset, request)  # type: ignore[attr-defined]
+            frame = source_adapter.fetch(spec.name, request)  # type: ignore[attr-defined]
             return FetchPage(
                 request_key=request_key,
                 request_params=request,
@@ -304,8 +304,8 @@ def _fetch_one(
     )
 
 
-def _request_options(spec: DatasetSpec, context: RequestContext) -> dict[str, Any]:
-    options = dict(spec.request_options)
+def _request_options(context: RequestContext) -> dict[str, Any]:
+    options: dict[str, Any] = {}
     source_options = context.options.get("source_options")
     if isinstance(source_options, dict):
         options.update(source_options)

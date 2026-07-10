@@ -1,6 +1,6 @@
 """Core source-agnostic framework primitives."""
 
-from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec, dataset_key, incremental_key
 from bagelquant_data.core.exceptions import (
     BagelQuantDataError,
     ConfigurationError,
@@ -18,6 +18,7 @@ from bagelquant_data.core.source import DataSource
 
 __all__ = [
     "BagelQuantDataError",
+    "ASSET_BUCKET_COUNT",
     "ConfigurationError",
     "DataSource",
     "DatasetNotFoundError",
@@ -31,7 +32,9 @@ __all__ = [
     "SourceNotFoundError",
     "ValidationError",
     "default_registries",
+    "dataset_key",
     "frame_content_hash",
+    "incremental_key",
     "stable_bucket",
     "stable_record_hash",
 ]

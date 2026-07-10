@@ -18,11 +18,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     lake = DataLake.open(args.root)
     if args.command == "status":
-        print(lake.status.summary())
+        print(lake.admin.summary())
     elif args.command == "dataset-list":
-        print(lake.datasets.list(args.source))
+        print(lake.admin.datasets.list(args.source))
     elif args.command == "source-list":
-        print(lake.sources.list())
+        print(lake.admin.sources.list())
     return 0
 
 

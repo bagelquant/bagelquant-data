@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
+from bagelquant_data.core import ConfigurationError
 from bagelquant_data.storage.metadata import MetadataStore
 
 
@@ -10,6 +15,16 @@ def test_metadata_store_initializes_wal_mode(tmp_path) -> None:
         journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
 
     assert journal_mode == "wal"
+
+
+def test_metadata_store_rejects_pre_simplification_schema(tmp_path) -> None:
+    path = tmp_path / "metadata" / "lake.db"
+    path.parent.mkdir()
+    with sqlite3.connect(path) as db:
+        db.execute("create table datasets (category text not null)")
+
+    with pytest.raises(ConfigurationError, match="pre-simplification"):
+        MetadataStore(path)
 
 
 def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) -> None:

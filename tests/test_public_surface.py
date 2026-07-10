@@ -1,13 +1,20 @@
-from __future__ import annotations
-
 import bagelquant_data
+
 from bagelquant_data import DataLake, DatasetSpec, LakeAdmin, LakeQuery, LakeUpdater, TushareSource
 
 
-def test_core_public_imports_are_new_facade() -> None:
-    assert bagelquant_data.DataLake is DataLake
-    assert bagelquant_data.DatasetSpec is DatasetSpec
-    assert bagelquant_data.LakeAdmin is LakeAdmin
-    assert bagelquant_data.LakeQuery is LakeQuery
-    assert bagelquant_data.LakeUpdater is LakeUpdater
-    assert bagelquant_data.TushareSource is TushareSource
+def test_public_surface_is_limited_to_three_facades(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+
+    assert isinstance(lake.admin, LakeAdmin)
+    assert isinstance(lake.update, LakeUpdater)
+    assert isinstance(lake.query, LakeQuery)
+    assert not hasattr(lake, "sources")
+    assert not hasattr(lake, "datasets")
+    assert not hasattr(lake, "status")
+    assert hasattr(lake.query, "query_general")
+    assert hasattr(lake.query, "query")
+    for removed in ("raw", "field", "fields", "records", "price", "fundamental", "reference"):
+        assert not hasattr(lake.query, removed)
+    assert not hasattr(bagelquant_data, "FinancialFieldSpec")
+    assert DatasetSpec and TushareSource
