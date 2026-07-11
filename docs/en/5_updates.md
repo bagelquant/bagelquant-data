@@ -14,3 +14,7 @@ their partition files.
 
 Pass provider-specific values for one run with `params`, for example
 `lake.update.dataset("stock_basic", source="tushare", params={"exchange": "SSE"})`.
+Per-run `params` override a dataset's configured `source_api_params` and
+`source_api_param_sets`; planner-owned daily and asset keys continue to take
+precedence. General datasets merge every expanded parameter-set response and
+replace stored data only when all calls succeed.

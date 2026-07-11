@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from itertools import product
 
 import polars as pl
 
@@ -35,12 +36,13 @@ def plan_update(
 
     final_day = _date_value(end or today or date.today())
     if spec.update_type == "general":
-        request = _base_request(params)
-        if start is not None:
-            request["start"] = _date_value(start).isoformat()
-        if end is not None:
-            request["end"] = _date_value(end).isoformat()
-        return PlannedUpdate((request,))
+        requests = _base_requests(spec, params)
+        for request in requests:
+            if start is not None:
+                request["start"] = _date_value(start).isoformat()
+            if end is not None:
+                request["end"] = _date_value(end).isoformat()
+        return PlannedUpdate(tuple(requests))
     if spec.update_type == "by_daily":
         return PlannedUpdate(
             tuple(_daily_requests(spec, raw=raw, start=start, final_day=final_day, params=params))
@@ -68,7 +70,11 @@ def _daily_requests(
         for value in dates
         if value <= final_day and value not in existing and (requested_start is None or value >= requested_start)
     ]
-    return [_request_for_date(value, params) for value in missing]
+    return [
+        _request_for_date(request, value)
+        for value in missing
+        for request in _base_requests(spec, params)
+    ]
 
 
 def _asset_requests(
@@ -89,21 +95,36 @@ def _asset_requests(
         request_start = asset_start + timedelta(days=1) if asset_start is not None else fallback_start
         if request_start is not None and request_start > final_day:
             continue
-        request = _base_request(params)
-        request["id"] = asset_id
-        if request_start is not None:
-            request["start"] = request_start.isoformat()
-        request["end"] = final_day.isoformat()
-        requests.append(request)
+        for request in _base_requests(spec, params):
+            request["id"] = asset_id
+            if request_start is not None:
+                request["start"] = request_start.isoformat()
+            request["end"] = final_day.isoformat()
+            requests.append(request)
     return requests
 
 
-def _base_request(params: dict[str, object] | None) -> dict[str, object]:
-    return dict(params or {})
+def _base_requests(spec: DatasetSpec, params: dict[str, object] | None) -> list[dict[str, object]]:
+    defaults = dict(spec.source_api_params)
+    overrides = dict(params or {})
+    parameter_sets = spec.source_api_param_sets or ({},)
+    requests: list[dict[str, object]] = []
+    for parameter_set in parameter_sets:
+        for variant in _expand_parameter_set(parameter_set):
+            request = dict(defaults)
+            request.update(variant)
+            request.update(overrides)
+            requests.append(request)
+    return requests
 
 
-def _request_for_date(value: date, params: dict[str, object] | None) -> dict[str, object]:
-    request = _base_request(params)
+def _expand_parameter_set(parameter_set: dict[str, object]) -> list[dict[str, object]]:
+    keys = tuple(parameter_set)
+    value_sets = [value if isinstance(value, list) else [value] for value in parameter_set.values()]
+    return [dict(zip(keys, values, strict=True)) for values in product(*value_sets)]
+
+
+def _request_for_date(request: dict[str, object], value: date) -> dict[str, object]:
     request["date"] = value.isoformat()
     return request
 

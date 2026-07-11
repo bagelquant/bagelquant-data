@@ -56,7 +56,7 @@ def update_dataset(
     retry_backoff_seconds = float(context.options.get("retry_backoff_seconds", 60.0))
     request_options = _request_options(context)
     planned_requests = [dict(request) for request in requests]
-    batches = _request_batches(planned_requests, context)
+    batches = [list(enumerate(planned_requests))] if spec.update_type == "general" else _request_batches(planned_requests, context)
     errors: list[str] = []
     request_count = 0
     success_count = 0
@@ -151,7 +151,8 @@ def update_dataset(
             success_count += batch_success_count
             failure_count += len(pages) - batch_success_count
             rows_downloaded += sum(page.row_count for page in pages if page.status == "success")
-            if frames:
+            batch_has_failures = any(page.status != "success" for page in pages)
+            if frames and not (spec.update_type == "general" and batch_has_failures):
                 frame = pl.concat(frames, how="diagonal_relaxed")
                 rows_committed += pipeline.commit_frame(
                     spec,
