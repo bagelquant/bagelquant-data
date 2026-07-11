@@ -22,6 +22,7 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "primary_key_extra",
         "source_api_params",
         "source_api_param_sets",
+        "date_param",
     ]
     assert incremental_key(spec) == ("time", "asset_id", "period")
     assert not hasattr(spec, "primary_key")
@@ -37,14 +38,16 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
 
     path = tmp_path / "daily.toml"
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n[source_api_params]\nexchange = "SSE"\n[[source_api_param_sets]]\nlist_status = ["L", "D"]\n'
+        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\ndate_param = "pub_date"\n[source_api_params]\nexchange = "SSE"\n[[source_api_param_sets]]\nlist_status = ["L", "D"]\n'
     )
     spec = lake.admin.datasets.register_toml(path)
     assert spec.calendar == "trade_cal"
+    assert spec.date_param == "pub_date"
     assert spec.source_api_params == {"exchange": "SSE"}
     assert spec.source_api_param_sets == ({"list_status": ["L", "D"]},)
     reopened = DataLake.open(tmp_path)
     assert reopened.admin.datasets.get("daily", source="custom").source_api_params == {"exchange": "SSE"}
+    assert reopened.admin.datasets.get("daily", source="custom").date_param == "pub_date"
     assert reopened.admin.datasets.get("daily", source="custom").source_api_param_sets == ({"list_status": ["L", "D"]},)
 
     path.write_text('name = "invalid"\nupdate_type = "general"\nsource_api_params = "SSE"\n')
@@ -68,6 +71,13 @@ def test_manager_loads_stored_specs_without_source_api_params(tmp_path) -> None:
 
     reopened = DataLake.open(tmp_path)
     assert reopened.admin.datasets.get("stock_basic", source="custom").source_api_params == {}
+
+
+def test_manager_rejects_date_param_for_non_daily_datasets(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+
+    with pytest.raises(DatasetSpecError, match="date_param"):
+        lake.admin.datasets.register(DatasetSpec("stock_basic", "general", date_param="pub_date"))
 
 
 def test_general_and_incremental_ingestion(tmp_path) -> None:

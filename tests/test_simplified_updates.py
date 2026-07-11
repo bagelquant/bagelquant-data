@@ -151,6 +151,26 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(tmp_path)
     assert lake.admin.status.partitions("daily", source="custom")[0]["partition_path"] == "year=2025/month=01/data.parquet"
 
 
+def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = StaticSource({"st": pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"]})})
+    lake.admin.sources.register(source)
+    lake.ingest(DatasetSpec("trade_cal", "general"), pl.DataFrame({"time": ["20250102"], "is_open": [1]}))
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "st",
+            "by_daily",
+            calendar="trade_cal",
+            date_param="pub_date",
+            source_api_params={"pub_date": "wrong"},
+        )
+    )
+
+    lake.update.dataset("st", source="custom", today="2025-01-02", progress=False)
+
+    assert source.requests == [{"pub_date": "2025-01-02"}]
+
+
 def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = StaticSource({})

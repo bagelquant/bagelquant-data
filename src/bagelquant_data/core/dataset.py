@@ -20,6 +20,7 @@ class DatasetSpec:
     primary_key_extra: tuple[str, ...] = ()
     source_api_params: dict[str, object] = field(default_factory=dict)
     source_api_param_sets: tuple[dict[str, object], ...] = ()
+    date_param: str | None = None
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:

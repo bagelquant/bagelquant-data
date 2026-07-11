@@ -71,7 +71,7 @@ def _daily_requests(
         if value <= final_day and value not in existing and (requested_start is None or value >= requested_start)
     ]
     return [
-        _request_for_date(request, value)
+        _request_for_date(request, value, spec.date_param)
         for value in missing
         for request in _base_requests(spec, params)
     ]
@@ -124,8 +124,8 @@ def _expand_parameter_set(parameter_set: dict[str, object]) -> list[dict[str, ob
     return [dict(zip(keys, values, strict=True)) for values in product(*value_sets)]
 
 
-def _request_for_date(request: dict[str, object], value: date) -> dict[str, object]:
-    request["date"] = value.isoformat()
+def _request_for_date(request: dict[str, object], value: date, date_param: str | None) -> dict[str, object]:
+    request[date_param or "date"] = value.isoformat()
     return request
 
 

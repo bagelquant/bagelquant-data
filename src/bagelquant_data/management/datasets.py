@@ -57,6 +57,10 @@ class DatasetManager:
             raise DatasetSpecError(f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}")
         if spec.update_type == "by_daily" and not spec.calendar:
             raise DatasetSpecError(f"{spec.source}/{spec.name} by_daily requires calendar")
+        if spec.date_param is not None and spec.update_type != "by_daily":
+            raise DatasetSpecError(f"{spec.source}/{spec.name} date_param is only valid for by_daily")
+        if spec.date_param is not None and not spec.date_param:
+            raise DatasetSpecError(f"{spec.source}/{spec.name} date_param cannot be empty")
         if spec.update_type == "by_asset" and not spec.asset_list:
             raise DatasetSpecError(f"{spec.source}/{spec.name} by_asset requires asset_list")
 
@@ -75,6 +79,7 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
         "update_type",
         "source",
         "calendar",
+        "date_param",
         "asset_list",
         "primary_key_extra",
         "source_api_params",
@@ -107,6 +112,7 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
         update_type=str(value["update_type"]),
         source=str(value.get("source", "custom")),
         calendar=None if value.get("calendar") is None else str(value["calendar"]),
+        date_param=None if value.get("date_param") is None else str(value["date_param"]),
         asset_list=None if value.get("asset_list") is None else str(value["asset_list"]),
         primary_key_extra=tuple(str(field) for field in extra),
         source_api_params=dict(source_api_params),
