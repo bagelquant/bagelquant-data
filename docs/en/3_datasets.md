@@ -28,7 +28,7 @@ name = "daily"
 update_type = "by_daily"
 calendar = "trade_cal"
 
-[[field_mappings]]
+[field_mappings]
 trade_date = "time"
 ts_code = "asset_id"
 ```

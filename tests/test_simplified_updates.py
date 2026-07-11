@@ -215,3 +215,149 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
         f"year=2025/batch={stable_bucket('000002.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
     }
     assert {row["partition_path"] for row in lake.admin.status.partitions("fundamental", source="custom")} == expected
+
+
+def test_by_daily_starts_after_latest_date_and_does_not_fill_older_gaps(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = StaticSource({})
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 1]}),
+    )
+    lake.ingest(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        ),
+        pl.DataFrame(
+            {
+                "trade_date": ["20250102", "20250104"],
+                "ts_code": ["000001.SZ", "000001.SZ"],
+                "close": [9.0, 10.0],
+            }
+        ),
+    )
+
+    lake.update.dataset("daily", source="custom", start="20250101", end="20250104", progress=False)
+
+    assert source.requests == []
+
+
+def test_empty_incremental_dataset_accepts_compact_fallback_dates(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = StaticSource({})
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["19991231", "20000101"], "is_open": [1, 1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    lake.update.dataset("daily", source="custom", start="19991231", end="19991231", progress=False)
+
+    assert source.requests == [{"date": "1999-12-31"}]
+
+
+def test_batch_update_confirmation_filters_jobs_and_quit_is_safe(tmp_path, monkeypatch, capsys) -> None:
+    lake = DataLake.open(tmp_path)
+    source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    answers = iter(["invalid", "4"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    report = lake.update.datasets(
+        ["stock_basic", "daily"],
+        source="custom",
+        end="20250102",
+        progress=False,
+    )
+
+    assert report.datasets == ("stock_basic",)
+    assert source.requests == [{}]
+    assert "Invalid selection" in capsys.readouterr().out
+
+    source.requests.clear()
+    monkeypatch.setattr("builtins.input", lambda _: "5")
+    report = lake.update.datasets(
+        ["stock_basic", "daily"],
+        source="custom",
+        end="20250102",
+        progress=False,
+    )
+    assert report.datasets == ()
+    assert source.requests == []
+
+
+def test_noninteractive_all_excludes_general_refresh(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    report = lake.update.datasets(
+        ["stock_basic", "daily"],
+        source="custom",
+        end="20250102",
+        confirm=False,
+        progress=False,
+    )
+
+    assert report.datasets == ("daily",)
+    assert source.requests == [{"date": "2025-01-02"}]
+
+
+def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -> None:
+    source = FanoutSource(failed_status="L")
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.admin.datasets.register(
+        DatasetSpec("stock_basic", "general", source_api_param_sets=({"list_status": "L"},))
+    )
+    waits: list[float] = []
+    monkeypatch.setattr("bagelquant_data.pipeline.update.time.sleep", waits.append)
+
+    report = lake.update.dataset(
+        "stock_basic",
+        source="custom",
+        retry_backoff_seconds=60,
+        progress=False,
+    )
+
+    assert report.failure_count == 1
+    assert len(source.requests) == 3
+    assert waits == [60.0, 60.0]
