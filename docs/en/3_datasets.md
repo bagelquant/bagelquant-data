@@ -8,11 +8,17 @@ from bagelquant_data import DatasetSpec
 
 lake.admin.datasets.register(DatasetSpec("trade_cal", "general"))
 lake.admin.datasets.register(DatasetSpec("daily", "by_daily", calendar="trade_cal"))
+lake.admin.datasets.register(DatasetSpec("st", "by_daily", calendar="trade_cal", date_param="pub_date"))
 lake.admin.datasets.register(DatasetSpec("balancesheet", "by_asset", asset_list="stock_basic", primary_key_extra=("period",)))
 ```
 
 The pipeline derives the incremental key from `time`, `asset_id`, and optional
 `primary_key_extra` fields. General datasets do not require a canonical key.
+
+`by_daily` datasets send each missing calendar day under `date` by default. Set
+`date_param` when a provider API uses a different date parameter, such as
+`date_param = "pub_date"` for Tushare's `st` API. The generated date always
+overrides a conflicting value in `source_api_params` or runtime `params`.
 
 Store the same compact mapping in TOML and register it with `register_toml`.
 
