@@ -14,14 +14,20 @@ import polars as pl
 from bagelquant_data import DataLake, DatasetSpec
 
 lake = DataLake.open("data")
-spec = DatasetSpec("daily", "by_daily", calendar="trade_cal")
+spec = DatasetSpec(
+    "daily",
+    "by_daily",
+    calendar="trade_cal",
+    field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+)
 lake.ingest(spec, pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"], "close": [11.25]}))
 print(lake.query.query("daily", source="custom", fields=["time", "asset_id", "close"]).collect())
 ```
 
 `general` datasets replace one file and do not require canonical key fields.
-`by_daily` and `by_asset` datasets derive the key `(time, asset_id)`; add
-`primary_key_extra` when another field, such as `period`, is also unique.
+`by_daily` and `by_asset` datasets derive the key `(time, asset_id)` and must
+explicitly map provider fields to those names; add `primary_key_extra` when
+another field, such as `period`, is also unique.
 
 ```bash
 uv run pytest

@@ -141,7 +141,13 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(tmp_path)
     lake.admin.sources.register(source)
     lake.ingest(DatasetSpec("trade_cal", "general"), pl.DataFrame({"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 0]}))
     lake.ingest(
-        DatasetSpec("daily", "by_daily", calendar="trade_cal", source_api_params={"date": "wrong", "exchange": "SSE"}),
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            source_api_params={"date": "wrong", "exchange": "SSE"},
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        ),
         pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"], "close": [9.0]}),
     )
 
@@ -163,6 +169,7 @@ def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
             calendar="trade_cal",
             date_param="pub_date",
             source_api_params={"pub_date": "wrong"},
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
@@ -175,13 +182,17 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = StaticSource({})
     lake.admin.sources.register(source)
-    lake.ingest(DatasetSpec("stock_basic", "general"), pl.DataFrame({"ts_code": ["000001.SZ", "000002.SZ"]}))
+    lake.ingest(
+        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
+        pl.DataFrame({"ts_code": ["000001.SZ", "000002.SZ"]}),
+    )
     lake.ingest(
         DatasetSpec(
             "fundamental",
             "by_asset",
             asset_list="stock_basic",
             source_api_params={"id": "wrong", "start": "wrong", "end": "wrong", "limit": 10},
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
         ),
         pl.DataFrame({"ann_date": ["20250102"], "ts_code": ["000001.SZ"], "value": [0.5]}),
     )

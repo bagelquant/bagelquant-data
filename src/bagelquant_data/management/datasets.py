@@ -39,7 +39,7 @@ class DatasetManager:
         row = self.metadata.get_dataset(source, dataset)
         if row is None:
             raise DatasetNotFoundError(f"Dataset is not registered: {source}/{dataset}")
-        spec = _spec_from_mapping(json.loads(row["spec_json"]))
+        spec = _spec_from_mapping(json.loads(row["spec_json"]), stored=True)
         self._specs[key] = spec
         return spec
 
@@ -63,6 +63,20 @@ class DatasetManager:
             raise DatasetSpecError(f"{spec.source}/{spec.name} date_param cannot be empty")
         if spec.update_type == "by_asset" and not spec.asset_list:
             raise DatasetSpecError(f"{spec.source}/{spec.name} by_asset requires asset_list")
+        mappings = spec.field_mappings
+        if not isinstance(mappings, dict) or not all(
+            isinstance(source, str) and source and isinstance(target, str) and target
+            for source, target in mappings.items()
+        ):
+            raise DatasetSpecError(f"{spec.source}/{spec.name} field_mappings must map non-empty strings")
+        if len(set(mappings.values())) != len(mappings):
+            raise DatasetSpecError(f"{spec.source}/{spec.name} field_mappings cannot reuse destinations")
+        if spec.update_type != "general":
+            missing_targets = sorted({"time", "asset_id"} - set(mappings.values()))
+            if missing_targets:
+                raise DatasetSpecError(
+                    f"{spec.source}/{spec.name} field_mappings must map to: {', '.join(missing_targets)}"
+                )
 
     def remove(self, dataset: str, *, source: str, delete_data: bool = False, confirm: bool = False) -> None:
         if delete_data and not confirm:
@@ -73,7 +87,7 @@ class DatasetManager:
             shutil.rmtree(self.paths.dataset_root(source, dataset), ignore_errors=True)
 
 
-def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
+def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> DatasetSpec:
     allowed = {
         "name",
         "update_type",
@@ -84,6 +98,7 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
         "primary_key_extra",
         "source_api_params",
         "source_api_param_sets",
+        "field_mappings",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -107,6 +122,29 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
             raise DatasetSpecError("source_api_param_sets must contain only TOML tables")
         if any(isinstance(value, list) and not value for param_set in source_api_param_sets for value in param_set.values()):
             raise DatasetSpecError("source_api_param_sets cannot contain empty lists")
+    field_mapping_tables = value.get("field_mappings")
+    if field_mapping_tables is None:
+        field_mappings: dict[str, str] = {}
+    elif stored and isinstance(field_mapping_tables, dict):
+        # Stored dataset specifications serialize the parsed TOML tables as one mapping.
+        field_mappings = dict(field_mapping_tables)
+    elif not isinstance(field_mapping_tables, list) or not field_mapping_tables:
+        raise DatasetSpecError("field_mappings must be a non-empty array of TOML tables")
+    else:
+        field_mappings = {}
+        destinations: set[str] = set()
+        for mapping_table in field_mapping_tables:
+            if not isinstance(mapping_table, dict) or not mapping_table:
+                raise DatasetSpecError("field_mappings must contain non-empty TOML tables")
+            for source_field, target_field in mapping_table.items():
+                if not isinstance(source_field, str) or not source_field or not isinstance(target_field, str) or not target_field:
+                    raise DatasetSpecError("field_mappings must map non-empty strings")
+                if source_field in field_mappings:
+                    raise DatasetSpecError(f"field_mappings repeats source field: {source_field}")
+                if target_field in destinations:
+                    raise DatasetSpecError(f"field_mappings repeats destination field: {target_field}")
+                field_mappings[source_field] = target_field
+                destinations.add(target_field)
     return DatasetSpec(
         name=str(value["name"]),
         update_type=str(value["update_type"]),
@@ -117,4 +155,5 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
         primary_key_extra=tuple(str(field) for field in extra),
         source_api_params=dict(source_api_params),
         source_api_param_sets=tuple(dict(param_set) for param_set in source_api_param_sets),
+        field_mappings=field_mappings,
     )

@@ -21,6 +21,7 @@ class DatasetSpec:
     source_api_params: dict[str, object] = field(default_factory=dict)
     source_api_param_sets: tuple[dict[str, object], ...] = ()
     date_param: str | None = None
+    field_mappings: dict[str, str] = field(default_factory=dict)
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:
