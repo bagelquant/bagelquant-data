@@ -18,7 +18,13 @@ from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.planner import plan_update
-from bagelquant_data.pipeline.update import UpdateReport, combine_reports, update_dataset
+from bagelquant_data.pipeline.update import (
+    DatasetUpdateWork,
+    UpdateReport,
+    combine_reports,
+    update_dataset,
+    update_datasets,
+)
 from bagelquant_data.query import LakeQuery
 from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.metadata import MetadataStore
@@ -31,7 +37,9 @@ from bagelquant_data.storage.staging import StagingStore
 class DataLake:
     """Source-agnostic local data lake facade."""
 
-    def __init__(self, root: str | Path, registries: FrameworkRegistries | None = None) -> None:
+    def __init__(
+        self, root: str | Path, registries: FrameworkRegistries | None = None
+    ) -> None:
         self.paths = LakePaths.open(root)
         self.paths.ensure()
         self.registries = registries or default_registries()
@@ -85,8 +93,17 @@ class LakeAdmin:
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.status.runs(limit)
 
-    def failures(self, dataset: str | None = None, source: str | None = None) -> list[dict[str, Any]]:
+    def failures(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
         return self.status.failures(dataset=dataset, source=source)
+
+    def pending_update_jobs(
+        self,
+        dataset: str | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.status.pending_update_jobs(dataset=dataset, source=source)
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.status.rejected(dataset, source=source)
@@ -142,7 +159,9 @@ class LakeUpdater:
         **kwargs: Any,
     ) -> UpdateReport:
         raw = RawQueryService(self.lake.parquet, self.lake.metadata)
-        jobs: list[tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]] = []
+        jobs: list[
+            tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]
+        ] = []
         for dataset in datasets:
             spec = self.lake.admin.datasets.get(dataset, source=source)
             context = _request_context(
@@ -161,28 +180,30 @@ class LakeUpdater:
             )
             jobs.append((spec, context, planned.requests))
 
-        _print_job_summary(jobs)
+        _print_job_summary(jobs, self.lake.metadata)
         selected_type = _confirm_update_jobs() if confirm else "incremental"
         if selected_type == "quit":
             return combine_reports(source, [])
         selected = [
             job
             for job in jobs
-            if (selected_type == "incremental" and job[0].update_type in {"by_daily", "by_asset"})
+            if (
+                selected_type == "incremental"
+                and job[0].update_type in {"by_daily", "by_asset"}
+            )
             or job[0].update_type == selected_type
         ]
         adapter = self.lake.admin.sources.get(source) if selected else None
-        reports = [
-            update_dataset(
-                spec=spec,
-                source_adapter=adapter,
-                pipeline=self.lake._pipeline,
-                context=context,
-                requests=requests,
-            )
-            for spec, context, requests in selected
-        ]
-        return combine_reports(source, reports)
+        if not selected or adapter is None:
+            return combine_reports(source, [])
+        return update_datasets(
+            source_adapter=adapter,
+            pipeline=self.lake._pipeline,
+            works=tuple(
+                DatasetUpdateWork(spec, context, requests)
+                for spec, context, requests in selected
+            ),
+        )
 
     def source(
         self,
@@ -193,7 +214,11 @@ class LakeUpdater:
         confirm: bool = True,
         **kwargs: Any,
     ) -> UpdateReport:
-        names = [row["name"] for row in self.lake.admin.datasets.list(source) if row["enabled"]]
+        names = [
+            row["name"]
+            for row in self.lake.admin.datasets.list(source)
+            if row["enabled"]
+        ]
         return self.datasets(
             names,
             source=source,
@@ -206,12 +231,20 @@ class LakeUpdater:
 
 def _print_job_summary(
     jobs: list[tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]],
+    metadata: MetadataStore,
 ) -> None:
     print("Planned update jobs:")
     for spec, _, requests in jobs:
         details = _request_range(spec, requests)
+        pending = len(
+            metadata.pending_update_jobs(source=spec.source, dataset=spec.name)
+        )
         suffix = f", {details}" if details else ""
-        print(f"- {spec.name} ({spec.update_type}): {len(requests)} request(s){suffix}")
+        retry = f", {pending} pending retry job(s)" if pending else ""
+        print(
+            f"- {spec.name} ({spec.update_type}): "
+            f"{len(requests)} new request(s){retry}{suffix}"
+        )
 
 
 def _request_range(spec: DatasetSpec, requests: tuple[dict[str, object], ...]) -> str:
@@ -246,7 +279,9 @@ def _confirm_update_jobs() -> str:
         print("Invalid selection. Enter a number from 1 to 5.")
 
 
-def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> RequestContext:
+def _request_context(
+    source: str, dataset: str, kwargs: dict[str, Any]
+) -> RequestContext:
     known = {
         "start": kwargs.pop("start", None),
         "end": kwargs.pop("end", None),
@@ -254,6 +289,8 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
     }
     workers = kwargs.pop("workers", None)
     batch_size = kwargs.pop("batch_size", None)
+    max_in_flight = kwargs.pop("max_in_flight", None)
+    max_buffer_mb = kwargs.pop("max_buffer_mb", None)
     source_options = kwargs.pop("source_options", None)
     progress = kwargs.pop("progress", None)
     max_retries = kwargs.pop("max_retries", None)
@@ -269,6 +306,10 @@ def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> Reque
         options["workers"] = workers
     if batch_size is not None:
         options["batch_size"] = batch_size
+    if max_in_flight is not None:
+        options["max_in_flight"] = max_in_flight
+    if max_buffer_mb is not None:
+        options["max_buffer_mb"] = max_buffer_mb
     if source_options is not None:
         options["source_options"] = source_options
     if progress is not None:

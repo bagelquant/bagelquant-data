@@ -31,7 +31,9 @@ class StatusManager:
             "bytes": sum(int(row["file_size_bytes"]) for row in manifest),
         }
 
-    def dataset(self, dataset: str, *, source: str, deep: bool = False) -> dict[str, Any]:
+    def dataset(
+        self, dataset: str, *, source: str, deep: bool = False
+    ) -> dict[str, Any]:
         manifest = self.metadata.manifest(source, dataset)
         return {
             "source": source,
@@ -40,8 +42,12 @@ class StatusManager:
             "partition_count": len(manifest),
             "total_size": sum(int(row["file_size_bytes"]) for row in manifest),
             "row_count": sum(int(row["row_count"]) for row in manifest),
-            "minimum_time": min((row["min_time"] for row in manifest if row["min_time"]), default=None),
-            "maximum_time": max((row["max_time"] for row in manifest if row["max_time"]), default=None),
+            "minimum_time": min(
+                (row["min_time"] for row in manifest if row["min_time"]), default=None
+            ),
+            "maximum_time": max(
+                (row["max_time"] for row in manifest if row["max_time"]), default=None
+            ),
             "last_update": max((row["updated_at"] for row in manifest), default=None),
             "deep": deep,
         }
@@ -52,7 +58,9 @@ class StatusManager:
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.metadata.runs(limit)
 
-    def failures(self, dataset: str | None = None, source: str | None = None) -> list[dict[str, Any]]:
+    def failures(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
         return [
             run
             for run in self.metadata.runs(1000)
@@ -60,6 +68,15 @@ class StatusManager:
             and (dataset is None or run["dataset"] == dataset)
             and (source is None or run["source"] == source)
         ]
+
+    def pending_update_jobs(
+        self,
+        dataset: str | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return unresolved logical source jobs awaiting a later retry."""
+
+        return self.metadata.pending_update_jobs(source=source, dataset=dataset)
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.metadata.rejected(source, dataset)
@@ -80,7 +97,9 @@ class StatusManager:
             relative_path = path.relative_to(root)
             frame = pl.read_parquet(path)
             time_values = (
-                frame.select(pl.min("time").alias("min_time"), pl.max("time").alias("max_time")).row(0)
+                frame.select(
+                    pl.min("time").alias("min_time"), pl.max("time").alias("max_time")
+                ).row(0)
                 if "time" in frame.columns and frame.height
                 else (None, None)
             )
@@ -92,8 +111,12 @@ class StatusManager:
                     "partition_values": _partition_values(relative_path),
                     "row_count": frame.height,
                     "file_size_bytes": path.stat().st_size,
-                    "min_time": str(time_values[0]) if time_values[0] is not None else None,
-                    "max_time": str(time_values[1]) if time_values[1] is not None else None,
+                    "min_time": str(time_values[0])
+                    if time_values[0] is not None
+                    else None,
+                    "max_time": str(time_values[1])
+                    if time_values[1] is not None
+                    else None,
                     "content_hash": frame_content_hash(frame),
                     "schema_hash": _schema_hash(frame),
                 }

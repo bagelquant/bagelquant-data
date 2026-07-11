@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from threading import Lock
 from typing import Any
 
 import polars as pl
@@ -14,10 +15,17 @@ from bagelquant_data.sources.tushare.client import build_client
 class TushareSource:
     """Tushare Pro implementation of the generic DataSource protocol."""
 
-    def __init__(self, name: str = "tushare", *, token: str | None = None, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        name: str = "tushare",
+        *,
+        token: str | None = None,
+        client: Any | None = None,
+    ) -> None:
         self._name = name
         self._token = token
         self._client = client
+        self._client_lock = Lock()
 
     @property
     def name(self) -> str:
@@ -37,7 +45,10 @@ class TushareSource:
         if callable(query):
             query("trade_cal", start_date="20200101", end_date="20200101")
             return
-        if not any(callable(getattr(client, name, None)) for name in ("trade_cal", "stock_basic")):
+        if not any(
+            callable(getattr(client, name, None))
+            for name in ("trade_cal", "stock_basic")
+        ):
             raise DataSourceError("Tushare client has no callable API methods")
 
     def fetch(self, dataset: str, request: Mapping[str, Any]) -> pl.DataFrame:
@@ -55,14 +66,21 @@ class TushareSource:
 
     def _ensure_client(self) -> Any:
         if self._client is None:
-            self._client = build_client(self._token)
+            with self._client_lock:
+                if self._client is None:
+                    self._client = build_client(self._token)
         return self._client
 
 
 def _to_tushare_params(request: Mapping[str, Any]) -> dict[str, Any]:
     params: dict[str, Any] = {}
     for key, value in request.items():
-        mapped = {"start": "start_date", "end": "end_date", "date": "trade_date", "id": "ts_code"}.get(key, key)
+        mapped = {
+            "start": "start_date",
+            "end": "end_date",
+            "date": "trade_date",
+            "id": "ts_code",
+        }.get(key, key)
         params[mapped] = _format_date(value) if mapped.endswith("date") else value
     return params
 
@@ -80,5 +98,7 @@ def _from_pandas(value: Any) -> pl.DataFrame:
     except ImportError as exc:
         raise DataSourceError("Tushare support requires pandas") from exc
     if not isinstance(value, pd.DataFrame):
-        raise DataSourceError(f"Tushare returned {type(value)!r}, expected pandas.DataFrame")
+        raise DataSourceError(
+            f"Tushare returned {type(value)!r}, expected pandas.DataFrame"
+        )
     return pl.from_pandas(value.copy(deep=True))
