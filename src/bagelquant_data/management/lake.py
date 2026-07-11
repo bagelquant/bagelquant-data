@@ -12,6 +12,7 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
+from bagelquant_data.core.types import DateLike
 from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
@@ -97,15 +98,27 @@ class LakeUpdater:
 
     lake: DataLake
 
-    def dataset(self, dataset: str, *, source: str, **kwargs: Any) -> IngestionReport:
+    def dataset(
+        self,
+        dataset: str,
+        *,
+        source: str,
+        start: DateLike = "1999-12-31",
+        end: DateLike | None = None,
+        **kwargs: Any,
+    ) -> IngestionReport:
         spec = self.lake.admin.datasets.get(dataset, source=source)
         adapter = self.lake.admin.sources.get(source)
-        context = _request_context(source=source, dataset=dataset, kwargs=kwargs)
+        context = _request_context(
+            source=source,
+            dataset=dataset,
+            kwargs={**kwargs, "start": start, "end": end},
+        )
         planned = plan_update(
             spec=spec,
             raw=RawQueryService(self.lake.parquet, self.lake.metadata),
-            start=context.start,
-            end=context.end,
+            start=context.start if spec.update_type != "general" else None,
+            end=context.end if spec.update_type != "general" else None,
             today=context.options.get("today"),
             ids=context.options.get("ids"),
             params=context.options.get("params"),
@@ -118,13 +131,119 @@ class LakeUpdater:
             requests=planned.requests,
         )
 
-    def datasets(self, datasets: list[str], *, source: str, **kwargs: Any) -> UpdateReport:
-        reports = [self.dataset(dataset, source=source, **kwargs) for dataset in datasets]
+    def datasets(
+        self,
+        datasets: list[str],
+        *,
+        source: str,
+        start: DateLike = "1999-12-31",
+        end: DateLike | None = None,
+        confirm: bool = True,
+        **kwargs: Any,
+    ) -> UpdateReport:
+        raw = RawQueryService(self.lake.parquet, self.lake.metadata)
+        jobs: list[tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]] = []
+        for dataset in datasets:
+            spec = self.lake.admin.datasets.get(dataset, source=source)
+            context = _request_context(
+                source=source,
+                dataset=dataset,
+                kwargs={**kwargs, "start": start, "end": end},
+            )
+            planned = plan_update(
+                spec=spec,
+                raw=raw,
+                start=context.start if spec.update_type != "general" else None,
+                end=context.end if spec.update_type != "general" else None,
+                today=context.options.get("today"),
+                ids=context.options.get("ids"),
+                params=context.options.get("params"),
+            )
+            jobs.append((spec, context, planned.requests))
+
+        _print_job_summary(jobs)
+        selected_type = _confirm_update_jobs() if confirm else "incremental"
+        if selected_type == "quit":
+            return combine_reports(source, [])
+        selected = [
+            job
+            for job in jobs
+            if (selected_type == "incremental" and job[0].update_type in {"by_daily", "by_asset"})
+            or job[0].update_type == selected_type
+        ]
+        adapter = self.lake.admin.sources.get(source) if selected else None
+        reports = [
+            update_dataset(
+                spec=spec,
+                source_adapter=adapter,
+                pipeline=self.lake._pipeline,
+                context=context,
+                requests=requests,
+            )
+            for spec, context, requests in selected
+        ]
         return combine_reports(source, reports)
 
-    def source(self, source: str, **kwargs: Any) -> UpdateReport:
+    def source(
+        self,
+        source: str,
+        *,
+        start: DateLike = "1999-12-31",
+        end: DateLike | None = None,
+        confirm: bool = True,
+        **kwargs: Any,
+    ) -> UpdateReport:
         names = [row["name"] for row in self.lake.admin.datasets.list(source) if row["enabled"]]
-        return self.datasets(names, source=source, **kwargs)
+        return self.datasets(
+            names,
+            source=source,
+            start=start,
+            end=end,
+            confirm=confirm,
+            **kwargs,
+        )
+
+
+def _print_job_summary(
+    jobs: list[tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]],
+) -> None:
+    print("Planned update jobs:")
+    for spec, _, requests in jobs:
+        details = _request_range(spec, requests)
+        suffix = f", {details}" if details else ""
+        print(f"- {spec.name} ({spec.update_type}): {len(requests)} request(s){suffix}")
+
+
+def _request_range(spec: DatasetSpec, requests: tuple[dict[str, object], ...]) -> str:
+    if not requests:
+        return "no work"
+    if spec.update_type == "by_daily":
+        key = spec.date_param or "date"
+        values = [str(request[key]) for request in requests if key in request]
+        return f"dates {min(values)} to {max(values)}" if values else ""
+    if spec.update_type == "by_asset":
+        assets = {str(request["id"]) for request in requests if "id" in request}
+        starts = [str(request["start"]) for request in requests if "start" in request]
+        ends = [str(request["end"]) for request in requests if "end" in request]
+        date_range = f", dates {min(starts)} to {max(ends)}" if starts and ends else ""
+        return f"{len(assets)} asset(s){date_range}"
+    return "full refresh"
+
+
+def _confirm_update_jobs() -> str:
+    choices = {
+        "1": "incremental",
+        "2": "by_daily",
+        "3": "by_asset",
+        "4": "general",
+        "5": "quit",
+    }
+    while True:
+        print("1. all\n2. by daily only\n3. by asset only\n4. refresh general\n5. quit")
+        choice = input("Select update jobs: ").strip()
+        if choice in choices:
+            return choices[choice]
+        print("Invalid selection. Enter a number from 1 to 5.")
 
 
 def _request_context(source: str, dataset: str, kwargs: dict[str, Any]) -> RequestContext:

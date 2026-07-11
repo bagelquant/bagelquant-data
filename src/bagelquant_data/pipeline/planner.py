@@ -62,17 +62,18 @@ def _daily_requests(
     final_day: date,
     params: dict[str, object] | None,
 ) -> list[dict[str, object]]:
-    existing = _existing_dates(raw, spec)
-    requested_start = _date_value(start) if start is not None else None
+    latest = _latest_date(raw, spec)
+    fallback_start = _date_value(start) if start is not None else None
+    request_start = latest + timedelta(days=1) if latest is not None else fallback_start
     dates = _calendar_dates(spec, raw)
-    missing = [
+    pending = [
         value
         for value in dates
-        if value <= final_day and value not in existing and (requested_start is None or value >= requested_start)
+        if value <= final_day and (request_start is None or value >= request_start)
     ]
     return [
         _request_for_date(request, value, spec.date_param)
-        for value in missing
+        for value in pending
         for request in _base_requests(spec, params)
     ]
 
@@ -168,14 +169,14 @@ def _asset_ids(spec: DatasetSpec, raw: RawQueryService) -> list[str]:
     ]
 
 
-def _existing_dates(raw: RawQueryService, spec: DatasetSpec) -> set[date]:
+def _latest_date(raw: RawQueryService, spec: DatasetSpec) -> date | None:
     try:
         frame = raw.query(spec.name, source=spec.source, fields=("time",)).collect()
     except DatasetNotFoundError:
-        return set()
+        return None
     if frame.is_empty() or "time" not in frame.columns:
-        return set()
-    return set(frame.select(pl.col("time").cast(pl.Date).alias("time")).get_column("time").to_list())
+        return None
+    return frame.select(pl.col("time").cast(pl.Date).max()).item()
 
 
 def _latest_dates_by_asset(raw: RawQueryService, spec: DatasetSpec) -> dict[str, date]:
@@ -202,6 +203,8 @@ def _date_value(value: DateLike) -> date:
     text = str(value)
     if "T" in text:
         text = text.split("T", maxsplit=1)[0]
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").date()
     return datetime.strptime(text[:10], "%Y-%m-%d").date()
 
 

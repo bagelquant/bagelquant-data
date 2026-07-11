@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from bagelquant_data.core.dataset import DatasetSpec, dataset_key
-from bagelquant_data.core.exceptions import DatasetNotFoundError, DatasetSpecError, DestructiveOperationError
+from bagelquant_data.core.exceptions import (
+    DatasetNotFoundError,
+    DatasetSpecError,
+    DestructiveOperationError,
+)
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
 
@@ -54,23 +58,37 @@ class DatasetManager:
 
     def validate_spec(self, spec: DatasetSpec) -> None:
         if spec.update_type not in {"general", "by_daily", "by_asset"}:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}"
+            )
         if spec.update_type == "by_daily" and not spec.calendar:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} by_daily requires calendar")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} by_daily requires calendar"
+            )
         if spec.date_param is not None and spec.update_type != "by_daily":
-            raise DatasetSpecError(f"{spec.source}/{spec.name} date_param is only valid for by_daily")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} date_param is only valid for by_daily"
+            )
         if spec.date_param is not None and not spec.date_param:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} date_param cannot be empty")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} date_param cannot be empty"
+            )
         if spec.update_type == "by_asset" and not spec.asset_list:
-            raise DatasetSpecError(f"{spec.source}/{spec.name} by_asset requires asset_list")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} by_asset requires asset_list"
+            )
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
             for source, target in mappings.items()
         ):
-            raise DatasetSpecError(f"{spec.source}/{spec.name} field_mappings must map non-empty strings")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} field_mappings must map non-empty strings"
+            )
         if len(set(mappings.values())) != len(mappings):
-            raise DatasetSpecError(f"{spec.source}/{spec.name} field_mappings cannot reuse destinations")
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} field_mappings cannot reuse destinations"
+            )
         if spec.update_type != "general":
             missing_targets = sorted({"time", "asset_id"} - set(mappings.values()))
             if missing_targets:
@@ -78,9 +96,18 @@ class DatasetManager:
                     f"{spec.source}/{spec.name} field_mappings must map to: {', '.join(missing_targets)}"
                 )
 
-    def remove(self, dataset: str, *, source: str, delete_data: bool = False, confirm: bool = False) -> None:
+    def remove(
+        self,
+        dataset: str,
+        *,
+        source: str,
+        delete_data: bool = False,
+        confirm: bool = False,
+    ) -> None:
         if delete_data and not confirm:
-            raise DestructiveOperationError("Pass confirm=True to delete canonical data")
+            raise DestructiveOperationError(
+                "Pass confirm=True to delete canonical data"
+            )
         self.metadata.remove_dataset(source, dataset)
         self._specs.pop((source, dataset), None)
         if delete_data:
@@ -105,7 +132,9 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         raise DatasetSpecError(f"Unsupported dataset fields: {', '.join(unknown)}")
     missing = [field for field in ("name", "update_type") if field not in value]
     if missing:
-        raise DatasetSpecError(f"Dataset declaration is missing fields: {', '.join(missing)}")
+        raise DatasetSpecError(
+            f"Dataset declaration is missing fields: {', '.join(missing)}"
+        )
     extra = value.get("primary_key_extra", ())
     if isinstance(extra, str):
         extra = (extra,)
@@ -115,45 +144,49 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
     source_api_param_sets = value.get("source_api_param_sets")
     if source_api_param_sets is None:
         source_api_param_sets = ()
+    elif stored and source_api_param_sets == []:
+        # JSON serializes an empty tuple as a list. Treat that persisted value
+        # as the same optional no-fan-out setting used by DatasetSpec.
+        source_api_param_sets = ()
     elif not isinstance(source_api_param_sets, list) or not source_api_param_sets:
-        raise DatasetSpecError("source_api_param_sets must be a non-empty array of TOML tables")
+        raise DatasetSpecError(
+            "source_api_param_sets must be a non-empty array of TOML tables"
+        )
     if source_api_param_sets:
         if not all(isinstance(param_set, dict) for param_set in source_api_param_sets):
-            raise DatasetSpecError("source_api_param_sets must contain only TOML tables")
-        if any(isinstance(value, list) and not value for param_set in source_api_param_sets for value in param_set.values()):
+            raise DatasetSpecError(
+                "source_api_param_sets must contain only TOML tables"
+            )
+        if any(
+            isinstance(value, list) and not value
+            for param_set in source_api_param_sets
+            for value in param_set.values()
+        ):
             raise DatasetSpecError("source_api_param_sets cannot contain empty lists")
     field_mapping_tables = value.get("field_mappings")
     if field_mapping_tables is None:
         field_mappings: dict[str, str] = {}
-    elif stored and isinstance(field_mapping_tables, dict):
-        # Stored dataset specifications serialize the parsed TOML tables as one mapping.
+    elif isinstance(field_mapping_tables, dict):
+        # TOML declarations use one [field_mappings] table, which persists as
+        # the same mapping in metadata.
         field_mappings = dict(field_mapping_tables)
-    elif not isinstance(field_mapping_tables, list) or not field_mapping_tables:
-        raise DatasetSpecError("field_mappings must be a non-empty array of TOML tables")
     else:
-        field_mappings = {}
-        destinations: set[str] = set()
-        for mapping_table in field_mapping_tables:
-            if not isinstance(mapping_table, dict) or not mapping_table:
-                raise DatasetSpecError("field_mappings must contain non-empty TOML tables")
-            for source_field, target_field in mapping_table.items():
-                if not isinstance(source_field, str) or not source_field or not isinstance(target_field, str) or not target_field:
-                    raise DatasetSpecError("field_mappings must map non-empty strings")
-                if source_field in field_mappings:
-                    raise DatasetSpecError(f"field_mappings repeats source field: {source_field}")
-                if target_field in destinations:
-                    raise DatasetSpecError(f"field_mappings repeats destination field: {target_field}")
-                field_mappings[source_field] = target_field
-                destinations.add(target_field)
+        raise DatasetSpecError("field_mappings must be a TOML table")
     return DatasetSpec(
         name=str(value["name"]),
         update_type=str(value["update_type"]),
         source=str(value.get("source", "custom")),
         calendar=None if value.get("calendar") is None else str(value["calendar"]),
-        date_param=None if value.get("date_param") is None else str(value["date_param"]),
-        asset_list=None if value.get("asset_list") is None else str(value["asset_list"]),
+        date_param=None
+        if value.get("date_param") is None
+        else str(value["date_param"]),
+        asset_list=None
+        if value.get("asset_list") is None
+        else str(value["asset_list"]),
         primary_key_extra=tuple(str(field) for field in extra),
         source_api_params=dict(source_api_params),
-        source_api_param_sets=tuple(dict(param_set) for param_set in source_api_param_sets),
+        source_api_param_sets=tuple(
+            dict(param_set) for param_set in source_api_param_sets
+        ),
         field_mappings=field_mappings,
     )

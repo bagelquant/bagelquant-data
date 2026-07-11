@@ -292,7 +292,7 @@ def _fetch_one(
         except Exception as exc:  # noqa: BLE001 - source SDKs raise provider-specific exceptions.
             last_error = exc
             if attempt + 1 < max_retries:
-                time.sleep(retry_backoff_seconds * (attempt + 1))
+                time.sleep(retry_backoff_seconds)
     return FetchPage(
         request_key=request_key,
         request_params=request,
