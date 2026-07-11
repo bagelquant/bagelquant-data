@@ -70,7 +70,16 @@ class DatasetManager:
 
 
 def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
-    allowed = {"name", "update_type", "source", "calendar", "asset_list", "primary_key_extra"}
+    allowed = {
+        "name",
+        "update_type",
+        "source",
+        "calendar",
+        "asset_list",
+        "primary_key_extra",
+        "source_api_params",
+        "source_api_param_sets",
+    }
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise DatasetSpecError(f"Unsupported dataset fields: {', '.join(unknown)}")
@@ -80,6 +89,19 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
     extra = value.get("primary_key_extra", ())
     if isinstance(extra, str):
         extra = (extra,)
+    source_api_params = value.get("source_api_params", {})
+    if not isinstance(source_api_params, dict):
+        raise DatasetSpecError("source_api_params must be a TOML table")
+    source_api_param_sets = value.get("source_api_param_sets")
+    if source_api_param_sets is None:
+        source_api_param_sets = ()
+    elif not isinstance(source_api_param_sets, list) or not source_api_param_sets:
+        raise DatasetSpecError("source_api_param_sets must be a non-empty array of TOML tables")
+    if source_api_param_sets:
+        if not all(isinstance(param_set, dict) for param_set in source_api_param_sets):
+            raise DatasetSpecError("source_api_param_sets must contain only TOML tables")
+        if any(isinstance(value, list) and not value for param_set in source_api_param_sets for value in param_set.values()):
+            raise DatasetSpecError("source_api_param_sets cannot contain empty lists")
     return DatasetSpec(
         name=str(value["name"]),
         update_type=str(value["update_type"]),
@@ -87,4 +109,6 @@ def _spec_from_mapping(value: dict[str, Any]) -> DatasetSpec:
         calendar=None if value.get("calendar") is None else str(value["calendar"]),
         asset_list=None if value.get("asset_list") is None else str(value["asset_list"]),
         primary_key_extra=tuple(str(field) for field in extra),
+        source_api_params=dict(source_api_params),
+        source_api_param_sets=tuple(dict(param_set) for param_set in source_api_param_sets),
     )

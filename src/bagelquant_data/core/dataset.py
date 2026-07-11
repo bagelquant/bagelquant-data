@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 ASSET_BUCKET_COUNT = 32
@@ -18,6 +18,8 @@ class DatasetSpec:
     calendar: str | None = None
     asset_list: str | None = None
     primary_key_extra: tuple[str, ...] = ()
+    source_api_params: dict[str, object] = field(default_factory=dict)
+    source_api_param_sets: tuple[dict[str, object], ...] = ()
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:
