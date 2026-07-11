@@ -40,7 +40,11 @@ class MetadataStore:
         options: dict[str, Any] | None = None,
     ) -> None:
         now = _now()
-        options_json = None if options is None else json.dumps(options, sort_keys=True, default=str)
+        options_json = (
+            None
+            if options is None
+            else json.dumps(options, sort_keys=True, default=str)
+        )
         with self.connect() as db:
             db.execute(
                 """
@@ -118,7 +122,9 @@ class MetadataStore:
 
     def remove_dataset(self, source: str, dataset: str) -> None:
         with self.connect() as db:
-            db.execute("delete from datasets where source = ? and name = ?", (source, dataset))
+            db.execute(
+                "delete from datasets where source = ? and name = ?", (source, dataset)
+            )
 
     def list_datasets(self, source: str | None = None) -> list[dict[str, Any]]:
         if source is None:
@@ -193,7 +199,9 @@ class MetadataStore:
                         row["source"],
                         row["dataset"],
                         str(row["partition_path"]),
-                        json.dumps(row["partition_values"], sort_keys=True, default=str),
+                        json.dumps(
+                            row["partition_values"], sort_keys=True, default=str
+                        ),
                         int(row["row_count"]),
                         int(row["file_size_bytes"]),
                         row.get("min_time"),
@@ -206,7 +214,9 @@ class MetadataStore:
                 ],
             )
 
-    def replace_manifests(self, source: str, dataset: str, manifests: Iterable[dict[str, Any]]) -> None:
+    def replace_manifests(
+        self, source: str, dataset: str, manifests: Iterable[dict[str, Any]]
+    ) -> None:
         rows = list(manifests)
         now = _now()
         with self.connect() as db:
@@ -228,7 +238,9 @@ class MetadataStore:
                             row["source"],
                             row["dataset"],
                             str(row["partition_path"]),
-                            json.dumps(row["partition_values"], sort_keys=True, default=str),
+                            json.dumps(
+                                row["partition_values"], sort_keys=True, default=str
+                            ),
                             int(row["row_count"]),
                             int(row["file_size_bytes"]),
                             row.get("min_time"),
@@ -241,7 +253,9 @@ class MetadataStore:
                     ],
                 )
 
-    def manifest(self, source: str | None = None, dataset: str | None = None) -> list[dict[str, Any]]:
+    def manifest(
+        self, source: str | None = None, dataset: str | None = None
+    ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if source is not None:
@@ -317,7 +331,9 @@ class MetadataStore:
                 (run_id, source, dataset, reason, int(row_count), _now()),
             )
 
-    def rejected(self, source: str | None = None, dataset: str | None = None) -> list[dict[str, Any]]:
+    def rejected(
+        self, source: str | None = None, dataset: str | None = None
+    ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if source is not None:
@@ -396,6 +412,144 @@ class MetadataStore:
                 ],
             )
 
+    def pending_update_jobs(
+        self,
+        source: str | None = None,
+        dataset: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if dataset is not None:
+            clauses.append("dataset = ?")
+            params.append(dataset)
+        where = f" where {' and '.join(clauses)}" if clauses else ""
+        rows = self._rows(
+            f"select * from pending_update_jobs{where} order by created_at, job_key",
+            params,
+        )
+        for row in rows:
+            row["request_params"] = json.loads(str(row["request_params"]))
+        return rows
+
+    def record_failed_update_job(
+        self,
+        *,
+        job_key: str,
+        source: str,
+        dataset: str,
+        update_type: str,
+        request_params: dict[str, Any],
+        asset_id: str | None,
+        error_message: str,
+    ) -> None:
+        now = _now()
+        with self.connect() as db:
+            db.execute(
+                """
+                insert into pending_update_jobs(
+                    job_key, source, dataset, update_type, request_params,
+                    asset_id, error_message, failure_count, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                on conflict(job_key) do update set
+                    error_message=excluded.error_message,
+                    failure_count=pending_update_jobs.failure_count + 1,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    job_key,
+                    source,
+                    dataset,
+                    update_type,
+                    json.dumps(request_params, sort_keys=True, default=str),
+                    asset_id,
+                    error_message,
+                    now,
+                    now,
+                ),
+            )
+
+    def resolve_update_job(self, job_key: str) -> None:
+        with self.connect() as db:
+            db.execute("delete from pending_update_jobs where job_key = ?", (job_key,))
+
+    def record_update_results(
+        self,
+        calls: Iterable[dict[str, Any]],
+        resolved_job_keys: Iterable[str],
+        failed_jobs: Iterable[dict[str, Any]],
+    ) -> None:
+        """Persist one scheduler harvest in a single SQLite transaction."""
+
+        call_rows = list(calls)
+        resolved = [(key,) for key in resolved_job_keys]
+        failures = list(failed_jobs)
+        now = _now()
+        with self.connect() as db:
+            if call_rows:
+                db.executemany(
+                    """
+                    insert into api_calls(
+                        run_id, source, dataset, request_key, asset_id, request_params,
+                        status, row_count, retry_count, started_at, finished_at, error_message
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            row["run_id"],
+                            row["source"],
+                            row["dataset"],
+                            str(row["request_key"]),
+                            row.get("asset_id"),
+                            json.dumps(
+                                row["request_params"], sort_keys=True, default=str
+                            ),
+                            row["status"],
+                            int(row.get("row_count", 0)),
+                            int(row.get("retry_count", 0)),
+                            now,
+                            now,
+                            row.get("error_message"),
+                        )
+                        for row in call_rows
+                    ],
+                )
+            if resolved:
+                db.executemany(
+                    "delete from pending_update_jobs where job_key = ?", resolved
+                )
+            if failures:
+                db.executemany(
+                    """
+                    insert into pending_update_jobs(
+                        job_key, source, dataset, update_type, request_params,
+                        asset_id, error_message, failure_count, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    on conflict(job_key) do update set
+                        error_message=excluded.error_message,
+                        failure_count=pending_update_jobs.failure_count + 1,
+                        updated_at=excluded.updated_at
+                    """,
+                    [
+                        (
+                            row["job_key"],
+                            row["source"],
+                            row["dataset"],
+                            row["update_type"],
+                            json.dumps(
+                                row["request_params"], sort_keys=True, default=str
+                            ),
+                            row.get("asset_id"),
+                            row["error_message"],
+                            now,
+                            now,
+                        )
+                        for row in failures
+                    ],
+                )
+
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._rows(
             "select * from ingestion_runs order by started_at desc limit ?",
@@ -409,7 +563,10 @@ class MetadataStore:
     def _initialize(self) -> None:
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
-            existing_columns = {row["name"] for row in db.execute("pragma table_info(datasets)").fetchall()}
+            existing_columns = {
+                row["name"]
+                for row in db.execute("pragma table_info(datasets)").fetchall()
+            }
             if "category" in existing_columns or "source_dataset" in existing_columns:
                 raise ConfigurationError(
                     "This lake uses the pre-simplification dataset schema. Delete and recreate the lake root."
@@ -464,6 +621,18 @@ class MetadataStore:
                     finished_at text,
                     error_message text
                 );
+                create table if not exists pending_update_jobs (
+                    job_key text primary key,
+                    source text not null,
+                    dataset text not null,
+                    update_type text not null,
+                    request_params text not null,
+                    asset_id text,
+                    error_message text not null,
+                    failure_count integer not null default 1,
+                    created_at text not null,
+                    updated_at text not null
+                );
                 create table if not exists partition_manifest (
                     source text not null,
                     dataset text not null,
@@ -497,14 +666,15 @@ def _now() -> str:
 
 
 def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:
-    return {
-        field: getattr(spec, field)
-        for field in spec.__dataclass_fields__
+    return {field: getattr(spec, field) for field in spec.__dataclass_fields__}
+
+
+def _ensure_column(
+    db: sqlite3.Connection, table: str, field: str, definition: str
+) -> None:
+    fields = {
+        row["name"] for row in db.execute(f"pragma table_info({table})").fetchall()
     }
-
-
-def _ensure_column(db: sqlite3.Connection, table: str, field: str, definition: str) -> None:
-    fields = {row["name"] for row in db.execute(f"pragma table_info({table})").fetchall()}
     if field not in fields:
         db.execute(f"alter table {table} add column {field} {definition}")
 
@@ -512,6 +682,10 @@ def _ensure_column(db: sqlite3.Connection, table: str, field: str, definition: s
 def _redact_options(options: dict[str, Any]) -> dict[str, Any]:
     redacted = dict(options)
     for key in list(redacted):
-        if "token" in key.lower() or "secret" in key.lower() or "password" in key.lower():
+        if (
+            "token" in key.lower()
+            or "secret" in key.lower()
+            or "password" in key.lower()
+        ):
             redacted[key] = "<redacted>"
     return redacted

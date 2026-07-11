@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import polars as pl
+import pyarrow.parquet as pq
 
 from bagelquant_data.core.exceptions import ValidationError
 
@@ -22,8 +23,15 @@ def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
         compression_level=3,
         statistics=True,
     )
-    read_back = pl.read_parquet(tmp)
-    if read_back.height != frame.height:
+    parquet_file = pq.ParquetFile(tmp)
+    metadata = parquet_file.metadata
+    schema_matches = parquet_file.schema_arrow.equals(frame.to_arrow().schema)
+    parquet_file.close()
+    if (
+        metadata.num_rows != frame.height
+        or metadata.num_columns != frame.width
+        or not schema_matches
+    ):
         tmp.unlink(missing_ok=True)
         raise ValidationError("Atomic parquet write failed read-back row count check")
     os.replace(tmp, path)

@@ -30,6 +30,14 @@ class IngestionReport:
     request_count: int = 0
     success_count: int = 0
     failure_count: int = 0
+    pending_job_count: int = 0
+    elapsed_seconds: float = 0.0
+    fetch_seconds: float = 0.0
+    commit_seconds: float = 0.0
+    metadata_seconds: float = 0.0
+    commit_count: int = 0
+    partitions_rewritten: int = 0
+    peak_in_flight: int = 0
     error_message: str | None = None
 
 
@@ -114,7 +122,9 @@ class IngestionPipeline:
             )
             rejected = result.rejected.collect()
             if rejected.height:
-                self.rejected.write(spec.source, spec.name, run_id, "normalization", rejected)
+                self.rejected.write(
+                    spec.source, spec.name, run_id, "normalization", rejected
+                )
                 self.metadata.record_rejected(
                     run_id=run_id,
                     source=spec.source,

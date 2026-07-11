@@ -23,6 +23,40 @@ Pass `confirm=False` to run all daily and asset jobs without prompting. General
 datasets are refreshed only through the explicit general choice or a direct
 `dataset()` call.
 
+`workers` is a global source-call limit for one update invocation. Requests for
+different dates, assets, and datasets share the same thread pool, while commits
+remain coordinated per dataset. Failed logical requests are attempted three
+times, recorded as pending, and retried before newly planned work on the next
+update. A persistent failure does not block later dates or assets:
+
+```python
+lake.update.source("tushare", workers=8)
+lake.admin.status.pending_update_jobs(source="tushare")
+```
+
+Use `batch_size` to control how many successful logical requests are combined
+per incremental commit. The default is 100.
+
+The scheduler keeps a bounded number of calls queued. By default this is twice
+`workers`; use `max_in_flight` to override it. `max_buffer_mb` (default 256)
+also flushes buffered results before `batch_size`, limiting memory use:
+
+```python
+report = lake.update.source(
+    "tushare",
+    workers=8,
+    batch_size=100,
+    max_in_flight=16,
+    max_buffer_mb=256,
+)
+print(report.elapsed_seconds, report.commit_count, report.partitions_rewritten)
+```
+
+For Tushare, start with 4 workers and increase to 8 only when the account's
+rate limits allow it. Larger batches reduce partition rewrites but retain more
+downloaded data in memory. Update reports expose fetch, commit, and metadata
+timings plus the peak queued call count for tuning.
+
 Pass provider-specific values for one run with `params`, for example
 `lake.update.dataset("stock_basic", source="tushare", params={"exchange": "SSE"})`.
 Per-run `params` override a dataset's configured `source_api_params` and

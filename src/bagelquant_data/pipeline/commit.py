@@ -8,7 +8,11 @@ from typing import Any, cast
 
 import polars as pl
 
-from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec, incremental_key
+from bagelquant_data.core.dataset import (
+    ASSET_BUCKET_COUNT,
+    DatasetSpec,
+    incremental_key,
+)
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.registry import FrameworkRegistries
 from bagelquant_data.core.validation import Validator
@@ -31,8 +35,12 @@ def commit_frame(
     if spec.update_type == "general":
         final = _deduplicate(data, spec)
         final = _sort(final, spec)
-        shutil.rmtree(parquet.paths.dataset_root(spec.source, spec.name), ignore_errors=True)
-        _, manifest = parquet.write_partition_file(spec, final, Path("data.parquet"), {})
+        shutil.rmtree(
+            parquet.paths.dataset_root(spec.source, spec.name), ignore_errors=True
+        )
+        _, manifest = parquet.write_partition_file(
+            spec, final, Path("data.parquet"), {}
+        )
         parquet.metadata.replace_manifests(spec.source, spec.name, [manifest])
         return final.height
     if spec.update_type == "by_daily":
@@ -63,7 +71,9 @@ def _write_grouped(
     for values, group in data.group_by(group_columns, maintain_order=True):
         if not isinstance(values, tuple):
             values = (values,)
-        partition_values: dict[str, object] = dict(zip(group_columns, values, strict=True))
+        partition_values: dict[str, object] = dict(
+            zip(group_columns, values, strict=True)
+        )
         path = _partition_path(spec, partition_values)
         final = _merge_partition(
             existing=_read_existing(parquet, spec, path),
@@ -90,7 +100,9 @@ def _merge_partition(
     return _deduplicate(merged, spec)
 
 
-def _read_existing(parquet: ParquetStore, spec: DatasetSpec, relative_path: Path) -> pl.DataFrame | None:
+def _read_existing(
+    parquet: ParquetStore, spec: DatasetSpec, relative_path: Path
+) -> pl.DataFrame | None:
     path = parquet.paths.dataset_root(spec.source, spec.name) / relative_path
     if not path.exists():
         return None
@@ -118,19 +130,36 @@ def _derive_partition_columns(frame: pl.LazyFrame, spec: DatasetSpec) -> pl.Lazy
             pl.col("time").dt.month().cast(pl.Int8).alias("month"),
         )
     if spec.update_type == "by_asset":
+        assets = frame.select(pl.col("asset_id").cast(pl.String).unique()).collect()[
+            "asset_id"
+        ]
+        bucket_map = pl.DataFrame(
+            {
+                "asset_id": assets,
+                "bucket": [
+                    stable_bucket(value, ASSET_BUCKET_COUNT) for value in assets
+                ],
+            },
+            schema_overrides={"asset_id": pl.String, "bucket": pl.Int16},
+        ).lazy()
         return frame.with_columns(
             pl.col("time").dt.year().cast(pl.Int16).alias("year"),
-            pl.col("asset_id")
-            .cast(pl.String)
-            .map_elements(lambda value: stable_bucket(value, ASSET_BUCKET_COUNT), return_dtype=pl.Int16)
-            .alias("bucket"),
-        )
+            pl.col("asset_id").cast(pl.String),
+        ).join(bucket_map, on="asset_id", how="left")
     return frame
 
 
 def _partition_path(spec: DatasetSpec, values: dict[str, object]) -> Path:
     if spec.update_type == "by_daily":
-        return Path(f"year={values['year']}") / f"month={int(str(values['month'])):02d}" / "data.parquet"
+        return (
+            Path(f"year={values['year']}")
+            / f"month={int(str(values['month'])):02d}"
+            / "data.parquet"
+        )
     if spec.update_type == "by_asset":
-        return Path(f"year={values['year']}") / f"batch={int(str(values['bucket'])):02d}" / "data.parquet"
+        return (
+            Path(f"year={values['year']}")
+            / f"batch={int(str(values['bucket'])):02d}"
+            / "data.parquet"
+        )
     return Path("data.parquet")

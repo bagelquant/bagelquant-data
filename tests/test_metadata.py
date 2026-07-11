@@ -153,7 +153,32 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
 
     rows = metadata.manifest("tushare", "income")
 
-    assert [(row["partition_path"], row["row_count"], row["content_hash"]) for row in rows] == [
+    assert [
+        (row["partition_path"], row["row_count"], row["content_hash"]) for row in rows
+    ] == [
         ("year=2024/bucket=0/data.parquet", 11, "hash-1b"),
         ("year=2024/bucket=1/data.parquet", 20, "hash-2"),
     ]
+
+
+def test_pending_update_jobs_upsert_and_resolve(tmp_path) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    values = {
+        "job_key": "job-1",
+        "source": "tushare",
+        "dataset": "daily",
+        "update_type": "by_daily",
+        "request_params": {"date": "2025-01-02"},
+        "asset_id": None,
+        "error_message": "rate limit",
+    }
+
+    metadata.record_failed_update_job(**values)
+    metadata.record_failed_update_job(**values)
+
+    rows = metadata.pending_update_jobs(source="tushare", dataset="daily")
+    assert rows[0]["request_params"] == {"date": "2025-01-02"}
+    assert rows[0]["failure_count"] == 2
+
+    metadata.resolve_update_job("job-1")
+    assert metadata.pending_update_jobs() == []
