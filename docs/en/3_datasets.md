@@ -7,13 +7,14 @@ planner needs.
 from bagelquant_data import DatasetSpec
 
 lake.admin.datasets.register(DatasetSpec("trade_cal", "general"))
-lake.admin.datasets.register(DatasetSpec("daily", "by_daily", calendar="trade_cal"))
-lake.admin.datasets.register(DatasetSpec("st", "by_daily", calendar="trade_cal", date_param="pub_date"))
-lake.admin.datasets.register(DatasetSpec("balancesheet", "by_asset", asset_list="stock_basic", primary_key_extra=("period",)))
+lake.admin.datasets.register(DatasetSpec("daily", "by_daily", calendar="trade_cal", field_mappings={"trade_date": "time", "ts_code": "asset_id"}))
+lake.admin.datasets.register(DatasetSpec("st", "by_daily", calendar="trade_cal", date_param="pub_date", field_mappings={"trade_date": "time", "ts_code": "asset_id"}))
+lake.admin.datasets.register(DatasetSpec("balancesheet", "by_asset", asset_list="stock_basic", primary_key_extra=("period",), field_mappings={"ann_date": "time", "ts_code": "asset_id"}))
 ```
 
 The pipeline derives the incremental key from `time`, `asset_id`, and optional
-`primary_key_extra` fields. General datasets do not require a canonical key.
+`primary_key_extra` fields. Each incremental dataset must explicitly declare
+the provider-to-canonical field mapping; general datasets do not require one.
 
 `by_daily` datasets send each missing calendar day under `date` by default. Set
 `date_param` when a provider API uses a different date parameter, such as
@@ -21,6 +22,20 @@ The pipeline derives the incremental key from `time`, `asset_id`, and optional
 overrides a conflicting value in `source_api_params` or runtime `params`.
 
 Store the same compact mapping in TOML and register it with `register_toml`.
+
+```toml
+name = "daily"
+update_type = "by_daily"
+calendar = "trade_cal"
+
+[[field_mappings]]
+trade_date = "time"
+ts_code = "asset_id"
+```
+
+Mappings are true renames, so provider columns named `trade_date` and
+`ts_code` are stored as `time` and `asset_id`. A mapping may rename other
+columns as well, but incremental datasets must map both canonical key fields.
 
 Use the optional `source_api_params` table for provider parameters that should
 be sent unchanged on every update of a dataset. List values in this table are
