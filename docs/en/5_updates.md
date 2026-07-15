@@ -57,6 +57,15 @@ rate limits allow it. Larger batches reduce partition rewrites but retain more
 downloaded data in memory. Update reports expose fetch, commit, and metadata
 timings plus the peak queued call count for tuning.
 
+Applications can observe the scheduler through `progress_callback` without
+parsing terminal output. The callback receives an immutable `UpdateProgress`
+snapshot when work is planned, when a retry or new-request phase advances, and
+when a dataset finishes. Snapshots include the dataset, phase, completed and
+total provider calls, success and failure counts, downloaded rows, and final
+status. Pagination can increase the total while an update is running. Callback
+delivery is synchronous on the scheduler thread. The existing `progress=True`
+option continues to control tqdm terminal output independently.
+
 Pass provider-specific values for one run with `params`, for example
 `lake.update.dataset("stock_basic", source="tushare", params={"exchange": "SSE"})`.
 Per-run `params` override a dataset's configured `source_api_params` and

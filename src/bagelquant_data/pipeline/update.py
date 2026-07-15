@@ -6,11 +6,11 @@ import hashlib
 import json
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 from uuid import uuid4
 
 import polars as pl
@@ -36,6 +36,23 @@ class UpdateReport:
     commit_count: int = 0
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateProgress:
+    """Immutable scheduler progress for one dataset."""
+
+    dataset: str
+    phase: str
+    completed: int
+    total: int
+    success_count: int
+    failure_count: int
+    rows_downloaded: int
+    status: str
+
+
+UpdateProgressCallback: TypeAlias = Callable[[UpdateProgress], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +155,9 @@ def update_datasets(
         )
         for work in works
     }
+    callbacks = {
+        work.spec.name: _progress_callback(work.context) for work in works
+    }
     selected_names = set(states)
     pending_rows = [
         row
@@ -162,12 +182,24 @@ def update_datasets(
             key = _job_key(work.spec, request)
             if key not in retry_keys:
                 new_tasks.append((work, request, key))
+    totals = {
+        name: sum(
+            work.spec.name == name for work, _, _ in (*retry_tasks, *new_tasks)
+        )
+        for name in states
+    }
+    completed_calls = dict.fromkeys(states, 0)
     for name, progress in progresses.items():
         if progress is not None:
-            progress.total = sum(
-                work.spec.name == name for work, _, _ in (*retry_tasks, *new_tasks)
-            )
+            progress.total = totals[name]
             progress.refresh()
+        _emit_progress(
+            callbacks[name],
+            states[name],
+            phase="planned",
+            completed=0,
+            total=totals[name],
+        )
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -179,6 +211,9 @@ def update_datasets(
                 pipeline,
                 states,
                 progresses,
+                callbacks,
+                totals,
+                completed_calls,
                 max_in_flight=max_in_flight,
             )
             _flush_incremental_states(pipeline, states)
@@ -190,6 +225,9 @@ def update_datasets(
                 pipeline,
                 states,
                 progresses,
+                callbacks,
+                totals,
+                completed_calls,
                 max_in_flight=max_in_flight,
             )
             _flush_states(pipeline, states)
@@ -199,6 +237,15 @@ def update_datasets(
                 progress.close()
 
     reports = tuple(_finish_state(pipeline, state) for state in states.values())
+    for report in reports:
+        _emit_progress(
+            callbacks[report.dataset],
+            states[report.dataset],
+            phase="complete",
+            completed=completed_calls[report.dataset],
+            total=totals[report.dataset],
+            status=report.status,
+        )
     pending_count = sum(report.pending_job_count for report in reports)
     return UpdateReport(
         source=works[0].spec.source,
@@ -223,11 +270,23 @@ def _run_phase(
     pipeline: IngestionPipeline,
     states: dict[str, _RunState],
     progresses: dict[str, Any | None],
+    callbacks: dict[str, UpdateProgressCallback | None],
+    totals: dict[str, int],
+    completed_calls: dict[str, int],
     *,
     max_in_flight: int,
 ) -> None:
     task_iter = iter(enumerate(tasks))
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
+    phase_datasets = dict.fromkeys(work.spec.name for work, _, _ in tasks)
+    for dataset in phase_datasets:
+        _emit_progress(
+            callbacks[dataset],
+            states[dataset],
+            phase=phase,
+            completed=completed_calls[dataset],
+            total=totals[dataset],
+        )
 
     def submit_next() -> bool:
         try:
@@ -322,6 +381,16 @@ def _run_phase(
                     progress.total = (progress.total or 0) + len(pages) - 1
                     progress.refresh()
                 progress.update(len(pages))
+            if len(pages) > 1:
+                totals[work.spec.name] += len(pages) - 1
+            completed_calls[work.spec.name] += len(pages)
+            _emit_progress(
+                callbacks[work.spec.name],
+                state,
+                phase=phase,
+                completed=completed_calls[work.spec.name],
+                total=totals[work.spec.name],
+            )
 
             failed_pages = [page for page in pages if page.status != "success"]
             if failed_pages:
@@ -670,3 +739,33 @@ def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:
     except ImportError:
         return None
     return tqdm(total=total, desc=dataset, unit="call")  # type: ignore[no-any-return]
+
+
+def _progress_callback(context: RequestContext) -> UpdateProgressCallback | None:
+    callback = context.options.get("progress_callback")
+    return cast(UpdateProgressCallback, callback) if callable(callback) else None
+
+
+def _emit_progress(
+    callback: UpdateProgressCallback | None,
+    state: _RunState,
+    *,
+    phase: str,
+    completed: int,
+    total: int,
+    status: str = "running",
+) -> None:
+    if callback is None:
+        return
+    callback(
+        UpdateProgress(
+            dataset=state.work.spec.name,
+            phase=phase,
+            completed=completed,
+            total=total,
+            success_count=state.success_count,
+            failure_count=state.failure_count,
+            rows_downloaded=state.rows_downloaded,
+            status=status,
+        )
+    )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import polars as pl
@@ -20,6 +21,7 @@ from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.planner import plan_update
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
+    UpdateProgress,
     UpdateReport,
     combine_reports,
     update_dataset,
@@ -122,6 +124,7 @@ class LakeUpdater:
         source: str,
         start: DateLike = "1999-12-31",
         end: DateLike | None = None,
+        progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> IngestionReport:
         spec = self.lake.admin.datasets.get(dataset, source=source)
@@ -129,7 +132,12 @@ class LakeUpdater:
         context = _request_context(
             source=source,
             dataset=dataset,
-            kwargs={**kwargs, "start": start, "end": end},
+            kwargs={
+                **kwargs,
+                "start": start,
+                "end": end,
+                "progress_callback": progress_callback,
+            },
         )
         planned = plan_update(
             spec=spec,
@@ -156,6 +164,7 @@ class LakeUpdater:
         start: DateLike = "1999-12-31",
         end: DateLike | None = None,
         confirm: bool = True,
+        progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> UpdateReport:
         raw = RawQueryService(self.lake.parquet, self.lake.metadata)
@@ -167,7 +176,12 @@ class LakeUpdater:
             context = _request_context(
                 source=source,
                 dataset=dataset,
-                kwargs={**kwargs, "start": start, "end": end},
+                kwargs={
+                    **kwargs,
+                    "start": start,
+                    "end": end,
+                    "progress_callback": progress_callback,
+                },
             )
             planned = plan_update(
                 spec=spec,
@@ -212,6 +226,7 @@ class LakeUpdater:
         start: DateLike = "1999-12-31",
         end: DateLike | None = None,
         confirm: bool = True,
+        progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> UpdateReport:
         names = [
@@ -225,6 +240,7 @@ class LakeUpdater:
             start=start,
             end=end,
             confirm=confirm,
+            progress_callback=progress_callback,
             **kwargs,
         )
 
@@ -293,6 +309,7 @@ def _request_context(
     max_buffer_mb = kwargs.pop("max_buffer_mb", None)
     source_options = kwargs.pop("source_options", None)
     progress = kwargs.pop("progress", None)
+    progress_callback = kwargs.pop("progress_callback", None)
     max_retries = kwargs.pop("max_retries", None)
     retry_backoff_seconds = kwargs.pop("retry_backoff_seconds", None)
     today = kwargs.pop("today", None)
@@ -314,6 +331,10 @@ def _request_context(
         options["source_options"] = source_options
     if progress is not None:
         options["progress"] = progress
+    if progress_callback is not None:
+        if not callable(progress_callback):
+            raise ConfigurationError("progress_callback must be callable")
+        options["progress_callback"] = progress_callback
     if max_retries is not None:
         options["max_retries"] = max_retries
     if retry_backoff_seconds is not None:

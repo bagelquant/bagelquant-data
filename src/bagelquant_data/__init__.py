@@ -12,6 +12,7 @@ from bagelquant_data.core import (
     stable_bucket,
 )
 from bagelquant_data.management import DataLake, LakeAdmin, LakeUpdater
+from bagelquant_data.pipeline import UpdateProgress
 from bagelquant_data.query import LakeQuery
 from bagelquant_data.sources.tushare import TushareSource
 
@@ -28,6 +29,7 @@ __all__ = [
     "LakeUpdater",
     "SourceNotFoundError",
     "TushareSource",
+    "UpdateProgress",
     "ValidationError",
     "stable_bucket",
 ]
