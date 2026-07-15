@@ -186,7 +186,9 @@ def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset("stock_basic", source="custom", progress=False)
+    lake.update.dataset(
+        "stock_basic", source="custom", workers=1, progress=False
+    )
 
     assert source.requests == [
         {"list_status": "L", "exchange": "SSE"},
