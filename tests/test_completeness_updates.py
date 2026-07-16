@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 
 import polars as pl
@@ -77,6 +78,21 @@ def test_full_daily_plan_finds_historical_gap(tmp_path) -> None:
     assert plan.datasets[0].requests == ({"date": "2025-01-02"},)
 
 
+def test_state_fingerprint_ignores_identical_reregistration(tmp_path) -> None:
+    lake = _daily_lake(tmp_path)
+    spec = lake.admin.datasets.get("daily", source="custom")
+    first = lake.update.state_fingerprint(source="custom")
+
+    lake.admin.datasets.register(spec)
+    repeated = lake.update.state_fingerprint(source="custom")
+    lake.admin.datasets.register(
+        replace(spec, source_api_params={"adjust": "qfq"})
+    )
+
+    assert repeated == first
+    assert lake.update.state_fingerprint(source="custom") != first
+
+
 def test_successful_empty_response_becomes_verified_coverage(tmp_path) -> None:
     source = AuditSource(empty=True)
     lake = _daily_lake(tmp_path, source=source)
@@ -141,6 +157,20 @@ def test_execute_rejects_stale_plan(tmp_path) -> None:
 
     with pytest.raises(StaleUpdatePlanError, match="changed after preview"):
         lake.update.execute(plan, progress=False)
+
+
+def test_state_fingerprint_matches_plan_and_changes_with_lake_state(tmp_path) -> None:
+    lake = _daily_lake(tmp_path)
+    before = lake.update.state_fingerprint(source="custom")
+    plan = lake.update.plan(
+        ["daily"], source="custom", start="2025-01-02", end="2025-01-02"
+    )
+
+    assert before == plan.state_fingerprint
+
+    lake.ingest(DatasetSpec("other", "general"), pl.DataFrame({"value": [1]}))
+
+    assert lake.update.state_fingerprint(source="custom") != before
 
 
 def test_execute_reports_changed_partition_hashes(tmp_path) -> None:

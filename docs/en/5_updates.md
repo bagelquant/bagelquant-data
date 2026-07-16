@@ -101,6 +101,18 @@ Execution reports include changed partition identities and their before/after
 content hashes. Applications should use those changes to invalidate downstream
 calculations instead of treating every successful update as a full rebuild.
 
+Applications that need to trigger audits only when the lake changes can read
+the same provider-free planning identity through
+`lake.update.state_fingerprint(source="tushare")`. The fingerprint covers
+dataset declarations, manifests, pending requests, coverage rows, and audit
+watermarks. It is safe to poll from an operator UI and changes whenever a new
+plan is required; it does not contact the provider.
+
+An application may automatically execute a completed plan. In that workflow,
+persist the plan identity, render its summary, and pass the exact plan to
+`execute`. Automatic execution does not weaken stale-plan protection: any lake
+change between planning and execution still requires a replacement plan.
+
 Pass provider-specific values for one run with `params`, for example
 `lake.update.dataset("stock_basic", source="tushare", params={"exchange": "SSE"})`.
 Per-run `params` override a dataset's configured `source_api_params` and
