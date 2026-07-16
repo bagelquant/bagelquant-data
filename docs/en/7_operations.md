@@ -35,3 +35,9 @@ An `UpdatePlan` is valid only while its dataset declarations, calendar or
 asset-list inputs, manifests, pending failures, and coverage state remain
 unchanged. A stale-plan error is a safety result: preview the work again and
 confirm the new summary.
+
+`lake.update.state_fingerprint(source=...)` exposes that validation identity
+without building a plan or making a provider call. Operator applications can
+combine it with their normalized audit scope to submit exactly one fast audit
+for each distinct lake state. Failed or cancelled executions remain retryable;
+successful executions should be retained as the durable idempotency record.

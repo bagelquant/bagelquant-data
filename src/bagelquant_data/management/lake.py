@@ -123,6 +123,11 @@ class LakeUpdater:
 
     lake: DataLake
 
+    def state_fingerprint(self, *, source: str) -> str:
+        """Return the provider-free identity used to validate update plans."""
+
+        return planning_state_fingerprint(self.lake.metadata, source)
+
     def plan(
         self,
         datasets: Sequence[str],

@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from itertools import product
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 import polars as pl
 
@@ -126,16 +126,66 @@ def planning_state_fingerprint(metadata: MetadataStore, source: str) -> str:
     """Hash lake state that can change a completeness plan."""
 
     payload = {
-        "datasets": metadata.list_datasets(source),
-        "manifest": metadata.manifest(source),
-        "pending": metadata.pending_update_jobs(source=source),
-        "coverage": metadata.coverage(source),
-        "watermarks": metadata.audit_watermarks(source),
+        "datasets": _planning_rows(
+            metadata.list_datasets(source),
+            ("source", "name", "enabled", "spec_hash"),
+        ),
+        "manifest": _planning_rows(
+            metadata.manifest(source),
+            (
+                "source",
+                "dataset",
+                "partition_path",
+                "partition_values",
+                "row_count",
+                "file_size_bytes",
+                "min_time",
+                "max_time",
+                "content_hash",
+                "schema_hash",
+            ),
+        ),
+        "pending": _planning_rows(
+            metadata.pending_update_jobs(source=source),
+            (
+                "job_key",
+                "source",
+                "dataset",
+                "update_type",
+                "request_params",
+                "asset_id",
+            ),
+        ),
+        "coverage": _planning_rows(
+            metadata.coverage(source),
+            (
+                "source",
+                "dataset",
+                "scope_kind",
+                "scope_key",
+                "provisional",
+                "row_count",
+                "spec_hash",
+            ),
+        ),
+        "watermarks": _planning_rows(
+            metadata.audit_watermarks(source),
+            ("source", "dataset"),
+        ),
     }
     return hashlib.blake2b(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8"),
         digest_size=20,
     ).hexdigest()
+
+
+def _planning_rows(
+    rows: Sequence[Mapping[str, object]],
+    fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    """Remove timestamps and other metadata that cannot change a plan."""
+
+    return [{field: row.get(field) for field in fields} for row in rows]
 
 
 def coverage_scopes(
