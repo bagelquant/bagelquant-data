@@ -18,7 +18,20 @@ import polars as pl
 from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
+from bagelquant_data.pipeline.completeness import coverage_scopes
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionChange:
+    """Content-hash change for one committed partition."""
+
+    dataset: str
+    partition_path: str
+    before_hash: str | None
+    after_hash: str | None
+    min_time: str | None = None
+    max_time: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +49,7 @@ class UpdateReport:
     commit_count: int = 0
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
+    changed_partitions: tuple[PartitionChange, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +414,23 @@ def _run_phase(
                     state.general_failed or work.spec.update_type == "general"
                 )
                 continue
+
+            spec_hash = pipeline.metadata.dataset_spec_hash(
+                work.spec.source, work.spec.name
+            )
+            logical_rows = sum(page.row_count for page in pages)
+            for scope_kind, scope_key, provisional in coverage_scopes(
+                work.spec, request
+            ):
+                pipeline.metadata.record_coverage(
+                    source=work.spec.source,
+                    dataset=work.spec.name,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    provisional=provisional and logical_rows == 0,
+                    row_count=logical_rows,
+                    spec_hash=spec_hash,
+                )
 
             state.successful_jobs += 1
             frames = [
