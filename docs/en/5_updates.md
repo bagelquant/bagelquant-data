@@ -66,6 +66,41 @@ status. Pagination can increase the total while an update is running. Callback
 delivery is synchronous on the scheduler thread. The existing `progress=True`
 option continues to control tqdm terminal output independently.
 
+## Completeness audits and confirmed execution
+
+Use `lake.update.plan(...)` before a provider-backed update when the caller
+must inspect the work before it starts. Plans are immutable snapshots of the
+selected datasets, lake manifests, coverage records, and logical provider
+requests. `lake.update.execute(plan, ...)` rechecks the plan fingerprint and
+refuses stale plans rather than silently running a different download.
+
+```python
+plan = lake.update.plan(
+    ["daily", "income"], source="tushare",
+    start="2020-01-01", end="2026-07-10", audit="fast",
+)
+for summary in plan.summaries:
+    print(summary.dataset, summary.missing, summary.estimated_calls)
+report = lake.update.execute(plan, workers=4)
+```
+
+`fast` is the default audit used by normal updates. It plans forward work,
+pending retries, provisional empty scopes, and gaps already known to the
+coverage index. `full` compares the complete requested history: every open
+calendar date for `by_daily`, and every listing-active asset-year for
+`by_asset`. Full audits are intended for the initial coverage backfill and
+periodic operator checks, not every routine update.
+
+A successful provider response establishes coverage even when it contains no
+rows. Historical empty scopes are retained so sparse datasets are not
+downloaded forever. Today's empty daily response and the current asset-year
+remain provisional and are reconsidered by later fast audits. Failed requests
+never establish coverage.
+
+Execution reports include changed partition identities and their before/after
+content hashes. Applications should use those changes to invalidate downstream
+calculations instead of treating every successful update as a full rebuild.
+
 Pass provider-specific values for one run with `params`, for example
 `lake.update.dataset("stock_basic", source="tushare", params={"exchange": "SSE"})`.
 Per-run `params` override a dataset's configured `source_api_params` and

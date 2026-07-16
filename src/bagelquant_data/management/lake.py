@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.exceptions import ConfigurationError
+from bagelquant_data.core.exceptions import ConfigurationError, StaleUpdatePlanError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.types import DateLike
@@ -18,13 +18,19 @@ from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
+from bagelquant_data.pipeline.completeness import (
+    AuditMode,
+    UpdatePlan,
+    build_update_plan,
+    planning_state_fingerprint,
+)
 from bagelquant_data.pipeline.planner import plan_update
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
+    PartitionChange,
     UpdateProgress,
     UpdateReport,
     combine_reports,
-    update_dataset,
     update_datasets,
 )
 from bagelquant_data.query import LakeQuery
@@ -117,6 +123,95 @@ class LakeUpdater:
 
     lake: DataLake
 
+    def plan(
+        self,
+        datasets: Sequence[str],
+        *,
+        source: str,
+        start: DateLike = "1999-12-31",
+        end: DateLike | None = None,
+        audit: AuditMode = "fast",
+        ids: Sequence[str] | None = None,
+        params: dict[str, object] | None = None,
+        today: DateLike | None = None,
+    ) -> UpdatePlan:
+        """Plan fast or full completeness work without provider calls."""
+
+        names = list(dict.fromkeys(str(value) for value in datasets))
+        specs = [
+            self.lake.admin.datasets.get(name, source=source) for name in names
+        ]
+        return build_update_plan(
+            specs=specs,
+            raw=RawQueryService(self.lake.parquet, self.lake.metadata),
+            metadata=self.lake.metadata,
+            source=source,
+            start=start,
+            end=end,
+            audit=audit,
+            ids=ids,
+            params=params,
+            today=today,
+        )
+
+    def execute(
+        self,
+        plan: UpdatePlan,
+        *,
+        progress_callback: Callable[[UpdateProgress], None] | None = None,
+        **kwargs: Any,
+    ) -> UpdateReport:
+        """Execute an unchanged, previously previewed update plan."""
+
+        current = planning_state_fingerprint(self.lake.metadata, plan.source)
+        if current != plan.state_fingerprint:
+            raise StaleUpdatePlanError(
+                "lake state changed after preview; create and confirm a new update plan"
+            )
+        if not plan.datasets:
+            return combine_reports(plan.source, [])
+        before = _manifest_map(self.lake.metadata, plan.source)
+        works = []
+        for planned in plan.datasets:
+            spec = self.lake.admin.datasets.get(
+                planned.dataset, source=plan.source
+            )
+            context = _request_context(
+                source=plan.source,
+                dataset=planned.dataset,
+                kwargs={
+                    **kwargs,
+                    "start": plan.start,
+                    "end": plan.end,
+                    "progress_callback": progress_callback,
+                },
+            )
+            works.append(
+                DatasetUpdateWork(spec, context, planned.requests)
+            )
+        adapter = self.lake.admin.sources.get(plan.source)
+        report = update_datasets(
+            source_adapter=adapter,
+            pipeline=self.lake._pipeline,
+            works=tuple(works),
+        )
+        after = _manifest_map(self.lake.metadata, plan.source)
+        report = replace(
+            report,
+            changed_partitions=_partition_changes(before, after),
+        )
+        if plan.audit == "full":
+            for run in report.runs:
+                if run.status == "success" and run.pending_job_count == 0:
+                    self.lake.metadata.record_audit_watermark(
+                        source=plan.source,
+                        dataset=run.dataset,
+                        start=plan.start,
+                        end=plan.end,
+                        state_fingerprint=plan.state_fingerprint,
+                    )
+        return report
+
     def dataset(
         self,
         dataset: str,
@@ -127,34 +222,18 @@ class LakeUpdater:
         progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> IngestionReport:
-        spec = self.lake.admin.datasets.get(dataset, source=source)
-        adapter = self.lake.admin.sources.get(source)
-        context = _request_context(
-            source=source,
-            dataset=dataset,
-            kwargs={
-                **kwargs,
-                "start": start,
-                "end": end,
-                "progress_callback": progress_callback,
-            },
+        audit = kwargs.pop("audit", "fast")
+        ids = kwargs.pop("ids", None)
+        params = kwargs.pop("params", None)
+        today = kwargs.pop("today", None)
+        plan = self.plan(
+            [dataset], source=source, start=start, end=end, audit=audit,
+            ids=ids, params=params, today=today,
         )
-        planned = plan_update(
-            spec=spec,
-            raw=RawQueryService(self.lake.parquet, self.lake.metadata),
-            start=context.start if spec.update_type != "general" else None,
-            end=context.end if spec.update_type != "general" else None,
-            today=context.options.get("today"),
-            ids=context.options.get("ids"),
-            params=context.options.get("params"),
+        report = self.execute(
+            plan, progress_callback=progress_callback, **kwargs
         )
-        return update_dataset(
-            spec=spec,
-            source_adapter=adapter,
-            pipeline=self.lake._pipeline,
-            context=context,
-            requests=planned.requests,
-        )
+        return report.runs[0]
 
     def datasets(
         self,
@@ -346,3 +425,42 @@ def _request_context(
     if params is not None:
         options["params"] = params
     return RequestContext(source=source, dataset=dataset, options=options, **known)
+
+
+def _manifest_map(
+    metadata: MetadataStore, source: str
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return {
+        (str(row["dataset"]), str(row["partition_path"])): row
+        for row in metadata.manifest(source)
+    }
+
+
+def _partition_changes(
+    before: dict[tuple[str, str], dict[str, Any]],
+    after: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[PartitionChange, ...]:
+    changes = []
+    for key in sorted(set(before) | set(after)):
+        old = before.get(key)
+        new = after.get(key)
+        old_hash = None if old is None else str(old["content_hash"])
+        new_hash = None if new is None else str(new["content_hash"])
+        if old_hash == new_hash:
+            continue
+        row = new or old or {}
+        changes.append(
+            PartitionChange(
+                dataset=key[0],
+                partition_path=key[1],
+                before_hash=old_hash,
+                after_hash=new_hash,
+                min_time=(
+                    None if row.get("min_time") is None else str(row["min_time"])
+                ),
+                max_time=(
+                    None if row.get("max_time") is None else str(row["max_time"])
+                ),
+            )
+        )
+    return tuple(changes)

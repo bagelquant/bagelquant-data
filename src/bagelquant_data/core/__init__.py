@@ -9,6 +9,7 @@ from bagelquant_data.core.exceptions import (
     DestructiveOperationError,
     DuplicateResolutionError,
     SourceNotFoundError,
+    StaleUpdatePlanError,
     ValidationError,
 )
 from bagelquant_data.core.hashing import frame_content_hash, stable_bucket, stable_record_hash
@@ -30,6 +31,7 @@ __all__ = [
     "Registry",
     "RequestContext",
     "SourceNotFoundError",
+    "StaleUpdatePlanError",
     "ValidationError",
     "default_registries",
     "dataset_key",

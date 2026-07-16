@@ -434,6 +434,113 @@ class MetadataStore:
             row["request_params"] = json.loads(str(row["request_params"]))
         return rows
 
+    def coverage(
+        self,
+        source: str,
+        dataset: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return successful logical completeness checks."""
+
+        if dataset is None:
+            return self._rows(
+                "select * from update_coverage where source=? "
+                "order by dataset, scope_kind, scope_key",
+                (source,),
+            )
+        return self._rows(
+            "select * from update_coverage where source=? and dataset=? "
+            "order by scope_kind, scope_key",
+            (source, dataset),
+        )
+
+    def record_coverage(
+        self,
+        *,
+        source: str,
+        dataset: str,
+        scope_kind: str,
+        scope_key: str,
+        provisional: bool,
+        row_count: int,
+        spec_hash: str,
+    ) -> None:
+        """Record one successfully fetched daily or asset-year scope."""
+
+        with self.connect() as db:
+            db.execute(
+                """
+                insert into update_coverage(
+                    source,dataset,scope_kind,scope_key,provisional,row_count,
+                    spec_hash,checked_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(source,dataset,scope_kind,scope_key) do update set
+                    provisional=excluded.provisional,
+                    row_count=excluded.row_count,
+                    spec_hash=excluded.spec_hash,
+                    checked_at=excluded.checked_at
+                """,
+                (
+                    source,
+                    dataset,
+                    scope_kind,
+                    scope_key,
+                    int(provisional),
+                    int(row_count),
+                    spec_hash,
+                    _now(),
+                ),
+            )
+
+    def record_audit_watermark(
+        self,
+        *,
+        source: str,
+        dataset: str,
+        start: str,
+        end: str,
+        state_fingerprint: str,
+    ) -> None:
+        """Record a fully successful historical completeness audit."""
+
+        with self.connect() as db:
+            db.execute(
+                """
+                insert into audit_watermarks(
+                    source,dataset,start_date,end_date,state_fingerprint,completed_at
+                ) values (?, ?, ?, ?, ?, ?)
+                on conflict(source,dataset) do update set
+                    start_date=excluded.start_date,
+                    end_date=excluded.end_date,
+                    state_fingerprint=excluded.state_fingerprint,
+                    completed_at=excluded.completed_at
+                """,
+                (source, dataset, start, end, state_fingerprint, _now()),
+            )
+
+    def audit_watermarks(
+        self, source: str, dataset: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return completed full-audit watermarks."""
+
+        if dataset is None:
+            return self._rows(
+                "select * from audit_watermarks where source=? order by dataset",
+                (source,),
+            )
+        return self._rows(
+            "select * from audit_watermarks where source=? and dataset=?",
+            (source, dataset),
+        )
+
+    def dataset_spec_hash(self, source: str, dataset: str) -> str:
+        rows = self._rows(
+            "select spec_hash from datasets where source=? and name=?",
+            (source, dataset),
+        )
+        if not rows:
+            raise KeyError(f"Unknown dataset: {source}/{dataset}")
+        return str(rows[0]["spec_hash"])
+
     def record_failed_update_job(
         self,
         *,
@@ -632,6 +739,28 @@ class MetadataStore:
                     failure_count integer not null default 1,
                     created_at text not null,
                     updated_at text not null
+                );
+                create table if not exists update_coverage (
+                    source text not null,
+                    dataset text not null,
+                    scope_kind text not null,
+                    scope_key text not null,
+                    provisional integer not null default 0,
+                    row_count integer not null default 0,
+                    spec_hash text not null,
+                    checked_at text not null,
+                    primary key(source, dataset, scope_kind, scope_key)
+                );
+                create index if not exists idx_update_coverage_lookup
+                    on update_coverage(source, dataset, provisional);
+                create table if not exists audit_watermarks (
+                    source text not null,
+                    dataset text not null,
+                    start_date text not null,
+                    end_date text not null,
+                    state_fingerprint text not null,
+                    completed_at text not null,
+                    primary key(source, dataset)
                 );
                 create table if not exists partition_manifest (
                     source text not null,

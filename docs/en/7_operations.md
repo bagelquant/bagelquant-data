@@ -24,3 +24,14 @@ Use `rebuild_manifest` after repairing local Parquet files and
 `validate_manifest` to compare metadata with the stored files. Remove a dataset
 with `lake.admin.datasets.remove`; pass `delete_data=True, confirm=True` only
 when its Parquet data should also be removed.
+
+Completeness state is stored additively in the lake metadata database. Coverage
+rows identify successful daily or asset-year checks, including verified empty
+responses, and audit watermarks record the last completed full range. Removing
+Parquet files or rebuilding a manifest does not fabricate coverage; run a full
+audit after manual storage repair.
+
+An `UpdatePlan` is valid only while its dataset declarations, calendar or
+asset-list inputs, manifests, pending failures, and coverage state remain
+unchanged. A stale-plan error is a safety result: preview the work again and
+confirm the new summary.
