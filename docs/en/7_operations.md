@@ -6,38 +6,34 @@ Inspect a lake through `lake.admin`:
 print(lake.admin.summary())
 print(lake.admin.status.dataset("daily", source="tushare"))
 print(lake.admin.runs())
-print(lake.admin.status.pending_update_jobs(source="tushare"))
+print(lake.admin.status.update_summary(source="tushare"))
 ```
 
-Failed daily and asset requests remain in the metadata database and are retried
-before new work in the next update. A persistent failure does not stop other
-dates, assets, or datasets from advancing. Inspect `pending_update_jobs` after a
-partial run to find the original request parameters, error, and failure count.
+The update ledger is current state; `api_calls` and ingestion runs are the
+attempt history. Failed scopes retain their error and attempt count. Invalid
+scopes identify provider responses whose keys, date range, asset identity, or
+payload did not satisfy the dataset contract.
 
-Update reports include `elapsed_seconds`, cumulative `fetch_seconds`,
-`commit_seconds`, `metadata_seconds`, `commit_count`,
-`partitions_rewritten`, and `peak_in_flight`. Use these counters to distinguish
-provider latency from local write overhead. `fetch_seconds` is cumulative across
-parallel jobs, so it can exceed wall-clock `elapsed_seconds`.
+Use `reset_update_scopes` to retry selected terminal state deliberately. A
+dataset declaration or parameter-variant change automatically invalidates its
+old scope identities and creates pending work.
+
+Update reports include elapsed, fetch, commit, and metadata timings, commit and
+partition counts, and peak in-flight calls. Fetch time is cumulative across
+parallel jobs and may exceed elapsed wall-clock time.
 
 Use `rebuild_manifest` after repairing local Parquet files and
-`validate_manifest` to compare metadata with the stored files. Remove a dataset
-with `lake.admin.datasets.remove`; pass `delete_data=True, confirm=True` only
-when its Parquet data should also be removed.
+`validate_manifest` to compare metadata with stored files. These integrity
+tools do not mutate the update ledger. If external storage changes invalidate
+the ledger, reset the affected scopes explicitly before updating.
 
-Completeness state is stored additively in the lake metadata database. Coverage
-rows identify successful daily or asset-year checks, including verified empty
-responses, and audit watermarks record the last completed full range. Removing
-Parquet files or rebuilding a manifest does not fabricate coverage; run a full
-audit after manual storage repair.
+## Existing-lake migration
 
-An `UpdatePlan` is valid only while its dataset declarations, calendar or
-asset-list inputs, manifests, pending failures, and coverage state remain
-unchanged. A stale-plan error is a safety result: preview the work again and
-confirm the new summary.
+Existing audit-based lakes require a one-time ledger bootstrap. The migration
+backs up `metadata/lake.db`, seeds daily success only from physically committed
+dates, marks unverifiable dates pending, and conservatively marks every asset
+pending for one full re-fetch. Corrupt legacy coverage is never trusted.
 
-`lake.update.state_fingerprint(source=...)` exposes that validation identity
-without building a plan or making a provider call. Operator applications can
-combine it with their normalized audit scope to submit exactly one fast audit
-for each distinct lake state. Failed or cancelled executions remain retryable;
-successful executions should be retained as the durable idempotency record.
+The bootstrap is resumable and must complete before normal updates. After it
+finishes, the legacy pending-job, coverage, and audit-watermark tables are
+removed. Fresh lakes initialize ledger version 1 automatically.

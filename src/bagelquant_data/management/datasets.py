@@ -77,6 +77,16 @@ class DatasetManager:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} by_asset requires asset_list"
             )
+        if spec.update_type != "by_asset" and (
+            spec.revision_lookback_days != 730 or spec.revision_refresh_days != 30
+        ):
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} revision settings are only valid for by_asset"
+            )
+        if spec.revision_lookback_days <= 0 or spec.revision_refresh_days <= 0:
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} revision settings must be positive"
+            )
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
@@ -126,6 +136,8 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "source_api_params",
         "source_api_param_sets",
         "field_mappings",
+        "revision_lookback_days",
+        "revision_refresh_days",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -189,4 +201,6 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
             dict(param_set) for param_set in source_api_param_sets
         ),
         field_mappings=field_mappings,
+        revision_lookback_days=int(value.get("revision_lookback_days", 730)),
+        revision_refresh_days=int(value.get("revision_refresh_days", 30)),
     )

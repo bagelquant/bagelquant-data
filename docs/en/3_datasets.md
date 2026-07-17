@@ -1,7 +1,7 @@
 # Datasets
 
 Register a dataset with the name, update type, and only the options its update
-planner needs.
+scope synchronizer needs.
 
 ```python
 from bagelquant_data import DatasetSpec
@@ -32,6 +32,19 @@ calendar = "trade_cal"
 trade_date = "time"
 ts_code = "asset_id"
 ```
+
+`by_asset` declarations may configure later-revision refreshes:
+
+```toml
+update_type = "by_asset"
+asset_list = "stock_basic"
+revision_lookback_days = 730
+revision_refresh_days = 30
+```
+
+The lake stores `checked_through` separately from the latest returned record.
+This prevents sparse event data from being downloaded repeatedly while the
+revision window still captures later restatements.
 
 Mappings are true renames, so provider columns named `trade_date` and
 `ts_code` are stored as `time` and `asset_id`. A mapping may rename other

@@ -51,7 +51,7 @@ def _lake(tmp_path, source: ProgressSource, *datasets: str) -> DataLake:
     return lake
 
 
-def test_progress_callback_reports_plan_advance_and_completion(tmp_path) -> None:
+def test_progress_callback_reports_ledger_phases_and_completion(tmp_path) -> None:
     lake = _lake(tmp_path, ProgressSource(), "daily")
     events: list[UpdateProgress] = []
 
@@ -64,14 +64,16 @@ def test_progress_callback_reports_plan_advance_and_completion(tmp_path) -> None
     )
 
     assert report.status == "success"
-    assert events[0] == UpdateProgress("daily", "planned", 0, 1, 0, 0, 0, "running")
-    assert any(event.phase == "new" and event.completed == 1 for event in events)
+    assert events[0].phase == "sync"
+    assert events[1].phase == "claim"
+    assert any(event.phase == "fetch" and event.completed == 1 for event in events)
+    assert any(event.phase == "commit" for event in events)
     assert events[-1].phase == "complete"
     assert events[-1].status == "success"
     assert events[-1].success_count == 1
 
 
-def test_progress_callback_expands_paginated_total(tmp_path) -> None:
+def test_progress_callback_counts_paginated_request_as_one_scope(tmp_path) -> None:
     lake = _lake(tmp_path, ProgressSource(paginated=True), "daily")
     events: list[UpdateProgress] = []
 
@@ -85,8 +87,8 @@ def test_progress_callback_expands_paginated_total(tmp_path) -> None:
     )
 
     assert events[0].total == 1
-    assert any(event.completed == 2 and event.total == 2 for event in events)
-    assert events[-1].total == 2
+    assert any(event.completed == 1 and event.total == 1 for event in events)
+    assert events[-1].total == 1
 
 
 def test_progress_callback_reports_multiple_datasets_and_failure(tmp_path) -> None:

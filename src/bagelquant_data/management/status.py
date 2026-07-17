@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -69,14 +72,72 @@ class StatusManager:
             and (source is None or run["source"] == source)
         ]
 
-    def pending_update_jobs(
+    def update_scopes(
         self,
         dataset: str | None = None,
         source: str | None = None,
+        status: str | Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Return unresolved logical source jobs awaiting a later retry."""
+        """Return filtered authoritative update-scope rows."""
 
-        return self.metadata.pending_update_jobs(source=source, dataset=dataset)
+        return self.metadata.update_scopes(
+            source=source, dataset=dataset, status=status
+        )
+
+    def update_summary(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Summarize ledger counts and watermarks per dataset."""
+
+        rows = self.update_scopes(dataset=dataset, source=source)
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault((str(row["source"]), str(row["dataset"])), []).append(
+                row
+            )
+        summaries = []
+        for (row_source, row_dataset), scopes in sorted(grouped.items()):
+            counts = Counter(str(scope["status"]) for scope in scopes)
+            pending_keys = [
+                str(scope["scope_key"])
+                for scope in scopes
+                if scope["status"] in {"pending", "failed"}
+            ]
+            checked = [
+                str(scope["checked_through"])
+                for scope in scopes
+                if scope["checked_through"] is not None
+            ]
+            successes = [
+                str(scope["last_success_at"])
+                for scope in scopes
+                if scope["last_success_at"] is not None
+            ]
+            revision_due = sum(_revision_due(scope) for scope in scopes)
+            summaries.append(
+                {
+                    "source": row_source,
+                    "dataset": row_dataset,
+                    "total": len(scopes),
+                    "pending": counts["pending"],
+                    "running": counts["running"],
+                    "success": counts["success"],
+                    "empty": counts["empty"],
+                    "failed": counts["failed"],
+                    "invalid": counts["invalid"],
+                    "earliest_pending_scope": min(pending_keys, default=None),
+                    "checked_through_min": min(checked, default=None),
+                    "checked_through_max": max(checked, default=None),
+                    "last_success_at": max(successes, default=None),
+                    "revision_due_assets": revision_due,
+                }
+            )
+        return summaries
+
+    def reset_update_scopes(self, scope_ids: Iterable[int]) -> int:
+        """Move selected terminal scopes back to pending."""
+
+        return self.metadata.reset_update_scopes(scope_ids)
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.metadata.rejected(source, dataset)
@@ -161,3 +222,15 @@ def _partition_scalar(value: str) -> object:
 def _schema_hash(frame: pl.DataFrame) -> str:
     payload = "|".join(f"{name}:{dtype}" for name, dtype in frame.schema.items())
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _revision_due(scope: dict[str, Any]) -> bool:
+    if scope["scope_kind"] != "asset" or scope["status"] == "running":
+        return False
+    value = scope["last_revision_check_at"]
+    if value is None:
+        return True
+    checked = datetime.fromisoformat(str(value))
+    if checked.tzinfo is None:
+        checked = checked.replace(tzinfo=UTC)
+    return checked <= datetime.now(UTC) - timedelta(days=30)

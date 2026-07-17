@@ -1,15 +1,13 @@
-"""Dataset update orchestration."""
+"""Ledger-driven dataset update orchestration."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import Any, TypeAlias, cast
 from uuid import uuid4
 
@@ -18,8 +16,9 @@ import polars as pl
 from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
-from bagelquant_data.pipeline.completeness import coverage_scopes
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
+from bagelquant_data.pipeline.scopes import LedgerRequest
+from bagelquant_data.query.raw import RawQueryService
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +40,7 @@ class UpdateReport:
     source: str
     datasets: tuple[str, ...]
     runs: tuple[IngestionReport, ...]
-    pending_job_count: int = 0
+    remaining_scope_count: int = 0
     elapsed_seconds: float = 0.0
     fetch_seconds: float = 0.0
     commit_seconds: float = 0.0
@@ -64,6 +63,9 @@ class UpdateProgress:
     failure_count: int
     rows_downloaded: int
     status: str
+    empty_count: int = 0
+    invalid_count: int = 0
+    remaining_count: int = 0
 
 
 UpdateProgressCallback: TypeAlias = Callable[[UpdateProgress], None]
@@ -71,55 +73,52 @@ UpdateProgressCallback: TypeAlias = Callable[[UpdateProgress], None]
 
 @dataclass(frozen=True, slots=True)
 class DatasetUpdateWork:
-    """Planned logical requests for one dataset in a shared update run."""
+    """Eligible ledger requests for one dataset."""
 
     spec: DatasetSpec
     context: RequestContext
-    requests: tuple[dict[str, object], ...]
+    requests: tuple[LedgerRequest, ...]
+    run_id: str = field(default_factory=lambda: uuid4().hex)
 
 
-UpdateTask: TypeAlias = tuple[DatasetUpdateWork, dict[str, object], str]
+@dataclass(frozen=True, slots=True)
+class FetchPage:
+    """Result of one physical provider call."""
+
+    request_key: str
+    request_params: dict[str, Any]
+    frame: pl.DataFrame | None
+    status: str
+    row_count: int
+    retry_count: int
+    error_message: str | None = None
+    asset_id: str | None = None
 
 
 @dataclass(slots=True)
 class _RunState:
     work: DatasetUpdateWork
-    run_id: str
     request_count: int = 0
     success_count: int = 0
+    empty_count: int = 0
     failure_count: int = 0
+    invalid_count: int = 0
     rows_downloaded: int = 0
     rows_committed: int = 0
-    successful_jobs: int = 0
     errors: list[str] = field(default_factory=list)
-    frames: list[pl.DataFrame] = field(default_factory=list)
-    buffered_jobs: int = 0
-    general_failed: bool = False
-    started_at: float = 0.0
+    buffered: list[tuple[pl.DataFrame, LedgerRequest]] = field(default_factory=list)
+    buffered_bytes: int = 0
+    started_at: float = field(default_factory=time.perf_counter)
     fetch_seconds: float = 0.0
     commit_seconds: float = 0.0
     metadata_seconds: float = 0.0
     commit_count: int = 0
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
-    buffered_bytes: int = 0
-
-    def __post_init__(self) -> None:
-        self.started_at = time.perf_counter()
+    fatal_error: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class FetchPage:
-    """Result of one physical source API call."""
-
-    request_key: str
-    request_params: dict[str, Any]
-    frame: object | None
-    status: str
-    row_count: int
-    retry_count: int
-    error_message: str | None = None
-    asset_id: str | None = None
+UpdateTask: TypeAlias = tuple[DatasetUpdateWork, LedgerRequest]
 
 
 def update_dataset(
@@ -128,20 +127,15 @@ def update_dataset(
     source_adapter: object,
     pipeline: IngestionPipeline,
     context: RequestContext,
-    requests: Sequence[dict[str, object]],
+    requests: Sequence[LedgerRequest],
 ) -> IngestionReport:
-    """Fetch one dataset through the shared global scheduler."""
+    """Fetch one dataset through the shared bounded scheduler."""
 
-    report = update_datasets(
+    return update_datasets(
         source_adapter=source_adapter,
         pipeline=pipeline,
-        works=(
-            DatasetUpdateWork(
-                spec, context, tuple(dict(request) for request in requests)
-            ),
-        ),
-    )
-    return report.runs[0]
+        works=(DatasetUpdateWork(spec, context, tuple(requests)),),
+    ).runs[0]
 
 
 def update_datasets(
@@ -150,17 +144,17 @@ def update_datasets(
     pipeline: IngestionPipeline,
     works: Sequence[DatasetUpdateWork],
 ) -> UpdateReport:
-    """Execute logical requests with one worker limit shared across datasets."""
+    """Claim centrally selected scopes, fetch concurrently, then commit."""
 
     if not works:
         return UpdateReport(source="", datasets=(), runs=())
     started_at = time.perf_counter()
     workers = max(1, int(works[0].context.options.get("workers", 4)))
     max_in_flight = max(
-        workers,
-        int(works[0].context.options.get("max_in_flight", workers * 2)),
+        workers, int(works[0].context.options.get("max_in_flight", workers * 2))
     )
-    states = {work.spec.name: _RunState(work, uuid4().hex) for work in works}
+    states = {work.spec.name: _RunState(work) for work in works}
+    callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
     progresses = {
         work.spec.name: _progress_bar(
             work.spec.name,
@@ -169,152 +163,113 @@ def update_datasets(
         )
         for work in works
     }
-    callbacks = {
-        work.spec.name: _progress_callback(work.context) for work in works
-    }
-    selected_names = set(states)
-    pending_rows = [
-        row
-        for row in pipeline.metadata.pending_update_jobs(source=works[0].spec.source)
-        if row["dataset"] in selected_names and row["update_type"] != "general"
-    ]
-    retry_keys = {str(row["job_key"]) for row in pending_rows}
-    retry_tasks = [
-        (
-            states[str(row["dataset"])].work,
-            dict(row["request_params"]),
-            str(row["job_key"]),
-        )
-        for row in pending_rows
-    ]
-    new_tasks: list[UpdateTask] = []
-    for work in works:
-        for original in work.requests:
-            request = _after_pending_asset_ranges(work, dict(original), pending_rows)
-            if request is None:
-                continue
-            key = _job_key(work.spec, request)
-            if key not in retry_keys:
-                new_tasks.append((work, request, key))
-    totals = {
-        name: sum(
-            work.spec.name == name for work, _, _ in (*retry_tasks, *new_tasks)
-        )
-        for name in states
-    }
-    completed_calls = dict.fromkeys(states, 0)
-    for name, progress in progresses.items():
-        if progress is not None:
-            progress.total = totals[name]
-            progress.refresh()
-        _emit_progress(
-            callbacks[name],
-            states[name],
-            phase="planned",
-            completed=0,
-            total=totals[name],
-        )
-
+    tasks: list[UpdateTask] = []
+    begun: set[str] = set()
+    totals = dict.fromkeys(states, 0)
+    completed = dict.fromkeys(states, 0)
+    caught: BaseException | None = None
     try:
+        for work in works:
+            pipeline.metadata.begin_run(
+                run_id=work.run_id,
+                source=work.spec.source,
+                dataset=work.spec.name,
+                mode=work.spec.update_type,
+            )
+            begun.add(work.spec.name)
+            _emit_progress(callbacks[work.spec.name], states[work.spec.name], "sync", 0)
+            scope_ids = [
+                request.scope_id for request in work.requests if request.scope_id
+            ]
+            claimed = set(
+                pipeline.metadata.claim_update_scopes(scope_ids, run_id=work.run_id)
+            )
+            tasks.extend(
+                (work, request)
+                for request in work.requests
+                if request.scope_id is None or request.scope_id in claimed
+            )
+            _emit_progress(callbacks[work.spec.name], states[work.spec.name], "claim", 0)
+        totals = {
+            name: sum(work.spec.name == name for work, _ in tasks) for name in states
+        }
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            _run_phase(
-                "retry",
-                retry_tasks,
-                executor,
-                source_adapter,
-                pipeline,
-                states,
-                progresses,
-                callbacks,
-                totals,
-                completed_calls,
+            _run_fetches(
+                _fair_tasks(tasks),
+                executor=executor,
+                source_adapter=source_adapter,
+                pipeline=pipeline,
+                states=states,
+                callbacks=callbacks,
+                totals=totals,
+                completed=completed,
                 max_in_flight=max_in_flight,
             )
-            _flush_incremental_states(pipeline, states)
-            _run_phase(
-                "new",
-                _fair_tasks(new_tasks),
-                executor,
-                source_adapter,
+        for state in states.values():
+            _commit_state(
                 pipeline,
-                states,
-                progresses,
-                callbacks,
-                totals,
-                completed_calls,
-                max_in_flight=max_in_flight,
+                state,
+                callbacks[state.work.spec.name],
+                completed[state.work.spec.name],
+                totals[state.work.spec.name],
             )
-            _flush_states(pipeline, states)
+    except BaseException as exc:  # finalize durable run state before propagation
+        caught = exc
+        for name, state in states.items():
+            if name not in begun:
+                continue
+            state.fatal_error = str(exc)
+            _fail_buffered(pipeline, state, str(exc))
+            _fail_running(pipeline, state, str(exc))
     finally:
         for progress in progresses.values():
             if progress is not None:
                 progress.close()
-
-    reports = tuple(_finish_state(pipeline, state) for state in states.values())
+        reports = tuple(
+            _finish_state(pipeline, state)
+            for name, state in states.items()
+            if name in begun
+        )
     for report in reports:
         _emit_progress(
             callbacks[report.dataset],
             states[report.dataset],
-            phase="complete",
-            completed=completed_calls[report.dataset],
-            total=totals[report.dataset],
+            "complete",
+            completed[report.dataset],
             status=report.status,
+            total=totals[report.dataset],
         )
-    pending_count = sum(report.pending_job_count for report in reports)
-    return UpdateReport(
-        source=works[0].spec.source,
-        datasets=tuple(report.dataset for report in reports),
-        runs=reports,
-        pending_job_count=pending_count,
-        elapsed_seconds=time.perf_counter() - started_at,
-        fetch_seconds=sum(report.fetch_seconds for report in reports),
-        commit_seconds=sum(report.commit_seconds for report in reports),
-        metadata_seconds=sum(report.metadata_seconds for report in reports),
-        commit_count=sum(report.commit_count for report in reports),
-        partitions_rewritten=sum(report.partitions_rewritten for report in reports),
-        peak_in_flight=max((report.peak_in_flight for report in reports), default=0),
-    )
+    if caught is not None:
+        raise caught
+    return _combine(works[0].spec.source, reports, time.perf_counter() - started_at)
 
 
-def _run_phase(
-    phase: str,
+def _run_fetches(
     tasks: Sequence[UpdateTask],
+    *,
     executor: ThreadPoolExecutor,
     source_adapter: object,
     pipeline: IngestionPipeline,
     states: dict[str, _RunState],
-    progresses: dict[str, Any | None],
     callbacks: dict[str, UpdateProgressCallback | None],
     totals: dict[str, int],
-    completed_calls: dict[str, int],
-    *,
+    completed: dict[str, int],
     max_in_flight: int,
 ) -> None:
     task_iter = iter(enumerate(tasks))
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
-    phase_datasets = dict.fromkeys(work.spec.name for work, _, _ in tasks)
-    for dataset in phase_datasets:
-        _emit_progress(
-            callbacks[dataset],
-            states[dataset],
-            phase=phase,
-            completed=completed_calls[dataset],
-            total=totals[dataset],
-        )
 
     def submit_next() -> bool:
         try:
-            index, (work, request, key) = next(task_iter)
+            index, task = next(task_iter)
         except StopIteration:
             return False
-        progress = progresses[work.spec.name]
-        if progress is not None:
-            progress.set_description_str(f"{work.spec.name} [{phase}]")
+        work, request = task
         future = executor.submit(
             _fetch_request_pages,
             spec=work.spec,
             source_adapter=source_adapter,
-            request=request,
+            request=request.params,
             request_index=index,
             request_options=_request_options(work.context),
             max_retries=max(1, int(work.context.options.get("max_retries", 3))),
@@ -322,7 +277,7 @@ def _run_phase(
                 work.context.options.get("retry_backoff_seconds", 60.0)
             ),
         )
-        futures[future] = (time.perf_counter(), (work, request, key))
+        futures[future] = (time.perf_counter(), task)
         states[work.spec.name].peak_in_flight = max(
             states[work.spec.name].peak_in_flight, len(futures)
         )
@@ -331,21 +286,20 @@ def _run_phase(
     while len(futures) < max_in_flight and submit_next():
         pass
     while futures:
-        completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-        api_rows: list[dict[str, object]] = []
-        resolved_keys: list[str] = []
-        failed_jobs: list[dict[str, object]] = []
-        completed_results = []
-        for future in completed:
-            submitted_at, task = futures.pop(future)
-            work, request, key = task
+        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+        for future in done:
+            submitted_at, (work, request) = futures.pop(future)
             state = states[work.spec.name]
             pages = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
-            completed_results.append((work, request, key, state, pages))
-            api_rows.extend(
+            state.request_count += len(pages)
+            state.rows_downloaded += sum(
+                page.row_count for page in pages if page.status == "success"
+            )
+            started = time.perf_counter()
+            pipeline.metadata.record_api_calls(
                 {
-                    "run_id": state.run_id,
+                    "run_id": work.run_id,
                     "source": work.spec.source,
                     "dataset": work.spec.name,
                     "request_key": page.request_key,
@@ -355,183 +309,345 @@ def _run_phase(
                     "retry_count": page.retry_count,
                     "error_message": page.error_message,
                     "asset_id": page.asset_id,
+                    "scope_id": request.scope_id,
+                    "request_kind": request.request_kind,
                 }
                 for page in pages
             )
-            failed_pages = [page for page in pages if page.status != "success"]
-            if failed_pages:
-                message = failed_pages[-1].error_message or "Unknown source error"
-                failed_jobs.append(
-                    {
-                        "job_key": key,
-                        "source": work.spec.source,
-                        "dataset": work.spec.name,
-                        "update_type": work.spec.update_type,
-                        "request_params": request,
-                        "asset_id": _request_asset(request),
-                        "error_message": message,
-                    }
-                )
-            else:
-                resolved_keys.append(key)
-        metadata_started = time.perf_counter()
-        pipeline.metadata.record_update_results(api_rows, resolved_keys, failed_jobs)
-        metadata_elapsed = time.perf_counter() - metadata_started
-        if completed_results:
-            share = metadata_elapsed / len(completed_results)
-            for _, _, _, state, _ in completed_results:
-                state.metadata_seconds += share
-
-        for work, request, key, state, pages in completed_results:
-            state.request_count += len(pages)
-            state.success_count += sum(page.status == "success" for page in pages)
-            state.failure_count += sum(page.status != "success" for page in pages)
-            state.rows_downloaded += sum(
-                page.row_count for page in pages if page.status == "success"
-            )
-            progress = progresses[work.spec.name]
-            if progress is not None:
-                if len(pages) > 1:
-                    progress.total = (progress.total or 0) + len(pages) - 1
-                    progress.refresh()
-                progress.update(len(pages))
-            if len(pages) > 1:
-                totals[work.spec.name] += len(pages) - 1
-            completed_calls[work.spec.name] += len(pages)
+            state.metadata_seconds += time.perf_counter() - started
+            _harvest_request(pipeline, state, request, pages)
+            completed[work.spec.name] += 1
             _emit_progress(
                 callbacks[work.spec.name],
                 state,
-                phase=phase,
-                completed=completed_calls[work.spec.name],
+                "fetch",
+                completed[work.spec.name],
                 total=totals[work.spec.name],
             )
-
-            failed_pages = [page for page in pages if page.status != "success"]
-            if failed_pages:
-                message = failed_pages[-1].error_message or "Unknown source error"
-                state.errors.append(f"{key}: {message}")
-                state.general_failed = (
-                    state.general_failed or work.spec.update_type == "general"
-                )
-                continue
-
-            spec_hash = pipeline.metadata.dataset_spec_hash(
-                work.spec.source, work.spec.name
-            )
-            logical_rows = sum(page.row_count for page in pages)
-            for scope_kind, scope_key, provisional in coverage_scopes(
-                work.spec, request
-            ):
-                pipeline.metadata.record_coverage(
-                    source=work.spec.source,
-                    dataset=work.spec.name,
-                    scope_kind=scope_kind,
-                    scope_key=scope_key,
-                    provisional=provisional and logical_rows == 0,
-                    row_count=logical_rows,
-                    spec_hash=spec_hash,
-                )
-
-            state.successful_jobs += 1
-            frames = [
-                page.frame
-                for page in pages
-                if isinstance(page.frame, pl.DataFrame)
-                and (page.frame.height > 0 or work.spec.update_type == "general")
-            ]
-            state.frames.extend(frames)
-            state.buffered_bytes += sum(frame.estimated_size() for frame in frames)
-            state.buffered_jobs += 1
             batch_size = max(1, int(work.context.options.get("batch_size", 100)))
-            max_buffer_bytes = (
+            max_bytes = (
                 max(1, int(work.context.options.get("max_buffer_mb", 256)))
                 * 1024
                 * 1024
             )
             if work.spec.update_type != "general" and (
-                state.buffered_jobs >= batch_size
-                or state.buffered_bytes >= max_buffer_bytes
+                len(state.buffered) >= batch_size or state.buffered_bytes >= max_bytes
             ):
-                _commit_state(pipeline, state)
+                _commit_state(
+                    pipeline,
+                    state,
+                    callbacks[work.spec.name],
+                    completed[work.spec.name],
+                    totals[work.spec.name],
+                )
+            pipeline.metadata.refresh_update_lease(run_id=work.run_id)
         while len(futures) < max_in_flight and submit_next():
             pass
 
 
-def _commit_state(pipeline: IngestionPipeline, state: _RunState) -> None:
-    if state.frames:
-        frame = pl.concat(state.frames, how="diagonal_relaxed")
-        started_at = time.perf_counter()
-        state.rows_committed += pipeline.commit_frame(
-            state.work.spec,
-            frame,
-            run_id=state.run_id,
+def _harvest_request(
+    pipeline: IngestionPipeline,
+    state: _RunState,
+    request: LedgerRequest,
+    pages: Sequence[FetchPage],
+) -> None:
+    failures = [page for page in pages if page.status != "success"]
+    if failures:
+        status = (
+            "invalid"
+            if any(page.status == "invalid" for page in failures)
+            else "failed"
         )
-        state.commit_seconds += time.perf_counter() - started_at
+        message = failures[-1].error_message or "provider request failed"
+        _transition(pipeline, state, request, status, message)
+        return
+    frames = [
+        page.frame for page in pages if page.frame is not None and page.frame.height
+    ]
+    frame = pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    error = _validate_response(state.work.spec, request, frame)
+    if error is not None:
+        _transition(pipeline, state, request, "invalid", error)
+        return
+    if frame.is_empty():
+        if request.overlaps_existing:
+            _transition(
+                pipeline,
+                state,
+                request,
+                "invalid",
+                "empty response contradicts existing canonical coverage",
+            )
+            return
+        _transition(pipeline, state, request, "empty", None)
+        return
+    state.buffered.append((frame, request))
+    state.buffered_bytes += int(frame.estimated_size())
+
+
+def _commit_state(
+    pipeline: IngestionPipeline,
+    state: _RunState,
+    callback: UpdateProgressCallback | None,
+    completed: int,
+    total: int,
+) -> None:
+    if not state.buffered:
+        return
+    if state.work.spec.update_type == "general" and (
+        state.failure_count or state.invalid_count
+    ):
+        state.buffered.clear()
+        state.buffered_bytes = 0
+        return
+    _emit_progress(callback, state, "commit", completed, total=total)
+    buffered = list(state.buffered)
+    frame = pl.concat([item[0] for item in buffered], how="diagonal_relaxed")
+    try:
+        started = time.perf_counter()
+        committed = pipeline.commit_frame(
+            state.work.spec, frame, run_id=state.work.run_id
+        )
+        state.commit_seconds += time.perf_counter() - started
+        state.rows_committed += committed
         state.commit_count += 1
         state.partitions_rewritten += _partition_count(frame, state.work.spec)
-    state.frames.clear()
-    state.buffered_jobs = 0
+        canonical_maxima = _canonical_data_maxima(pipeline, state.work.spec, buffered)
+        transitions = [
+            _success_transition(
+                state.work.spec,
+                request,
+                scope_frame,
+                data_max_time=canonical_maxima.get(request.scope_id),
+            )
+            for scope_frame, request in buffered
+            if request.scope_id is not None
+        ]
+        started = time.perf_counter()
+        pipeline.metadata.transition_update_scopes(
+            transitions, run_id=state.work.run_id
+        )
+        state.metadata_seconds += time.perf_counter() - started
+        state.success_count += len(buffered)
+    except Exception as exc:
+        message = f"commit failed: {exc}"
+        for _, request in buffered:
+            _transition(pipeline, state, request, "failed", message)
+        raise
+    finally:
+        state.buffered.clear()
+        state.buffered_bytes = 0
+
+
+def _transition(
+    pipeline: IngestionPipeline,
+    state: _RunState,
+    request: LedgerRequest,
+    status: str,
+    error: str | None,
+) -> None:
+    if request.scope_id is not None:
+        pipeline.metadata.transition_update_scopes(
+            [
+                {
+                    "scope_id": request.scope_id,
+                    "status": status,
+                    "checked_through": request.target_end
+                    if status in {"success", "empty"}
+                    else None,
+                    "last_revision_check_at": datetime.now(UTC).isoformat()
+                    if request.revision_check and status in {"success", "empty"}
+                    else None,
+                    "recheck_after": request.recheck_after,
+                    "last_error": error,
+                }
+            ],
+            run_id=state.work.run_id,
+        )
+    if status == "empty":
+        state.empty_count += 1
+    elif status == "invalid":
+        state.invalid_count += 1
+        state.errors.append(error or "invalid response")
+    elif status == "failed":
+        state.failure_count += 1
+        state.errors.append(error or "failed request")
+
+
+def _success_transition(
+    spec: DatasetSpec,
+    request: LedgerRequest,
+    frame: pl.DataFrame,
+    *,
+    data_max_time: str | None,
+) -> dict[str, object]:
+    return {
+        "scope_id": request.scope_id,
+        "status": "success",
+        "checked_through": request.target_end,
+        "data_max_time": data_max_time,
+        "row_count": frame.height,
+        "last_revision_check_at": datetime.now(UTC).isoformat()
+        if request.revision_check
+        else None,
+        "recheck_after": request.recheck_after,
+        "last_error": None,
+    }
+
+
+def _canonical_data_maxima(
+    pipeline: IngestionPipeline,
+    spec: DatasetSpec,
+    buffered: Sequence[tuple[pl.DataFrame, LedgerRequest]],
+) -> dict[int | None, str]:
+    if spec.update_type == "general":
+        return {}
+    raw = RawQueryService(pipeline.parquet, pipeline.metadata)
+    requests = [request for _, request in buffered]
+    assets = [
+        str(request.params["id"])
+        for request in requests
+        if spec.update_type == "by_asset" and "id" in request.params
+    ] or None
+    daily_dates = [
+        str(request.target_end)
+        for request in requests
+        if spec.update_type == "by_daily" and request.target_end is not None
+    ]
+    frame = raw.query(
+        spec.name,
+        source=spec.source,
+        start=min(daily_dates) if daily_dates else None,
+        end=max(daily_dates) if daily_dates else None,
+        assets=assets,
+        fields=("time", "asset_id"),
+    ).collect()
+    if frame.is_empty() or "time" not in frame.columns:
+        return {}
+    if spec.update_type == "by_asset":
+        maxima = {
+            str(row["asset_id"]): row["time"].isoformat()
+            for row in frame.group_by("asset_id").agg(pl.col("time").max()).to_dicts()
+            if row["asset_id"] is not None and row["time"] is not None
+        }
+        return {
+            request.scope_id: maxima[str(request.params["id"])]
+            for request in requests
+            if str(request.params["id"]) in maxima
+        }
+    present = {value.isoformat() for value in frame["time"].unique().to_list()}
+    return {
+        request.scope_id: str(request.target_end)
+        for request in requests
+        if request.target_end in present
+    }
+
+
+def _validate_response(
+    spec: DatasetSpec, request: LedgerRequest, frame: pl.DataFrame
+) -> str | None:
+    if frame.is_empty():
+        return None
+    if spec.update_type == "general":
+        return None
+    time_column = _source_column(spec, "time")
+    asset_column = _source_column(spec, "asset_id")
+    required = [time_column, asset_column]
+    required.extend(_source_column(spec, key) for key in spec.primary_key_extra)
+    missing = [field for field in required if field not in frame.columns]
+    if missing:
+        return f"response missing required key columns: {', '.join(missing)}"
+    if any(frame[field].null_count() for field in required):
+        return "response contains null primary keys"
+    dates = frame.select(_date_expr(time_column).alias("value")).get_column("value")
+    if dates.null_count():
+        return "response contains invalid dates"
+    if spec.update_type == "by_daily":
+        expected = _date_value(request.target_end)
+        if any(value != expected for value in dates):
+            return (
+                f"response contains dates outside requested date {expected.isoformat()}"
+            )
+    if spec.update_type == "by_asset":
+        expected_asset = str(request.params["id"])
+        if any(str(value) != expected_asset for value in frame[asset_column]):
+            return f"response contains assets other than {expected_asset}"
+        lower = _date_value(request.params["start"])
+        upper = _date_value(request.params["end"])
+        if any(value < lower or value > upper for value in dates):
+            return "response contains dates outside requested range"
+    payload = [field for field in frame.columns if field not in required]
+    if payload and all(frame[field].null_count() == frame.height for field in payload):
+        return "response payload is entirely null"
+    return None
+
+
+def _fail_buffered(pipeline: IngestionPipeline, state: _RunState, message: str) -> None:
+    for _, request in list(state.buffered):
+        _transition(pipeline, state, request, "failed", message)
+    state.buffered.clear()
     state.buffered_bytes = 0
 
 
-def _flush_incremental_states(
-    pipeline: IngestionPipeline,
-    states: dict[str, _RunState],
-) -> None:
-    for state in states.values():
-        if state.work.spec.update_type != "general":
-            _commit_state(pipeline, state)
-
-
-def _flush_states(pipeline: IngestionPipeline, states: dict[str, _RunState]) -> None:
-    for state in states.values():
-        if state.work.spec.update_type == "general" and state.general_failed:
-            state.frames.clear()
-            continue
-        _commit_state(pipeline, state)
+def _fail_running(pipeline: IngestionPipeline, state: _RunState, message: str) -> None:
+    rows = pipeline.metadata.update_scopes(
+        source=state.work.spec.source,
+        dataset=state.work.spec.name,
+        status="running",
+    )
+    pipeline.metadata.transition_update_scopes(
+        (
+            {"scope_id": row["id"], "status": "failed", "last_error": message}
+            for row in rows
+        ),
+        run_id=state.work.run_id,
+    )
 
 
 def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
-    error_message = "; ".join(state.errors[:5]) if state.errors else None
-    if len(state.errors) > 5:
-        error_message = f"{error_message}; ... {len(state.errors) - 5} more"
-    status = (
-        "failed"
-        if state.general_failed or (state.failure_count and not state.successful_jobs)
-        else "partial"
-        if state.failure_count
-        else "success"
-    )
-    pending_count = len(
-        pipeline.metadata.pending_update_jobs(
+    remaining = len(
+        pipeline.metadata.update_scopes(
             source=state.work.spec.source,
             dataset=state.work.spec.name,
+            status=("pending", "failed", "invalid"),
         )
     )
-    pipeline.metadata.record_run(
-        run_id=state.run_id,
-        source=state.work.spec.source,
-        dataset=state.work.spec.name,
-        mode=state.work.spec.update_type,
+    error = state.fatal_error or ("; ".join(state.errors[:5]) if state.errors else None)
+    attempted = (
+        state.success_count
+        + state.empty_count
+        + state.failure_count
+        + state.invalid_count
+    )
+    status = (
+        "failed"
+        if state.fatal_error
+        or (attempted and not state.success_count and not state.empty_count)
+        else "partial"
+        if state.failure_count or state.invalid_count
+        else "success"
+    )
+    pipeline.metadata.finalize_run(
+        run_id=state.work.run_id,
         status=status,
         request_count=state.request_count,
-        success_count=state.success_count,
-        failure_count=state.failure_count,
+        success_count=state.success_count + state.empty_count,
+        failure_count=state.failure_count + state.invalid_count,
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
-        error_message=error_message,
+        error_message=error,
     )
     return IngestionReport(
-        run_id=state.run_id,
+        run_id=state.work.run_id,
         source=state.work.spec.source,
         dataset=state.work.spec.name,
         status=status,
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
         request_count=state.request_count,
-        success_count=state.success_count,
-        failure_count=state.failure_count,
-        pending_job_count=pending_count,
+        success_count=state.success_count + state.empty_count,
+        failure_count=state.failure_count + state.invalid_count,
+        remaining_scope_count=remaining,
         elapsed_seconds=time.perf_counter() - state.started_at,
         fetch_seconds=state.fetch_seconds,
         commit_seconds=state.commit_seconds,
@@ -539,67 +655,19 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         commit_count=state.commit_count,
         partitions_rewritten=state.partitions_rewritten,
         peak_in_flight=state.peak_in_flight,
-        error_message=error_message,
+        error_message=error,
     )
 
 
-def _job_key(spec: DatasetSpec, request: dict[str, object]) -> str:
-    payload = json.dumps(
-        {
-            "source": spec.source,
-            "dataset": spec.name,
-            "update_type": spec.update_type,
-            "request": request,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
-
-
-def _after_pending_asset_ranges(
-    work: DatasetUpdateWork,
-    request: dict[str, object],
-    pending_rows: Sequence[dict[str, Any]],
-) -> dict[str, object] | None:
-    if work.spec.update_type != "by_asset" or "id" not in request:
-        return request
-    matching_ends = [
-        _date_value(dict(row["request_params"])["end"])
-        for row in pending_rows
-        if row["dataset"] == work.spec.name
-        and dict(row["request_params"]).get("id") == request.get("id")
-        and "end" in dict(row["request_params"])
-    ]
-    if not matching_ends:
-        return request
-    start = max(_date_value(request["start"]), max(matching_ends) + timedelta(days=1))
-    end = _date_value(request["end"])
-    if start > end:
-        return None
-    request["start"] = start.isoformat()
-    return request
-
-
-def _date_value(value: object) -> date:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    text = str(value)
-    return datetime.strptime(text, "%Y-%m-%d").date()
-
-
-def combine_reports(source: str, reports: Sequence[IngestionReport]) -> UpdateReport:
+def _combine(
+    source: str, reports: Sequence[IngestionReport], elapsed: float
+) -> UpdateReport:
     return UpdateReport(
         source=source,
         datasets=tuple(report.dataset for report in reports),
         runs=tuple(reports),
-        pending_job_count=sum(report.pending_job_count for report in reports),
-        elapsed_seconds=max(
-            (report.elapsed_seconds for report in reports), default=0.0
-        ),
+        remaining_scope_count=sum(report.remaining_scope_count for report in reports),
+        elapsed_seconds=elapsed,
         fetch_seconds=sum(report.fetch_seconds for report in reports),
         commit_seconds=sum(report.commit_seconds for report in reports),
         metadata_seconds=sum(report.metadata_seconds for report in reports),
@@ -609,11 +677,17 @@ def combine_reports(source: str, reports: Sequence[IngestionReport]) -> UpdateRe
     )
 
 
-def _fair_tasks(
-    tasks: Sequence[UpdateTask],
-) -> list[UpdateTask]:
-    """Round-robin datasets while preserving each dataset's request order."""
+def combine_reports(source: str, reports: Sequence[IngestionReport]) -> UpdateReport:
+    """Combine already-finished reports for compatibility with empty selections."""
 
+    return _combine(
+        source,
+        reports,
+        max((report.elapsed_seconds for report in reports), default=0.0),
+    )
+
+
+def _fair_tasks(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
     grouped: dict[str, deque[UpdateTask]] = {}
     for task in tasks:
         grouped.setdefault(task[0].spec.name, deque()).append(task)
@@ -627,29 +701,6 @@ def _fair_tasks(
     return result
 
 
-def _partition_count(frame: pl.DataFrame, spec: DatasetSpec) -> int:
-    if spec.update_type == "general" or not frame.height:
-        return int(bool(frame.height))
-    source_for = {target: source for source, target in spec.field_mappings.items()}
-    time_column = source_for.get("time", "time")
-    if spec.update_type == "by_daily":
-        values = frame[time_column]
-        if values.dtype == pl.Date:
-            return int(values.dt.strftime("%Y-%m").n_unique())
-        return len({str(value).replace("-", "")[:6] for value in values})
-    asset_column = source_for.get("asset_id", "asset_id")
-    pairs = frame.select(time_column, asset_column).unique().iter_rows()
-    return len(
-        {
-            (
-                str(value).replace("-", "")[:4],
-                stable_bucket(str(asset), ASSET_BUCKET_COUNT),
-            )
-            for value, asset in pairs
-        }
-    )
-
-
 def _fetch_request_pages(
     *,
     spec: DatasetSpec,
@@ -661,44 +712,52 @@ def _fetch_request_pages(
     retry_backoff_seconds: float,
 ) -> list[FetchPage]:
     if request_options.get("pagination") != "offset":
-        page = _fetch_one(
-            spec=spec,
-            source_adapter=source_adapter,
-            request=request,
-            request_key=str(request_index),
-            max_retries=max_retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-        )
-        return [page]
-
+        return [
+            _fetch_one(
+                spec,
+                source_adapter,
+                request,
+                str(request_index),
+                max_retries,
+                retry_backoff_seconds,
+            )
+        ]
     page_size = int(request_options.get("page_size", 5000))
     limit_param = str(request_options.get("limit_param", "limit"))
     offset_param = str(request_options.get("offset_param", "offset"))
     offset = int(request_options.get("offset_start", 0))
-    pages: list[FetchPage] = []
-    page_index = 0
-    while True:
-        paged_request = dict(request)
-        paged_request[limit_param] = page_size
-        paged_request[offset_param] = offset
+    max_pages = int(request_options.get("max_pages", 10_000))
+    pages = []
+    for page_index in range(max_pages):
+        paged = {**request, limit_param: page_size, offset_param: offset}
         page = _fetch_one(
-            spec=spec,
-            source_adapter=source_adapter,
-            request=paged_request,
-            request_key=f"{request_index}:{page_index}",
-            max_retries=max_retries,
-            retry_backoff_seconds=retry_backoff_seconds,
+            spec,
+            source_adapter,
+            paged,
+            f"{request_index}:{page_index}",
+            max_retries,
+            retry_backoff_seconds,
         )
         pages.append(page)
         if page.status != "success" or page.row_count < page_size:
-            break
+            return pages
         offset += page_size
-        page_index += 1
+    pages.append(
+        FetchPage(
+            f"{request_index}:exhausted",
+            request,
+            None,
+            "invalid",
+            0,
+            0,
+            "pagination exhausted configured max_pages",
+            _request_asset(request),
+        )
+    )
     return pages
 
 
 def _fetch_one(
-    *,
     spec: DatasetSpec,
     source_adapter: object,
     request: dict[str, Any],
@@ -710,46 +769,82 @@ def _fetch_one(
     for attempt in range(max_retries):
         try:
             frame = source_adapter.fetch(spec.name, request)  # type: ignore[attr-defined]
+            if not isinstance(frame, pl.DataFrame):
+                raise TypeError("source adapter must return a Polars DataFrame")
             return FetchPage(
-                request_key=request_key,
-                request_params=request,
-                frame=frame,
-                status="success",
-                row_count=frame.height,
-                retry_count=attempt,
+                request_key,
+                request,
+                frame,
+                "success",
+                frame.height,
+                attempt,
                 asset_id=_request_asset(request),
             )
-        except Exception as exc:  # noqa: BLE001 - source SDKs raise provider-specific exceptions.
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt + 1 < max_retries:
                 time.sleep(retry_backoff_seconds)
     return FetchPage(
-        request_key=request_key,
-        request_params=request,
-        frame=None,
-        status="failed",
-        row_count=0,
-        retry_count=max_retries - 1,
-        error_message=str(last_error) if last_error else "Unknown source error",
-        asset_id=_request_asset(request),
+        request_key,
+        request,
+        None,
+        "failed",
+        0,
+        max_retries - 1,
+        str(last_error) if last_error else "unknown provider error",
+        _request_asset(request),
     )
 
 
 def _request_options(context: RequestContext) -> dict[str, Any]:
-    options: dict[str, Any] = {}
-    source_options = context.options.get("source_options")
-    if isinstance(source_options, dict):
-        options.update(source_options)
+    options = (
+        dict(context.options.get("source_options", {}))
+        if isinstance(context.options.get("source_options"), dict)
+        else {}
+    )
     for key in (
         "pagination",
         "page_size",
         "limit_param",
         "offset_param",
         "offset_start",
+        "max_pages",
     ):
         if key in context.options:
             options[key] = context.options[key]
     return options
+
+
+def _source_column(spec: DatasetSpec, canonical: str) -> str:
+    return next(
+        (
+            source
+            for source, target in spec.field_mappings.items()
+            if target == canonical
+        ),
+        canonical,
+    )
+
+
+def _date_expr(field: str) -> pl.Expr:
+    return (
+        pl.when(pl.col(field).cast(pl.String).str.len_chars() == 8)
+        .then(
+            pl.col(field).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False)
+        )
+        .otherwise(pl.col(field).cast(pl.Date, strict=False))
+    )
+
+
+def _date_value(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).split("T", maxsplit=1)[0]
+    return datetime.strptime(
+        text, "%Y%m%d" if len(text) == 8 and text.isdigit() else "%Y-%m-%d"
+    ).date()
 
 
 def _request_asset(request: dict[str, Any]) -> str | None:
@@ -762,6 +857,26 @@ def _request_asset(request: dict[str, Any]) -> str | None:
     return None if value is None else str(value)
 
 
+def _partition_count(frame: pl.DataFrame, spec: DatasetSpec) -> int:
+    if spec.update_type == "general" or not frame.height:
+        return int(bool(frame.height))
+    time_column = _source_column(spec, "time")
+    if spec.update_type == "by_daily":
+        return len({str(value).replace("-", "")[:6] for value in frame[time_column]})
+    asset_column = _source_column(spec, "asset_id")
+    return len(
+        {
+            (
+                str(value).replace("-", "")[:4],
+                stable_bucket(str(asset), ASSET_BUCKET_COUNT),
+            )
+            for value, asset in frame.select(time_column, asset_column)
+            .unique()
+            .iter_rows()
+        }
+    )
+
+
 def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:
     if not enabled:
         return None
@@ -769,7 +884,7 @@ def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:
         from tqdm import tqdm
     except ImportError:
         return None
-    return tqdm(total=total, desc=dataset, unit="call")  # type: ignore[no-any-return]
+    return tqdm(total=total, desc=dataset, unit="scope")  # type: ignore[no-any-return]
 
 
 def _progress_callback(context: RequestContext) -> UpdateProgressCallback | None:
@@ -780,23 +895,27 @@ def _progress_callback(context: RequestContext) -> UpdateProgressCallback | None
 def _emit_progress(
     callback: UpdateProgressCallback | None,
     state: _RunState,
-    *,
     phase: str,
     completed: int,
-    total: int,
+    *,
+    total: int | None = None,
     status: str = "running",
 ) -> None:
     if callback is None:
         return
+    final_total = len(state.work.requests) if total is None else total
     callback(
         UpdateProgress(
             dataset=state.work.spec.name,
             phase=phase,
             completed=completed,
-            total=total,
+            total=final_total,
             success_count=state.success_count,
             failure_count=state.failure_count,
             rows_downloaded=state.rows_downloaded,
             status=status,
+            empty_count=state.empty_count,
+            invalid_count=state.invalid_count,
+            remaining_count=max(0, final_total - completed),
         )
     )

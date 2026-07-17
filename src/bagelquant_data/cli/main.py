@@ -15,6 +15,10 @@ def main(argv: list[str] | None = None) -> int:
     datasets = sub.add_parser("dataset-list")
     datasets.add_argument("--source")
     sub.add_parser("source-list")
+    bootstrap = sub.add_parser("bootstrap-update-state")
+    bootstrap.add_argument("--start", default="1999-12-31")
+    bootstrap.add_argument("--end")
+    bootstrap.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     lake = DataLake.open(args.root)
     if args.command == "status":
@@ -23,6 +27,12 @@ def main(argv: list[str] | None = None) -> int:
         print(lake.admin.datasets.list(args.source))
     elif args.command == "source-list":
         print(lake.admin.sources.list())
+    elif args.command == "bootstrap-update-state":
+        print(
+            lake.update.bootstrap_update_state(
+                start=args.start, end=args.end, apply=args.apply
+            )
+        )
     return 0
 
 

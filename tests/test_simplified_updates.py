@@ -186,9 +186,7 @@ def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset(
-        "stock_basic", source="custom", workers=1, progress=False
-    )
+    lake.update.dataset("stock_basic", source="custom", workers=1, progress=False)
 
     assert source.requests == [
         {"list_status": "L", "exchange": "SSE"},
@@ -257,7 +255,10 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(
         progress=False,
     )
 
-    assert source.requests == [{"date": "2025-01-03", "exchange": "SZSE"}]
+    assert source.requests == [
+        {"date": "2025-01-02", "exchange": "SZSE"},
+        {"date": "2025-01-03", "exchange": "SZSE"},
+    ]
     assert (
         lake.admin.status.partitions("daily", source="custom")[0]["partition_path"]
         == "year=2025/month=01/data.parquet"
@@ -326,7 +327,7 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
     )
 
     assert source.requests == [
-        {"id": "000001.SZ", "start": "2025-01-03", "end": "2025-01-04", "limit": 25},
+        {"id": "000001.SZ", "start": "2025-01-01", "end": "2025-01-04", "limit": 25},
         {"id": "000002.SZ", "start": "2025-01-01", "end": "2025-01-04", "limit": 25},
     ]
     expected = {
@@ -339,7 +340,7 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
     } == expected
 
 
-def test_by_daily_starts_after_latest_date_and_does_not_fill_older_gaps(
+def test_by_daily_ledger_checks_every_untracked_date(
     tmp_path,
 ) -> None:
     lake = DataLake.open(tmp_path)
@@ -371,7 +372,11 @@ def test_by_daily_starts_after_latest_date_and_does_not_fill_older_gaps(
         "daily", source="custom", start="20250101", end="20250104", progress=False
     )
 
-    assert source.requests == []
+    assert source.requests == [
+        {"date": "2025-01-02"},
+        {"date": "2025-01-03"},
+        {"date": "2025-01-04"},
+    ]
 
 
 def test_empty_incremental_dataset_accepts_compact_fallback_dates(tmp_path) -> None:
@@ -443,7 +448,7 @@ def test_batch_update_confirmation_filters_jobs_and_quit_is_safe(
     assert source.requests == []
 
 
-def test_noninteractive_all_excludes_general_refresh(tmp_path) -> None:
+def test_noninteractive_selection_includes_explicit_general_refresh(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
     lake.admin.sources.register(source)
@@ -469,8 +474,8 @@ def test_noninteractive_all_excludes_general_refresh(tmp_path) -> None:
         progress=False,
     )
 
-    assert report.datasets == ("daily",)
-    assert source.requests == [{"date": "2025-01-02"}]
+    assert report.datasets == ("stock_basic", "daily")
+    assert source.requests == [{}, {"date": "2025-01-02"}]
 
 
 def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -> None:
@@ -560,8 +565,10 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
         progress=False,
     )
     assert first.status == "partial"
-    assert first.pending_job_count == 1
-    assert lake.admin.status.pending_update_jobs(dataset="daily", source="custom")
+    assert first.remaining_scope_count == 1
+    assert lake.admin.status.update_scopes(
+        dataset="daily", source="custom", status="failed"
+    )
 
     source.failures.clear()
     source.requests.clear()
@@ -585,7 +592,12 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
         "2025-01-02",
         "2025-01-04",
     ]
-    assert lake.admin.status.pending_update_jobs(dataset="daily", source="custom") == []
+    assert (
+        lake.admin.status.update_scopes(
+            dataset="daily", source="custom", status="failed"
+        )
+        == []
+    )
 
 
 def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
@@ -633,7 +645,7 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
         "2025-01-02",
         "2025-01-04",
     ]
-    assert report.pending_job_count == 1
+    assert report.remaining_scope_count == 1
     assert lake.query.query("daily", source="custom").collect()[
         "time"
     ].max() == __import__("datetime").date(2025, 1, 4)
@@ -666,8 +678,10 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
     first = lake.update.dataset("daily", **options)
     assert first.status == "failed"
     assert lake.admin.status.files("daily", source="custom") == []
-    pending = lake.admin.status.pending_update_jobs(dataset="daily", source="custom")
-    assert pending[0]["request_params"] == {"date": "2025-01-02"}
+    failed = lake.admin.status.update_scopes(
+        dataset="daily", source="custom", status="failed"
+    )
+    assert failed[0]["scope_key"] == "2025-01-02"
 
     source.fail_second_page = False
     source.requests.clear()
@@ -676,4 +690,9 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
     assert second.status == "success"
     assert [request["offset"] for request in source.requests] == [0, 2]
     assert lake.query.query("daily", source="custom").collect().height == 3
-    assert lake.admin.status.pending_update_jobs(dataset="daily", source="custom") == []
+    assert (
+        lake.admin.status.update_scopes(
+            dataset="daily", source="custom", status="failed"
+        )
+        == []
+    )

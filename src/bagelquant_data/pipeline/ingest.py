@@ -30,7 +30,7 @@ class IngestionReport:
     request_count: int = 0
     success_count: int = 0
     failure_count: int = 0
-    pending_job_count: int = 0
+    remaining_scope_count: int = 0
     elapsed_seconds: float = 0.0
     fetch_seconds: float = 0.0
     commit_seconds: float = 0.0

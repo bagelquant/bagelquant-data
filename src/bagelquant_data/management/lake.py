@@ -10,7 +10,7 @@ from typing import Any
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.exceptions import ConfigurationError, StaleUpdatePlanError
+from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.core.registry import FrameworkRegistries, default_registries
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.types import DateLike
@@ -18,13 +18,7 @@ from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
-from bagelquant_data.pipeline.completeness import (
-    AuditMode,
-    UpdatePlan,
-    build_update_plan,
-    planning_state_fingerprint,
-)
-from bagelquant_data.pipeline.planner import plan_update
+from bagelquant_data.pipeline.scopes import LedgerRequest, synchronize_requests
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
     PartitionChange,
@@ -106,12 +100,21 @@ class LakeAdmin:
     ) -> list[dict[str, Any]]:
         return self.status.failures(dataset=dataset, source=source)
 
-    def pending_update_jobs(
+    def update_scopes(
         self,
         dataset: str | None = None,
         source: str | None = None,
+        status: str | Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        return self.status.pending_update_jobs(dataset=dataset, source=source)
+        return self.status.update_scopes(dataset=dataset, source=source, status=status)
+
+    def update_summary(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.status.update_summary(dataset=dataset, source=source)
+
+    def reset_update_scopes(self, scope_ids: Sequence[int]) -> int:
+        return self.status.reset_update_scopes(scope_ids)
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.status.rejected(dataset, source=source)
@@ -123,99 +126,18 @@ class LakeUpdater:
 
     lake: DataLake
 
-    def state_fingerprint(self, *, source: str) -> str:
-        """Return the provider-free identity used to validate update plans."""
-
-        return planning_state_fingerprint(self.lake.metadata, source)
-
-    def plan(
+    def bootstrap_update_state(
         self,
-        datasets: Sequence[str],
         *,
-        source: str,
         start: DateLike = "1999-12-31",
         end: DateLike | None = None,
-        audit: AuditMode = "fast",
-        ids: Sequence[str] | None = None,
-        params: dict[str, object] | None = None,
-        today: DateLike | None = None,
-    ) -> UpdatePlan:
-        """Plan fast or full completeness work without provider calls."""
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Preview or apply the one-time ledger-v1 migration."""
 
-        names = list(dict.fromkeys(str(value) for value in datasets))
-        specs = [
-            self.lake.admin.datasets.get(name, source=source) for name in names
-        ]
-        return build_update_plan(
-            specs=specs,
-            raw=RawQueryService(self.lake.parquet, self.lake.metadata),
-            metadata=self.lake.metadata,
-            source=source,
-            start=start,
-            end=end,
-            audit=audit,
-            ids=ids,
-            params=params,
-            today=today,
-        )
+        from bagelquant_data.pipeline.bootstrap import bootstrap_update_state
 
-    def execute(
-        self,
-        plan: UpdatePlan,
-        *,
-        progress_callback: Callable[[UpdateProgress], None] | None = None,
-        **kwargs: Any,
-    ) -> UpdateReport:
-        """Execute an unchanged, previously previewed update plan."""
-
-        current = planning_state_fingerprint(self.lake.metadata, plan.source)
-        if current != plan.state_fingerprint:
-            raise StaleUpdatePlanError(
-                "lake state changed after preview; create and confirm a new update plan"
-            )
-        if not plan.datasets:
-            return combine_reports(plan.source, [])
-        before = _manifest_map(self.lake.metadata, plan.source)
-        works = []
-        for planned in plan.datasets:
-            spec = self.lake.admin.datasets.get(
-                planned.dataset, source=plan.source
-            )
-            context = _request_context(
-                source=plan.source,
-                dataset=planned.dataset,
-                kwargs={
-                    **kwargs,
-                    "start": plan.start,
-                    "end": plan.end,
-                    "progress_callback": progress_callback,
-                },
-            )
-            works.append(
-                DatasetUpdateWork(spec, context, planned.requests)
-            )
-        adapter = self.lake.admin.sources.get(plan.source)
-        report = update_datasets(
-            source_adapter=adapter,
-            pipeline=self.lake._pipeline,
-            works=tuple(works),
-        )
-        after = _manifest_map(self.lake.metadata, plan.source)
-        report = replace(
-            report,
-            changed_partitions=_partition_changes(before, after),
-        )
-        if plan.audit == "full":
-            for run in report.runs:
-                if run.status == "success" and run.pending_job_count == 0:
-                    self.lake.metadata.record_audit_watermark(
-                        source=plan.source,
-                        dataset=run.dataset,
-                        start=plan.start,
-                        end=plan.end,
-                        state_fingerprint=plan.state_fingerprint,
-                    )
-        return report
+        return bootstrap_update_state(self.lake, start=start, end=end, apply=apply)
 
     def dataset(
         self,
@@ -227,16 +149,14 @@ class LakeUpdater:
         progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> IngestionReport:
-        audit = kwargs.pop("audit", "fast")
-        ids = kwargs.pop("ids", None)
-        params = kwargs.pop("params", None)
-        today = kwargs.pop("today", None)
-        plan = self.plan(
-            [dataset], source=source, start=start, end=end, audit=audit,
-            ids=ids, params=params, today=today,
-        )
-        report = self.execute(
-            plan, progress_callback=progress_callback, **kwargs
+        report = self.datasets(
+            [dataset],
+            source=source,
+            start=start,
+            end=end,
+            confirm=False,
+            progress_callback=progress_callback,
+            **kwargs,
         )
         return report.runs[0]
 
@@ -251,11 +171,14 @@ class LakeUpdater:
         progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> UpdateReport:
+        if not self.lake.metadata.update_state_ready():
+            raise ConfigurationError(
+                "update-state migration is incomplete; run bootstrap_update_state first"
+            )
+        self.lake.metadata.recover_stale_running_scopes()
         raw = RawQueryService(self.lake.parquet, self.lake.metadata)
-        jobs: list[
-            tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]
-        ] = []
-        for dataset in datasets:
+        works: list[DatasetUpdateWork] = []
+        for dataset in dict.fromkeys(datasets):
             spec = self.lake.admin.datasets.get(dataset, source=source)
             context = _request_context(
                 source=source,
@@ -267,41 +190,50 @@ class LakeUpdater:
                     "progress_callback": progress_callback,
                 },
             )
-            planned = plan_update(
+            requests = synchronize_requests(
                 spec=spec,
                 raw=raw,
+                metadata=self.lake.metadata,
                 start=context.start if spec.update_type != "general" else None,
                 end=context.end if spec.update_type != "general" else None,
                 today=context.options.get("today"),
                 ids=context.options.get("ids"),
                 params=context.options.get("params"),
             )
-            jobs.append((spec, context, planned.requests))
+            works.append(DatasetUpdateWork(spec, context, requests))
 
-        _print_job_summary(jobs, self.lake.metadata)
-        selected_type = _confirm_update_jobs() if confirm else "incremental"
+        _print_job_summary(works)
+        selected_type = _confirm_update_jobs() if confirm else "all"
         if selected_type == "quit":
             return combine_reports(source, [])
         selected = [
-            job
-            for job in jobs
+            work
+            for work in works
             if (
-                selected_type == "incremental"
-                and job[0].update_type in {"by_daily", "by_asset"}
+                selected_type == "all"
+                or (
+                    selected_type == "incremental"
+                    and work.spec.update_type in {"by_daily", "by_asset"}
+                )
             )
-            or job[0].update_type == selected_type
+            or work.spec.update_type == selected_type
         ]
         adapter = self.lake.admin.sources.get(source) if selected else None
         if not selected or adapter is None:
             return combine_reports(source, [])
-        return update_datasets(
-            source_adapter=adapter,
-            pipeline=self.lake._pipeline,
-            works=tuple(
-                DatasetUpdateWork(spec, context, requests)
-                for spec, context, requests in selected
-            ),
-        )
+        before = _manifest_map(self.lake.metadata, source)
+        leases = [(work.spec.source, work.spec.name, work.run_id) for work in selected]
+        self.lake.metadata.acquire_update_leases(leases)
+        try:
+            report = update_datasets(
+                source_adapter=adapter,
+                pipeline=self.lake._pipeline,
+                works=tuple(selected),
+            )
+        finally:
+            self.lake.metadata.release_update_leases(work.run_id for work in selected)
+        after = _manifest_map(self.lake.metadata, source)
+        return replace(report, changed_partitions=_partition_changes(before, after))
 
     def source(
         self,
@@ -330,34 +262,41 @@ class LakeUpdater:
 
 
 def _print_job_summary(
-    jobs: list[tuple[DatasetSpec, RequestContext, tuple[dict[str, object], ...]]],
-    metadata: MetadataStore,
+    works: Sequence[DatasetUpdateWork],
 ) -> None:
-    print("Planned update jobs:")
-    for spec, _, requests in jobs:
-        details = _request_range(spec, requests)
-        pending = len(
-            metadata.pending_update_jobs(source=spec.source, dataset=spec.name)
-        )
+    print("Eligible update scopes:")
+    for work in works:
+        details = _request_range(work.spec, work.requests)
         suffix = f", {details}" if details else ""
-        retry = f", {pending} pending retry job(s)" if pending else ""
         print(
-            f"- {spec.name} ({spec.update_type}): "
-            f"{len(requests)} new request(s){retry}{suffix}"
+            f"- {work.spec.name} ({work.spec.update_type}): "
+            f"{len(work.requests)} scope(s){suffix}"
         )
 
 
-def _request_range(spec: DatasetSpec, requests: tuple[dict[str, object], ...]) -> str:
+def _request_range(spec: DatasetSpec, requests: tuple[LedgerRequest, ...]) -> str:
     if not requests:
         return "no work"
     if spec.update_type == "by_daily":
         key = spec.date_param or "date"
-        values = [str(request[key]) for request in requests if key in request]
+        values = [
+            str(request.params[key]) for request in requests if key in request.params
+        ]
         return f"dates {min(values)} to {max(values)}" if values else ""
     if spec.update_type == "by_asset":
-        assets = {str(request["id"]) for request in requests if "id" in request}
-        starts = [str(request["start"]) for request in requests if "start" in request]
-        ends = [str(request["end"]) for request in requests if "end" in request]
+        assets = {
+            str(request.params["id"]) for request in requests if "id" in request.params
+        }
+        starts = [
+            str(request.params["start"])
+            for request in requests
+            if "start" in request.params
+        ]
+        ends = [
+            str(request.params["end"])
+            for request in requests
+            if "end" in request.params
+        ]
         date_range = f", dates {min(starts)} to {max(ends)}" if starts and ends else ""
         return f"{len(assets)} asset(s){date_range}"
     return "full refresh"
@@ -365,7 +304,7 @@ def _request_range(spec: DatasetSpec, requests: tuple[dict[str, object], ...]) -
 
 def _confirm_update_jobs() -> str:
     choices = {
-        "1": "incremental",
+        "1": "all",
         "2": "by_daily",
         "3": "by_asset",
         "4": "general",

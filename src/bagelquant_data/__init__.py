@@ -8,25 +8,20 @@ from bagelquant_data.core import (
     DatasetSpecError,
     DuplicateResolutionError,
     SourceNotFoundError,
-    StaleUpdatePlanError,
     ValidationError,
     stable_bucket,
 )
 from bagelquant_data.management import DataLake, LakeAdmin, LakeUpdater
 from bagelquant_data.pipeline import (
-    CoverageSummary,
-    CoverageYearSummary,
     PartitionChange,
-    UpdatePlan,
     UpdateProgress,
+    UpdateReport,
 )
 from bagelquant_data.query import LakeQuery
 from bagelquant_data.sources.tushare import TushareSource
 
 __all__ = [
     "BagelQuantDataError",
-    "CoverageSummary",
-    "CoverageYearSummary",
     "DataLake",
     "DataSource",
     "DatasetNotFoundError",
@@ -38,10 +33,9 @@ __all__ = [
     "LakeUpdater",
     "PartitionChange",
     "SourceNotFoundError",
-    "StaleUpdatePlanError",
     "TushareSource",
-    "UpdatePlan",
     "UpdateProgress",
+    "UpdateReport",
     "ValidationError",
     "stable_bucket",
 ]

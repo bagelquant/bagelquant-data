@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -34,4 +35,12 @@ def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
     ):
         tmp.unlink(missing_ok=True)
         raise ValidationError("Atomic parquet write failed read-back row count check")
-    os.replace(tmp, path)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (2**attempt))

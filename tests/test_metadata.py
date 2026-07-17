@@ -161,24 +161,60 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
     ]
 
 
-def test_pending_update_jobs_upsert_and_resolve(tmp_path) -> None:
+def test_update_scopes_claim_transition_and_reset(tmp_path) -> None:
     metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
-    values = {
-        "job_key": "job-1",
-        "source": "tushare",
-        "dataset": "daily",
-        "update_type": "by_daily",
-        "request_params": {"date": "2025-01-02"},
-        "asset_id": None,
-        "error_message": "rate limit",
-    }
+    metadata.synchronize_update_scopes(
+        [
+            {
+                "source": "tushare",
+                "dataset": "daily",
+                "scope_kind": "date",
+                "scope_key": "2025-01-02",
+                "variant_hash": "variant",
+                "initial_start": "2025-01-02",
+                "spec_hash": "spec",
+            }
+        ]
+    )
+    row = metadata.update_scopes()[0]
+    assert metadata.claim_update_scopes([row["id"]], run_id="run") == [row["id"]]
+    metadata.transition_update_scopes(
+        [{"scope_id": row["id"], "status": "failed", "last_error": "rate limit"}],
+        run_id="run",
+    )
+    failed = metadata.update_scopes(status="failed")[0]
+    assert failed["attempt_count"] == 1
+    assert failed["last_error"] == "rate limit"
+    assert metadata.reset_update_scopes([row["id"]]) == 1
+    assert metadata.update_scopes()[0]["status"] == "pending"
 
-    metadata.record_failed_update_job(**values)
-    metadata.record_failed_update_job(**values)
 
-    rows = metadata.pending_update_jobs(source="tushare", dataset="daily")
-    assert rows[0]["request_params"] == {"date": "2025-01-02"}
-    assert rows[0]["failure_count"] == 2
+def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata.synchronize_update_scopes(
+        [
+            {
+                "source": "tushare",
+                "dataset": "daily",
+                "scope_kind": "date",
+                "scope_key": "2025-01-02",
+                "variant_hash": "variant",
+                "initial_start": "2025-01-02",
+                "spec_hash": "spec",
+            }
+        ]
+    )
+    scope_id = int(metadata.update_scopes()[0]["id"])
+    metadata.acquire_update_leases([("tushare", "daily", "run-1")])
+    with pytest.raises(RuntimeError, match="already active"):
+        metadata.acquire_update_leases([("tushare", "daily", "run-2")])
+    metadata.claim_update_scopes([scope_id], run_id="run-1")
+    with metadata.connect() as db:
+        db.execute(
+            "update update_leases set lease_expires_at='2000-01-01T00:00:00+00:00'"
+        )
 
-    metadata.resolve_update_job("job-1")
-    assert metadata.pending_update_jobs() == []
+    assert metadata.recover_stale_running_scopes() == 1
+    row = metadata.update_scopes()[0]
+    assert row["status"] == "failed"
+    assert row["last_error"] == "writer lease expired"

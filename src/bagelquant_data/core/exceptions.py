@@ -37,7 +37,3 @@ class DuplicateResolutionError(BagelQuantDataError):
 
 class DestructiveOperationError(BagelQuantDataError):
     """A destructive operation was requested without explicit confirmation."""
-
-
-class StaleUpdatePlanError(BagelQuantDataError):
-    """The lake changed after an update plan was previewed."""
