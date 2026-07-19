@@ -29,6 +29,7 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "source_api_params",
         "source_api_param_sets",
         "date_param",
+        "request_date_field",
         "field_mappings",
         "revision_lookback_days",
         "revision_refresh_days",
@@ -55,6 +56,21 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
     assert spec.source_api_params == {"exchange": "SSE"}
     assert spec.source_api_param_sets == ({"list_status": ["L", "D"]},)
     assert spec.field_mappings == {"trade_date": "time", "ts_code": "asset_id"}
+
+    financial_path = tmp_path / "income.toml"
+    financial_path.write_text(
+        'name = "income"\nupdate_type = "by_asset"\nasset_list = "stock_basic"\n'
+        'request_date_field = "ann_date"\n[field_mappings]\n'
+        'f_ann_date = "time"\nts_code = "asset_id"\n'
+    )
+    financial = lake.admin.datasets.register_toml(financial_path)
+    assert financial.request_date_field == "ann_date"
+    assert (
+        DataLake.open(tmp_path)
+        .admin.datasets.get("income", source="custom")
+        .request_date_field
+        == "ann_date"
+    )
     reopened = DataLake.open(tmp_path)
     assert reopened.admin.datasets.get("daily", source="custom").source_api_params == {
         "exchange": "SSE"
@@ -115,6 +131,11 @@ def test_manager_rejects_date_param_for_non_daily_datasets(tmp_path) -> None:
     with pytest.raises(DatasetSpecError, match="date_param"):
         lake.admin.datasets.register(
             DatasetSpec("stock_basic", "general", date_param="pub_date")
+        )
+
+    with pytest.raises(DatasetSpecError, match="request_date_field"):
+        lake.admin.datasets.register(
+            DatasetSpec("stock_basic", "general", request_date_field="ann_date")
         )
 
 

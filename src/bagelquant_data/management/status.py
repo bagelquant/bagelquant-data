@@ -134,10 +134,14 @@ class StatusManager:
             )
         return summaries
 
-    def reset_update_scopes(self, scope_ids: Iterable[int]) -> int:
+    def reset_update_scopes(
+        self, scope_ids: Iterable[int], *, clear_watermark: bool = False
+    ) -> int:
         """Move selected terminal scopes back to pending."""
 
-        return self.metadata.reset_update_scopes(scope_ids)
+        return self.metadata.reset_update_scopes(
+            scope_ids, clear_watermark=clear_watermark
+        )
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.metadata.rejected(source, dataset)
@@ -191,15 +195,85 @@ class StatusManager:
             "bytes": sum(int(row["file_size_bytes"]) for row in manifests),
         }
 
-    def validate_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
+    def validate_manifest(
+        self, dataset: str, *, source: str, deep: bool = False
+    ) -> dict[str, Any]:
         files = self.files(dataset, source=source)
         missing = [row["partition_path"] for row in files if not row["exists"]]
+        root = self.paths.dataset_root(source, dataset)
+        manifested = {str(row["partition_path"]) for row in files}
+        physical = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*.parquet")
+        } if root.exists() else set()
+        orphaned = sorted(physical - manifested)
+        issues: list[dict[str, Any]] = [
+            {"kind": "missing", "path": path, "detail": "manifest file is missing"}
+            for path in missing
+        ]
+        issues.extend(
+            {"kind": "orphaned", "path": path, "detail": "file is not manifested"}
+            for path in orphaned
+        )
+        bytes_read = 0
+        scanned = 0
+        if deep:
+            for row in files:
+                if not row["exists"]:
+                    continue
+                relative = str(row["partition_path"])
+                path = root / relative
+                try:
+                    frame = pl.read_parquet(path)
+                    scanned += 1
+                    bytes_read += path.stat().st_size
+                    time_values = (
+                        frame.select(
+                            pl.min("time").alias("min_time"),
+                            pl.max("time").alias("max_time"),
+                        ).row(0)
+                        if "time" in frame.columns and frame.height
+                        else (None, None)
+                    )
+                    actual = {
+                        "row_count": frame.height,
+                        "file_size_bytes": path.stat().st_size,
+                        "min_time": None if time_values[0] is None else str(time_values[0]),
+                        "max_time": None if time_values[1] is None else str(time_values[1]),
+                        "content_hash": frame_content_hash(frame),
+                        "schema_hash": _schema_hash(frame),
+                    }
+                    for field, value in actual.items():
+                        if value != row[field]:
+                            issues.append(
+                                {
+                                    "kind": "mismatch",
+                                    "path": relative,
+                                    "field": field,
+                                    "expected": row[field],
+                                    "actual": value,
+                                    "detail": f"{field} does not match manifest",
+                                }
+                            )
+                except Exception as error:  # noqa: BLE001 - isolate corrupt files.
+                    issues.append(
+                        {
+                            "kind": "unreadable",
+                            "path": relative,
+                            "detail": str(error),
+                        }
+                    )
         return {
             "source": source,
             "dataset": dataset,
             "manifest_files": len(files),
             "missing_files": missing,
-            "valid": not missing,
+            "orphaned_files": orphaned,
+            "files_scanned": scanned,
+            "bytes_read": bytes_read,
+            "issues": issues,
+            "deep": deep,
+            "valid": not issues,
         }
 
 

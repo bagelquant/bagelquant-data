@@ -127,6 +127,44 @@ class MetadataStore:
                 "delete from datasets where source = ? and name = ?", (source, dataset)
             )
 
+    def clear_dataset_data(self, source: str, dataset: str) -> dict[str, int]:
+        """Clear current dataset state while preserving its registration and audit."""
+
+        with self.connect() as db:
+            db.execute("begin immediate")
+            lease = db.execute(
+                "select 1 from update_leases where source=? and dataset=?",
+                (source, dataset),
+            ).fetchone()
+            if lease is not None:
+                raise RuntimeError(f"Dataset update is active: {source}/{dataset}")
+            manifest = db.execute(
+                "select count(*), coalesce(sum(row_count), 0) from partition_manifest "
+                "where source=? and dataset=?",
+                (source, dataset),
+            ).fetchone()
+            scopes = db.execute(
+                "select count(*) from update_scopes where source=? and dataset=?",
+                (source, dataset),
+            ).fetchone()
+            db.execute(
+                "delete from partition_manifest where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from update_scopes where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from update_leases where source=? and dataset=?",
+                (source, dataset),
+            )
+        return {
+            "partitions": int(manifest[0]),
+            "rows": int(manifest[1]),
+            "scopes": int(scopes[0]),
+        }
+
     def list_datasets(self, source: str | None = None) -> list[dict[str, Any]]:
         if source is None:
             return self._rows("select * from datasets order by source, name")
@@ -648,14 +686,17 @@ class MetadataStore:
                     ),
                 )
 
-    def reset_update_scopes(self, scope_ids: Iterable[int]) -> int:
+    def reset_update_scopes(
+        self, scope_ids: Iterable[int], *, clear_watermark: bool = False
+    ) -> int:
         ids = list(dict.fromkeys(int(scope_id) for scope_id in scope_ids))
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as db:
+            checked_through = ",checked_through=null" if clear_watermark else ""
             cursor = db.execute(
-                f"update update_scopes set status='pending',checked_through=null,"
+                f"update update_scopes set status='pending'{checked_through},"
                 f"last_error=null,active_run_id=null,recheck_after=null,updated_at=? "
                 f"where id in ({placeholders}) and status in "
                 "('failed','invalid','empty','success')",

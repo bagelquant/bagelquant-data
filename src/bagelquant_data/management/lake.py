@@ -89,8 +89,10 @@ class LakeAdmin:
     def rebuild_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
         return self.status.rebuild_manifest(dataset, source=source)
 
-    def validate_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
-        return self.status.validate_manifest(dataset, source=source)
+    def validate_manifest(
+        self, dataset: str, *, source: str, deep: bool = False
+    ) -> dict[str, Any]:
+        return self.status.validate_manifest(dataset, source=source, deep=deep)
 
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.status.runs(limit)
@@ -113,8 +115,12 @@ class LakeAdmin:
     ) -> list[dict[str, Any]]:
         return self.status.update_summary(dataset=dataset, source=source)
 
-    def reset_update_scopes(self, scope_ids: Sequence[int]) -> int:
-        return self.status.reset_update_scopes(scope_ids)
+    def reset_update_scopes(
+        self, scope_ids: Sequence[int], *, clear_watermark: bool = False
+    ) -> int:
+        return self.status.reset_update_scopes(
+            scope_ids, clear_watermark=clear_watermark
+        )
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.status.rejected(dataset, source=source)

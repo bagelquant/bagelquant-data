@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +75,13 @@ class DatasetManager:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} date_param cannot be empty"
             )
+        if spec.request_date_field is not None and (
+            spec.update_type != "by_asset" or not spec.request_date_field
+        ):
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} request_date_field is only valid "
+                "for by_asset and cannot be empty"
+            )
         if spec.update_type == "by_asset" and not spec.asset_list:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} by_asset requires asset_list"
@@ -123,6 +132,44 @@ class DatasetManager:
         if delete_data:
             shutil.rmtree(self.paths.dataset_root(source, dataset), ignore_errors=True)
 
+    def clear_dataset_data(
+        self, dataset: str, *, source: str, confirm: bool = False
+    ) -> dict[str, int]:
+        """Delete stored data and current state, retaining the dataset declaration."""
+
+        if not confirm:
+            raise DestructiveOperationError("Pass confirm=True to clear dataset data")
+        self.get(dataset, source=source)
+        roots = [
+            (self.paths.lake / source, self.paths.dataset_root(source, dataset)),
+            (self.paths.staging / source, self.paths.staging / source / dataset),
+            (self.paths.rejected / source, self.paths.rejected / source / dataset),
+        ]
+        trash = self.paths.tmp / "deletions" / uuid.uuid4().hex
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for index, (base, path) in enumerate(roots):
+                if not path.resolve().is_relative_to(base.resolve()):
+                    raise DestructiveOperationError(
+                        f"Dataset path escapes lake root: {source}/{dataset}"
+                    )
+                if not path.exists():
+                    continue
+                target = trash / str(index)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, target)
+                staged.append((path, target))
+            result = self.metadata.clear_dataset_data(source, dataset)
+        except Exception:
+            for path, target in reversed(staged):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    os.replace(target, path)
+            raise
+        result["directories"] = len(staged)
+        shutil.rmtree(trash, ignore_errors=True)
+        return result
+
 
 def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> DatasetSpec:
     allowed = {
@@ -131,6 +178,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "source",
         "calendar",
         "date_param",
+        "request_date_field",
         "asset_list",
         "primary_key_extra",
         "source_api_params",
@@ -192,6 +240,9 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         date_param=None
         if value.get("date_param") is None
         else str(value["date_param"]),
+        request_date_field=None
+        if value.get("request_date_field") is None
+        else str(value["request_date_field"]),
         asset_list=None
         if value.get("asset_list") is None
         else str(value["asset_list"]),

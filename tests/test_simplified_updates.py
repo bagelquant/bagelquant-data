@@ -161,11 +161,11 @@ def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(
 
     lake.update.dataset("stock_basic", source="custom", progress=False)
 
-    assert source.requests == [
+    assert sorted(source.requests, key=lambda request: str(request["list_status"])) == sorted([
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "L"},
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "D"},
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "P"},
-    ]
+    ], key=lambda request: str(request["list_status"]))
     assert lake.query.query_general("stock_basic", source="custom").collect()[
         "status"
     ].sort().to_list() == ["D", "L", "P"]
@@ -372,7 +372,7 @@ def test_by_daily_ledger_checks_every_untracked_date(
         "daily", source="custom", start="20250101", end="20250104", progress=False
     )
 
-    assert source.requests == [
+    assert sorted(source.requests, key=lambda request: str(request["date"])) == [
         {"date": "2025-01-02"},
         {"date": "2025-01-03"},
         {"date": "2025-01-04"},

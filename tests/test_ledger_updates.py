@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 import polars as pl
 import pytest
@@ -114,11 +115,189 @@ def test_asset_empty_advances_checked_through_without_data(tmp_path) -> None:
     row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
     assert row["status"] == "empty"
     assert row["checked_through"] == "2025-01-31"
+    assert lake.admin.status.reset_update_scopes([int(row["id"])]) == 1
+    reset = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    assert reset["checked_through"] == "2025-01-31"
+    lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    )
+    reset = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    assert lake.admin.status.reset_update_scopes(
+        [int(reset["id"])], clear_watermark=True
+    ) == 1
+    assert (
+        lake.admin.status.update_scopes(dataset="income", source="custom")[0][
+            "checked_through"
+        ]
+        is None
+    )
     source.requests.clear()
     lake.update.dataset(
         "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
     )
-    assert source.requests == []
+    assert len(source.requests) == 1
+
+
+def test_asset_request_date_field_is_distinct_from_pit_time(tmp_path) -> None:
+    class FinancialSource:
+        name = "custom"
+
+        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            return pl.DataFrame(
+                {
+                    "ann_date": ["20250131"],
+                    "f_ann_date": ["20241231"],
+                    "ts_code": [str(request["id"])],
+                    "value": [1.0],
+                }
+            )
+
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(FinancialSource())
+    lake.ingest(
+        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
+        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            request_date_field="ann_date",
+            field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    report = lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    )
+
+    assert report.status == "success"
+    frame = lake.query.query("income", source="custom").collect()
+    assert frame["time"].item().isoformat() == "2024-12-31"
+    scope = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    assert scope["checked_through"] == "2025-01-31"
+
+
+def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
+    source = LedgerSource()
+    lake = _daily_lake(tmp_path, source)
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+    )
+    before_runs = lake.admin.status.runs(20)
+
+    result = lake.admin.datasets.clear_dataset_data(
+        "daily", source="custom", confirm=True
+    )
+
+    assert result["partitions"] > 0
+    assert result["rows"] == 2
+    assert lake.admin.datasets.get("daily", source="custom").name == "daily"
+    assert lake.admin.status.files("daily", source="custom") == []
+    assert lake.admin.status.update_scopes(dataset="daily", source="custom") == []
+    assert lake.admin.status.runs(20) == before_runs
+    assert not lake.paths.dataset_root("custom", "daily").exists()
+
+
+def test_clear_dataset_data_requires_confirmation_and_rejects_escape(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    lake.admin.datasets.register(DatasetSpec("../escape", "general"))
+
+    with pytest.raises(Exception, match="confirm=True"):
+        lake.admin.datasets.clear_dataset_data("../escape", source="custom")
+    with pytest.raises(Exception, match="escapes lake root"):
+        lake.admin.datasets.clear_dataset_data(
+            "../escape", source="custom", confirm=True
+        )
+
+
+def test_clear_dataset_data_restores_files_on_metadata_failure(
+    tmp_path, monkeypatch
+) -> None:
+    lake = _daily_lake(tmp_path, LedgerSource())
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+    )
+    root = lake.paths.dataset_root("custom", "daily")
+    files = sorted(path.relative_to(root) for path in root.rglob("*.parquet"))
+
+    def fail(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise sqlite3.OperationalError("metadata unavailable")
+
+    monkeypatch.setattr(lake.metadata, "clear_dataset_data", fail)
+    with pytest.raises(sqlite3.OperationalError, match="metadata unavailable"):
+        lake.admin.datasets.clear_dataset_data(
+            "daily", source="custom", confirm=True
+        )
+
+    assert sorted(path.relative_to(root) for path in root.rglob("*.parquet")) == files
+
+
+def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> None:
+    lake = _daily_lake(tmp_path, LedgerSource())
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+    )
+    healthy = lake.admin.status.validate_manifest(
+        "daily", source="custom", deep=True
+    )
+    assert healthy["valid"]
+    assert healthy["files_scanned"] == healthy["manifest_files"]
+
+    root = lake.paths.dataset_root("custom", "daily")
+    orphan = root / "year=1999" / "orphan.parquet"
+    orphan.parent.mkdir(parents=True)
+    pl.DataFrame({"time": ["1999-01-01"], "asset_id": ["X"]}).write_parquet(orphan)
+    with_orphan = lake.admin.status.validate_manifest(
+        "daily", source="custom", deep=True
+    )
+    assert with_orphan["orphaned_files"] == ["year=1999/orphan.parquet"]
+
+    manifested = next(
+        path for path in root.rglob("*.parquet") if path != orphan
+    )
+    pl.DataFrame(
+        {"time": ["2025-01-02"], "asset_id": ["000001.SZ"], "close": [99.0]}
+    ).write_parquet(manifested)
+    mismatched = lake.admin.status.validate_manifest(
+        "daily", source="custom", deep=True
+    )
+    assert any(issue["kind"] == "mismatch" for issue in mismatched["issues"])
+
+
+def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -> None:
+    lake = _daily_lake(tmp_path, LedgerSource())
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+    )
+
+    def fail(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("fast health must not read parquet")
+
+    monkeypatch.setattr(pl, "read_parquet", fail)
+    result = lake.admin.status.validate_manifest(
+        "daily", source="custom", deep=False
+    )
+
+    assert result["valid"]
+    assert result["files_scanned"] == 0
+
+
+def test_deep_manifest_validation_isolates_unreadable_file(tmp_path) -> None:
+    lake = _daily_lake(tmp_path, LedgerSource())
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+    )
+    path = next(lake.paths.dataset_root("custom", "daily").rglob("*.parquet"))
+    path.write_bytes(b"not parquet")
+
+    result = lake.admin.status.validate_manifest(
+        "daily", source="custom", deep=True
+    )
+
+    assert not result["valid"]
+    assert any(issue["kind"] == "unreadable" for issue in result["issues"])
 
 
 def test_commit_failure_cannot_publish_buffered_daily_success(

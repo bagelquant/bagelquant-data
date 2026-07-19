@@ -572,9 +572,17 @@ def _validate_response(
         expected_asset = str(request.params["id"])
         if any(str(value) != expected_asset for value in frame[asset_column]):
             return f"response contains assets other than {expected_asset}"
+        request_date_column = spec.request_date_field or time_column
+        if request_date_column not in frame.columns:
+            return f"response missing request date column: {request_date_column}"
+        request_dates = frame.select(
+            _date_expr(request_date_column).alias("value")
+        ).get_column("value")
+        if request_dates.null_count():
+            return "response contains invalid request dates"
         lower = _date_value(request.params["start"])
         upper = _date_value(request.params["end"])
-        if any(value < lower or value > upper for value in dates):
+        if any(value < lower or value > upper for value in request_dates):
             return "response contains dates outside requested range"
     payload = [field for field in frame.columns if field not in required]
     if payload and all(frame[field].null_count() == frame.height for field in payload):
