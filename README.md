@@ -29,11 +29,12 @@ print(lake.query.query("daily", source="custom", fields=["time", "asset_id", "cl
 explicitly map provider fields to those names; add `primary_key_extra` when
 another field, such as `period`, is also unique.
 
-Incremental completeness is owned by the lake's `update_scopes` ledger.
-`by_daily` records one scope per open date and request variant. `by_asset`
-records one scope per asset and request variant, with a `checked_through`
-watermark independent from the latest returned record. Provider work is marked
-successful only after its canonical Parquet commit succeeds.
+Incremental local coverage is owned by the lake's `update_scopes` ledger.
+`by_daily` records one scope per open date and request variant, and `by_asset`
+records one scope per asset and request variant. A scope becomes successful
+only after its canonical Parquet commit succeeds. Provider-only range checks
+are stored separately in `provider_scope_checks` and never advance local data
+coverage.
 
 ```bash
 uv run pytest

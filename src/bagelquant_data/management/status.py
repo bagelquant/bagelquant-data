@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -84,12 +84,23 @@ class StatusManager:
             source=source, dataset=dataset, status=status
         )
 
+    def provider_scope_checks(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return provider-check scheduling records separately from local coverage."""
+
+        return self.metadata.provider_scope_checks(source=source, dataset=dataset)
+
     def update_summary(
         self, dataset: str | None = None, source: str | None = None
     ) -> list[dict[str, Any]]:
         """Summarize ledger counts and watermarks per dataset."""
 
         rows = self.update_scopes(dataset=dataset, source=source)
+        provider_checks = {
+            int(row["scope_id"]): row
+            for row in self.provider_scope_checks(dataset=dataset, source=source)
+        }
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault((str(row["source"]), str(row["dataset"])), []).append(
@@ -103,17 +114,27 @@ class StatusManager:
                 for scope in scopes
                 if scope["status"] in {"pending", "failed"}
             ]
-            checked = [
-                str(scope["checked_through"])
+            local_maxima = [
+                str(scope["data_max_time"])
                 for scope in scopes
-                if scope["checked_through"] is not None
+                if scope["data_max_time"] is not None
+            ]
+            checked = [
+                str(provider_checks[int(scope["id"])]["checked_through"])
+                for scope in scopes
+                if int(scope["id"]) in provider_checks
             ]
             successes = [
                 str(scope["last_success_at"])
                 for scope in scopes
                 if scope["last_success_at"] is not None
             ]
-            revision_due = sum(_revision_due(scope) for scope in scopes)
+            revision_due = sum(
+                _revision_due(
+                    scope, provider_checks.get(int(scope["id"]))
+                )
+                for scope in scopes
+            )
             summaries.append(
                 {
                     "source": row_source,
@@ -126,8 +147,10 @@ class StatusManager:
                     "failed": counts["failed"],
                     "invalid": counts["invalid"],
                     "earliest_pending_scope": min(pending_keys, default=None),
-                    "checked_through_min": min(checked, default=None),
-                    "checked_through_max": max(checked, default=None),
+                    "local_data_max_min": min(local_maxima, default=None),
+                    "local_data_max_max": max(local_maxima, default=None),
+                    "provider_checked_through_min": min(checked, default=None),
+                    "provider_checked_through_max": max(checked, default=None),
                     "last_success_at": max(successes, default=None),
                     "revision_due_assets": revision_due,
                 }
@@ -141,6 +164,21 @@ class StatusManager:
 
         return self.metadata.reset_update_scopes(
             scope_ids, clear_watermark=clear_watermark
+        )
+
+    def reset_dataset_update_coverage(
+        self,
+        datasets: Iterable[str],
+        *,
+        source: str,
+        clear_provider_checks: bool = True,
+    ) -> int:
+        """Reset selected dataset coverage without deleting canonical data."""
+
+        return self.metadata.reset_dataset_update_coverage(
+            datasets,
+            source=source,
+            clear_provider_checks=clear_provider_checks,
         )
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
@@ -298,13 +336,11 @@ def _schema_hash(frame: pl.DataFrame) -> str:
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 
-def _revision_due(scope: dict[str, Any]) -> bool:
+def _revision_due(
+    scope: dict[str, Any], provider_check: dict[str, Any] | None
+) -> bool:
     if scope["scope_kind"] != "asset" or scope["status"] == "running":
         return False
-    value = scope["last_revision_check_at"]
-    if value is None:
+    if provider_check is None or provider_check["recheck_after"] is None:
         return True
-    checked = datetime.fromisoformat(str(value))
-    if checked.tzinfo is None:
-        checked = checked.replace(tzinfo=UTC)
-    return checked <= datetime.now(UTC) - timedelta(days=30)
+    return date.fromisoformat(str(provider_check["recheck_after"])) <= date.today()

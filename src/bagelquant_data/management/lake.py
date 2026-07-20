@@ -115,11 +115,29 @@ class LakeAdmin:
     ) -> list[dict[str, Any]]:
         return self.status.update_summary(dataset=dataset, source=source)
 
+    def provider_scope_checks(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.status.provider_scope_checks(dataset=dataset, source=source)
+
     def reset_update_scopes(
         self, scope_ids: Sequence[int], *, clear_watermark: bool = False
     ) -> int:
         return self.status.reset_update_scopes(
             scope_ids, clear_watermark=clear_watermark
+        )
+
+    def reset_dataset_update_coverage(
+        self,
+        datasets: Sequence[str],
+        *,
+        source: str,
+        clear_provider_checks: bool = True,
+    ) -> int:
+        return self.status.reset_dataset_update_coverage(
+            datasets,
+            source=source,
+            clear_provider_checks=clear_provider_checks,
         )
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:

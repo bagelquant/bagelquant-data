@@ -152,6 +152,11 @@ class MetadataStore:
                 (source, dataset),
             )
             db.execute(
+                "delete from provider_scope_checks where scope_id in "
+                "(select id from update_scopes where source=? and dataset=?)",
+                (source, dataset),
+            )
+            db.execute(
                 "delete from update_scopes where source=? and dataset=?",
                 (source, dataset),
             )
@@ -319,6 +324,7 @@ class MetadataStore:
         status: str,
         request_count: int = 0,
         success_count: int = 0,
+        empty_count: int = 0,
         failure_count: int = 0,
         rows_downloaded: int = 0,
         rows_committed: int = 0,
@@ -330,10 +336,10 @@ class MetadataStore:
                 """
                 insert into ingestion_runs(
                     run_id, source, dataset, mode, started_at, finished_at, status,
-                    request_count, success_count, failure_count, rows_downloaded,
+                    request_count, success_count, empty_count, failure_count, rows_downloaded,
                     rows_committed, error_message
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -345,6 +351,7 @@ class MetadataStore:
                     status,
                     request_count,
                     success_count,
+                    empty_count,
                     failure_count,
                     rows_downloaded,
                     rows_committed,
@@ -373,6 +380,7 @@ class MetadataStore:
         status: str,
         request_count: int,
         success_count: int,
+        empty_count: int,
         failure_count: int,
         rows_downloaded: int,
         rows_committed: int,
@@ -385,7 +393,7 @@ class MetadataStore:
                 """
                 update ingestion_runs set
                     finished_at=?, status=?, request_count=?, success_count=?,
-                    failure_count=?, rows_downloaded=?, rows_committed=?,
+                    empty_count=?, failure_count=?, rows_downloaded=?, rows_committed=?,
                     error_message=?
                 where run_id=?
                 """,
@@ -394,6 +402,7 @@ class MetadataStore:
                     status,
                     int(request_count),
                     int(success_count),
+                    int(empty_count),
                     int(failure_count),
                     int(rows_downloaded),
                     int(rows_committed),
@@ -512,6 +521,21 @@ class MetadataStore:
             return
         now = _now()
         with self.connect() as db:
+            for row in rows:
+                db.execute(
+                    "delete from provider_scope_checks where scope_id in ("
+                    "select id from update_scopes where source=? and dataset=? "
+                    "and scope_kind=? and scope_key=? and variant_hash=? "
+                    "and spec_hash != ?)",
+                    (
+                        row["source"],
+                        row["dataset"],
+                        row["scope_kind"],
+                        row["scope_key"],
+                        row["variant_hash"],
+                        row["spec_hash"],
+                    ),
+                )
             db.executemany(
                 """
                 insert into update_scopes(
@@ -601,6 +625,12 @@ class MetadataStore:
         """Remove identities that can no longer be reconstructed from the spec."""
 
         with self.connect() as db:
+            db.execute(
+                "delete from provider_scope_checks where scope_id in ("
+                "select id from update_scopes where source=? and dataset=? "
+                "and spec_hash != ? and status != 'running')",
+                (source, dataset, spec_hash),
+            )
             cursor = db.execute(
                 "delete from update_scopes where source=? and dataset=? "
                 "and spec_hash != ? and status != 'running'",
@@ -648,35 +678,35 @@ class MetadataStore:
         with self.connect() as db:
             for row in rows:
                 status = str(row["status"])
-                if status not in {"success", "empty", "failed", "invalid"}:
+                if status not in {"success", "failed", "invalid"}:
                     raise ValueError(f"Unsupported scope transition: {status}")
                 db.execute(
                     """
                     update update_scopes set
                         status=?, checked_through=case
-                            when ? is null then checked_through
-                            when checked_through is null or checked_through < ? then ?
+                            when ?='success' then coalesce(?,data_max_time,checked_through)
                             else checked_through
                         end,
-                        data_max_time=coalesce(?,data_max_time), row_count=?,
-                        last_success_at=case when ? in ('success','empty') then ? else last_success_at end,
-                        last_revision_check_at=coalesce(?,last_revision_check_at),
-                        recheck_after=?, last_error=?, active_run_id=null,
+                        data_max_time=case when ?='success' then coalesce(?,data_max_time)
+                            else data_max_time end,
+                        row_count=case when ?='success' then ? else row_count end,
+                        last_success_at=case when ?='success' then ? else last_success_at end,
+                        last_revision_check_at=null,
+                        recheck_after=null, last_error=?, active_run_id=null,
                         commit_run_id=case when ?='success' then ? else commit_run_id end,
                         updated_at=?
                     where id=? and active_run_id=?
                     """,
                     (
                         status,
-                        row.get("checked_through"),
-                        row.get("checked_through"),
-                        row.get("checked_through"),
+                        status,
                         row.get("data_max_time"),
+                        status,
+                        row.get("data_max_time"),
+                        status,
                         int(row.get("row_count", 0)),
                         status,
                         now,
-                        row.get("last_revision_check_at"),
-                        row.get("recheck_after"),
                         row.get("last_error"),
                         status,
                         run_id,
@@ -685,6 +715,139 @@ class MetadataStore:
                         run_id,
                     ),
                 )
+                if status == "success" and row.get("provider_checked_through"):
+                    self._upsert_provider_scope_check(
+                        db,
+                        scope_id=int(row["scope_id"]),
+                        checked_through=str(row["provider_checked_through"]),
+                        recheck_after=row.get("provider_recheck_after"),
+                        result="nonempty",
+                        checked_at=now,
+                    )
+
+    def record_empty_provider_check(
+        self,
+        *,
+        scope_id: int,
+        run_id: str,
+        checked_through: str,
+        recheck_after: str | None,
+    ) -> None:
+        """Release one claimed scope without changing commit-backed coverage."""
+
+        now = _now()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            self._upsert_provider_scope_check(
+                db,
+                scope_id=scope_id,
+                checked_through=checked_through,
+                recheck_after=recheck_after,
+                result="empty",
+                checked_at=now,
+            )
+            db.execute(
+                """
+                update update_scopes set
+                    status=case when data_max_time is null then 'pending' else 'success' end,
+                    last_error=null,active_run_id=null,updated_at=?
+                where id=? and active_run_id=?
+                """,
+                (now, scope_id, run_id),
+            )
+
+    @staticmethod
+    def _upsert_provider_scope_check(
+        db: sqlite3.Connection,
+        *,
+        scope_id: int,
+        checked_through: str,
+        recheck_after: object,
+        result: str,
+        checked_at: str,
+    ) -> None:
+        db.execute(
+            """
+            insert into provider_scope_checks(
+                scope_id,checked_through,last_checked_at,recheck_after,last_result
+            ) values (?, ?, ?, ?, ?)
+            on conflict(scope_id) do update set
+                checked_through=case
+                    when provider_scope_checks.checked_through < excluded.checked_through
+                    then excluded.checked_through
+                    else provider_scope_checks.checked_through
+                end,
+                last_checked_at=excluded.last_checked_at,
+                recheck_after=excluded.recheck_after,
+                last_result=excluded.last_result
+            """,
+            (scope_id, checked_through, checked_at, recheck_after, result),
+        )
+
+    def provider_scope_checks(
+        self, *, source: str | None = None, dataset: str | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("s.source=?")
+            params.append(source)
+        if dataset is not None:
+            clauses.append("s.dataset=?")
+            params.append(dataset)
+        where = f" where {' and '.join(clauses)}" if clauses else ""
+        return self._rows(
+            "select c.*,s.source,s.dataset,s.scope_kind,s.scope_key,s.variant_hash "
+            "from provider_scope_checks c join update_scopes s on s.id=c.scope_id"
+            f"{where} order by s.source,s.dataset,s.scope_key,s.variant_hash",
+            params,
+        )
+
+    def reset_dataset_update_coverage(
+        self,
+        datasets: Iterable[str],
+        *,
+        source: str,
+        clear_provider_checks: bool = True,
+    ) -> int:
+        """Reset dataset coverage while retaining canonical files and audit history."""
+
+        names = list(dict.fromkeys(str(dataset) for dataset in datasets))
+        if not names:
+            return 0
+        placeholders = ",".join("?" for _ in names)
+        now = _now()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            active = db.execute(
+                f"select source,dataset from update_leases where source=? "
+                f"and dataset in ({placeholders}) limit 1",
+                (source, *names),
+            ).fetchone()
+            running = db.execute(
+                f"select source,dataset from update_scopes where source=? "
+                f"and dataset in ({placeholders}) and status='running' limit 1",
+                (source, *names),
+            ).fetchone()
+            conflict = active or running
+            if conflict is not None:
+                raise RuntimeError(
+                    f"Dataset update is active: {conflict['source']}/{conflict['dataset']}"
+                )
+            if clear_provider_checks:
+                db.execute(
+                    "delete from provider_scope_checks where scope_id in ("
+                    f"select id from update_scopes where source=? and dataset in ({placeholders}))",
+                    (source, *names),
+                )
+            cursor = db.execute(
+                f"update update_scopes set status='pending',checked_through=null,"
+                "last_revision_check_at=null,recheck_after=null,last_error=null,"
+                "active_run_id=null,updated_at=? where source=? "
+                f"and dataset in ({placeholders})",
+                (now, source, *names),
+            )
+            return int(cursor.rowcount)
 
     def reset_update_scopes(
         self, scope_ids: Iterable[int], *, clear_watermark: bool = False
@@ -695,6 +858,12 @@ class MetadataStore:
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as db:
             checked_through = ",checked_through=null" if clear_watermark else ""
+            if clear_watermark:
+                db.execute(
+                    "delete from provider_scope_checks where scope_id in "
+                    f"({placeholders})",
+                    ids,
+                )
             cursor = db.execute(
                 f"update update_scopes set status='pending'{checked_through},"
                 f"last_error=null,active_run_id=null,recheck_after=null,updated_at=? "
@@ -924,6 +1093,7 @@ class MetadataStore:
                     status text not null,
                     request_count integer not null default 0,
                     success_count integer not null default 0,
+                    empty_count integer not null default 0,
                     failure_count integer not null default 0,
                     rows_downloaded integer not null default 0,
                     rows_committed integer not null default 0,
@@ -974,6 +1144,13 @@ class MetadataStore:
                 );
                 create index if not exists idx_update_scopes_eligibility
                     on update_scopes(source,dataset,status,scope_key);
+                create table if not exists provider_scope_checks (
+                    scope_id integer primary key,
+                    checked_through text not null,
+                    last_checked_at text not null,
+                    recheck_after text,
+                    last_result text not null check(last_result in ('empty','nonempty'))
+                );
                 create table if not exists update_leases (
                     source text not null,
                     dataset text not null,
@@ -1015,6 +1192,46 @@ class MetadataStore:
             _ensure_column(db, "sources", "enabled", "integer not null default 1")
             _ensure_column(db, "api_calls", "scope_id", "integer")
             _ensure_column(db, "api_calls", "request_kind", "text")
+            _ensure_column(db, "ingestion_runs", "empty_count", "integer not null default 0")
+            provider_state = db.execute(
+                "select value from metadata_state where key='provider_check_version'"
+            ).fetchone()
+            if provider_state is None or provider_state["value"] != "1":
+                now = _now()
+                db.execute(
+                    """
+                    insert into provider_scope_checks(
+                        scope_id,checked_through,last_checked_at,recheck_after,last_result
+                    )
+                    select id,checked_through,
+                        coalesce(last_attempt_at,last_success_at,updated_at),
+                        recheck_after,
+                        case when status='empty' then 'empty' else 'nonempty' end
+                    from update_scopes where checked_through is not null
+                    on conflict(scope_id) do nothing
+                    """
+                )
+                db.execute(
+                    """
+                    update update_scopes set
+                        status=case
+                            when status='empty' and data_max_time is null then 'pending'
+                            when status='empty' then 'success'
+                            else status
+                        end,
+                        checked_through=data_max_time,
+                        last_revision_check_at=null,
+                        recheck_after=null,
+                        updated_at=?
+                    """,
+                    (now,),
+                )
+                db.execute(
+                    "insert into metadata_state(key,value,updated_at) values "
+                    "('provider_check_version','1',?) on conflict(key) do update set "
+                    "value=excluded.value,updated_at=excluded.updated_at",
+                    (now,),
+                )
             if not had_legacy_update_state:
                 db.execute(
                     """

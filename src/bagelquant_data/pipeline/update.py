@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Any, TypeAlias, cast
 from uuid import uuid4
 
@@ -63,6 +63,7 @@ class UpdateProgress:
     failure_count: int
     rows_downloaded: int
     status: str
+    rows_committed: int = 0
     empty_count: int = 0
     invalid_count: int = 0
     remaining_count: int = 0
@@ -93,6 +94,11 @@ class FetchPage:
     retry_count: int
     error_message: str | None = None
     asset_id: str | None = None
+    fatal: bool = False
+
+
+class _UnexpectedHistoricalEmptyError(RuntimeError):
+    """A dense historical provider request returned no rows."""
 
 
 @dataclass(slots=True)
@@ -276,6 +282,10 @@ def _run_fetches(
             retry_backoff_seconds=float(
                 work.context.options.get("retry_backoff_seconds", 60.0)
             ),
+            require_nonempty=(
+                work.spec.historical_empty_is_error
+                and request.recheck_after is None
+            ),
         )
         futures[future] = (time.perf_counter(), task)
         states[work.spec.name].peak_in_flight = max(
@@ -316,6 +326,9 @@ def _run_fetches(
             )
             state.metadata_seconds += time.perf_counter() - started
             _harvest_request(pipeline, state, request, pages)
+            fatal = next((page.error_message for page in pages if page.fatal), None)
+            if fatal is not None:
+                raise _UnexpectedHistoricalEmptyError(fatal)
             completed[work.spec.name] += 1
             _emit_progress(
                 callbacks[work.spec.name],
@@ -370,15 +383,6 @@ def _harvest_request(
         _transition(pipeline, state, request, "invalid", error)
         return
     if frame.is_empty():
-        if request.overlaps_existing:
-            _transition(
-                pipeline,
-                state,
-                request,
-                "invalid",
-                "empty response contradicts existing canonical coverage",
-            )
-            return
         _transition(pipeline, state, request, "empty", None)
         return
     state.buffered.append((frame, request))
@@ -447,23 +451,26 @@ def _transition(
     error: str | None,
 ) -> None:
     if request.scope_id is not None:
-        pipeline.metadata.transition_update_scopes(
-            [
-                {
-                    "scope_id": request.scope_id,
-                    "status": status,
-                    "checked_through": request.target_end
-                    if status in {"success", "empty"}
-                    else None,
-                    "last_revision_check_at": datetime.now(UTC).isoformat()
-                    if request.revision_check and status in {"success", "empty"}
-                    else None,
-                    "recheck_after": request.recheck_after,
-                    "last_error": error,
-                }
-            ],
-            run_id=state.work.run_id,
-        )
+        if status == "empty":
+            if request.target_end is None:
+                raise RuntimeError("incremental empty response has no provider watermark")
+            pipeline.metadata.record_empty_provider_check(
+                scope_id=request.scope_id,
+                run_id=state.work.run_id,
+                checked_through=request.target_end,
+                recheck_after=request.recheck_after,
+            )
+        else:
+            pipeline.metadata.transition_update_scopes(
+                [
+                    {
+                        "scope_id": request.scope_id,
+                        "status": status,
+                        "last_error": error,
+                    }
+                ],
+                run_id=state.work.run_id,
+            )
     if status == "empty":
         state.empty_count += 1
     elif status == "invalid":
@@ -481,16 +488,17 @@ def _success_transition(
     *,
     data_max_time: str | None,
 ) -> dict[str, object]:
+    if data_max_time is None:
+        raise RuntimeError(
+            f"canonical data maximum missing after commit for {spec.source}/{spec.name}"
+        )
     return {
         "scope_id": request.scope_id,
         "status": "success",
-        "checked_through": request.target_end,
         "data_max_time": data_max_time,
         "row_count": frame.height,
-        "last_revision_check_at": datetime.now(UTC).isoformat()
-        if request.revision_check
-        else None,
-        "recheck_after": request.recheck_after,
+        "provider_checked_through": request.target_end,
+        "provider_recheck_after": request.recheck_after,
         "last_error": None,
     }
 
@@ -612,14 +620,40 @@ def _fail_running(pipeline: IngestionPipeline, state: _RunState, message: str) -
     )
 
 
-def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
-    remaining = len(
-        pipeline.metadata.update_scopes(
+def _remaining_scope_count(
+    pipeline: IngestionPipeline, state: _RunState
+) -> int:
+    rows = pipeline.metadata.update_scopes(
+        source=state.work.spec.source,
+        dataset=state.work.spec.name,
+        status=("pending", "failed", "invalid"),
+    )
+    checks = {
+        int(row["scope_id"]): row
+        for row in pipeline.metadata.provider_scope_checks(
             source=state.work.spec.source,
             dataset=state.work.spec.name,
-            status=("pending", "failed", "invalid"),
         )
-    )
+    }
+    today = date.today()
+    remaining = 0
+    for row in rows:
+        if row["status"] in {"failed", "invalid"}:
+            remaining += 1
+            continue
+        check = checks.get(int(row["id"]))
+        if check is None:
+            remaining += 1
+            continue
+        if check["recheck_after"] is not None and (
+            date.fromisoformat(str(check["recheck_after"])) <= today
+        ):
+            remaining += 1
+    return remaining
+
+
+def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
+    remaining = _remaining_scope_count(pipeline, state)
     error = state.fatal_error or ("; ".join(state.errors[:5]) if state.errors else None)
     attempted = (
         state.success_count
@@ -639,7 +673,8 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         run_id=state.work.run_id,
         status=status,
         request_count=state.request_count,
-        success_count=state.success_count + state.empty_count,
+        success_count=state.success_count,
+        empty_count=state.empty_count,
         failure_count=state.failure_count + state.invalid_count,
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
@@ -653,7 +688,8 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
         request_count=state.request_count,
-        success_count=state.success_count + state.empty_count,
+        success_count=state.success_count,
+        empty_count=state.empty_count,
         failure_count=state.failure_count + state.invalid_count,
         remaining_scope_count=remaining,
         elapsed_seconds=time.perf_counter() - state.started_at,
@@ -718,6 +754,7 @@ def _fetch_request_pages(
     request_options: dict[str, Any],
     max_retries: int,
     retry_backoff_seconds: float,
+    require_nonempty: bool,
 ) -> list[FetchPage]:
     if request_options.get("pagination") != "offset":
         return [
@@ -728,6 +765,7 @@ def _fetch_request_pages(
                 str(request_index),
                 max_retries,
                 retry_backoff_seconds,
+                require_nonempty,
             )
         ]
     page_size = int(request_options.get("page_size", 5000))
@@ -745,6 +783,7 @@ def _fetch_request_pages(
             f"{request_index}:{page_index}",
             max_retries,
             retry_backoff_seconds,
+            require_nonempty and page_index == 0,
         )
         pages.append(page)
         if page.status != "success" or page.row_count < page_size:
@@ -772,6 +811,7 @@ def _fetch_one(
     request_key: str,
     max_retries: int,
     retry_backoff_seconds: float,
+    require_nonempty: bool = False,
 ) -> FetchPage:
     last_error: Exception | None = None
     for attempt in range(max_retries):
@@ -779,6 +819,10 @@ def _fetch_one(
             frame = source_adapter.fetch(spec.name, request)  # type: ignore[attr-defined]
             if not isinstance(frame, pl.DataFrame):
                 raise TypeError("source adapter must return a Polars DataFrame")
+            if require_nonempty and frame.is_empty():
+                raise _UnexpectedHistoricalEmptyError(
+                    f"unexpected empty response for dense historical dataset {spec.name}"
+                )
             return FetchPage(
                 request_key,
                 request,
@@ -801,6 +845,7 @@ def _fetch_one(
         max_retries - 1,
         str(last_error) if last_error else "unknown provider error",
         _request_asset(request),
+        isinstance(last_error, _UnexpectedHistoricalEmptyError),
     )
 
 
@@ -922,6 +967,7 @@ def _emit_progress(
             failure_count=state.failure_count,
             rows_downloaded=state.rows_downloaded,
             status=status,
+            rows_committed=state.rows_committed,
             empty_count=state.empty_count,
             invalid_count=state.invalid_count,
             remaining_count=max(0, final_total - completed),

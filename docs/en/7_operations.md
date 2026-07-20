@@ -9,7 +9,8 @@ print(lake.admin.runs())
 print(lake.admin.status.update_summary(source="tushare"))
 ```
 
-The update ledger is current state; `api_calls` and ingestion runs are the
+The update ledger is commit-backed local state. `provider_scope_checks` is the
+separate scheduling watermark, while `api_calls` and ingestion runs are the
 attempt history. Failed scopes retain their error and attempt count. Invalid
 scopes identify provider responses whose keys, date range, asset identity, or
 payload did not satisfy the dataset contract.
@@ -17,6 +18,11 @@ payload did not satisfy the dataset contract.
 Use `reset_update_scopes` to retry selected terminal state deliberately. A
 dataset declaration or parameter-variant change automatically invalidates its
 old scope identities and creates pending work.
+
+Use `reset_dataset_update_coverage` for a full dataset recovery. It refuses to
+run while matching writer leases or running scopes exist, preserves canonical
+files and audit history, and can clear provider checks so the next explicit
+update rebuilds coverage from the requested start.
 
 Update reports include elapsed, fetch, commit, and metadata timings, commit and
 partition counts, and peak in-flight calls. Fetch time is cumulative across
