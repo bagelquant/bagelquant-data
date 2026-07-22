@@ -135,6 +135,14 @@ class StatusManager:
                 )
                 for scope in scopes
             )
+            future_rechecks = [
+                str(check["recheck_after"])
+                for scope in scopes
+                if scope["status"] in {"success", "empty"}
+                and (check := provider_checks.get(int(scope["id"]))) is not None
+                and check["recheck_after"] is not None
+                and date.fromisoformat(str(check["recheck_after"])) > date.today()
+            ]
             summaries.append(
                 {
                     "source": row_source,
@@ -146,6 +154,10 @@ class StatusManager:
                     "empty": counts["empty"],
                     "failed": counts["failed"],
                     "invalid": counts["invalid"],
+                    "actionable_pending_failed": counts["pending"]
+                    + counts["failed"],
+                    "deferred_recheck": len(future_rechecks),
+                    "next_provider_recheck": min(future_rechecks, default=None),
                     "earliest_pending_scope": min(pending_keys, default=None),
                     "local_data_max_min": min(local_maxima, default=None),
                     "local_data_max_max": max(local_maxima, default=None),
@@ -164,21 +176,6 @@ class StatusManager:
 
         return self.metadata.reset_update_scopes(
             scope_ids, clear_watermark=clear_watermark
-        )
-
-    def reset_dataset_update_coverage(
-        self,
-        datasets: Iterable[str],
-        *,
-        source: str,
-        clear_provider_checks: bool = True,
-    ) -> int:
-        """Reset selected dataset coverage without deleting canonical data."""
-
-        return self.metadata.reset_dataset_update_coverage(
-            datasets,
-            source=source,
-            clear_provider_checks=clear_provider_checks,
         )
 
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:

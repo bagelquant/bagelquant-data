@@ -142,8 +142,9 @@ def _daily_requests(
             and check["recheck_after"] is not None
             and _date_value(check["recheck_after"]) <= execution_day
         )
-        eligible = row["status"] == "failed" or check_due or (
-            row["status"] == "pending" and check is None
+        status = str(row["status"])
+        eligible = status in {"pending", "failed"} or (
+            status in {"success", "empty"} and check_due
         )
         if not eligible:
             continue
@@ -240,12 +241,19 @@ def _asset_requests(
         last_revision = _optional_datetime(
             None if check is None else check["last_checked_at"]
         )
-        revision_due = (
+        recheck_due = bool(
+            check is not None
+            and check["recheck_after"] is not None
+            and _date_value(check["recheck_after"]) <= execution_day
+        )
+        revision_due = recheck_due or (
             last_revision is None
             or (datetime.now(UTC) - last_revision).days >= spec.revision_refresh_days
         )
         forward_due = checked is None or checked < target_end
-        if row["status"] != "failed" and not forward_due and not revision_due:
+        status = str(row["status"])
+        eligible = status in {"pending", "failed"} or forward_due or revision_due
+        if not eligible:
             continue
         request_start = forward_start
         if revision_due:

@@ -17,13 +17,13 @@ def test_metadata_store_initializes_wal_mode(tmp_path) -> None:
     assert journal_mode == "wal"
 
 
-def test_metadata_store_rejects_pre_simplification_schema(tmp_path) -> None:
+def test_metadata_store_rejects_incompatible_unversioned_schema(tmp_path) -> None:
     path = tmp_path / "metadata" / "lake.db"
     path.parent.mkdir()
     with sqlite3.connect(path) as db:
         db.execute("create table datasets (category text not null)")
 
-    with pytest.raises(ConfigurationError, match="pre-simplification"):
+    with pytest.raises(ConfigurationError, match="Incompatible data-lake metadata schema"):
         MetadataStore(path)
 
 
@@ -70,7 +70,8 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
 
     rows = metadata._rows(
         """
-        select request_key, asset_id, request_params, status, row_count, retry_count, error_message
+        select request_key, asset_id, request_params, status, result_kind,
+            row_count, retry_count, error_message
         from api_calls
         order by request_key
         """
@@ -82,6 +83,7 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
             "asset_id": "000001.SZ",
             "request_params": '{"ts_code": "000001.SZ"}',
             "status": "success",
+            "result_kind": "nonempty",
             "row_count": 3,
             "retry_count": 0,
             "error_message": None,
@@ -91,6 +93,7 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
             "asset_id": "000002.SZ",
             "request_params": '{"ts_code": "000002.SZ"}',
             "status": "failed",
+            "result_kind": "transport_failure",
             "row_count": 0,
             "retry_count": 2,
             "error_message": "limit",
@@ -100,6 +103,7 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
             "asset_id": "000003.SZ",
             "request_params": '{"ts_code": "000003.SZ"}',
             "status": "success",
+            "result_kind": "nonempty",
             "row_count": 1,
             "retry_count": 0,
             "error_message": None,
@@ -218,3 +222,122 @@ def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) ->
     row = metadata.update_scopes()[0]
     assert row["status"] == "failed"
     assert row["last_error"] == "writer lease expired"
+
+
+def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata.synchronize_update_scopes(
+        [
+            {
+                "source": "tushare",
+                "dataset": "income",
+                "scope_kind": "asset",
+                "scope_key": "000001.SZ",
+                "variant_hash": "variant",
+                "initial_start": "2025-01-01",
+                "spec_hash": "spec",
+            }
+        ]
+    )
+    scope_id = int(metadata.update_scopes()[0]["id"])
+    metadata.begin_run(
+        run_id="run-empty",
+        source="tushare",
+        dataset="income",
+        mode="by_asset",
+    )
+    metadata.claim_update_scopes([scope_id], run_id="run-empty")
+
+    def fail_provider_check(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise sqlite3.OperationalError("fault injection")
+
+    monkeypatch.setattr(metadata, "_upsert_provider_scope_check", fail_provider_check)
+    with pytest.raises(sqlite3.OperationalError, match="fault injection"):
+        metadata.record_empty_scope_result(
+            calls=[
+                {
+                    "run_id": "run-empty",
+                    "source": "tushare",
+                    "dataset": "income",
+                    "request_key": "0",
+                    "request_params": {"ts_code": "000001.SZ"},
+                    "status": "success",
+                    "result_kind": "empty",
+                    "row_count": 0,
+                }
+            ],
+            scope_id=scope_id,
+            run_id="run-empty",
+            checked_through="2025-01-31",
+            recheck_after="2025-02-28",
+        )
+
+    assert metadata._rows("select * from api_calls") == []
+    assert metadata.provider_scope_checks() == []
+    assert metadata.update_scopes()[0]["status"] == "running"
+    run = metadata._rows("select * from ingestion_runs where run_id='run-empty'")[0]
+    assert run["empty_count"] == 0
+    assert run["request_count"] == 0
+
+
+def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(tmp_path) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata.synchronize_update_scopes(
+        {
+            "source": "tushare",
+            "dataset": "income",
+            "scope_kind": "asset",
+            "scope_key": asset,
+            "variant_hash": "variant",
+            "initial_start": "2025-01-01",
+            "spec_hash": "spec",
+        }
+        for asset in ("A", "B")
+    )
+    scopes = metadata.update_scopes()
+    owner_id = "workflow:42"
+    metadata.begin_run(
+        run_id="run-owner",
+        source="tushare",
+        dataset="income",
+        mode="by_asset",
+        owner_id=owner_id,
+    )
+    metadata.acquire_update_leases(
+        [("tushare", "income", "run-owner")], owner_id=owner_id
+    )
+    metadata.claim_update_scopes([int(scopes[0]["id"])], run_id="run-owner")
+    metadata.record_empty_scope_result(
+        calls=[
+            {
+                "run_id": "run-owner",
+                "source": "tushare",
+                "dataset": "income",
+                "request_key": "0",
+                "request_params": {"ts_code": "A"},
+                "status": "success",
+                "result_kind": "empty",
+                "row_count": 0,
+            }
+        ],
+        scope_id=int(scopes[0]["id"]),
+        run_id="run-owner",
+        checked_through="2025-01-31",
+        recheck_after="2025-02-28",
+    )
+    metadata.claim_update_scopes([int(scopes[1]["id"])], run_id="run-owner")
+
+    cleaned = metadata.abandon_update_owner(owner_id, reason="forced termination")
+
+    assert cleaned == {"runs": 1, "scopes": 1, "leases": 1}
+    rows = metadata.update_scopes()
+    assert [row["status"] for row in rows] == ["empty", "failed"]
+    assert metadata.active_update_leases() == []
+    run = metadata._rows("select * from ingestion_runs where run_id='run-owner'")[0]
+    assert run["status"] == "cancelled"
+    assert run["empty_count"] == 1
+    assert metadata.abandon_update_owner(owner_id, reason="again") == {
+        "runs": 0,
+        "scopes": 0,
+        "leases": 0,
+    }
