@@ -814,6 +814,7 @@ class MetadataStore:
                     raise ValueError("An incremental empty result needs checked_through")
             self._insert_api_calls(db, rows, recorded_at=now)
             if scope_id is not None:
+                assert checked_through is not None
                 self._upsert_provider_scope_check(
                     db,
                     scope_id=scope_id,

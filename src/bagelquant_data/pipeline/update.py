@@ -303,7 +303,7 @@ def _run_fetches(
                     work.spec.historical_empty_is_error
                     and request.recheck_after is None
                 ),
-                cancel_requested=lambda context=work.context: _cancel_requested(context),
+                cancel_requested=_cancel_callback(work.context),
             )
             futures[future] = (time.perf_counter(), task)
             states[work.spec.name].peak_in_flight = max(
@@ -785,7 +785,7 @@ def _fetch_request_pages(
     max_retries: int,
     retry_backoff_seconds: float,
     require_nonempty: bool,
-    cancel_requested: Callable[[], bool],
+    cancel_requested: Callable[[], bool] | None,
 ) -> list[FetchPage]:
     if request_options.get("pagination") != "offset":
         return [
@@ -931,8 +931,13 @@ def _owner_id(context: RequestContext) -> str | None:
 
 
 def _cancel_requested(context: RequestContext) -> bool:
+    callback = _cancel_callback(context)
+    return bool(callback()) if callback is not None else False
+
+
+def _cancel_callback(context: RequestContext) -> Callable[[], bool] | None:
     callback = context.options.get("cancel_requested")
-    return bool(callback()) if callable(callback) else False
+    return cast(Callable[[], bool], callback) if callable(callback) else None
 
 
 def _cooperative_backoff(
@@ -940,6 +945,9 @@ def _cooperative_backoff(
     *,
     cancel_requested: Callable[[], bool] | None,
 ) -> bool:
+    if cancel_requested is None:
+        time.sleep(max(0.0, seconds))
+        return True
     deadline = time.monotonic() + max(0.0, seconds)
     while time.monotonic() < deadline:
         if cancel_requested is not None and cancel_requested():
