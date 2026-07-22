@@ -39,6 +39,7 @@ class IngestionReport:
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
     error_message: str | None = None
+    empty_count: int = 0
 
 
 class IngestionPipeline:

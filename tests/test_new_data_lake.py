@@ -33,10 +33,46 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "field_mappings",
         "revision_lookback_days",
         "revision_refresh_days",
+        "historical_empty_is_error",
     ]
     assert incremental_key(spec) == ("time", "asset_id", "period")
     assert not hasattr(spec, "primary_key")
     assert not hasattr(DatasetSpec, "from_mapping")
+
+
+def test_historical_empty_policy_round_trips_from_toml(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    path = tmp_path / "daily.toml"
+    path.write_text(
+        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n'
+        'historical_empty_is_error = true\n[field_mappings]\n'
+        'trade_date = "time"\nts_code = "asset_id"\n'
+    )
+
+    spec = lake.admin.datasets.register_toml(path)
+
+    assert spec.historical_empty_is_error is True
+    assert (
+        DataLake.open(tmp_path)
+        .admin.datasets.get("daily", source="custom")
+        .historical_empty_is_error
+        is True
+    )
+
+
+def test_historical_empty_policy_is_daily_only(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+
+    with pytest.raises(DatasetSpecError, match="only valid for by_daily"):
+        lake.admin.datasets.register(
+            DatasetSpec(
+                "income",
+                "by_asset",
+                asset_list="stock_basic",
+                field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+                historical_empty_is_error=True,
+            )
+        )
 
 
 def test_manager_validates_references_and_toml(tmp_path) -> None:

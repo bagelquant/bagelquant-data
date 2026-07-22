@@ -27,6 +27,7 @@ Store the same compact mapping in TOML and register it with `register_toml`.
 name = "daily"
 update_type = "by_daily"
 calendar = "trade_cal"
+historical_empty_is_error = true
 
 [field_mappings]
 trade_date = "time"
@@ -42,9 +43,11 @@ revision_lookback_days = 730
 revision_refresh_days = 30
 ```
 
-The lake stores `checked_through` separately from the latest returned record.
+The lake stores provider checks separately from commit-backed `data_max_time`.
 This prevents sparse event data from being downloaded repeatedly while the
-revision window still captures later restatements.
+revision window still captures later restatements. Set
+`historical_empty_is_error = true` only for dense daily datasets that must
+return rows for every historical open date.
 
 Mappings are true renames, so provider columns named `trade_date` and
 `ts_code` are stored as `time` and `asset_id`. A mapping may rename other

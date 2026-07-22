@@ -18,7 +18,7 @@ class MetadataStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    UPDATE_STATE_VERSION = "1"
+    SCHEMA_VERSION = "2"
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -149,6 +149,11 @@ class MetadataStore:
             ).fetchone()
             db.execute(
                 "delete from partition_manifest where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from provider_scope_checks where scope_id in "
+                "(select id from update_scopes where source=? and dataset=?)",
                 (source, dataset),
             )
             db.execute(
@@ -319,6 +324,7 @@ class MetadataStore:
         status: str,
         request_count: int = 0,
         success_count: int = 0,
+        empty_count: int = 0,
         failure_count: int = 0,
         rows_downloaded: int = 0,
         rows_committed: int = 0,
@@ -330,10 +336,10 @@ class MetadataStore:
                 """
                 insert into ingestion_runs(
                     run_id, source, dataset, mode, started_at, finished_at, status,
-                    request_count, success_count, failure_count, rows_downloaded,
+                    request_count, success_count, empty_count, failure_count, rows_downloaded,
                     rows_committed, error_message
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -345,6 +351,7 @@ class MetadataStore:
                     status,
                     request_count,
                     success_count,
+                    empty_count,
                     failure_count,
                     rows_downloaded,
                     rows_committed,
@@ -352,7 +359,15 @@ class MetadataStore:
                 ),
             )
 
-    def begin_run(self, *, run_id: str, source: str, dataset: str, mode: str) -> None:
+    def begin_run(
+        self,
+        *,
+        run_id: str,
+        source: str,
+        dataset: str,
+        mode: str,
+        owner_id: str | None = None,
+    ) -> None:
         """Create an ingestion run before any scope is claimed."""
 
         now = _now()
@@ -360,10 +375,10 @@ class MetadataStore:
             db.execute(
                 """
                 insert into ingestion_runs(
-                    run_id, source, dataset, mode, started_at, status
-                ) values (?, ?, ?, ?, ?, 'running')
+                    run_id, source, dataset, mode, started_at, status, owner_id
+                ) values (?, ?, ?, ?, ?, 'running', ?)
                 """,
-                (run_id, source, dataset, mode, now),
+                (run_id, source, dataset, mode, now, owner_id),
             )
 
     def finalize_run(
@@ -373,6 +388,7 @@ class MetadataStore:
         status: str,
         request_count: int,
         success_count: int,
+        empty_count: int,
         failure_count: int,
         rows_downloaded: int,
         rows_committed: int,
@@ -385,7 +401,7 @@ class MetadataStore:
                 """
                 update ingestion_runs set
                     finished_at=?, status=?, request_count=?, success_count=?,
-                    failure_count=?, rows_downloaded=?, rows_committed=?,
+                    empty_count=?, failure_count=?, rows_downloaded=?, rows_committed=?,
                     error_message=?
                 where run_id=?
                 """,
@@ -394,6 +410,7 @@ class MetadataStore:
                     status,
                     int(request_count),
                     int(success_count),
+                    int(empty_count),
                     int(failure_count),
                     int(rows_downloaded),
                     int(rows_committed),
@@ -474,35 +491,63 @@ class MetadataStore:
             return
         now = _now()
         with self.connect() as db:
-            db.executemany(
-                """
-                insert into api_calls(
-                    run_id, source, dataset, request_key, asset_id, request_params,
-                    status, row_count, retry_count, started_at, finished_at, error_message,
-                    scope_id, request_kind
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+            self._insert_api_calls(db, rows, recorded_at=now)
+            for run_id in {str(row["run_id"]) for row in rows}:
+                run_rows = [row for row in rows if str(row["run_id"]) == run_id]
+                db.execute(
+                    """
+                    update ingestion_runs set request_count=request_count+?,
+                        rows_downloaded=rows_downloaded+?
+                    where run_id=? and status='running'
+                    """,
                     (
-                        row["run_id"],
-                        row["source"],
-                        row["dataset"],
-                        str(row["request_key"]),
-                        row.get("asset_id"),
-                        json.dumps(row["request_params"], sort_keys=True, default=str),
-                        row["status"],
-                        int(row.get("row_count", 0)),
-                        int(row.get("retry_count", 0)),
-                        now,
-                        now,
-                        row.get("error_message"),
-                        row.get("scope_id"),
-                        row.get("request_kind"),
-                    )
-                    for row in rows
-                ],
+                        len(run_rows),
+                        sum(
+                            int(row.get("row_count", 0))
+                            for row in run_rows
+                            if row.get("status") == "success"
+                        ),
+                        run_id,
+                    ),
+                )
+
+    @staticmethod
+    def _insert_api_calls(
+        db: sqlite3.Connection,
+        rows: Iterable[dict[str, Any]],
+        *,
+        recorded_at: str,
+    ) -> None:
+        db.executemany(
+            """
+            insert into api_calls(
+                run_id, source, dataset, request_key, asset_id, request_params,
+                status, result_kind, row_count, retry_count, started_at, finished_at,
+                error_message, scope_id, request_kind
             )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["run_id"],
+                    row["source"],
+                    row["dataset"],
+                    str(row["request_key"]),
+                    row.get("asset_id"),
+                    json.dumps(row["request_params"], sort_keys=True, default=str),
+                    row["status"],
+                    row.get("result_kind") or _api_result_kind(row),
+                    int(row.get("row_count", 0)),
+                    int(row.get("retry_count", 0)),
+                    recorded_at,
+                    recorded_at,
+                    row.get("error_message"),
+                    row.get("scope_id"),
+                    row.get("request_kind"),
+                )
+                for row in rows
+            ],
+        )
 
     def synchronize_update_scopes(self, scopes: Iterable[dict[str, Any]]) -> None:
         """Insert ledger identities and invalidate rows whose spec changed."""
@@ -512,6 +557,21 @@ class MetadataStore:
             return
         now = _now()
         with self.connect() as db:
+            for row in rows:
+                db.execute(
+                    "delete from provider_scope_checks where scope_id in ("
+                    "select id from update_scopes where source=? and dataset=? "
+                    "and scope_kind=? and scope_key=? and variant_hash=? "
+                    "and spec_hash != ?)",
+                    (
+                        row["source"],
+                        row["dataset"],
+                        row["scope_kind"],
+                        row["scope_key"],
+                        row["variant_hash"],
+                        row["spec_hash"],
+                    ),
+                )
             db.executemany(
                 """
                 insert into update_scopes(
@@ -601,6 +661,12 @@ class MetadataStore:
         """Remove identities that can no longer be reconstructed from the spec."""
 
         with self.connect() as db:
+            db.execute(
+                "delete from provider_scope_checks where scope_id in ("
+                "select id from update_scopes where source=? and dataset=? "
+                "and spec_hash != ? and status != 'running')",
+                (source, dataset, spec_hash),
+            )
             cursor = db.execute(
                 "delete from update_scopes where source=? and dataset=? "
                 "and spec_hash != ? and status != 'running'",
@@ -637,7 +703,11 @@ class MetadataStore:
             return claimable
 
     def transition_update_scopes(
-        self, transitions: Iterable[dict[str, Any]], *, run_id: str
+        self,
+        transitions: Iterable[dict[str, Any]],
+        *,
+        run_id: str,
+        committed_rows: int = 0,
     ) -> None:
         """Commit scope outcomes in one metadata transaction."""
 
@@ -648,35 +718,35 @@ class MetadataStore:
         with self.connect() as db:
             for row in rows:
                 status = str(row["status"])
-                if status not in {"success", "empty", "failed", "invalid"}:
+                if status not in {"success", "failed", "invalid"}:
                     raise ValueError(f"Unsupported scope transition: {status}")
-                db.execute(
+                cursor = db.execute(
                     """
                     update update_scopes set
                         status=?, checked_through=case
-                            when ? is null then checked_through
-                            when checked_through is null or checked_through < ? then ?
+                            when ?='success' then coalesce(?,data_max_time,checked_through)
                             else checked_through
                         end,
-                        data_max_time=coalesce(?,data_max_time), row_count=?,
-                        last_success_at=case when ? in ('success','empty') then ? else last_success_at end,
-                        last_revision_check_at=coalesce(?,last_revision_check_at),
-                        recheck_after=?, last_error=?, active_run_id=null,
+                        data_max_time=case when ?='success' then coalesce(?,data_max_time)
+                            else data_max_time end,
+                        row_count=case when ?='success' then ? else row_count end,
+                        last_success_at=case when ?='success' then ? else last_success_at end,
+                        last_revision_check_at=null,
+                        recheck_after=null, last_error=?, active_run_id=null,
                         commit_run_id=case when ?='success' then ? else commit_run_id end,
                         updated_at=?
                     where id=? and active_run_id=?
                     """,
                     (
                         status,
-                        row.get("checked_through"),
-                        row.get("checked_through"),
-                        row.get("checked_through"),
+                        status,
                         row.get("data_max_time"),
+                        status,
+                        row.get("data_max_time"),
+                        status,
                         int(row.get("row_count", 0)),
                         status,
                         now,
-                        row.get("last_revision_check_at"),
-                        row.get("recheck_after"),
                         row.get("last_error"),
                         status,
                         run_id,
@@ -685,6 +755,139 @@ class MetadataStore:
                         run_id,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"Scope {row['scope_id']} is not claimed by ingestion run {run_id}"
+                    )
+                if status == "success" and row.get("provider_checked_through"):
+                    self._upsert_provider_scope_check(
+                        db,
+                        scope_id=int(row["scope_id"]),
+                        checked_through=str(row["provider_checked_through"]),
+                        recheck_after=row.get("provider_recheck_after"),
+                        result="nonempty",
+                        checked_at=now,
+                    )
+            success_count = sum(row["status"] == "success" for row in rows)
+            if success_count:
+                db.execute(
+                    """
+                    update ingestion_runs set success_count=success_count+?,
+                        rows_committed=rows_committed+?
+                    where run_id=? and status='running'
+                    """,
+                    (success_count, int(committed_rows), run_id),
+                )
+
+    def record_empty_scope_result(
+        self,
+        *,
+        calls: Iterable[dict[str, Any]],
+        scope_id: int | None,
+        run_id: str,
+        checked_through: str | None,
+        recheck_after: str | None,
+    ) -> None:
+        """Atomically persist one validated empty provider result.
+
+        Local coverage columns are deliberately untouched. A process interruption can
+        therefore expose either the complete empty outcome or none of it.
+        """
+
+        rows = list(calls)
+        if not rows:
+            raise ValueError("An empty result must include at least one API audit row")
+        now = _now()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            if scope_id is not None:
+                claimed = db.execute(
+                    "select id from update_scopes where id=? and status='running' "
+                    "and active_run_id=?",
+                    (scope_id, run_id),
+                ).fetchone()
+                if claimed is None:
+                    raise RuntimeError(
+                        f"Scope {scope_id} is not claimed by ingestion run {run_id}"
+                    )
+                if checked_through is None:
+                    raise ValueError("An incremental empty result needs checked_through")
+            self._insert_api_calls(db, rows, recorded_at=now)
+            if scope_id is not None:
+                assert checked_through is not None
+                self._upsert_provider_scope_check(
+                    db,
+                    scope_id=scope_id,
+                    checked_through=checked_through,
+                    recheck_after=recheck_after,
+                    result="empty",
+                    checked_at=now,
+                )
+                cursor = db.execute(
+                    """
+                    update update_scopes set status='empty',last_error=null,
+                        active_run_id=null,updated_at=?
+                    where id=? and active_run_id=?
+                    """,
+                    (now, scope_id, run_id),
+                )
+            cursor = db.execute(
+                """
+                update ingestion_runs set request_count=request_count+?,
+                    empty_count=empty_count+1
+                where run_id=? and status='running'
+                """,
+                (len(rows), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Ingestion run {run_id} is not running")
+
+    @staticmethod
+    def _upsert_provider_scope_check(
+        db: sqlite3.Connection,
+        *,
+        scope_id: int,
+        checked_through: str,
+        recheck_after: object,
+        result: str,
+        checked_at: str,
+    ) -> None:
+        db.execute(
+            """
+            insert into provider_scope_checks(
+                scope_id,checked_through,last_checked_at,recheck_after,last_result
+            ) values (?, ?, ?, ?, ?)
+            on conflict(scope_id) do update set
+                checked_through=case
+                    when provider_scope_checks.checked_through < excluded.checked_through
+                    then excluded.checked_through
+                    else provider_scope_checks.checked_through
+                end,
+                last_checked_at=excluded.last_checked_at,
+                recheck_after=excluded.recheck_after,
+                last_result=excluded.last_result
+            """,
+            (scope_id, checked_through, checked_at, recheck_after, result),
+        )
+
+    def provider_scope_checks(
+        self, *, source: str | None = None, dataset: str | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("s.source=?")
+            params.append(source)
+        if dataset is not None:
+            clauses.append("s.dataset=?")
+            params.append(dataset)
+        where = f" where {' and '.join(clauses)}" if clauses else ""
+        return self._rows(
+            "select c.*,s.source,s.dataset,s.scope_kind,s.scope_key,s.variant_hash "
+            "from provider_scope_checks c join update_scopes s on s.id=c.scope_id"
+            f"{where} order by s.source,s.dataset,s.scope_key,s.variant_hash",
+            params,
+        )
 
     def reset_update_scopes(
         self, scope_ids: Iterable[int], *, clear_watermark: bool = False
@@ -695,6 +898,12 @@ class MetadataStore:
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as db:
             checked_through = ",checked_through=null" if clear_watermark else ""
+            if clear_watermark:
+                db.execute(
+                    "delete from provider_scope_checks where scope_id in "
+                    f"({placeholders})",
+                    ids,
+                )
             cursor = db.execute(
                 f"update update_scopes set status='pending'{checked_through},"
                 f"last_error=null,active_run_id=null,recheck_after=null,updated_at=? "
@@ -705,7 +914,11 @@ class MetadataStore:
             return int(cursor.rowcount)
 
     def acquire_update_leases(
-        self, leases: Iterable[tuple[str, str, str]], *, ttl_seconds: int = 300
+        self,
+        leases: Iterable[tuple[str, str, str]],
+        *,
+        ttl_seconds: int = 300,
+        owner_id: str | None = None,
     ) -> None:
         rows = list(leases)
         if not rows:
@@ -729,17 +942,63 @@ class MetadataStore:
                     )
             db.executemany(
                 """
-                insert into update_leases(source,dataset,run_id,heartbeat_at,lease_expires_at)
-                values (?, ?, ?, ?, ?)
+                insert into update_leases(
+                    source,dataset,run_id,owner_id,heartbeat_at,lease_expires_at
+                )
+                values (?, ?, ?, ?, ?, ?)
                 on conflict(source,dataset) do update set
-                    run_id=excluded.run_id,heartbeat_at=excluded.heartbeat_at,
+                    run_id=excluded.run_id,owner_id=excluded.owner_id,
+                    heartbeat_at=excluded.heartbeat_at,
                     lease_expires_at=excluded.lease_expires_at
                 """,
                 [
-                    (source, dataset, run_id, now.isoformat(), expires)
+                    (source, dataset, run_id, owner_id, now.isoformat(), expires)
                     for source, dataset, run_id in rows
                 ],
             )
+
+    def abandon_update_owner(self, owner_id: str, *, reason: str) -> dict[str, int]:
+        """Release one workflow owner's unfinished writes after forced termination."""
+
+        now = _now()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            run_ids = {
+                str(row["run_id"])
+                for row in db.execute(
+                    "select run_id from ingestion_runs where owner_id=? and status='running'",
+                    (owner_id,),
+                ).fetchall()
+            }
+            run_ids.update(
+                str(row["run_id"])
+                for row in db.execute(
+                    "select run_id from update_leases where owner_id=?", (owner_id,)
+                ).fetchall()
+            )
+            scope_count = 0
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                cursor = db.execute(
+                    f"update update_scopes set status='failed',active_run_id=null,"  # noqa: S608
+                    f"last_error=?,updated_at=? where status='running' "
+                    f"and active_run_id in ({placeholders})",
+                    (reason, now, *sorted(run_ids)),
+                )
+                scope_count = int(cursor.rowcount)
+                db.execute(
+                    f"update ingestion_runs set status='cancelled',finished_at=?,"  # noqa: S608
+                    f"error_message=? where status='running' and run_id in ({placeholders})",
+                    (now, reason, *sorted(run_ids)),
+                )
+            leases = db.execute(
+                "delete from update_leases where owner_id=?", (owner_id,)
+            ).rowcount
+            return {
+                "runs": len(run_ids),
+                "scopes": scope_count,
+                "leases": int(leases),
+            }
 
     def refresh_update_lease(self, *, run_id: str, ttl_seconds: int = 300) -> None:
         now = datetime.now(UTC)
@@ -772,6 +1031,22 @@ class MetadataStore:
     def recover_stale_running_scopes(self) -> int:
         now = _now()
         with self.connect() as db:
+            db.execute("begin immediate")
+            stale_runs = [
+                str(row["active_run_id"])
+                for row in db.execute(
+                    """
+                    select distinct active_run_id from update_scopes
+                    where status='running' and not exists (
+                        select 1 from update_leases
+                        where update_leases.run_id=update_scopes.active_run_id
+                          and update_leases.lease_expires_at > ?
+                    )
+                    """,
+                    (now,),
+                ).fetchall()
+                if row["active_run_id"] is not None
+            ]
             cursor = db.execute(
                 """
                 update update_scopes set status='failed',active_run_id=null,
@@ -784,74 +1059,16 @@ class MetadataStore:
                 """,
                 (now, now),
             )
+            db.execute("delete from update_leases where lease_expires_at <= ?", (now,))
+            if stale_runs:
+                placeholders = ",".join("?" for _ in stale_runs)
+                db.execute(
+                    f"update ingestion_runs set status='cancelled',finished_at=?,"  # noqa: S608
+                    f"error_message='writer lease expired' where status='running' "
+                    f"and run_id in ({placeholders})",
+                    (now, *stale_runs),
+                )
             return int(cursor.rowcount)
-
-    def update_state_ready(self) -> bool:
-        rows = self._rows(
-            "select value from metadata_state where key='update_state_version'"
-        )
-        return bool(rows and rows[0]["value"] == self.UPDATE_STATE_VERSION)
-
-    def mark_update_state_ready(self) -> None:
-        with self.connect() as db:
-            db.execute(
-                "insert into metadata_state(key,value,updated_at) values ('update_state_version',?,?)"
-                " on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at",
-                (self.UPDATE_STATE_VERSION, _now()),
-            )
-
-    def bootstrap_daily_success(self, scope_ids: Iterable[int]) -> int:
-        ids = list(dict.fromkeys(int(scope_id) for scope_id in scope_ids))
-        if not ids:
-            return 0
-        placeholders = ",".join("?" for _ in ids)
-        now = _now()
-        with self.connect() as db:
-            cursor = db.execute(
-                f"update update_scopes set status='success',checked_through=scope_key,"
-                f"data_max_time=scope_key,last_success_at=?,commit_run_id='bootstrap',"
-                f"last_error=null,active_run_id=null,updated_at=? "
-                f"where id in ({placeholders})",
-                (now, now, *ids),
-            )
-            return int(cursor.rowcount)
-
-    def bootstrap_asset_data_max(
-        self, *, source: str, dataset: str, maxima: dict[str, str]
-    ) -> None:
-        """Retain observed asset maxima without asserting checked coverage."""
-
-        if not maxima:
-            return
-        with self.connect() as db:
-            db.executemany(
-                """
-                update update_scopes set status='pending',checked_through=null,
-                    data_max_time=?,active_run_id=null,updated_at=?
-                where source=? and dataset=? and scope_kind='asset' and scope_key=?
-                """,
-                [
-                    (maximum, _now(), source, dataset, asset_id)
-                    for asset_id, maximum in maxima.items()
-                ],
-            )
-
-    def complete_update_state_bootstrap(self) -> None:
-        """Record ledger v1 and remove legacy inferred-state tables atomically."""
-
-        with self.connect() as db:
-            db.execute("begin immediate")
-            for table in ("pending_update_jobs", "update_coverage", "audit_watermarks"):
-                db.execute(f"drop table if exists {table}")
-            db.execute(
-                """
-                insert into metadata_state(key,value,updated_at)
-                values ('update_state_version',?,?)
-                on conflict(key) do update set
-                    value=excluded.value,updated_at=excluded.updated_at
-                """,
-                (self.UPDATE_STATE_VERSION, _now()),
-            )
 
     def dataset_spec_hash(self, source: str, dataset: str) -> str:
         rows = self._rows(
@@ -881,18 +1098,20 @@ class MetadataStore:
                     "select name from sqlite_master where type='table'"
                 ).fetchall()
             }
-            had_legacy_update_state = bool(
-                existing_tables
-                & {"pending_update_jobs", "update_coverage", "audit_watermarks"}
-            )
-            existing_columns = {
-                row["name"]
-                for row in db.execute("pragma table_info(datasets)").fetchall()
-            }
-            if "category" in existing_columns or "source_dataset" in existing_columns:
-                raise ConfigurationError(
-                    "This lake uses the pre-simplification dataset schema. Delete and recreate the lake root."
-                )
+            if existing_tables:
+                schema_version = None
+                if "metadata_state" in existing_tables:
+                    row = db.execute(
+                        "select value from metadata_state where key='schema_version'"
+                    ).fetchone()
+                    schema_version = None if row is None else str(row["value"])
+                if schema_version != self.SCHEMA_VERSION:
+                    raise ConfigurationError(
+                        "Incompatible data-lake metadata schema "
+                        f"({schema_version or 'unversioned'}). Stop all workers, delete "
+                        "the old lake, and create a fresh lake; automatic migration is "
+                        "intentionally disabled."
+                    )
             db.executescript(
                 """
                 create table if not exists sources (
@@ -924,10 +1143,12 @@ class MetadataStore:
                     status text not null,
                     request_count integer not null default 0,
                     success_count integer not null default 0,
+                    empty_count integer not null default 0,
                     failure_count integer not null default 0,
                     rows_downloaded integer not null default 0,
                     rows_committed integer not null default 0,
-                    error_message text
+                    error_message text,
+                    owner_id text
                 );
                 create table if not exists api_calls (
                     run_id text not null,
@@ -937,6 +1158,9 @@ class MetadataStore:
                     asset_id text,
                     request_params text not null,
                     status text not null,
+                    result_kind text not null check(result_kind in (
+                        'nonempty','empty','transport_failure','invalid','cancelled'
+                    )),
                     row_count integer not null default 0,
                     retry_count integer not null default 0,
                     started_at text not null,
@@ -974,10 +1198,18 @@ class MetadataStore:
                 );
                 create index if not exists idx_update_scopes_eligibility
                     on update_scopes(source,dataset,status,scope_key);
+                create table if not exists provider_scope_checks (
+                    scope_id integer primary key,
+                    checked_through text not null,
+                    last_checked_at text not null,
+                    recheck_after text,
+                    last_result text not null check(last_result in ('empty','nonempty'))
+                );
                 create table if not exists update_leases (
                     source text not null,
                     dataset text not null,
                     run_id text not null unique,
+                    owner_id text,
                     heartbeat_at text not null,
                     lease_expires_at text not null,
                     primary key(source, dataset)
@@ -1011,18 +1243,17 @@ class MetadataStore:
                 );
                 """
             )
-            _ensure_column(db, "sources", "options_json", "text")
-            _ensure_column(db, "sources", "enabled", "integer not null default 1")
-            _ensure_column(db, "api_calls", "scope_id", "integer")
-            _ensure_column(db, "api_calls", "request_kind", "text")
-            if not had_legacy_update_state:
+            if not existing_tables:
+                now = _now()
                 db.execute(
                     """
-                    insert into metadata_state(key,value,updated_at)
-                    values ('update_state_version',?,?)
-                    on conflict(key) do nothing
+                    insert into metadata_state(key,value,updated_at) values
+                        ('schema_version',?,?)
                     """,
-                    (self.UPDATE_STATE_VERSION, _now()),
+                    (
+                        self.SCHEMA_VERSION,
+                        now,
+                    ),
                 )
 
 
@@ -1034,14 +1265,15 @@ def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:
     return {field: getattr(spec, field) for field in spec.__dataclass_fields__}
 
 
-def _ensure_column(
-    db: sqlite3.Connection, table: str, field: str, definition: str
-) -> None:
-    fields = {
-        row["name"] for row in db.execute(f"pragma table_info({table})").fetchall()
-    }
-    if field not in fields:
-        db.execute(f"alter table {table} add column {field} {definition}")
+def _api_result_kind(row: dict[str, Any]) -> str:
+    status = str(row["status"])
+    if status == "invalid":
+        return "invalid"
+    if status == "cancelled":
+        return "cancelled"
+    if status != "success":
+        return "transport_failure"
+    return "empty" if int(row.get("row_count", 0)) == 0 else "nonempty"
 
 
 def _redact_options(options: dict[str, Any]) -> dict[str, Any]:

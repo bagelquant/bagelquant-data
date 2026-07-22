@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from datetime import date, timedelta
 import sqlite3
 
 import polars as pl
@@ -8,6 +8,7 @@ import pytest
 
 import bagelquant_data
 from bagelquant_data import DataLake, DatasetSpec
+from bagelquant_data.core import ConfigurationError
 from bagelquant_data.storage.atomic import atomic_write_parquet
 
 
@@ -92,7 +93,7 @@ def test_wrong_daily_date_is_invalid_and_requires_reset(tmp_path) -> None:
     )
 
 
-def test_asset_empty_advances_checked_through_without_data(tmp_path) -> None:
+def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> None:
     source = LedgerSource(empty=True)
     lake = DataLake.open(tmp_path)
     lake.admin.sources.register(source)
@@ -109,33 +110,247 @@ def test_asset_empty_advances_checked_through_without_data(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset(
+    report = lake.update.dataset(
         "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
     )
     row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    assert report.status == "no_data"
+    assert report.success_count == 0
+    assert report.empty_count == 1
+    assert report.rows_committed == 0
     assert row["status"] == "empty"
-    assert row["checked_through"] == "2025-01-31"
-    assert lake.admin.status.reset_update_scopes([int(row["id"])]) == 1
-    reset = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert reset["checked_through"] == "2025-01-31"
-    lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    assert row["checked_through"] is None
+    assert row["data_max_time"] is None
+    assert row["last_success_at"] is None
+    checks = lake.admin.status.provider_scope_checks(
+        dataset="income", source="custom"
     )
-    reset = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert lake.admin.status.reset_update_scopes(
-        [int(reset["id"])], clear_watermark=True
-    ) == 1
-    assert (
-        lake.admin.status.update_scopes(dataset="income", source="custom")[0][
-            "checked_through"
-        ]
-        is None
+    assert len(checks) == 1
+    assert checks[0]["checked_through"] == "2025-01-31"
+    assert checks[0]["last_result"] == "empty"
+    stored_run = next(
+        run for run in lake.admin.status.runs() if run["run_id"] == report.run_id
     )
+    assert stored_run["success_count"] == 0
+    assert stored_run["empty_count"] == 1
+
     source.requests.clear()
     lake.update.dataset(
         "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
     )
+    assert source.requests == []
+
+    assert lake.admin.status.reset_update_scopes(
+        [int(row["id"])], clear_watermark=True
+    ) == 1
+    assert lake.admin.status.provider_scope_checks(
+        dataset="income", source="custom"
+    ) == []
+    lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    )
     assert len(source.requests) == 1
+
+
+def test_empty_recheck_preserves_existing_committed_coverage(tmp_path) -> None:
+    source = LedgerSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
+        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    first = lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    )
+    committed = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    preserved = {
+        key: committed[key]
+        for key in ("data_max_time", "last_success_at", "row_count", "commit_run_id")
+    }
+    with lake.metadata.connect() as db:
+        db.execute(
+            "update provider_scope_checks set recheck_after='2000-01-01'"
+        )
+    source.empty = True
+    source.requests.clear()
+
+    second = lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+    )
+
+    row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
+    assert first.status == "success"
+    assert second.status == "no_data"
+    assert row["status"] == "empty"
+    assert {key: row[key] for key in preserved} == preserved
+    assert len(source.requests) == 1
+    api_call = lake.metadata._rows(
+        "select status,result_kind from api_calls order by finished_at desc limit 1"
+    )[0]
+    assert api_call == {"status": "success", "result_kind": "empty"}
+
+
+def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_path) -> None:
+    source = LedgerSource(empty=True)
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    assets = ["A", "B", "C", "D", "E"]
+    lake.ingest(
+        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
+        pl.DataFrame(
+            {"ts_code": assets, "list_date": ["20250101"] * len(assets)}
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "balancesheet",
+            "by_asset",
+            asset_list="stock_basic",
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    interrupted = lake.update.dataset(
+        "balancesheet",
+        source="custom",
+        start="2025-01-01",
+        end="2025-01-31",
+        workers=1,
+        max_in_flight=1,
+        cancel_requested=lambda: len(source.requests) >= 1,
+        progress=False,
+    )
+
+    scopes = lake.admin.status.update_scopes(
+        dataset="balancesheet", source="custom"
+    )
+    assert interrupted.status == "cancelled"
+    assert interrupted.empty_count == 1
+    assert sum(row["status"] == "empty" for row in scopes) == 1
+    assert sum(row["status"] == "pending" for row in scopes) == 4
+    assert all(row["status"] != "running" for row in scopes)
+    assert lake.metadata.active_update_leases() == []
+
+    source.requests.clear()
+    resumed = lake.update.dataset(
+        "balancesheet",
+        source="custom",
+        start="2025-01-01",
+        end="2025-01-31",
+        workers=1,
+        max_in_flight=1,
+        progress=False,
+    )
+
+    assert resumed.status == "no_data"
+    assert resumed.empty_count == 4
+    assert len(source.requests) == 4
+    assert all(
+        row["status"] == "empty"
+        for row in lake.admin.status.update_scopes(
+            dataset="balancesheet", source="custom"
+        )
+    )
+
+
+def test_dense_historical_empty_retries_then_fails_without_coverage(tmp_path) -> None:
+    source = LedgerSource(empty=True)
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+            historical_empty_is_error=True,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected empty response"):
+        lake.update.dataset(
+            "daily",
+            source="custom",
+            start="2025-01-02",
+            end="2025-01-02",
+            max_retries=2,
+            retry_backoff_seconds=0,
+            progress=False,
+        )
+
+    scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    assert scope["status"] == "failed"
+    assert scope["data_max_time"] is None
+    assert scope["last_success_at"] is None
+    assert lake.admin.status.provider_scope_checks(
+        dataset="daily", source="custom"
+    ) == []
+    assert len(source.requests) == 2
+
+
+def test_dense_current_day_empty_is_provisional_provider_check(tmp_path) -> None:
+    today = date.today()
+    source = LedgerSource(empty=True)
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": [today.isoformat()], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+            historical_empty_is_error=True,
+        )
+    )
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=today,
+        end=today,
+        progress=False,
+    )
+
+    assert report.status == "no_data"
+    assert report.success_count == 0
+    assert report.empty_count == 1
+    scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    assert scope["status"] == "empty"
+    check = lake.admin.status.provider_scope_checks(
+        dataset="daily", source="custom"
+    )[0]
+    assert check["checked_through"] == today.isoformat()
+    assert check["recheck_after"] == (today + timedelta(days=1)).isoformat()
+
+
+def test_incompatible_old_schema_is_rejected_without_migration(tmp_path) -> None:
+    path = tmp_path / "metadata" / "lake.db"
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as db:
+        db.execute("create table metadata_state (key text primary key, value text)")
+        db.execute(
+            "insert into metadata_state(key,value) values ('schema_version','1')"
+        )
+
+    with pytest.raises(ConfigurationError, match="automatic migration is intentionally disabled"):
+        DataLake.open(tmp_path)
 
 
 def test_asset_request_date_field_is_distinct_from_pit_time(tmp_path) -> None:
@@ -176,7 +391,12 @@ def test_asset_request_date_field_is_distinct_from_pit_time(tmp_path) -> None:
     frame = lake.query.query("income", source="custom").collect()
     assert frame["time"].item().isoformat() == "2024-12-31"
     scope = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert scope["checked_through"] == "2025-01-31"
+    assert scope["checked_through"] == "2024-12-31"
+    assert scope["data_max_time"] == "2024-12-31"
+    provider_check = lake.admin.status.provider_scope_checks(
+        dataset="income", source="custom"
+    )[0]
+    assert provider_check["checked_through"] == "2025-01-31"
 
 
 def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
@@ -331,66 +551,6 @@ def test_removed_audit_public_surface(tmp_path) -> None:
     assert not hasattr(lake.update, "plan")
     assert not hasattr(lake.update, "execute")
     assert not hasattr(lake.update, "state_fingerprint")
-
-
-def test_bootstrap_seeds_physical_daily_dates_and_keeps_assets_pending(
-    tmp_path,
-) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.ingest(
-        DatasetSpec("trade_cal", "general"),
-        pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
-    )
-    lake.ingest(
-        DatasetSpec(
-            "daily",
-            "by_daily",
-            calendar="trade_cal",
-            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-        ),
-        pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["A"]}),
-    )
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "income",
-            "by_asset",
-            asset_list="stock_basic",
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-    with lake.metadata.connect() as db:
-        db.execute("delete from metadata_state where key='update_state_version'")
-        db.execute("create table pending_update_jobs(job_key text)")
-        db.execute("create table update_coverage(scope_key text)")
-        db.execute("create table audit_watermarks(dataset text)")
-
-    preview = lake.update.bootstrap_update_state(start="2025-01-01", end="2025-01-03")
-    assert preview["mode"] == "dry-run"
-    assert not lake.metadata.update_state_ready()
-
-    result = lake.update.bootstrap_update_state(
-        start="2025-01-01", end="2025-01-03", apply=True
-    )
-    assert result["seeded_daily_scopes"] == 1
-    assert result["backup"] and Path(result["backup"]).is_file()
-    daily = lake.admin.status.update_scopes(dataset="daily", source="custom")
-    assert [(row["scope_key"], row["status"]) for row in daily] == [
-        ("2025-01-02", "success"),
-        ("2025-01-03", "pending"),
-    ]
-    asset = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert asset["status"] == "pending"
-    assert asset["checked_through"] is None
-    with lake.metadata.connect() as db:
-        tables = {
-            row[0]
-            for row in db.execute("select name from sqlite_master where type='table'")
-        }
-    assert not {"pending_update_jobs", "update_coverage", "audit_watermarks"} & tables
 
 
 def test_atomic_parquet_replace_retries_transient_permission_errors(

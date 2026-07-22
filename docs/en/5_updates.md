@@ -18,18 +18,22 @@ synchronizes the selected dataset's expected scopes, then claims and executes
 eligible rows. It never infers completeness from the maximum date in Parquet.
 
 - `by_daily` creates one scope per open calendar date and parameter variant.
-- `by_asset` creates one scope per asset and parameter variant. Its
-  `checked_through` watermark records the end of the last successful provider
-  check; `data_max_time` records the latest returned observation.
+- `by_asset` creates one scope per asset and parameter variant.
+- `data_max_time` and scope success are local, commit-backed facts.
+- `provider_scope_checks.checked_through` records the end of a validated
+  provider check independently from the latest returned observation.
 - `general` datasets remain explicit replacement refreshes and do not use
   incremental scopes.
 
 Scope statuses are `pending`, `running`, `success`, `empty`, `failed`, and
-`invalid`. Updates select pending and failed scopes. Successful current-day
-daily scopes are checked once more after the date becomes historical. Invalid
-responses require an explicit operator reset.
+`invalid`. Every validated empty response finishes the scope as `empty`, even
+when no local rows exist. The separate provider check controls when that scope
+is eligible again, while `data_max_time`, `last_success_at`, `row_count`, and
+`commit_run_id` continue to describe only committed local data. Successful
+current-day daily scopes are checked once more after the date becomes
+historical. Invalid responses require an explicit operator reset.
 
-For `by_asset`, normal work starts after `checked_through`. Once every
+For `by_asset`, normal work starts after the provider-check watermark. Once every
 `revision_refresh_days`, the request also includes the preceding
 `revision_lookback_days`, allowing later provider revisions to upsert canonical
 records without repeatedly downloading the full history.
@@ -39,12 +43,25 @@ records without repeatedly downloading the full history.
 Provider calls share one bounded thread pool. Results are committed per dataset
 on the scheduler thread. A nonempty scope becomes successful only after the
 corresponding Parquet batch commits. If the write fails, the scope becomes
-failed and its watermark does not advance. Empty successful responses need no
-Parquet write and can be recorded immediately after response validation.
+failed and its local watermark does not advance. A validated empty response
+writes the API audit (`result_kind = 'empty'`), provider check, `empty` scope
+transition, and durable run `empty_count` in one SQLite transaction. It does not
+increment `success_count`, update `last_success_at`, or move `data_max_time`.
+An all-empty valid run has status `no_data` and no local data change.
 
-Each selected dataset has a writer lease. A second process cannot update that
-dataset until the first process finishes or its lease expires. Stale running
-scopes are recovered on the next invocation.
+Set `historical_empty_is_error = true` for a dense `by_daily` dataset whose
+historical open-date request must contain rows. An unexpected historical empty
+then follows the configured retry policy and aborts the batch as a retryable
+failure after retries are exhausted. Current-day empties remain provisional.
+
+Each selected dataset has a writer lease tied to a workflow owner. A second
+process cannot update that dataset until the first process finishes or its
+lease expires. Scopes are claimed only when entering the bounded in-flight
+queue. Cooperative cancellation stops new claims, settles completed provider
+calls, commits completed nonempty buffers, preserves completed empties, and
+releases leases. Owner cleanup after forced termination changes only genuinely
+unfinished `running` scopes to retryable `failed`; committed `success` and
+durable `empty` scopes remain unchanged.
 
 Failed physical calls are retried three times within one invocation. A
 persistent failure is stored in the scope ledger and retried by a later update;
@@ -76,10 +93,9 @@ Inspect and reset state through the status facade:
 
 ```python
 lake.admin.status.update_summary(source="tushare")
+lake.admin.status.provider_scope_checks(source="tushare", dataset="income")
 lake.admin.status.update_scopes(
     source="tushare", dataset="income", status="failed"
 )
-lake.admin.status.reset_update_scopes(
-    source="tushare", dataset="income", statuses=("failed", "invalid")
-)
+lake.admin.status.reset_update_scopes([123, 124])
 ```

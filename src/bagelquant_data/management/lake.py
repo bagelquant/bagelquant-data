@@ -115,6 +115,11 @@ class LakeAdmin:
     ) -> list[dict[str, Any]]:
         return self.status.update_summary(dataset=dataset, source=source)
 
+    def provider_scope_checks(
+        self, dataset: str | None = None, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.status.provider_scope_checks(dataset=dataset, source=source)
+
     def reset_update_scopes(
         self, scope_ids: Sequence[int], *, clear_watermark: bool = False
     ) -> int:
@@ -131,19 +136,6 @@ class LakeUpdater:
     """Public dataset update API."""
 
     lake: DataLake
-
-    def bootstrap_update_state(
-        self,
-        *,
-        start: DateLike = "1999-12-31",
-        end: DateLike | None = None,
-        apply: bool = False,
-    ) -> dict[str, Any]:
-        """Preview or apply the one-time ledger-v1 migration."""
-
-        from bagelquant_data.pipeline.bootstrap import bootstrap_update_state
-
-        return bootstrap_update_state(self.lake, start=start, end=end, apply=apply)
 
     def dataset(
         self,
@@ -177,10 +169,6 @@ class LakeUpdater:
         progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> UpdateReport:
-        if not self.lake.metadata.update_state_ready():
-            raise ConfigurationError(
-                "update-state migration is incomplete; run bootstrap_update_state first"
-            )
         self.lake.metadata.recover_stale_running_scopes()
         raw = RawQueryService(self.lake.parquet, self.lake.metadata)
         works: list[DatasetUpdateWork] = []
@@ -229,7 +217,15 @@ class LakeUpdater:
             return combine_reports(source, [])
         before = _manifest_map(self.lake.metadata, source)
         leases = [(work.spec.source, work.spec.name, work.run_id) for work in selected]
-        self.lake.metadata.acquire_update_leases(leases)
+        owner_id = next(
+            (
+                str(work.context.options["owner_id"])
+                for work in selected
+                if work.context.options.get("owner_id") is not None
+            ),
+            None,
+        )
+        self.lake.metadata.acquire_update_leases(leases, owner_id=owner_id)
         try:
             report = update_datasets(
                 source_adapter=adapter,
@@ -344,6 +340,8 @@ def _request_context(
     today = kwargs.pop("today", None)
     ids = kwargs.pop("ids", None)
     params = kwargs.pop("params", None)
+    owner_id = kwargs.pop("owner_id", None)
+    cancel_requested = kwargs.pop("cancel_requested", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -374,6 +372,12 @@ def _request_context(
         options["ids"] = ids
     if params is not None:
         options["params"] = params
+    if owner_id is not None:
+        options["owner_id"] = str(owner_id)
+    if cancel_requested is not None:
+        if not callable(cancel_requested):
+            raise ConfigurationError("cancel_requested must be callable")
+        options["cancel_requested"] = cancel_requested
     return RequestContext(source=source, dataset=dataset, options=options, **known)
 
 

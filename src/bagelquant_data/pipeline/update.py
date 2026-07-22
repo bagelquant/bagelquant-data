@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Any, TypeAlias, cast
 from uuid import uuid4
 
@@ -63,6 +63,7 @@ class UpdateProgress:
     failure_count: int
     rows_downloaded: int
     status: str
+    rows_committed: int = 0
     empty_count: int = 0
     invalid_count: int = 0
     remaining_count: int = 0
@@ -93,6 +94,11 @@ class FetchPage:
     retry_count: int
     error_message: str | None = None
     asset_id: str | None = None
+    fatal: bool = False
+
+
+class _UnexpectedHistoricalEmptyError(RuntimeError):
+    """A dense historical provider request returned no rows."""
 
 
 @dataclass(slots=True)
@@ -116,6 +122,7 @@ class _RunState:
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
     fatal_error: str | None = None
+    cancelled: bool = False
 
 
 UpdateTask: TypeAlias = tuple[DatasetUpdateWork, LedgerRequest]
@@ -175,24 +182,12 @@ def update_datasets(
                 source=work.spec.source,
                 dataset=work.spec.name,
                 mode=work.spec.update_type,
+                owner_id=_owner_id(work.context),
             )
             begun.add(work.spec.name)
             _emit_progress(callbacks[work.spec.name], states[work.spec.name], "sync", 0)
-            scope_ids = [
-                request.scope_id for request in work.requests if request.scope_id
-            ]
-            claimed = set(
-                pipeline.metadata.claim_update_scopes(scope_ids, run_id=work.run_id)
-            )
-            tasks.extend(
-                (work, request)
-                for request in work.requests
-                if request.scope_id is None or request.scope_id in claimed
-            )
-            _emit_progress(callbacks[work.spec.name], states[work.spec.name], "claim", 0)
-        totals = {
-            name: sum(work.spec.name == name for work, _ in tasks) for name in states
-        }
+            tasks.extend((work, request) for request in work.requests)
+        totals = {name: len(states[name].work.requests) for name in states}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             _run_fetches(
                 _fair_tasks(tasks),
@@ -258,64 +253,85 @@ def _run_fetches(
 ) -> None:
     task_iter = iter(enumerate(tasks))
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
+    stop_submission = False
+
+    def cancellation_requested() -> bool:
+        return any(_cancel_requested(state.work.context) for state in states.values())
+
+    def mark_cancelled() -> None:
+        for state in states.values():
+            state.cancelled = True
 
     def submit_next() -> bool:
-        try:
-            index, task = next(task_iter)
-        except StopIteration:
-            return False
-        work, request = task
-        future = executor.submit(
-            _fetch_request_pages,
-            spec=work.spec,
-            source_adapter=source_adapter,
-            request=request.params,
-            request_index=index,
-            request_options=_request_options(work.context),
-            max_retries=max(1, int(work.context.options.get("max_retries", 3))),
-            retry_backoff_seconds=float(
-                work.context.options.get("retry_backoff_seconds", 60.0)
-            ),
-        )
-        futures[future] = (time.perf_counter(), task)
-        states[work.spec.name].peak_in_flight = max(
-            states[work.spec.name].peak_in_flight, len(futures)
-        )
-        return True
+        nonlocal stop_submission
+        while not stop_submission:
+            if cancellation_requested():
+                stop_submission = True
+                mark_cancelled()
+                return False
+            try:
+                index, task = next(task_iter)
+            except StopIteration:
+                return False
+            work, request = task
+            if request.scope_id is not None:
+                claimed = pipeline.metadata.claim_update_scopes(
+                    [request.scope_id], run_id=work.run_id
+                )
+                if request.scope_id not in claimed:
+                    totals[work.spec.name] = max(0, totals[work.spec.name] - 1)
+                    continue
+            _emit_progress(
+                callbacks[work.spec.name],
+                states[work.spec.name],
+                "claim",
+                completed[work.spec.name],
+                total=totals[work.spec.name],
+            )
+            future = executor.submit(
+                _fetch_request_pages,
+                spec=work.spec,
+                source_adapter=source_adapter,
+                request=request.params,
+                request_index=index,
+                request_options=_request_options(work.context),
+                max_retries=max(1, int(work.context.options.get("max_retries", 3))),
+                retry_backoff_seconds=float(
+                    work.context.options.get("retry_backoff_seconds", 60.0)
+                ),
+                require_nonempty=(
+                    work.spec.historical_empty_is_error
+                    and request.recheck_after is None
+                ),
+                cancel_requested=_cancel_callback(work.context),
+            )
+            futures[future] = (time.perf_counter(), task)
+            states[work.spec.name].peak_in_flight = max(
+                states[work.spec.name].peak_in_flight, len(futures)
+            )
+            return True
+        return False
 
     while len(futures) < max_in_flight and submit_next():
         pass
     while futures:
-        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+        if cancellation_requested():
+            stop_submission = True
+            mark_cancelled()
+        done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+        if not done:
+            continue
+        fatal_error: str | None = None
         for future in done:
             submitted_at, (work, request) = futures.pop(future)
             state = states[work.spec.name]
             pages = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
-            state.request_count += len(pages)
-            state.rows_downloaded += sum(
-                page.row_count for page in pages if page.status == "success"
-            )
             started = time.perf_counter()
-            pipeline.metadata.record_api_calls(
-                {
-                    "run_id": work.run_id,
-                    "source": work.spec.source,
-                    "dataset": work.spec.name,
-                    "request_key": page.request_key,
-                    "request_params": page.request_params,
-                    "status": page.status,
-                    "row_count": page.row_count,
-                    "retry_count": page.retry_count,
-                    "error_message": page.error_message,
-                    "asset_id": page.asset_id,
-                    "scope_id": request.scope_id,
-                    "request_kind": request.request_kind,
-                }
-                for page in pages
-            )
-            state.metadata_seconds += time.perf_counter() - started
             _harvest_request(pipeline, state, request, pages)
+            state.metadata_seconds += time.perf_counter() - started
+            fatal = next((page.error_message for page in pages if page.fatal), None)
+            fatal_error = fatal_error or fatal
             completed[work.spec.name] += 1
             _emit_progress(
                 callbacks[work.spec.name],
@@ -341,8 +357,11 @@ def _run_fetches(
                     totals[work.spec.name],
                 )
             pipeline.metadata.refresh_update_lease(run_id=work.run_id)
-        while len(futures) < max_in_flight and submit_next():
-            pass
+        if fatal_error is not None:
+            raise _UnexpectedHistoricalEmptyError(fatal_error)
+        if not stop_submission:
+            while len(futures) < max_in_flight and submit_next():
+                pass
 
 
 def _harvest_request(
@@ -351,13 +370,21 @@ def _harvest_request(
     request: LedgerRequest,
     pages: Sequence[FetchPage],
 ) -> None:
+    calls = _api_call_rows(state.work, request, pages)
+    request_count = len(pages)
+    downloaded = sum(page.row_count for page in pages if page.status == "success")
     failures = [page for page in pages if page.status != "success"]
     if failures:
+        pipeline.metadata.record_api_calls(calls)
+        state.request_count += request_count
+        state.rows_downloaded += downloaded
         status = (
             "invalid"
             if any(page.status == "invalid" for page in failures)
             else "failed"
         )
+        if any(page.status == "cancelled" for page in failures):
+            state.cancelled = True
         message = failures[-1].error_message or "provider request failed"
         _transition(pipeline, state, request, status, message)
         return
@@ -367,22 +394,54 @@ def _harvest_request(
     frame = pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
     error = _validate_response(state.work.spec, request, frame)
     if error is not None:
+        pipeline.metadata.record_api_calls(
+            ({**call, "result_kind": "invalid"} for call in calls)
+        )
+        state.request_count += request_count
+        state.rows_downloaded += downloaded
         _transition(pipeline, state, request, "invalid", error)
         return
     if frame.is_empty():
-        if request.overlaps_existing:
-            _transition(
-                pipeline,
-                state,
-                request,
-                "invalid",
-                "empty response contradicts existing canonical coverage",
-            )
-            return
-        _transition(pipeline, state, request, "empty", None)
+        pipeline.metadata.record_empty_scope_result(
+            calls=({**call, "result_kind": "empty"} for call in calls),
+            scope_id=request.scope_id,
+            run_id=state.work.run_id,
+            checked_through=request.target_end,
+            recheck_after=request.recheck_after,
+        )
+        state.request_count += request_count
+        state.rows_downloaded += downloaded
+        state.empty_count += 1
         return
+    pipeline.metadata.record_api_calls(calls)
+    state.request_count += request_count
+    state.rows_downloaded += downloaded
     state.buffered.append((frame, request))
     state.buffered_bytes += int(frame.estimated_size())
+
+
+def _api_call_rows(
+    work: DatasetUpdateWork,
+    request: LedgerRequest,
+    pages: Sequence[FetchPage],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "run_id": work.run_id,
+            "source": work.spec.source,
+            "dataset": work.spec.name,
+            "request_key": page.request_key,
+            "request_params": page.request_params,
+            "status": page.status,
+            "row_count": page.row_count,
+            "retry_count": page.retry_count,
+            "error_message": page.error_message,
+            "asset_id": page.asset_id,
+            "scope_id": request.scope_id,
+            "request_kind": request.request_kind,
+        }
+        for page in pages
+    ]
 
 
 def _commit_state(
@@ -425,7 +484,9 @@ def _commit_state(
         ]
         started = time.perf_counter()
         pipeline.metadata.transition_update_scopes(
-            transitions, run_id=state.work.run_id
+            transitions,
+            run_id=state.work.run_id,
+            committed_rows=committed,
         )
         state.metadata_seconds += time.perf_counter() - started
         state.success_count += len(buffered)
@@ -452,21 +513,12 @@ def _transition(
                 {
                     "scope_id": request.scope_id,
                     "status": status,
-                    "checked_through": request.target_end
-                    if status in {"success", "empty"}
-                    else None,
-                    "last_revision_check_at": datetime.now(UTC).isoformat()
-                    if request.revision_check and status in {"success", "empty"}
-                    else None,
-                    "recheck_after": request.recheck_after,
                     "last_error": error,
                 }
             ],
             run_id=state.work.run_id,
         )
-    if status == "empty":
-        state.empty_count += 1
-    elif status == "invalid":
+    if status == "invalid":
         state.invalid_count += 1
         state.errors.append(error or "invalid response")
     elif status == "failed":
@@ -481,16 +533,17 @@ def _success_transition(
     *,
     data_max_time: str | None,
 ) -> dict[str, object]:
+    if data_max_time is None:
+        raise RuntimeError(
+            f"canonical data maximum missing after commit for {spec.source}/{spec.name}"
+        )
     return {
         "scope_id": request.scope_id,
         "status": "success",
-        "checked_through": request.target_end,
         "data_max_time": data_max_time,
         "row_count": frame.height,
-        "last_revision_check_at": datetime.now(UTC).isoformat()
-        if request.revision_check
-        else None,
-        "recheck_after": request.recheck_after,
+        "provider_checked_through": request.target_end,
+        "provider_recheck_after": request.recheck_after,
         "last_error": None,
     }
 
@@ -612,34 +665,46 @@ def _fail_running(pipeline: IngestionPipeline, state: _RunState, message: str) -
     )
 
 
-def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
-    remaining = len(
-        pipeline.metadata.update_scopes(
-            source=state.work.spec.source,
-            dataset=state.work.spec.name,
-            status=("pending", "failed", "invalid"),
-        )
+def _remaining_scope_count(
+    pipeline: IngestionPipeline, state: _RunState
+) -> int:
+    rows = pipeline.metadata.update_scopes(
+        source=state.work.spec.source,
+        dataset=state.work.spec.name,
+        status=("pending", "failed"),
     )
+    return len(rows)
+
+
+def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
+    remaining = _remaining_scope_count(pipeline, state)
     error = state.fatal_error or ("; ".join(state.errors[:5]) if state.errors else None)
+    if state.cancelled and error is None:
+        error = "update cancelled by workflow owner"
     attempted = (
         state.success_count
         + state.empty_count
         + state.failure_count
         + state.invalid_count
     )
-    status = (
-        "failed"
-        if state.fatal_error
-        or (attempted and not state.success_count and not state.empty_count)
-        else "partial"
-        if state.failure_count or state.invalid_count
-        else "success"
-    )
+    if state.cancelled:
+        status = "cancelled"
+    elif state.fatal_error or (
+        attempted and not state.success_count and not state.empty_count
+    ):
+        status = "failed"
+    elif state.failure_count or state.invalid_count:
+        status = "partial"
+    elif state.empty_count and not state.success_count:
+        status = "no_data"
+    else:
+        status = "success"
     pipeline.metadata.finalize_run(
         run_id=state.work.run_id,
         status=status,
         request_count=state.request_count,
-        success_count=state.success_count + state.empty_count,
+        success_count=state.success_count,
+        empty_count=state.empty_count,
         failure_count=state.failure_count + state.invalid_count,
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
@@ -653,7 +718,8 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
         request_count=state.request_count,
-        success_count=state.success_count + state.empty_count,
+        success_count=state.success_count,
+        empty_count=state.empty_count,
         failure_count=state.failure_count + state.invalid_count,
         remaining_scope_count=remaining,
         elapsed_seconds=time.perf_counter() - state.started_at,
@@ -718,6 +784,8 @@ def _fetch_request_pages(
     request_options: dict[str, Any],
     max_retries: int,
     retry_backoff_seconds: float,
+    require_nonempty: bool,
+    cancel_requested: Callable[[], bool] | None,
 ) -> list[FetchPage]:
     if request_options.get("pagination") != "offset":
         return [
@@ -728,6 +796,8 @@ def _fetch_request_pages(
                 str(request_index),
                 max_retries,
                 retry_backoff_seconds,
+                require_nonempty,
+                cancel_requested,
             )
         ]
     page_size = int(request_options.get("page_size", 5000))
@@ -745,6 +815,8 @@ def _fetch_request_pages(
             f"{request_index}:{page_index}",
             max_retries,
             retry_backoff_seconds,
+            require_nonempty and page_index == 0,
+            cancel_requested,
         )
         pages.append(page)
         if page.status != "success" or page.row_count < page_size:
@@ -772,13 +844,30 @@ def _fetch_one(
     request_key: str,
     max_retries: int,
     retry_backoff_seconds: float,
+    require_nonempty: bool = False,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> FetchPage:
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        if cancel_requested is not None and cancel_requested():
+            return FetchPage(
+                request_key,
+                request,
+                None,
+                "cancelled",
+                0,
+                attempt,
+                "update cancelled before provider retry completed",
+                _request_asset(request),
+            )
         try:
             frame = source_adapter.fetch(spec.name, request)  # type: ignore[attr-defined]
             if not isinstance(frame, pl.DataFrame):
                 raise TypeError("source adapter must return a Polars DataFrame")
+            if require_nonempty and frame.is_empty():
+                raise _UnexpectedHistoricalEmptyError(
+                    f"unexpected empty response for dense historical dataset {spec.name}"
+                )
             return FetchPage(
                 request_key,
                 request,
@@ -791,7 +880,19 @@ def _fetch_one(
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt + 1 < max_retries:
-                time.sleep(retry_backoff_seconds)
+                if not _cooperative_backoff(
+                    retry_backoff_seconds, cancel_requested=cancel_requested
+                ):
+                    return FetchPage(
+                        request_key,
+                        request,
+                        None,
+                        "cancelled",
+                        0,
+                        attempt,
+                        "update cancelled during provider retry backoff",
+                        _request_asset(request),
+                    )
     return FetchPage(
         request_key,
         request,
@@ -801,6 +902,7 @@ def _fetch_one(
         max_retries - 1,
         str(last_error) if last_error else "unknown provider error",
         _request_asset(request),
+        isinstance(last_error, _UnexpectedHistoricalEmptyError),
     )
 
 
@@ -821,6 +923,37 @@ def _request_options(context: RequestContext) -> dict[str, Any]:
         if key in context.options:
             options[key] = context.options[key]
     return options
+
+
+def _owner_id(context: RequestContext) -> str | None:
+    value = context.options.get("owner_id")
+    return None if value is None else str(value)
+
+
+def _cancel_requested(context: RequestContext) -> bool:
+    callback = _cancel_callback(context)
+    return bool(callback()) if callback is not None else False
+
+
+def _cancel_callback(context: RequestContext) -> Callable[[], bool] | None:
+    callback = context.options.get("cancel_requested")
+    return cast(Callable[[], bool], callback) if callable(callback) else None
+
+
+def _cooperative_backoff(
+    seconds: float,
+    *,
+    cancel_requested: Callable[[], bool] | None,
+) -> bool:
+    if cancel_requested is None:
+        time.sleep(max(0.0, seconds))
+        return True
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if cancel_requested is not None and cancel_requested():
+            return False
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return cancel_requested is None or not cancel_requested()
 
 
 def _source_column(spec: DatasetSpec, canonical: str) -> str:
@@ -922,6 +1055,7 @@ def _emit_progress(
             failure_count=state.failure_count,
             rows_downloaded=state.rows_downloaded,
             status=status,
+            rows_committed=state.rows_committed,
             empty_count=state.empty_count,
             invalid_count=state.invalid_count,
             remaining_count=max(0, final_total - completed),

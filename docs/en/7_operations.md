@@ -9,7 +9,8 @@ print(lake.admin.runs())
 print(lake.admin.status.update_summary(source="tushare"))
 ```
 
-The update ledger is current state; `api_calls` and ingestion runs are the
+The update ledger is commit-backed local state. `provider_scope_checks` is the
+separate scheduling watermark, while `api_calls` and ingestion runs are the
 attempt history. Failed scopes retain their error and attempt count. Invalid
 scopes identify provider responses whose keys, date range, asset identity, or
 payload did not satisfy the dataset contract.
@@ -27,13 +28,10 @@ Use `rebuild_manifest` after repairing local Parquet files and
 tools do not mutate the update ledger. If external storage changes invalidate
 the ledger, reset the affected scopes explicitly before updating.
 
-## Existing-lake migration
+## Fresh-lake schema contract
 
-Existing audit-based lakes require a one-time ledger bootstrap. The migration
-backs up `metadata/lake.db`, seeds daily success only from physically committed
-dates, marks unverifiable dates pending, and conservatively marks every asset
-pending for one full re-fetch. Corrupt legacy coverage is never trusted.
-
-The bootstrap is resumable and must complete before normal updates. After it
-finishes, the legacy pending-job, coverage, and audit-watermark tables are
-removed. Fresh lakes initialize ledger version 1 automatically.
+Fresh lakes create the interruption-safe ledger schema directly. The metadata
+database stores an explicit schema version. Opening an unversioned or older
+database fails with a clear incompatibility error; the library never migrates,
+repairs, backs up, or rewrites an old lake automatically. Stop all workers and
+create a fresh lake root before downloading again.

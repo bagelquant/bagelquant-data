@@ -123,6 +123,12 @@ def _daily_requests(
     rows = metadata.update_scopes(
         source=spec.source, dataset=spec.name, scope_kind="date"
     )
+    checks = {
+        int(row["scope_id"]): row
+        for row in metadata.provider_scope_checks(
+            source=spec.source, dataset=spec.name
+        )
+    }
     selected = []
     for row in rows:
         if str(row["variant_hash"]) not in variant_params:
@@ -130,10 +136,15 @@ def _daily_requests(
         scope_day = _date_value(row["scope_key"])
         if scope_day not in dates:
             continue
-        eligible = row["status"] in {"pending", "failed"} or (
-            row["status"] in {"success", "empty"}
-            and row["recheck_after"] is not None
-            and _date_value(row["recheck_after"]) <= execution_day
+        check = checks.get(int(row["id"]))
+        check_due = (
+            check is not None
+            and check["recheck_after"] is not None
+            and _date_value(check["recheck_after"]) <= execution_day
+        )
+        status = str(row["status"])
+        eligible = status in {"pending", "failed"} or (
+            status in {"success", "empty"} and check_due
         )
         if not eligible:
             continue
@@ -144,7 +155,7 @@ def _daily_requests(
                 request,
                 scope_id=int(row["id"]),
                 request_kind="historical_recheck"
-                if row["status"] in {"success", "empty"}
+                if check is not None
                 else "forward",
                 target_end=scope_day.isoformat(),
                 recheck_after=(scope_day + timedelta(days=1)).isoformat()
@@ -203,6 +214,12 @@ def _asset_requests(
     rows = metadata.update_scopes(
         source=spec.source, dataset=spec.name, scope_kind="asset"
     )
+    checks = {
+        int(row["scope_id"]): row
+        for row in metadata.provider_scope_checks(
+            source=spec.source, dataset=spec.name
+        )
+    }
     requests = []
     for row in rows:
         if str(row["variant_hash"]) not in variant_params:
@@ -216,21 +233,27 @@ def _asset_requests(
         }:
             continue
         initial_start, target_end = bounds[asset_id]
-        checked = _optional_date(row["checked_through"])
+        check = checks.get(int(row["id"]))
+        checked = _optional_date(None if check is None else check["checked_through"])
         forward_start = (
             checked + timedelta(days=1) if checked is not None else initial_start
         )
-        last_revision = _optional_datetime(row["last_revision_check_at"])
-        revision_due = (
+        last_revision = _optional_datetime(
+            None if check is None else check["last_checked_at"]
+        )
+        recheck_due = bool(
+            check is not None
+            and check["recheck_after"] is not None
+            and _date_value(check["recheck_after"]) <= execution_day
+        )
+        revision_due = recheck_due or (
             last_revision is None
             or (datetime.now(UTC) - last_revision).days >= spec.revision_refresh_days
         )
         forward_due = checked is None or checked < target_end
-        if (
-            row["status"] not in {"pending", "failed"}
-            and not forward_due
-            and not revision_due
-        ):
+        status = str(row["status"])
+        eligible = status in {"pending", "failed"} or forward_due or revision_due
+        if not eligible:
             continue
         request_start = forward_start
         if revision_due:
@@ -261,6 +284,9 @@ def _asset_requests(
                 request_kind="revision" if revision_due else "forward",
                 target_end=target_end.isoformat(),
                 revision_check=revision_due,
+                recheck_after=(
+                    execution_day + timedelta(days=spec.revision_refresh_days)
+                ).isoformat(),
                 overlaps_existing=(
                     row["data_max_time"] is not None
                     and request_start <= _date_value(row["data_max_time"])

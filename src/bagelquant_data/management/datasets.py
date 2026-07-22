@@ -96,6 +96,11 @@ class DatasetManager:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} revision settings must be positive"
             )
+        if spec.historical_empty_is_error and spec.update_type != "by_daily":
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} historical_empty_is_error is only "
+                "valid for by_daily"
+            )
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
@@ -186,6 +191,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "field_mappings",
         "revision_lookback_days",
         "revision_refresh_days",
+        "historical_empty_is_error",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -254,4 +260,5 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         field_mappings=field_mappings,
         revision_lookback_days=int(value.get("revision_lookback_days", 730)),
         revision_refresh_days=int(value.get("revision_refresh_days", 30)),
+        historical_empty_is_error=bool(value.get("historical_empty_is_error", False)),
     )

@@ -25,6 +25,7 @@ class DatasetSpec:
     field_mappings: dict[str, str] = field(default_factory=dict)
     revision_lookback_days: int = 730
     revision_refresh_days: int = 30
+    historical_empty_is_error: bool = False
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:
