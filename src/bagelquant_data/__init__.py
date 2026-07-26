@@ -8,6 +8,7 @@ from bagelquant_data.core import (
     DatasetSpecError,
     DuplicateResolutionError,
     SourceNotFoundError,
+    RequestDiscoverySpec,
     ValidationError,
     stable_bucket,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "DataSource",
     "DatasetNotFoundError",
     "DatasetSpec",
+    "RequestDiscoverySpec",
     "DatasetSpecError",
     "DuplicateResolutionError",
     "LakeAdmin",

@@ -9,6 +9,16 @@ ASSET_BUCKET_COUNT = 32
 
 
 @dataclass(frozen=True, slots=True)
+class RequestDiscoverySpec:
+    """Provider request that yields values used to fan out target requests."""
+
+    api: str
+    params: dict[str, object]
+    result_field: str
+    target_param: str
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetSpec:
     """Identity and update references for one local dataset."""
 
@@ -26,6 +36,8 @@ class DatasetSpec:
     revision_lookback_days: int = 730
     revision_refresh_days: int = 30
     historical_empty_is_error: bool = False
+    source_api: str | None = None
+    request_discovery: RequestDiscoverySpec | None = None
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:

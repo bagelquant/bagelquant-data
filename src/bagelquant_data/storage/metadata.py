@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1262,7 +1263,12 @@ def _now() -> str:
 
 
 def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:
-    return {field: getattr(spec, field) for field in spec.__dataclass_fields__}
+    payload = asdict(spec)
+    if payload["source_api"] is None:
+        payload.pop("source_api")
+    if payload["request_discovery"] is None:
+        payload.pop("request_discovery")
+    return payload
 
 
 def _api_result_kind(row: dict[str, Any]) -> str:

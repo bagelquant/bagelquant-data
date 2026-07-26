@@ -3,6 +3,7 @@
 from bagelquant_data.core.dataset import (
     ASSET_BUCKET_COUNT,
     DatasetSpec,
+    RequestDiscoverySpec,
     dataset_key,
     incremental_key,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "DataSource",
     "DatasetNotFoundError",
     "DatasetSpec",
+    "RequestDiscoverySpec",
     "DatasetSpecError",
     "DestructiveOperationError",
     "DuplicateResolutionError",

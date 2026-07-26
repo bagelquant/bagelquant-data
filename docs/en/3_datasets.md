@@ -78,3 +78,36 @@ exchange = "SSE"
 [[source_api_param_sets]]
 list_status = ["L", "D", "P"]
 ```
+
+## Provider API and request discovery
+
+By default, the declared dataset name is also the provider API name. Set
+`source_api` when a stable local dataset name must call a differently named
+provider API. The local name remains the raw-data identity, while `source_api`
+controls only the request sent to the configured adapter.
+
+`request_discovery` performs one provider request at planning time and turns a
+non-empty result column into target request variants. Its values are deduplicated
+and sorted, then form a Cartesian product with `source_api_params` and
+`source_api_param_sets`. The discovery target parameter must not also appear in
+either static parameter declaration.
+
+```toml
+name = "sw_l1_industry_membership"
+source = "tushare"
+source_api = "index_member_all"
+update_type = "general"
+
+[source_api_params]
+is_new = "N"
+
+[request_discovery]
+api = "index_classify"
+params = { level = "L1" }
+result_field = "index_code"
+target_param = "l1_code"
+```
+
+Discovery is declarative: adapters receive only an API name and request
+parameters. A missing result field, an empty result, or a discovery error fails
+the update before any target request is made.

@@ -18,7 +18,11 @@ from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
-from bagelquant_data.pipeline.scopes import LedgerRequest, synchronize_requests
+from bagelquant_data.pipeline.scopes import (
+    LedgerRequest,
+    discover_request_param_sets,
+    synchronize_requests,
+)
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
     PartitionChange,
@@ -171,6 +175,7 @@ class LakeUpdater:
     ) -> UpdateReport:
         self.lake.metadata.recover_stale_running_scopes()
         raw = RawQueryService(self.lake.parquet, self.lake.metadata)
+        adapter = self.lake.admin.sources.get(source)
         works: list[DatasetUpdateWork] = []
         for dataset in dict.fromkeys(datasets):
             spec = self.lake.admin.datasets.get(dataset, source=source)
@@ -184,6 +189,9 @@ class LakeUpdater:
                     "progress_callback": progress_callback,
                 },
             )
+            discovered_param_sets, discovery_call = discover_request_param_sets(
+                spec, adapter
+            )
             requests = synchronize_requests(
                 spec=spec,
                 raw=raw,
@@ -193,8 +201,18 @@ class LakeUpdater:
                 today=context.options.get("today"),
                 ids=context.options.get("ids"),
                 params=context.options.get("params"),
+                discovered_param_sets=discovered_param_sets,
             )
-            works.append(DatasetUpdateWork(spec, context, requests))
+            works.append(
+                DatasetUpdateWork(
+                    spec=spec,
+                    context=context,
+                    requests=requests,
+                    discovery_calls=(
+                        () if discovery_call is None else (discovery_call,)
+                    ),
+                )
+            )
 
         _print_job_summary(works)
         selected_type = _confirm_update_jobs() if confirm else "all"
@@ -212,8 +230,7 @@ class LakeUpdater:
             )
             or work.spec.update_type == selected_type
         ]
-        adapter = self.lake.admin.sources.get(source) if selected else None
-        if not selected or adapter is None:
+        if not selected:
             return combine_reports(source, [])
         before = _manifest_map(self.lake.metadata, source)
         leases = [(work.spec.source, work.spec.name, work.run_id) for work in selected]

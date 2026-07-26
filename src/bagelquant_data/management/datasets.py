@@ -10,7 +10,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from bagelquant_data.core.dataset import DatasetSpec, dataset_key
+from bagelquant_data.core.dataset import (
+    DatasetSpec,
+    RequestDiscoverySpec,
+    dataset_key,
+)
 from bagelquant_data.core.exceptions import (
     DatasetNotFoundError,
     DatasetSpecError,
@@ -63,6 +67,34 @@ class DatasetManager:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}"
             )
+        if spec.source_api is not None and (
+            not isinstance(spec.source_api, str) or not spec.source_api.strip()
+        ):
+            raise DatasetSpecError("source_api cannot be empty")
+        if discovery := spec.request_discovery:
+            if not isinstance(discovery.params, dict):
+                raise DatasetSpecError("request_discovery.params must be a mapping")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (
+                    discovery.api,
+                    discovery.result_field,
+                    discovery.target_param,
+                )
+            ):
+                raise DatasetSpecError(
+                    "request_discovery api, result_field, and target_param cannot be empty"
+                )
+            reserved = set(spec.source_api_params)
+            reserved.update(
+                key
+                for parameter_set in spec.source_api_param_sets
+                for key in parameter_set
+            )
+            if discovery.target_param in reserved:
+                raise DatasetSpecError(
+                    "request_discovery.target_param conflicts with target request parameters"
+                )
         if spec.update_type == "by_daily" and not spec.calendar:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} by_daily requires calendar"
@@ -181,6 +213,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "name",
         "update_type",
         "source",
+        "source_api",
         "calendar",
         "date_param",
         "request_date_field",
@@ -188,6 +221,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "primary_key_extra",
         "source_api_params",
         "source_api_param_sets",
+        "request_discovery",
         "field_mappings",
         "revision_lookback_days",
         "revision_refresh_days",
@@ -229,6 +263,29 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
             for value in param_set.values()
         ):
             raise DatasetSpecError("source_api_param_sets cannot contain empty lists")
+    discovery_value = value.get("request_discovery")
+    if discovery_value is None:
+        request_discovery = None
+    elif not isinstance(discovery_value, dict):
+        raise DatasetSpecError("request_discovery must be a TOML table")
+    else:
+        required = {"api", "params", "result_field", "target_param"}
+        missing_discovery = sorted(required - set(discovery_value))
+        unknown_discovery = sorted(set(discovery_value) - required)
+        if missing_discovery or unknown_discovery:
+            raise DatasetSpecError(
+                "request_discovery fields invalid: "
+                f"missing={missing_discovery}, unknown={unknown_discovery}"
+            )
+        params = discovery_value["params"]
+        if not isinstance(params, dict):
+            raise DatasetSpecError("request_discovery.params must be a TOML table")
+        request_discovery = RequestDiscoverySpec(
+            api=str(discovery_value["api"]),
+            params=dict(params),
+            result_field=str(discovery_value["result_field"]),
+            target_param=str(discovery_value["target_param"]),
+        )
     field_mapping_tables = value.get("field_mappings")
     if field_mapping_tables is None:
         field_mappings: dict[str, str] = {}
@@ -242,6 +299,9 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         name=str(value["name"]),
         update_type=str(value["update_type"]),
         source=str(value.get("source", "custom")),
+        source_api=(
+            None if value.get("source_api") is None else str(value["source_api"])
+        ),
         calendar=None if value.get("calendar") is None else str(value["calendar"]),
         date_param=None
         if value.get("date_param") is None
@@ -257,6 +317,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         source_api_param_sets=tuple(
             dict(param_set) for param_set in source_api_param_sets
         ),
+        request_discovery=request_discovery,
         field_mappings=field_mappings,
         revision_lookback_days=int(value.get("revision_lookback_days", 730)),
         revision_refresh_days=int(value.get("revision_refresh_days", 30)),

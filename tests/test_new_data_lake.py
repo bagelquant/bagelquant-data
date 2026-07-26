@@ -34,6 +34,8 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "revision_lookback_days",
         "revision_refresh_days",
         "historical_empty_is_error",
+        "source_api",
+        "request_discovery",
     ]
     assert incremental_key(spec) == ("time", "asset_id", "period")
     assert not hasattr(spec, "primary_key")

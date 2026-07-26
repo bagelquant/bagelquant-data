@@ -25,6 +25,14 @@ eligible rows. It never infers completeness from the maximum date in Parquet.
 - `general` datasets remain explicit replacement refreshes and do not use
   incremental scopes.
 
+For a dataset with `request_discovery`, discovery runs once per explicit update
+before scopes are synchronized. Its normalized values participate in the same
+variant identity as static parameters, so daily and asset ledgers retain
+independent recoverable scopes for every discovered value. The discovery call
+is recorded in the target dataset's API audit with `request_kind = 'discovery'`.
+If discovery fails, produces no values, or a general fan-out request fails, the
+existing general dataset is not replaced.
+
 Scope statuses are `pending`, `running`, `success`, `empty`, `failed`, and
 `invalid`. Every validated empty response finishes the scope as `empty`, even
 when no local rows exist. The separate provider check controls when that scope

@@ -17,7 +17,7 @@ from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
-from bagelquant_data.pipeline.scopes import LedgerRequest
+from bagelquant_data.pipeline.scopes import DiscoveryCall, LedgerRequest
 from bagelquant_data.query.raw import RawQueryService
 
 
@@ -80,6 +80,7 @@ class DatasetUpdateWork:
     context: RequestContext
     requests: tuple[LedgerRequest, ...]
     run_id: str = field(default_factory=lambda: uuid4().hex)
+    discovery_calls: tuple[DiscoveryCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +185,7 @@ def update_datasets(
                 mode=work.spec.update_type,
                 owner_id=_owner_id(work.context),
             )
+            pipeline.metadata.record_api_calls(_discovery_api_call_rows(work))
             begun.add(work.spec.name)
             _emit_progress(callbacks[work.spec.name], states[work.spec.name], "sync", 0)
             tasks.extend((work, request) for request in work.requests)
@@ -441,6 +443,23 @@ def _api_call_rows(
             "request_kind": request.request_kind,
         }
         for page in pages
+    ]
+
+
+def _discovery_api_call_rows(work: DatasetUpdateWork) -> list[dict[str, Any]]:
+    return [
+        {
+            "run_id": work.run_id,
+            "source": work.spec.source,
+            "dataset": work.spec.name,
+            "request_key": f"discovery:{index}",
+            "request_params": {"api": call.api, **call.params},
+            "status": "success",
+            "row_count": call.row_count,
+            "retry_count": 0,
+            "request_kind": "discovery",
+        }
+        for index, call in enumerate(work.discovery_calls)
     ]
 
 
@@ -861,7 +880,7 @@ def _fetch_one(
                 _request_asset(request),
             )
         try:
-            frame = source_adapter.fetch(spec.name, request)  # type: ignore[attr-defined]
+            frame = source_adapter.fetch(spec.source_api or spec.name, request)  # type: ignore[attr-defined]
             if not isinstance(frame, pl.DataFrame):
                 raise TypeError("source adapter must return a Polars DataFrame")
             if require_nonempty and frame.is_empty():

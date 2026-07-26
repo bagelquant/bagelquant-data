@@ -12,7 +12,7 @@ from itertools import product
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.exceptions import ConfigurationError
+from bagelquant_data.core.exceptions import ConfigurationError, DataSourceError
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.metadata import MetadataStore
@@ -31,6 +31,55 @@ class LedgerRequest:
     overlaps_existing: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryCall:
+    """One successful provider discovery request retained for API provenance."""
+
+    api: str
+    params: dict[str, object]
+    row_count: int
+
+
+def discover_request_param_sets(
+    spec: DatasetSpec, source_adapter: object
+) -> tuple[tuple[dict[str, object], ...], DiscoveryCall | None]:
+    """Fetch and validate dynamic parameter values declared by a dataset."""
+
+    discovery = spec.request_discovery
+    if discovery is None:
+        return (), None
+    try:
+        frame = source_adapter.fetch(discovery.api, dict(discovery.params))  # type: ignore[attr-defined]
+    except Exception as error:  # noqa: BLE001
+        raise DataSourceError(
+            f"request discovery failed for {spec.source}/{spec.name} "
+            f"via {discovery.api}: {error}"
+        ) from error
+    if not isinstance(frame, pl.DataFrame):
+        raise DataSourceError("request discovery source adapter must return a Polars DataFrame")
+    if discovery.result_field not in frame.columns:
+        raise DataSourceError(
+            f"request discovery response for {spec.source}/{spec.name} is missing "
+            f"{discovery.result_field!r}"
+        )
+    values = sorted(
+        {
+            str(value).strip()
+            for value in frame.get_column(discovery.result_field).drop_nulls().to_list()
+            if str(value).strip()
+        }
+    )
+    if not values:
+        raise DataSourceError(
+            f"request discovery returned no usable {discovery.result_field!r} values "
+            f"for {spec.source}/{spec.name}"
+        )
+    return (
+        tuple({discovery.target_param: value} for value in values),
+        DiscoveryCall(discovery.api, dict(discovery.params), frame.height),
+    )
+
+
 def synchronize_requests(
     *,
     spec: DatasetSpec,
@@ -41,12 +90,13 @@ def synchronize_requests(
     today: DateLike | None = None,
     ids: Sequence[str] | None = None,
     params: dict[str, object] | None = None,
+    discovered_param_sets: Sequence[dict[str, object]] = (),
 ) -> tuple[LedgerRequest, ...]:
     """Synchronize declared scopes and return only currently eligible work."""
 
     final_day = _date_value(end or today or date.today())
     execution_day = _date_value(today or date.today())
-    variants = _base_variants(spec, params)
+    variants = _base_variants(spec, params, discovered_param_sets)
     if spec.update_type == "general":
         requests = []
         for _, request in variants:
@@ -297,12 +347,15 @@ def _asset_requests(
 
 
 def _base_variants(
-    spec: DatasetSpec, params: dict[str, object] | None
+    spec: DatasetSpec,
+    params: dict[str, object] | None,
+    discovered_param_sets: Sequence[dict[str, object]],
 ) -> list[tuple[str, dict[str, object]]]:
     defaults = dict(spec.source_api_params)
     overrides = dict(params or {})
     parameter_sets = spec.source_api_param_sets or ({},)
     result = []
+    discovered = discovered_param_sets or ({},)
     for parameter_set in parameter_sets:
         keys = tuple(parameter_set)
         values = [
@@ -310,18 +363,20 @@ def _base_variants(
             for value in parameter_set.values()
         ]
         for combination in product(*values):
-            request = dict(defaults)
-            request.update(dict(zip(keys, combination, strict=True)))
-            request.update(overrides)
-            identity = json.dumps(
-                request, sort_keys=True, separators=(",", ":"), default=str
-            )
-            result.append(
-                (
-                    hashlib.blake2b(identity.encode(), digest_size=16).hexdigest(),
-                    request,
+            for dynamic in discovered:
+                request = dict(defaults)
+                request.update(dict(zip(keys, combination, strict=True)))
+                request.update(dynamic)
+                request.update(overrides)
+                identity = json.dumps(
+                    request, sort_keys=True, separators=(",", ":"), default=str
                 )
-            )
+                result.append(
+                    (
+                        hashlib.blake2b(identity.encode(), digest_size=16).hexdigest(),
+                        request,
+                    )
+                )
     return result
 
 
