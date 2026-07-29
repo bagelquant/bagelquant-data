@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from threading import Lock
+from threading import Lock, local
 from typing import Any
 
 import polars as pl
@@ -24,7 +24,8 @@ class TushareSource:
     ) -> None:
         self._name = name
         self._token = token
-        self._client = client
+        self._provided_client = client
+        self._clients = local()
         self._client_lock = Lock()
 
     @property
@@ -36,8 +37,9 @@ class TushareSource:
 
     def configure(self, **options: Any) -> None:
         if "token" in options:
-            self._token = str(options["token"])
-            self._client = None
+            with self._client_lock:
+                self._token = str(options["token"])
+                self._clients = local()
 
     def test_connection(self) -> None:
         client = self._ensure_client()
@@ -65,11 +67,16 @@ class TushareSource:
         return _from_pandas(result)
 
     def _ensure_client(self) -> Any:
-        if self._client is None:
+        if self._provided_client is not None:
+            return self._provided_client
+        client = getattr(self._clients, "client", None)
+        if client is None:
+            # Tushare configures its token through module-global state while a
+            # client is created, so serialize initialization but not requests.
             with self._client_lock:
-                if self._client is None:
-                    self._client = build_client(self._token)
-        return self._client
+                client = build_client(self._token)
+                self._clients.client = client
+        return client
 
 
 def _to_tushare_params(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -101,4 +108,4 @@ def _from_pandas(value: Any) -> pl.DataFrame:
         raise DataSourceError(
             f"Tushare returned {type(value)!r}, expected pandas.DataFrame"
         )
-    return pl.from_pandas(value.copy(deep=True))
+    return pl.from_pandas(value)

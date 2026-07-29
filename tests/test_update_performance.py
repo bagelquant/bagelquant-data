@@ -20,6 +20,20 @@ class DailySource:
         )
 
 
+class AssetSource:
+    name = "custom"
+
+    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+        asset = str(request["id"])
+        return pl.DataFrame(
+            {
+                "ann_date": ["20240630", "20250630"],
+                "ts_code": [asset, asset],
+                "value": [1.0, 2.0],
+            }
+        )
+
+
 def _daily_lake(tmp_path, dates: list[str]) -> DataLake:
     lake = DataLake.open(tmp_path)
     lake.admin.sources.register(DailySource())
@@ -70,6 +84,72 @@ def test_one_batch_rewrites_one_shared_partition(tmp_path) -> None:
     assert report.commit_count == 1
     assert report.partitions_rewritten == 1
     assert lake.query.query("daily", source="custom").collect().height == 4
+
+
+def test_default_buffer_does_not_commit_every_hundred_requests(tmp_path) -> None:
+    dates = (
+        pl.date_range(
+            pl.date(2025, 1, 1),
+            pl.date(2025, 5, 30),
+            interval="1d",
+            eager=True,
+        )
+        .dt.strftime("%Y%m%d")
+        .to_list()
+    )
+    lake = _daily_lake(tmp_path, dates)
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        end="2025-05-30",
+        progress=False,
+    )
+
+    assert report.request_count == 150
+    assert report.commit_count == 1
+    assert report.partitions_rewritten == 5
+
+
+def test_by_asset_default_rewrites_each_touched_partition_once(tmp_path) -> None:
+    assets = [f"{index:06d}.SZ" for index in range(150)]
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(AssetSource())
+    lake.ingest(
+        DatasetSpec(
+            "stock_basic",
+            "general",
+            field_mappings={"ts_code": "asset_id"},
+        ),
+        pl.DataFrame(
+            {
+                "ts_code": assets,
+                "list_date": ["20240101"] * len(assets),
+            }
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    report = lake.update.dataset(
+        "income",
+        source="custom",
+        start="2024-01-01",
+        end="2025-12-31",
+        workers=8,
+        progress=False,
+    )
+
+    files = lake.admin.status.files("income", source="custom")
+    assert report.request_count == 150
+    assert report.commit_count == 1
+    assert report.partitions_rewritten == len(files)
 
 
 def test_atomic_validation_does_not_replace_existing_file(

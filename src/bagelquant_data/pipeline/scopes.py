@@ -194,7 +194,7 @@ def _daily_requests(
         )
         status = str(row["status"])
         eligible = status in {"pending", "failed"} or (
-            status in {"success", "empty"} and check_due
+            status == "success" and check_due
         )
         if not eligible:
             continue
@@ -204,9 +204,13 @@ def _daily_requests(
             LedgerRequest(
                 request,
                 scope_id=int(row["id"]),
-                request_kind="historical_recheck"
-                if check is not None
-                else "forward",
+                request_kind=(
+                    "retry"
+                    if status == "failed"
+                    else "historical_recheck"
+                    if check is not None
+                    else "forward"
+                ),
                 target_end=scope_day.isoformat(),
                 recheck_after=(scope_day + timedelta(days=1)).isoformat()
                 if scope_day >= execution_day
@@ -279,7 +283,6 @@ def _asset_requests(
             "pending",
             "failed",
             "success",
-            "empty",
         }:
             continue
         initial_start, target_end = bounds[asset_id]
@@ -331,7 +334,13 @@ def _asset_requests(
             LedgerRequest(
                 request,
                 scope_id=int(row["id"]),
-                request_kind="revision" if revision_due else "forward",
+                request_kind=(
+                    "retry"
+                    if status == "failed"
+                    else "revision"
+                    if revision_due
+                    else "forward"
+                ),
                 target_end=target_end.isoformat(),
                 revision_check=revision_due,
                 recheck_after=(

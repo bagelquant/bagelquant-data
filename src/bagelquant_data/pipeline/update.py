@@ -98,10 +98,6 @@ class FetchPage:
     fatal: bool = False
 
 
-class _UnexpectedHistoricalEmptyError(RuntimeError):
-    """A dense historical provider request returned no rows."""
-
-
 @dataclass(slots=True)
 class _RunState:
     work: DatasetUpdateWork
@@ -156,6 +152,21 @@ def update_datasets(
 
     if not works:
         return UpdateReport(source="", datasets=(), runs=())
+    if len(works) > 1:
+        started_at = time.perf_counter()
+        reports: list[IngestionReport] = []
+        for work in works:
+            report = update_datasets(
+                source_adapter=source_adapter,
+                pipeline=pipeline,
+                works=(work,),
+            )
+            reports.extend(report.runs)
+        return _combine(
+            works[0].spec.source,
+            reports,
+            time.perf_counter() - started_at,
+        )
     started_at = time.perf_counter()
     workers = max(1, int(works[0].context.options.get("workers", 4)))
     max_in_flight = max(
@@ -192,7 +203,7 @@ def update_datasets(
         totals = {name: len(states[name].work.requests) for name in states}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             _run_fetches(
-                _fair_tasks(tasks),
+                _retry_first(_fair_tasks(tasks)),
                 executor=executor,
                 source_adapter=source_adapter,
                 pipeline=pipeline,
@@ -254,6 +265,7 @@ def _run_fetches(
     max_in_flight: int,
 ) -> None:
     task_iter = iter(enumerate(tasks))
+    ready: deque[tuple[int, UpdateTask]] = deque()
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
     stop_submission = False
 
@@ -264,55 +276,74 @@ def _run_fetches(
         for state in states.values():
             state.cancelled = True
 
-    def submit_next() -> bool:
+    def fill_ready(capacity: int) -> bool:
         nonlocal stop_submission
-        while not stop_submission:
-            if cancellation_requested():
-                stop_submission = True
-                mark_cancelled()
-                return False
+        if stop_submission or capacity <= 0:
+            return False
+        if cancellation_requested():
+            stop_submission = True
+            mark_cancelled()
+            return False
+        candidates: list[tuple[int, UpdateTask]] = []
+        while len(candidates) < capacity:
             try:
                 index, task = next(task_iter)
             except StopIteration:
-                return False
-            work, request = task
+                break
+            candidates.append((index, task))
+        if not candidates:
+            return False
+        by_run: dict[str, list[int]] = {}
+        for _, (work, request) in candidates:
             if request.scope_id is not None:
-                claimed = pipeline.metadata.claim_update_scopes(
-                    [request.scope_id], run_id=work.run_id
-                )
-                if request.scope_id not in claimed:
-                    totals[work.spec.name] = max(0, totals[work.spec.name] - 1)
-                    continue
-            _emit_progress(
-                callbacks[work.spec.name],
-                states[work.spec.name],
-                "claim",
-                completed[work.spec.name],
-                total=totals[work.spec.name],
+                by_run.setdefault(work.run_id, []).append(request.scope_id)
+        claimed_by_run = {
+            run_id: set(
+                pipeline.metadata.claim_update_scopes(scope_ids, run_id=run_id)
             )
-            future = executor.submit(
-                _fetch_request_pages,
-                spec=work.spec,
-                source_adapter=source_adapter,
-                request=request.params,
-                request_index=index,
-                request_options=_request_options(work.context),
-                max_retries=max(1, int(work.context.options.get("max_retries", 3))),
-                retry_backoff_seconds=float(
-                    work.context.options.get("retry_backoff_seconds", 60.0)
-                ),
-                require_nonempty=(
-                    work.spec.historical_empty_is_error
-                    and request.recheck_after is None
-                ),
-                cancel_requested=_cancel_callback(work.context),
-            )
-            futures[future] = (time.perf_counter(), task)
-            states[work.spec.name].peak_in_flight = max(
-                states[work.spec.name].peak_in_flight, len(futures)
-            )
-            return True
-        return False
+            for run_id, scope_ids in by_run.items()
+        }
+        for candidate in candidates:
+            _, (work, request) = candidate
+            if (
+                request.scope_id is not None
+                and request.scope_id not in claimed_by_run.get(work.run_id, set())
+            ):
+                totals[work.spec.name] = max(0, totals[work.spec.name] - 1)
+                continue
+            ready.append(candidate)
+        return bool(ready)
+
+    def submit_next() -> bool:
+        if not ready and not fill_ready(max_in_flight - len(futures)):
+            return False
+        index, task = ready.popleft()
+        work, request = task
+        _emit_progress(
+            callbacks[work.spec.name],
+            states[work.spec.name],
+            "claim",
+            completed[work.spec.name],
+            total=totals[work.spec.name],
+        )
+        future = executor.submit(
+            _fetch_request_pages,
+            spec=work.spec,
+            source_adapter=source_adapter,
+            request=request.params,
+            request_index=index,
+            request_options=_request_options(work.context),
+            max_retries=max(1, int(work.context.options.get("max_retries", 3))),
+            retry_backoff_seconds=float(
+                work.context.options.get("retry_backoff_seconds", 60.0)
+            ),
+            cancel_requested=_cancel_callback(work.context),
+        )
+        futures[future] = (time.perf_counter(), task)
+        states[work.spec.name].peak_in_flight = max(
+            states[work.spec.name].peak_in_flight, len(futures)
+        )
+        return True
 
     while len(futures) < max_in_flight and submit_next():
         pass
@@ -323,7 +354,6 @@ def _run_fetches(
         done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
         if not done:
             continue
-        fatal_error: str | None = None
         for future in done:
             submitted_at, (work, request) = futures.pop(future)
             state = states[work.spec.name]
@@ -332,8 +362,6 @@ def _run_fetches(
             started = time.perf_counter()
             _harvest_request(pipeline, state, request, pages)
             state.metadata_seconds += time.perf_counter() - started
-            fatal = next((page.error_message for page in pages if page.fatal), None)
-            fatal_error = fatal_error or fatal
             completed[work.spec.name] += 1
             _emit_progress(
                 callbacks[work.spec.name],
@@ -342,14 +370,18 @@ def _run_fetches(
                 completed[work.spec.name],
                 total=totals[work.spec.name],
             )
-            batch_size = max(1, int(work.context.options.get("batch_size", 100)))
+            configured_batch_size = work.context.options.get("batch_size")
             max_bytes = (
-                max(1, int(work.context.options.get("max_buffer_mb", 256)))
+                max(1, int(work.context.options.get("max_buffer_mb", 512)))
                 * 1024
                 * 1024
             )
             if work.spec.update_type != "general" and (
-                len(state.buffered) >= batch_size or state.buffered_bytes >= max_bytes
+                (
+                    configured_batch_size is not None
+                    and len(state.buffered) >= max(1, int(configured_batch_size))
+                )
+                or state.buffered_bytes >= max_bytes
             ):
                 _commit_state(
                     pipeline,
@@ -359,8 +391,6 @@ def _run_fetches(
                     totals[work.spec.name],
                 )
             pipeline.metadata.refresh_update_lease(run_id=work.run_id)
-        if fatal_error is not None:
-            raise _UnexpectedHistoricalEmptyError(fatal_error)
         if not stop_submission:
             while len(futures) < max_in_flight and submit_next():
                 pass
@@ -409,7 +439,7 @@ def _harvest_request(
             scope_id=request.scope_id,
             run_id=state.work.run_id,
             checked_through=request.target_end,
-            recheck_after=request.recheck_after,
+            recheck_after=None,
         )
         state.request_count += request_count
         state.rows_downloaded += downloaded
@@ -794,6 +824,14 @@ def _fair_tasks(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
     return result
 
 
+def _retry_first(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
+    """Run durable failed scopes before forward or revision work."""
+
+    retries = [task for task in tasks if task[1].request_kind == "retry"]
+    incremental = [task for task in tasks if task[1].request_kind != "retry"]
+    return [*retries, *incremental]
+
+
 def _fetch_request_pages(
     *,
     spec: DatasetSpec,
@@ -803,7 +841,6 @@ def _fetch_request_pages(
     request_options: dict[str, Any],
     max_retries: int,
     retry_backoff_seconds: float,
-    require_nonempty: bool,
     cancel_requested: Callable[[], bool] | None,
 ) -> list[FetchPage]:
     if request_options.get("pagination") != "offset":
@@ -815,7 +852,6 @@ def _fetch_request_pages(
                 str(request_index),
                 max_retries,
                 retry_backoff_seconds,
-                require_nonempty,
                 cancel_requested,
             )
         ]
@@ -834,7 +870,6 @@ def _fetch_request_pages(
             f"{request_index}:{page_index}",
             max_retries,
             retry_backoff_seconds,
-            require_nonempty and page_index == 0,
             cancel_requested,
         )
         pages.append(page)
@@ -863,7 +898,6 @@ def _fetch_one(
     request_key: str,
     max_retries: int,
     retry_backoff_seconds: float,
-    require_nonempty: bool = False,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> FetchPage:
     last_error: Exception | None = None
@@ -883,10 +917,6 @@ def _fetch_one(
             frame = source_adapter.fetch(spec.source_api or spec.name, request)  # type: ignore[attr-defined]
             if not isinstance(frame, pl.DataFrame):
                 raise TypeError("source adapter must return a Polars DataFrame")
-            if require_nonempty and frame.is_empty():
-                raise _UnexpectedHistoricalEmptyError(
-                    f"unexpected empty response for dense historical dataset {spec.name}"
-                )
             return FetchPage(
                 request_key,
                 request,
@@ -921,7 +951,6 @@ def _fetch_one(
         max_retries - 1,
         str(last_error) if last_error else "unknown provider error",
         _request_asset(request),
-        isinstance(last_error, _UnexpectedHistoricalEmptyError),
     )
 
 

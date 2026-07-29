@@ -35,12 +35,14 @@ def atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
     ):
         tmp.unlink(missing_ok=True)
         raise ValidationError("Atomic parquet write failed read-back row count check")
-    for attempt in range(5):
+    for attempt in range(8):
         try:
             os.replace(tmp, path)
             break
-        except PermissionError:
-            if attempt == 4:
+        except PermissionError as error:
+            if attempt == 7:
                 tmp.unlink(missing_ok=True)
-                raise
+                raise PermissionError(
+                    f"atomic parquet replace failed for {path}: {error}"
+                ) from error
             time.sleep(0.05 * (2**attempt))

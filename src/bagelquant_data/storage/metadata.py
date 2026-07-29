@@ -31,6 +31,7 @@ class MetadataStore:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def upsert_source(

@@ -1,4 +1,5 @@
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 
 from bagelquant_data.sources.tushare.source import TushareSource, _to_tushare_params
 
@@ -38,3 +39,24 @@ def test_tushare_calls_the_declared_provider_api_without_dataset_special_cases()
 
     assert client.requests == [("801010.SI", "N")]
     assert result.to_dicts() == [{"l1_code": "801010.SI", "ts_code": "000001.SZ"}]
+
+
+def test_tushare_builds_one_client_per_worker_thread(monkeypatch) -> None:
+    clients: list[object] = []
+
+    class Client:
+        def trade_cal(self) -> pd.DataFrame:
+            return pd.DataFrame({"is_open": [1]})
+
+    def build(_token):
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("bagelquant_data.sources.tushare.source.build_client", build)
+    source = TushareSource(token="secret")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: source.fetch("trade_cal", {}), range(4)))
+
+    assert all(result.height == 1 for result in results)
+    assert 1 <= len(clients) <= 2

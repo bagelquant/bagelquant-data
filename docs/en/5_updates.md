@@ -48,8 +48,10 @@ records without repeatedly downloading the full history.
 
 ## Commit and failure semantics
 
-Provider calls share one bounded thread pool. Results are committed per dataset
-on the scheduler thread. A nonempty scope becomes successful only after the
+Selected datasets run sequentially. Each dataset owns one bounded provider
+thread pool, so `workers` controls concurrency inside that dataset and never
+multiplies across datasets. Results are committed on the scheduler thread. A
+nonempty scope becomes successful only after the
 corresponding Parquet batch commits. If the write fails, the scope becomes
 failed and its local watermark does not advance. A validated empty response
 writes the API audit (`result_kind = 'empty'`), provider check, `empty` scope
@@ -57,10 +59,10 @@ transition, and durable run `empty_count` in one SQLite transaction. It does not
 increment `success_count`, update `last_success_at`, or move `data_max_time`.
 An all-empty valid run has status `no_data` and no local data change.
 
-Set `historical_empty_is_error = true` for a dense `by_daily` dataset whose
-historical open-date request must contain rows. An unexpected historical empty
-then follows the configured retry policy and aborts the batch as a retryable
-failure after retries are exhausted. Current-day empties remain provisional.
+Every validated empty response is a terminal `empty` scope. It is not retried
+automatically; reset the scope or change the dataset definition to check it
+again. The legacy `historical_empty_is_error` declaration remains readable but
+does not change this behavior.
 
 Each selected dataset has a writer lease tied to a workflow owner. A second
 process cannot update that dataset until the first process finishes or its
@@ -71,20 +73,21 @@ releases leases. Owner cleanup after forced termination changes only genuinely
 unfinished `running` scopes to retryable `failed`; committed `success` and
 durable `empty` scopes remain unchanged.
 
-Failed physical calls are retried three times within one invocation. A
-persistent failure is stored in the scope ledger and retried by a later update;
-it does not block unrelated scopes.
+Failed physical calls are attempted three times within one invocation with a
+fixed, cancellable 60-second wait. A persistent failure is stored in the scope
+ledger and retried before forward or revision work in a later update; it does
+not block unrelated scopes.
 
-Use `batch_size` to control successful requests per commit, `max_in_flight` to
-bound queued calls, and `max_buffer_mb` to limit buffered frames:
+Omit `batch_size` to commit when the dataset completes or its buffer reaches
+`max_buffer_mb` (512 MiB by default). Setting `batch_size` explicitly keeps a
+request-count commit boundary. `max_in_flight` bounds queued calls:
 
 ```python
 report = lake.update.source(
     "tushare",
     workers=4,
-    batch_size=100,
     max_in_flight=8,
-    max_buffer_mb=256,
+    max_buffer_mb=512,
     confirm=False,
 )
 ```

@@ -502,7 +502,7 @@ def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -
     assert waits == [60.0, 60.0]
 
 
-def test_datasets_share_one_global_worker_pool(tmp_path) -> None:
+def test_datasets_run_sequentially_with_workers_inside_each_dataset(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = ConcurrentDailySource(release_at=4)
     lake.admin.sources.register(source)
@@ -536,6 +536,10 @@ def test_datasets_share_one_global_worker_pool(tmp_path) -> None:
 
     assert source.maximum_active == 4
     assert {dataset for dataset, _ in source.requests} == {"daily", "daily_basic"}
+    requested_datasets = [dataset for dataset, _ in source.requests]
+    boundary = requested_datasets.index("daily_basic")
+    assert set(requested_datasets[:boundary]) == {"daily"}
+    assert set(requested_datasets[boundary:]) == {"daily_basic"}
 
 
 def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:

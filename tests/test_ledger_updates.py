@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 import sqlite3
 
 import polars as pl
@@ -262,7 +262,7 @@ def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_pat
     )
 
 
-def test_dense_historical_empty_retries_then_fails_without_coverage(tmp_path) -> None:
+def test_dense_historical_empty_is_terminal_even_with_legacy_flag(tmp_path) -> None:
     source = LedgerSource(empty=True)
     lake = DataLake.open(tmp_path)
     lake.admin.sources.register(source)
@@ -280,28 +280,41 @@ def test_dense_historical_empty_retries_then_fails_without_coverage(tmp_path) ->
         )
     )
 
-    with pytest.raises(RuntimeError, match="unexpected empty response"):
-        lake.update.dataset(
-            "daily",
-            source="custom",
-            start="2025-01-02",
-            end="2025-01-02",
-            max_retries=2,
-            retry_backoff_seconds=0,
-            progress=False,
-        )
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start="2025-01-02",
+        end="2025-01-02",
+        max_retries=2,
+        retry_backoff_seconds=0,
+        progress=False,
+    )
 
     scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
-    assert scope["status"] == "failed"
+    assert report.status == "no_data"
+    assert scope["status"] == "empty"
     assert scope["data_max_time"] is None
     assert scope["last_success_at"] is None
-    assert lake.admin.status.provider_scope_checks(
-        dataset="daily", source="custom"
-    ) == []
-    assert len(source.requests) == 2
+    assert (
+        lake.admin.status.provider_scope_checks(
+            dataset="daily", source="custom"
+        )[0]["recheck_after"]
+        is None
+    )
+    assert len(source.requests) == 1
+
+    source.requests.clear()
+    lake.update.dataset(
+        "daily",
+        source="custom",
+        start="2025-01-02",
+        end="2025-01-02",
+        progress=False,
+    )
+    assert source.requests == []
 
 
-def test_dense_current_day_empty_is_provisional_provider_check(tmp_path) -> None:
+def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
     today = date.today()
     source = LedgerSource(empty=True)
     lake = DataLake.open(tmp_path)
@@ -337,7 +350,7 @@ def test_dense_current_day_empty_is_provisional_provider_check(tmp_path) -> None
         dataset="daily", source="custom"
     )[0]
     assert check["checked_through"] == today.isoformat()
-    assert check["recheck_after"] == (today + timedelta(days=1)).isoformat()
+    assert check["recheck_after"] is None
 
 
 def test_incompatible_old_schema_is_rejected_without_migration(tmp_path) -> None:
