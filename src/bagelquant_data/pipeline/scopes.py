@@ -29,6 +29,7 @@ class LedgerRequest:
     revision_check: bool = False
     recheck_after: str | None = None
     overlaps_existing: bool = False
+    previous_data_max_time: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +340,11 @@ def _asset_requests(
                 overlaps_existing=(
                     row["data_max_time"] is not None
                     and request_start <= _date_value(row["data_max_time"])
+                ),
+                previous_data_max_time=(
+                    None
+                    if row["data_max_time"] is None
+                    else str(row["data_max_time"])
                 ),
             )
         )

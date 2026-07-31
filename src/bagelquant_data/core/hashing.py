@@ -30,8 +30,9 @@ def stable_record_hash(values: dict[str, object]) -> str:
 def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None) -> str:
     """Hash logical dataframe content without materializing rows as Python objects."""
 
-    selected = list(fields or frame.columns)
-    canonical = frame.select(selected).sort(selected).rechunk()
+    selected = frame.columns if fields is None else list(fields)
+    candidate = frame if fields is None else frame.select(selected)
+    canonical = candidate.sort(selected).rechunk()
     table = canonical.to_arrow().combine_chunks()
     sink = pa.BufferOutputStream()
     with ipc.new_stream(sink, table.schema) as writer:

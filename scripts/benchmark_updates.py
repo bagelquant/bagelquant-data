@@ -13,9 +13,11 @@ import json
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import polars as pl
@@ -23,6 +25,8 @@ import pyarrow as pa
 
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
+from bagelquant_data.pipeline import commit as commit_module
+from bagelquant_data.pipeline import update as update_module
 from bagelquant_data.pipeline.commit import MAX_PARQUET_WRITE_WORKERS
 from bagelquant_data.query.scanner import manifest_rows
 from bagelquant_data.storage import parquet as parquet_module
@@ -397,6 +401,12 @@ def _bulk_asset_benchmark(
     peak_writers = 0
     writer_lock = threading.Lock()
     real_write = parquet_module.atomic_write_parquet
+    real_deduplicate = commit_module._deduplicate
+    real_coverage = commit_module._coverage
+    real_executor = update_module.ThreadPoolExecutor
+    deduplicate_calls = 0
+    coverage_calls = 0
+    writer_pool_creations = 0
 
     def tracked_write(
         frame: pl.DataFrame,
@@ -414,8 +424,30 @@ def _bulk_asset_benchmark(
             with writer_lock:
                 active_writers -= 1
 
+    def tracked_deduplicate(frame: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
+        nonlocal deduplicate_calls
+        deduplicate_calls += 1
+        return real_deduplicate(frame, spec)
+
+    def tracked_coverage(
+        frames: list[pl.DataFrame],
+        spec: DatasetSpec,
+    ) -> tuple[set[str], dict[str, str]]:
+        nonlocal coverage_calls
+        coverage_calls += 1
+        return real_coverage(frames, spec)
+
+    def tracked_executor(*args: Any, **kwargs: Any) -> ThreadPoolExecutor:
+        nonlocal writer_pool_creations
+        if kwargs.get("thread_name_prefix") == "bagelquant-parquet":
+            writer_pool_creations += 1
+        return real_executor(*args, **kwargs)
+
     with (
         patch.object(parquet_module, "atomic_write_parquet", tracked_write),
+        patch.object(commit_module, "_deduplicate", tracked_deduplicate),
+        patch.object(commit_module, "_coverage", tracked_coverage),
+        patch.object(update_module, "ThreadPoolExecutor", tracked_executor),
         redirect_stdout(io.StringIO()),
     ):
         report = lake.update.dataset(
@@ -436,6 +468,8 @@ def _bulk_asset_benchmark(
         "columns": 100,
         "commit_count": report.commit_count,
         "commit_seconds": report.commit_seconds,
+        "coverage_calls": coverage_calls,
+        "deduplicate_calls": deduplicate_calls,
         "elapsed_seconds": report.elapsed_seconds,
         "partitions_rewritten": report.partitions_rewritten,
         "rewrite_amplification": (
@@ -448,6 +482,7 @@ def _bulk_asset_benchmark(
         "unique_partitions": unique_partitions,
         "writer_concurrency_limit": MAX_PARQUET_WRITE_WORKERS,
         "writer_peak_concurrency": peak_writers,
+        "writer_pool_creations": writer_pool_creations,
     }
 
 

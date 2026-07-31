@@ -52,6 +52,7 @@ def commit_frame(
     frame: pl.LazyFrame,
     registries: FrameworkRegistries,
     parquet: ParquetStore,
+    writer_executor: ThreadPoolExecutor | None = None,
 ) -> CommitResult:
     """Validate, deduplicate, partition, and write canonical records."""
 
@@ -74,14 +75,14 @@ def commit_frame(
         )
     )
     data = align_frame(data, canonical_schema)
+    data = _deduplicate(data, spec)
     manifests = {
         str(row["partition_path"]): row
         for row in parquet.metadata.manifest(spec.source, spec.name)
     }
     write_context = partition_write_context(canonical_schema)
     if spec.update_type == "general":
-        final = _deduplicate(data, spec)
-        final = _sort(final, spec)
+        final = _sort(data, spec)
         result = parquet.write_partition_file_result(
             spec,
             final,
@@ -118,6 +119,7 @@ def commit_frame(
             canonical_schema,
             manifests,
             write_context,
+            writer_executor,
         )
     elif spec.update_type == "by_asset":
         commit = _write_grouped(
@@ -128,6 +130,7 @@ def commit_frame(
             canonical_schema,
             manifests,
             write_context,
+            writer_executor,
         )
     else:
         raise ValueError(f"Unsupported update_type: {spec.update_type}")
@@ -142,18 +145,19 @@ def _write_grouped(
     canonical_schema: pl.Schema,
     existing_manifests: dict[str, dict[str, Any]],
     write_context: PartitionWriteContext,
+    writer_executor: ThreadPoolExecutor | None,
 ) -> CommitResult:
     row_count = 0
     manifests: list[dict[str, Any]] = []
     rewritten = 0
     skipped = 0
     bytes_written = 0
-    present_times: set[str] = set()
-    asset_max_times: dict[str, str] = {}
+    coverage_frames: list[pl.DataFrame] = []
     writes_by_index: dict[int, PartitionWriteResult] = {}
     futures: dict[Future[PartitionWriteResult], int] = {}
     failure: BaseException | None = None
-    executor = ThreadPoolExecutor(
+    owns_executor = writer_executor is None
+    executor = writer_executor or ThreadPoolExecutor(
         max_workers=MAX_PARQUET_WRITE_WORKERS,
         thread_name_prefix="bagelquant-parquet",
     )
@@ -180,27 +184,26 @@ def _write_grouped(
                     zip(group_columns, values, strict=True)
                 )
                 path = _partition_path(spec, partition_values)
+                existing_manifest = existing_manifests.get(path.as_posix())
                 final = _merge_partition(
-                    existing=_read_existing(parquet, spec, path),
+                    existing=(
+                        None
+                        if existing_manifest is None
+                        else _read_existing(parquet, spec, path)
+                    ),
                     incoming=group,
                     spec=spec,
                 )
                 final = align_frame(final, canonical_schema)
-                final = _sort(final, spec)
-                _accumulate_coverage(
-                    final,
-                    spec,
-                    present_times=present_times,
-                    asset_max_times=asset_max_times,
-                )
+                coverage_frames.append(final.select("time", "asset_id"))
                 future = executor.submit(
-                    parquet.write_partition_file_result,
-                    spec,
-                    final,
-                    path,
-                    partition_values,
-                    existing_manifest=existing_manifests.get(path.as_posix()),
-                    retain_backup=True,
+                    _write_partition,
+                    parquet=parquet,
+                    spec=spec,
+                    frame=final,
+                    path=path,
+                    partition_values=partition_values,
+                    existing_manifest=existing_manifest,
                     write_context=write_context,
                 )
                 futures[future] = index
@@ -212,7 +215,8 @@ def _write_grouped(
             completed, futures, writes_by_index, failure
         )
     finally:
-        executor.shutdown(wait=True, cancel_futures=False)
+        if owns_executor:
+            executor.shutdown(wait=True, cancel_futures=False)
 
     writes = [writes_by_index[index] for index in sorted(writes_by_index)]
     if failure is not None:
@@ -226,6 +230,10 @@ def _write_grouped(
         else:
             skipped += 1
     try:
+        present_times, asset_max_times = _coverage(
+            coverage_frames,
+            spec,
+        )
         parquet.commit_metadata(
             spec,
             canonical_schema,
@@ -243,6 +251,29 @@ def _write_grouped(
         bytes_written=bytes_written,
         present_times=frozenset(present_times),
         asset_max_times=tuple(sorted(asset_max_times.items())),
+    )
+
+
+def _write_partition(
+    *,
+    parquet: ParquetStore,
+    spec: DatasetSpec,
+    frame: pl.DataFrame,
+    path: Path,
+    partition_values: dict[str, object],
+    existing_manifest: dict[str, Any] | None,
+    write_context: PartitionWriteContext,
+) -> PartitionWriteResult:
+    """Sort and publish one partition entirely inside a writer worker."""
+
+    return parquet.write_partition_file_result(
+        spec,
+        _sort(frame, spec),
+        path,
+        partition_values,
+        existing_manifest=existing_manifest,
+        retain_backup=True,
+        write_context=write_context,
     )
 
 
@@ -264,25 +295,26 @@ def _collect_write_results(
     return failure
 
 
-def _accumulate_coverage(
-    frame: pl.DataFrame,
+def _coverage(
+    frames: list[pl.DataFrame],
     spec: DatasetSpec,
-    *,
-    present_times: set[str],
-    asset_max_times: dict[str, str],
-) -> None:
+) -> tuple[set[str], dict[str, str]]:
+    if not frames:
+        return set(), {}
+    frame = pl.concat(frames, how="vertical", rechunk=False)
     if spec.update_type == "by_daily":
-        present_times.update(str(value) for value in frame["time"].unique())
-        return
-    if spec.update_type != "by_asset":
-        return
-    for asset_id, maximum in frame.group_by("asset_id").agg(
-        pl.col("time").max()
-    ).iter_rows():
-        value = str(maximum)
-        current = asset_max_times.get(str(asset_id))
-        if current is None or current < value:
-            asset_max_times[str(asset_id)] = value
+        return {str(value) for value in frame["time"].unique()}, {}
+    if spec.update_type == "by_asset":
+        return (
+            set(),
+            {
+                str(asset_id): str(maximum)
+                for asset_id, maximum in frame.group_by("asset_id")
+                .agg(pl.col("time").max())
+                .iter_rows()
+            },
+        )
+    return set(), {}
 
 
 def _merge_partition(
@@ -292,7 +324,7 @@ def _merge_partition(
     spec: DatasetSpec,
 ) -> pl.DataFrame:
     if existing is None:
-        return _deduplicate(incoming, spec)
+        return incoming
     merged = concat_compatible_frames([existing, incoming])
     return _deduplicate(merged, spec)
 

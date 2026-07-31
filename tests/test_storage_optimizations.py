@@ -64,6 +64,7 @@ def test_arrow_content_hash_is_logical_and_schema_sensitive() -> None:
 
     assert frame_content_hash(base) == frame_content_hash(chunked)
     assert frame_content_hash(base) == frame_content_hash(reordered)
+    assert frame_content_hash(base) == frame_content_hash(base, base.columns)
     assert frame_content_hash(base).startswith("arrow-ipc-v1:")
     assert frame_content_hash(base) != frame_content_hash(
         base.with_columns(pl.col("value").cast(pl.Float64))
@@ -107,6 +108,37 @@ def test_identical_ingest_skips_partition_and_preserves_manifest_and_file(
     assert second.partitions_skipped == 1
     assert path.stat().st_mtime_ns == mtime_before
     assert lake.metadata.manifest("custom", "daily") == manifest_before
+
+
+def test_batch_deduplication_preserves_last_write_upsert_semantics(
+    tmp_path,
+) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = _daily_spec()
+    lake.ingest(
+        spec,
+        pl.DataFrame(
+            {
+                "trade_date": ["20250102", "20250102"],
+                "ts_code": ["A", "A"],
+                "value": [1.0, 2.0],
+            }
+        ),
+    )
+    lake.ingest(
+        spec,
+        pl.DataFrame(
+            {
+                "trade_date": ["20250102", "20250102"],
+                "ts_code": ["A", "A"],
+                "value": [3.0, 4.0],
+            }
+        ),
+    )
+
+    frame = lake.query.query("daily", source="custom").collect()
+    assert frame.height == 1
+    assert frame["value"].item() == 4.0
 
 
 def test_compatibility_write_returns_clean_manifest_on_noop(tmp_path) -> None:
@@ -540,6 +572,57 @@ def test_hash_failure_drains_writers_and_removes_temporary_files(
 
     monkeypatch.setattr(parquet_module, "frame_content_hash", fail_one_hash)
     with pytest.raises(RuntimeError, match="hash fault injection"):
+        lake.ingest(
+            spec,
+            original.with_columns(pl.col("value") + 10),
+        )
+
+    assert 2 <= calls <= 4
+    assert lake.metadata.manifest("custom", "daily") == before_manifest
+    assert all(
+        pl.read_parquet(root / relative).equals(frame)
+        for relative, frame in before_frames.items()
+    )
+    assert not list(root.rglob("*.tmp"))
+    assert not list(root.rglob("*.rollback"))
+
+
+def test_sort_failure_drains_writers_and_restores_old_partitions(
+    tmp_path, monkeypatch
+) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = _daily_spec()
+    original = pl.DataFrame(
+        {
+            "trade_date": ["20250102", "20250203", "20250303", "20250401"],
+            "ts_code": ["A"] * 4,
+            "value": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    lake.ingest(spec, original)
+    root = lake.paths.dataset_root("custom", "daily")
+    before_manifest = lake.metadata.manifest("custom", "daily")
+    before_frames = {
+        str(row["partition_path"]): pl.read_parquet(
+            root / str(row["partition_path"])
+        )
+        for row in before_manifest
+    }
+    real_sort = commit_module._sort
+    calls = 0
+    lock = threading.Lock()
+
+    def fail_one_sort(frame, dataset_spec):
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            raise RuntimeError("sort fault injection")
+        return real_sort(frame, dataset_spec)
+
+    monkeypatch.setattr(commit_module, "_sort", fail_one_sort)
+    with pytest.raises(RuntimeError, match="sort fault injection"):
         lake.ingest(
             spec,
             original.with_columns(pl.col("value") + 10),

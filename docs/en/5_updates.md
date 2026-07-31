@@ -94,8 +94,13 @@ initial build also commits at retry/forward and bucket boundaries. A bucket
 smaller than the configured buffer is therefore written once; explicit
 `batch_size` and `max_buffer_mb` limits can still split an oversized bucket.
 Up to four internal workers hash, write, validate, and publish independent
-Parquet partitions in parallel. Schema reconciliation, manifest publication,
-and scope transitions remain serialized, and any writer failure settles the
+Parquet partitions in parallel. One writer pool is reused across every commit
+and sequential dataset in the update invocation. Incoming rows are
+deduplicated once per commit, new partitions avoid unnecessary reads, and
+coverage is aggregated once from the touched canonical partitions. Provider
+workers also combine and validate each request before returning it to the
+scheduler. Schema reconciliation, manifest publication, API audit writes, and
+scope transitions remain serialized, and any writer failure settles the
 remaining in-flight work before the whole batch is rolled back.
 `max_in_flight` bounds queued calls:
 

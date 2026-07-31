@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 from collections import Counter
+from datetime import date
 from types import SimpleNamespace
 
 import polars as pl
@@ -10,6 +12,8 @@ from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core import ValidationError
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
+from bagelquant_data.pipeline import commit as commit_module
+from bagelquant_data.pipeline import update as update_module
 from bagelquant_data.pipeline.scopes import LedgerRequest
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
@@ -56,6 +60,23 @@ class WideAssetSource:
                 "ann_date": ["20240630", "20250630"],
                 "ts_code": [asset, asset],
                 "payload": [payload, payload],
+            }
+        )
+
+
+class RevisionAssetSource:
+    name = "custom"
+
+    def __init__(self) -> None:
+        self.dates = ["20240630", "20250630"]
+
+    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+        asset = str(request["id"])
+        return pl.DataFrame(
+            {
+                "ann_date": self.dates,
+                "ts_code": [asset] * len(self.dates),
+                "value": list(range(len(self.dates))),
             }
         )
 
@@ -416,17 +437,37 @@ def test_clean_asset_build_writes_each_physical_partition_once(
         )
     )
     writes: Counter[str] = Counter()
+    deduplicate_calls = 0
+    coverage_calls = 0
     original = parquet_module.ParquetStore.write_partition_file_result
+    original_deduplicate = commit_module._deduplicate
+    original_coverage = commit_module._coverage
 
     def tracked_write(self, spec, frame, relative_path, *args, **kwargs):
         writes[relative_path.as_posix()] += 1
         return original(self, spec, frame, relative_path, *args, **kwargs)
+
+    def tracked_deduplicate(frame, spec):
+        nonlocal deduplicate_calls
+        deduplicate_calls += 1
+        return original_deduplicate(frame, spec)
+
+    def tracked_coverage(frames, spec):
+        nonlocal coverage_calls
+        coverage_calls += 1
+        return original_coverage(frames, spec)
+
+    def forbidden_read(*args, **kwargs):
+        raise AssertionError("clean partitions must not read parquet")
 
     monkeypatch.setattr(
         parquet_module.ParquetStore,
         "write_partition_file_result",
         tracked_write,
     )
+    monkeypatch.setattr(commit_module, "_deduplicate", tracked_deduplicate)
+    monkeypatch.setattr(commit_module, "_coverage", tracked_coverage)
+    monkeypatch.setattr(commit_module, "_read_existing", forbidden_read)
 
     report = lake.update.dataset(
         "income",
@@ -446,6 +487,153 @@ def test_clean_asset_build_writes_each_physical_partition_once(
     assert max(writes.values()) == 1
     assert sum(writes.values()) == len(files)
     assert report.partitions_rewritten == len(files)
+    assert deduplicate_calls == report.commit_count
+    assert coverage_calls == report.commit_count
+
+
+def test_update_reuses_one_internal_writer_pool_across_bucket_commits(
+    tmp_path, monkeypatch
+) -> None:
+    assets = [f"{index:06d}.SZ" for index in range(80)]
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(AssetSource())
+    lake.ingest(
+        DatasetSpec(
+            "stock_basic",
+            "general",
+            field_mappings={"ts_code": "asset_id"},
+        ),
+        pl.DataFrame(
+            {
+                "ts_code": assets,
+                "list_date": ["20240101"] * len(assets),
+            }
+        ),
+    )
+    for dataset in ("income", "balancesheet"):
+        lake.admin.datasets.register(
+            DatasetSpec(
+                dataset,
+                "by_asset",
+                asset_list="stock_basic",
+                field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+            )
+        )
+    real_executor = update_module.ThreadPoolExecutor
+    writer_pool_count = 0
+
+    def tracked_executor(*args, **kwargs):
+        nonlocal writer_pool_count
+        if kwargs.get("thread_name_prefix") == "bagelquant-parquet":
+            writer_pool_count += 1
+        return real_executor(*args, **kwargs)
+
+    monkeypatch.setattr(
+        update_module,
+        "ThreadPoolExecutor",
+        tracked_executor,
+    )
+
+    report = lake.update.datasets(
+        ["income", "balancesheet"],
+        source="custom",
+        start="2024-01-01",
+        end="2025-12-31",
+        confirm=False,
+        progress=False,
+    )
+
+    assert len(report.runs) == 2
+    assert report.commit_count > 2
+    assert writer_pool_count == 1
+
+
+def test_response_validation_runs_in_fetch_worker_but_sqlite_stays_on_scheduler(
+    tmp_path, monkeypatch
+) -> None:
+    lake = _daily_lake(tmp_path, ["20250102", "20250103"])
+    main_thread = threading.get_ident()
+    validation_threads: list[int] = []
+    transition_threads: list[int] = []
+    original_validation = update_module._validate_response
+    original_transition = lake.metadata.transition_update_scopes
+
+    def tracked_validation(spec, request, frame):
+        validation_threads.append(threading.get_ident())
+        return original_validation(spec, request, frame)
+
+    def tracked_transition(*args, **kwargs):
+        transition_threads.append(threading.get_ident())
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        update_module,
+        "_validate_response",
+        tracked_validation,
+    )
+    monkeypatch.setattr(
+        lake.metadata,
+        "transition_update_scopes",
+        tracked_transition,
+    )
+
+    lake.update.dataset(
+        "daily",
+        source="custom",
+        start="2025-01-02",
+        end="2025-01-03",
+        workers=2,
+        progress=False,
+    )
+
+    assert validation_threads
+    assert all(thread != main_thread for thread in validation_threads)
+    assert transition_threads
+    assert set(transition_threads) == {main_thread}
+
+
+def test_response_processing_failure_settles_fetches_without_committing(
+    tmp_path, monkeypatch
+) -> None:
+    lake = _daily_lake(
+        tmp_path,
+        ["20250102", "20250103", "20250104", "20250105"],
+    )
+    calls = 0
+    lock = threading.Lock()
+
+    def fail_one_validation(*args, **kwargs):
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            raise RuntimeError("response processing fault")
+        return None
+
+    monkeypatch.setattr(
+        update_module,
+        "_validate_response",
+        fail_one_validation,
+    )
+
+    with pytest.raises(RuntimeError, match="response processing fault"):
+        lake.update.dataset(
+            "daily",
+            source="custom",
+            start="2025-01-02",
+            end="2025-01-05",
+            workers=4,
+            max_in_flight=4,
+            progress=False,
+        )
+
+    scopes = lake.admin.status.update_scopes(
+        dataset="daily", source="custom"
+    )
+    assert 2 <= calls <= 4
+    assert {str(row["status"]) for row in scopes} <= {"failed", "pending"}
+    assert lake.admin.status.files("daily", source="custom") == []
 
 
 def test_clean_asset_build_still_splits_an_oversized_bucket(tmp_path) -> None:
@@ -571,6 +759,59 @@ def test_asset_commit_coverage_uses_maximum_across_years(
     )[0]
 
     assert scope["data_max_time"] == "2025-06-30"
+
+
+def test_asset_revision_of_older_year_does_not_regress_watermark(
+    tmp_path,
+) -> None:
+    source = RevisionAssetSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec(
+            "stock_basic",
+            "general",
+            field_mappings={"ts_code": "asset_id"},
+        ),
+        pl.DataFrame({"ts_code": ["A"], "list_date": ["20240101"]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            revision_refresh_days=1,
+            revision_lookback_days=730,
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    lake.update.dataset(
+        "income",
+        source="custom",
+        start="2024-01-01",
+        end="2025-12-31",
+        today="2025-12-31",
+        progress=False,
+    )
+    source.dates = ["20240630"]
+
+    lake.update.dataset(
+        "income",
+        source="custom",
+        start="2024-01-01",
+        end="2025-12-31",
+        today="2026-01-02",
+        progress=False,
+    )
+    scope = lake.admin.status.update_scopes(
+        dataset="income", source="custom"
+    )[0]
+
+    assert scope["data_max_time"] == "2025-06-30"
+    assert (
+        lake.query.query("income", source="custom").collect()["time"].max()
+        == date(2025, 6, 30)
+    )
 
 
 def test_atomic_validation_does_not_replace_existing_file(

@@ -17,7 +17,10 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.schema import concat_compatible_frames
-from bagelquant_data.pipeline.commit import CommitResult
+from bagelquant_data.pipeline.commit import (
+    MAX_PARQUET_WRITE_WORKERS,
+    CommitResult,
+)
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.scopes import DiscoveryCall, LedgerRequest
 
@@ -103,6 +106,15 @@ class FetchPage:
     fatal: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedFetch:
+    """Provider pages plus worker-prepared request-level response state."""
+
+    pages: tuple[FetchPage, ...]
+    frame: pl.DataFrame | None
+    validation_error: str | None = None
+
+
 @dataclass(slots=True)
 class _RunState:
     work: DatasetUpdateWork
@@ -158,11 +170,18 @@ def update_datasets(
 ) -> UpdateReport:
     """Claim centrally selected scopes, fetch concurrently, then commit."""
 
-    with pipeline.metadata.writer_session():
+    with (
+        pipeline.metadata.writer_session(),
+        ThreadPoolExecutor(
+            max_workers=MAX_PARQUET_WRITE_WORKERS,
+            thread_name_prefix="bagelquant-parquet",
+        ) as writer_executor,
+    ):
         return _update_datasets(
             source_adapter=source_adapter,
             pipeline=pipeline,
             works=works,
+            writer_executor=writer_executor,
         )
 
 
@@ -171,6 +190,7 @@ def _update_datasets(
     source_adapter: object,
     pipeline: IngestionPipeline,
     works: Sequence[DatasetUpdateWork],
+    writer_executor: ThreadPoolExecutor,
 ) -> UpdateReport:
     if not works:
         return UpdateReport(source="", datasets=(), runs=())
@@ -182,6 +202,7 @@ def _update_datasets(
                 source_adapter=source_adapter,
                 pipeline=pipeline,
                 works=(work,),
+                writer_executor=writer_executor,
             )
             sequential_reports.extend(report.runs)
         return _combine(
@@ -244,6 +265,7 @@ def _update_datasets(
                         totals=totals,
                         completed=completed,
                         max_in_flight=max_in_flight,
+                        writer_executor=writer_executor,
                         request_index_offset=request_index_offset,
                     )
                     state = states[works[0].spec.name]
@@ -253,6 +275,7 @@ def _update_datasets(
                         callbacks[state.work.spec.name],
                         completed[state.work.spec.name],
                         totals[state.work.spec.name],
+                        writer_executor,
                     )
                     request_index_offset += len(group)
                     if state.cancelled:
@@ -268,6 +291,7 @@ def _update_datasets(
                     totals=totals,
                     completed=completed,
                     max_in_flight=max_in_flight,
+                    writer_executor=writer_executor,
                 )
         for state in states.values():
             _commit_state(
@@ -276,6 +300,7 @@ def _update_datasets(
                 callbacks[state.work.spec.name],
                 completed[state.work.spec.name],
                 totals[state.work.spec.name],
+                writer_executor,
             )
     except BaseException as exc:  # noqa: BLE001 - finalize before propagation
         caught = exc
@@ -323,11 +348,12 @@ def _run_fetches(
     totals: dict[str, int],
     completed: dict[str, int],
     max_in_flight: int,
+    writer_executor: ThreadPoolExecutor,
     request_index_offset: int = 0,
 ) -> None:
     task_iter = iter(enumerate(tasks, start=request_index_offset))
     ready: deque[tuple[int, UpdateTask]] = deque()
-    futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
+    futures: dict[Future[PreparedFetch], tuple[float, UpdateTask]] = {}
     stop_submission = False
     next_heartbeat = time.monotonic() + 30.0
 
@@ -387,10 +413,10 @@ def _run_fetches(
             total=totals[work.spec.name],
         )
         future = executor.submit(
-            _fetch_request_pages,
+            _fetch_and_prepare_request,
             spec=work.spec,
             source_adapter=source_adapter,
-            request=request.params,
+            ledger_request=request,
             request_index=index,
             request_options=_request_options(work.context),
             max_retries=max(1, int(work.context.options.get("max_retries", 3))),
@@ -421,10 +447,10 @@ def _run_fetches(
         for future in done:
             submitted_at, (work, request) = futures.pop(future)
             state = states[work.spec.name]
-            pages = future.result()
+            prepared = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
             started = time.perf_counter()
-            _harvest_request(pipeline, state, request, pages)
+            _harvest_request(pipeline, state, request, prepared)
             state.metadata_seconds += time.perf_counter() - started
             completed[work.spec.name] += 1
             _emit_progress(
@@ -453,6 +479,7 @@ def _run_fetches(
                     callbacks[work.spec.name],
                     completed[work.spec.name],
                     totals[work.spec.name],
+                    writer_executor,
                 )
         if not stop_submission:
             while len(futures) < max_in_flight and submit_next():
@@ -463,8 +490,9 @@ def _harvest_request(
     pipeline: IngestionPipeline,
     state: _RunState,
     request: LedgerRequest,
-    pages: Sequence[FetchPage],
+    prepared: PreparedFetch,
 ) -> None:
+    pages = prepared.pages
     calls = _api_call_rows(state.work, request, pages)
     request_count = len(pages)
     downloaded = sum(page.row_count for page in pages if page.status == "success")
@@ -483,24 +511,22 @@ def _harvest_request(
         message = failures[-1].error_message or "provider request failed"
         _transition(pipeline, state, request, status, message)
         return
-    frames = [
-        page.frame for page in pages if page.frame is not None and page.frame.height
-    ]
-    frame = (
-        pl.DataFrame()
-        if not frames
-        else frames[0]
-        if len(frames) == 1
-        else concat_compatible_frames(frames)
-    )
-    error = _validate_response(state.work.spec, request, frame)
-    if error is not None:
+    frame = prepared.frame
+    if frame is None:
+        raise RuntimeError("successful provider response was not prepared")
+    if prepared.validation_error is not None:
         pipeline.metadata.record_api_calls(
             {**call, "result_kind": "invalid"} for call in calls
         )
         state.request_count += request_count
         state.rows_downloaded += downloaded
-        _transition(pipeline, state, request, "invalid", error)
+        _transition(
+            pipeline,
+            state,
+            request,
+            "invalid",
+            prepared.validation_error,
+        )
         return
     if frame.is_empty():
         pipeline.metadata.record_empty_scope_result(
@@ -568,6 +594,7 @@ def _commit_state(
     callback: UpdateProgressCallback | None,
     completed: int,
     total: int,
+    writer_executor: ThreadPoolExecutor,
 ) -> None:
     if not state.buffered:
         return
@@ -583,7 +610,12 @@ def _commit_state(
     try:
         _flush_api_calls(pipeline, state)
         started = time.perf_counter()
-        commit = pipeline.commit_frame(state.work.spec, frame, run_id=state.work.run_id)
+        commit = pipeline.commit_frame(
+            state.work.spec,
+            frame,
+            run_id=state.work.run_id,
+            writer_executor=writer_executor,
+        )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed
         state.commit_count += 1
@@ -679,11 +711,20 @@ def _canonical_data_maxima(
     requests = [request for _, request in buffered]
     if spec.update_type == "by_asset":
         maxima = dict(commit.asset_max_times)
-        return {
-            request.scope_id: maxima[str(request.params["id"])]
-            for request in requests
-            if str(request.params["id"]) in maxima
-        }
+        resolved: dict[int | None, str] = {}
+        for request in requests:
+            asset_maximum = maxima.get(str(request.params["id"]))
+            candidates = [
+                value
+                for value in (
+                    request.previous_data_max_time,
+                    asset_maximum,
+                )
+                if value is not None
+            ]
+            if candidates:
+                resolved[request.scope_id] = max(candidates)
+        return resolved
     return {
         request.scope_id: str(request.target_end)
         for request in requests
@@ -714,11 +755,11 @@ def _validate_response(
             time_column=time_column,
             asset_column=asset_column,
         )
+    null_counts = frame.null_count().row(0, named=True)
+    if any(int(null_counts[field]) for field in required):
+        return "response contains null primary keys"
     time_values = _date_expr(time_column)
     checks = [
-        pl.any_horizontal(pl.col(field).is_null() for field in required)
-        .any()
-        .alias("null_primary_keys"),
         time_values.is_null().any().alias("invalid_dates"),
     ]
     if spec.update_type == "by_daily":
@@ -753,15 +794,10 @@ def _validate_response(
             )
         )
     payload = [field for field in frame.columns if field not in required]
-    if payload:
-        checks.append(
-            pl.any_horizontal(pl.col(field).is_not_null() for field in payload)
-            .any()
-            .alias("has_payload")
-        )
+    has_payload = any(
+        int(null_counts[field]) < frame.height for field in payload
+    )
     summary = frame.select(checks).row(0, named=True)
-    if summary["null_primary_keys"]:
-        return "response contains null primary keys"
     if summary["invalid_dates"]:
         return "response contains invalid dates"
     if spec.update_type == "by_daily":
@@ -776,7 +812,7 @@ def _validate_response(
             return "response contains invalid request dates"
         if summary["outside_requested_range"]:
             return "response contains dates outside requested range"
-    if payload and not summary["has_payload"]:
+    if payload and not has_payload:
         return "response payload is entirely null"
     return None
 
@@ -1024,6 +1060,49 @@ def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:
             asset_id,
         )
     return (2, "", "")
+
+
+def _fetch_and_prepare_request(
+    *,
+    spec: DatasetSpec,
+    source_adapter: object,
+    ledger_request: LedgerRequest,
+    request_index: int,
+    request_options: dict[str, Any],
+    max_retries: int,
+    retry_backoff_seconds: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> PreparedFetch:
+    """Fetch, combine, and validate one logical request in its fetch worker."""
+
+    request = ledger_request.params
+    pages = _fetch_request_pages(
+        spec=spec,
+        source_adapter=source_adapter,
+        request=request,
+        request_index=request_index,
+        request_options=request_options,
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_requested=cancel_requested,
+    )
+    if any(page.status != "success" for page in pages):
+        return PreparedFetch(tuple(pages), None)
+    frames = [
+        page.frame for page in pages if page.frame is not None and page.frame.height
+    ]
+    frame = (
+        pl.DataFrame()
+        if not frames
+        else frames[0]
+        if len(frames) == 1
+        else concat_compatible_frames(frames)
+    )
+    return PreparedFetch(
+        tuple(pages),
+        frame,
+        _validate_response(spec, ledger_request, frame),
+    )
 
 
 def _fetch_request_pages(

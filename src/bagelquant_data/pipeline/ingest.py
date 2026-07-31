@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -118,6 +119,7 @@ class IngestionPipeline:
         frame: pl.DataFrame,
         *,
         run_id: str,
+        writer_executor: ThreadPoolExecutor | None = None,
     ) -> CommitResult:
         """Commit a frame as part of an existing logical run."""
 
@@ -143,4 +145,5 @@ class IngestionPipeline:
             frame=result.accepted,
             registries=self.registries,
             parquet=self.parquet,
+            writer_executor=writer_executor,
         )
