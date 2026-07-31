@@ -20,8 +20,13 @@ dataset declaration or parameter-variant change automatically invalidates its
 old scope identities and creates pending work.
 
 Update reports include elapsed, fetch, commit, and metadata timings, commit and
-partition counts, and peak in-flight calls. Fetch time is cumulative across
-parallel jobs and may exceed elapsed wall-clock time.
+partition counts, planning time, skipped no-op partitions, and peak in-flight
+calls. Fetch time is cumulative across parallel jobs and may exceed elapsed
+wall-clock time.
+
+Complete provider request parameters remain available through the admin
+facade. Metadata schema v3 stores their JSON as zlib-compressed SQLite blobs
+and decodes them transparently when read.
 
 Use `rebuild_manifest` after repairing local Parquet files and
 `validate_manifest` to compare metadata with stored files. These integrity
@@ -30,8 +35,9 @@ the ledger, reset the affected scopes explicitly before updating.
 
 ## Fresh-lake schema contract
 
-Fresh lakes create the interruption-safe ledger schema directly. The metadata
-database stores an explicit schema version. Opening an unversioned or older
+Fresh lakes create metadata schema v3 directly, including canonical dataset
+schemas and compressed API audit payloads. Opening an unversioned or older
 database fails with a clear incompatibility error; the library never migrates,
-repairs, backs up, or rewrites an old lake automatically. Stop all workers and
-create a fresh lake root before downloading again.
+repairs, backs up, or rewrites an old lake automatically. Stop all workers,
+delete or archive the old lake, and create a fresh lake root before downloading
+again.

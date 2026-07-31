@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import fields
 import json
+from dataclasses import fields
 
 import polars as pl
 import pytest
@@ -31,6 +31,7 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "date_param",
         "request_date_field",
         "field_mappings",
+        "asset_bucket_count",
         "revision_lookback_days",
         "revision_refresh_days",
         "historical_empty_is_error",
@@ -47,7 +48,7 @@ def test_historical_empty_policy_round_trips_from_toml(tmp_path) -> None:
     path = tmp_path / "daily.toml"
     path.write_text(
         'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n'
-        'historical_empty_is_error = true\n[field_mappings]\n'
+        "historical_empty_is_error = true\n[field_mappings]\n"
         'trade_date = "time"\nts_code = "asset_id"\n'
     )
 

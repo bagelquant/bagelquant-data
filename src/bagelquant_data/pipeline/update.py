@@ -8,17 +8,18 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, TypeAlias, cast
+from typing import Any, cast
 from uuid import uuid4
 
 import polars as pl
 
-from bagelquant_data.core.dataset import ASSET_BUCKET_COUNT, DatasetSpec
+from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
+from bagelquant_data.core.schema import concat_compatible_frames
+from bagelquant_data.pipeline.commit import CommitResult
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.scopes import DiscoveryCall, LedgerRequest
-from bagelquant_data.query.raw import RawQueryService
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,9 @@ class UpdateReport:
     partitions_rewritten: int = 0
     peak_in_flight: int = 0
     changed_partitions: tuple[PartitionChange, ...] = ()
+    partitions_skipped: int = 0
+    planning_seconds: float = 0.0
+    bytes_written: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +73,7 @@ class UpdateProgress:
     remaining_count: int = 0
 
 
-UpdateProgressCallback: TypeAlias = Callable[[UpdateProgress], None]
+type UpdateProgressCallback = Callable[[UpdateProgress], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +85,7 @@ class DatasetUpdateWork:
     requests: tuple[LedgerRequest, ...]
     run_id: str = field(default_factory=lambda: uuid4().hex)
     discovery_calls: tuple[DiscoveryCall, ...] = ()
+    planning_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,12 +122,15 @@ class _RunState:
     metadata_seconds: float = 0.0
     commit_count: int = 0
     partitions_rewritten: int = 0
+    partitions_skipped: int = 0
+    bytes_written: int = 0
     peak_in_flight: int = 0
     fatal_error: str | None = None
     cancelled: bool = False
+    pending_api_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
-UpdateTask: TypeAlias = tuple[DatasetUpdateWork, LedgerRequest]
+type UpdateTask = tuple[DatasetUpdateWork, LedgerRequest]
 
 
 def update_dataset(
@@ -150,21 +158,35 @@ def update_datasets(
 ) -> UpdateReport:
     """Claim centrally selected scopes, fetch concurrently, then commit."""
 
+    with pipeline.metadata.writer_session():
+        return _update_datasets(
+            source_adapter=source_adapter,
+            pipeline=pipeline,
+            works=works,
+        )
+
+
+def _update_datasets(
+    *,
+    source_adapter: object,
+    pipeline: IngestionPipeline,
+    works: Sequence[DatasetUpdateWork],
+) -> UpdateReport:
     if not works:
         return UpdateReport(source="", datasets=(), runs=())
     if len(works) > 1:
         started_at = time.perf_counter()
-        reports: list[IngestionReport] = []
+        sequential_reports: list[IngestionReport] = []
         for work in works:
-            report = update_datasets(
+            report = _update_datasets(
                 source_adapter=source_adapter,
                 pipeline=pipeline,
                 works=(work,),
             )
-            reports.extend(report.runs)
+            sequential_reports.extend(report.runs)
         return _combine(
             works[0].spec.source,
-            reports,
+            sequential_reports,
             time.perf_counter() - started_at,
         )
     started_at = time.perf_counter()
@@ -203,7 +225,7 @@ def update_datasets(
         totals = {name: len(states[name].work.requests) for name in states}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             _run_fetches(
-                _retry_first(_fair_tasks(tasks)),
+                _partition_affinity_order(_fair_tasks(tasks)),
                 executor=executor,
                 source_adapter=source_adapter,
                 pipeline=pipeline,
@@ -221,7 +243,7 @@ def update_datasets(
                 completed[state.work.spec.name],
                 totals[state.work.spec.name],
             )
-    except BaseException as exc:  # finalize durable run state before propagation
+    except BaseException as exc:  # noqa: BLE001 - finalize before propagation
         caught = exc
         for name, state in states.items():
             if name not in begun:
@@ -233,12 +255,12 @@ def update_datasets(
         for progress in progresses.values():
             if progress is not None:
                 progress.close()
-        reports = tuple(
+        finished_reports = tuple(
             _finish_state(pipeline, state)
             for name, state in states.items()
             if name in begun
         )
-    for report in reports:
+    for report in finished_reports:
         _emit_progress(
             callbacks[report.dataset],
             states[report.dataset],
@@ -249,7 +271,11 @@ def update_datasets(
         )
     if caught is not None:
         raise caught
-    return _combine(works[0].spec.source, reports, time.perf_counter() - started_at)
+    return _combine(
+        works[0].spec.source,
+        finished_reports,
+        time.perf_counter() - started_at,
+    )
 
 
 def _run_fetches(
@@ -268,6 +294,7 @@ def _run_fetches(
     ready: deque[tuple[int, UpdateTask]] = deque()
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
     stop_submission = False
+    next_heartbeat = time.monotonic() + 30.0
 
     def cancellation_requested() -> bool:
         return any(_cancel_requested(state.work.context) for state in states.values())
@@ -298,9 +325,7 @@ def _run_fetches(
             if request.scope_id is not None:
                 by_run.setdefault(work.run_id, []).append(request.scope_id)
         claimed_by_run = {
-            run_id: set(
-                pipeline.metadata.claim_update_scopes(scope_ids, run_id=run_id)
-            )
+            run_id: set(pipeline.metadata.claim_update_scopes(scope_ids, run_id=run_id))
             for run_id, scope_ids in by_run.items()
         }
         for candidate in candidates:
@@ -348,6 +373,10 @@ def _run_fetches(
     while len(futures) < max_in_flight and submit_next():
         pass
     while futures:
+        if time.monotonic() >= next_heartbeat:
+            for state in states.values():
+                pipeline.metadata.refresh_update_lease(run_id=state.work.run_id)
+            next_heartbeat = time.monotonic() + 30.0
         if cancellation_requested():
             stop_submission = True
             mark_cancelled()
@@ -390,7 +419,6 @@ def _run_fetches(
                     completed[work.spec.name],
                     totals[work.spec.name],
                 )
-            pipeline.metadata.refresh_update_lease(run_id=work.run_id)
         if not stop_submission:
             while len(futures) < max_in_flight and submit_next():
                 pass
@@ -423,11 +451,17 @@ def _harvest_request(
     frames = [
         page.frame for page in pages if page.frame is not None and page.frame.height
     ]
-    frame = pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    frame = (
+        pl.DataFrame()
+        if not frames
+        else frames[0]
+        if len(frames) == 1
+        else concat_compatible_frames(frames)
+    )
     error = _validate_response(state.work.spec, request, frame)
     if error is not None:
         pipeline.metadata.record_api_calls(
-            ({**call, "result_kind": "invalid"} for call in calls)
+            {**call, "result_kind": "invalid"} for call in calls
         )
         state.request_count += request_count
         state.rows_downloaded += downloaded
@@ -445,7 +479,7 @@ def _harvest_request(
         state.rows_downloaded += downloaded
         state.empty_count += 1
         return
-    pipeline.metadata.record_api_calls(calls)
+    state.pending_api_calls.extend(calls)
     state.request_count += request_count
     state.rows_downloaded += downloaded
     state.buffered.append((frame, request))
@@ -510,17 +544,20 @@ def _commit_state(
         return
     _emit_progress(callback, state, "commit", completed, total=total)
     buffered = list(state.buffered)
-    frame = pl.concat([item[0] for item in buffered], how="diagonal_relaxed")
+    frame = concat_compatible_frames(item[0] for item in buffered)
     try:
+        _flush_api_calls(pipeline, state)
         started = time.perf_counter()
-        committed = pipeline.commit_frame(
-            state.work.spec, frame, run_id=state.work.run_id
-        )
+        commit = pipeline.commit_frame(state.work.spec, frame, run_id=state.work.run_id)
         state.commit_seconds += time.perf_counter() - started
-        state.rows_committed += committed
+        state.rows_committed += commit.rows_committed
         state.commit_count += 1
-        state.partitions_rewritten += _partition_count(frame, state.work.spec)
-        canonical_maxima = _canonical_data_maxima(pipeline, state.work.spec, buffered)
+        state.partitions_rewritten += commit.partitions_rewritten
+        state.partitions_skipped += commit.partitions_skipped
+        state.bytes_written += commit.bytes_written
+        canonical_maxima = _canonical_data_maxima(
+            commit, state.work.spec, buffered
+        )
         transitions = [
             _success_transition(
                 state.work.spec,
@@ -535,7 +572,7 @@ def _commit_state(
         pipeline.metadata.transition_update_scopes(
             transitions,
             run_id=state.work.run_id,
-            committed_rows=committed,
+            committed_rows=commit.rows_committed,
         )
         state.metadata_seconds += time.perf_counter() - started
         state.success_count += len(buffered)
@@ -598,50 +635,24 @@ def _success_transition(
 
 
 def _canonical_data_maxima(
-    pipeline: IngestionPipeline,
+    commit: CommitResult,
     spec: DatasetSpec,
     buffered: Sequence[tuple[pl.DataFrame, LedgerRequest]],
 ) -> dict[int | None, str]:
     if spec.update_type == "general":
         return {}
-    raw = RawQueryService(pipeline.parquet, pipeline.metadata)
     requests = [request for _, request in buffered]
-    assets = [
-        str(request.params["id"])
-        for request in requests
-        if spec.update_type == "by_asset" and "id" in request.params
-    ] or None
-    daily_dates = [
-        str(request.target_end)
-        for request in requests
-        if spec.update_type == "by_daily" and request.target_end is not None
-    ]
-    frame = raw.query(
-        spec.name,
-        source=spec.source,
-        start=min(daily_dates) if daily_dates else None,
-        end=max(daily_dates) if daily_dates else None,
-        assets=assets,
-        fields=("time", "asset_id"),
-    ).collect()
-    if frame.is_empty() or "time" not in frame.columns:
-        return {}
     if spec.update_type == "by_asset":
-        maxima = {
-            str(row["asset_id"]): row["time"].isoformat()
-            for row in frame.group_by("asset_id").agg(pl.col("time").max()).to_dicts()
-            if row["asset_id"] is not None and row["time"] is not None
-        }
+        maxima = dict(commit.asset_max_times)
         return {
             request.scope_id: maxima[str(request.params["id"])]
             for request in requests
             if str(request.params["id"]) in maxima
         }
-    present = {value.isoformat() for value in frame["time"].unique().to_list()}
     return {
         request.scope_id: str(request.target_end)
         for request in requests
-        if request.target_end in present
+        if request.target_end in commit.present_times
     }
 
 
@@ -659,40 +670,127 @@ def _validate_response(
     missing = [field for field in required if field not in frame.columns]
     if missing:
         return f"response missing required key columns: {', '.join(missing)}"
-    if any(frame[field].null_count() for field in required):
-        return "response contains null primary keys"
-    dates = frame.select(_date_expr(time_column).alias("value")).get_column("value")
-    if dates.null_count():
-        return "response contains invalid dates"
+    if frame.height == 1:
+        return _validate_single_row_response(
+            spec,
+            request,
+            frame,
+            required=required,
+            time_column=time_column,
+            asset_column=asset_column,
+        )
+    time_values = _date_expr(time_column)
+    checks = [
+        pl.any_horizontal(pl.col(field).is_null() for field in required)
+        .any()
+        .alias("null_primary_keys"),
+        time_values.is_null().any().alias("invalid_dates"),
+    ]
     if spec.update_type == "by_daily":
         expected = _date_value(request.target_end)
-        if any(value != expected for value in dates):
-            return (
-                f"response contains dates outside requested date {expected.isoformat()}"
-            )
-    if spec.update_type == "by_asset":
+        checks.append(
+            (time_values != pl.lit(expected, dtype=pl.Date))
+            .any()
+            .alias("outside_requested_date")
+        )
+    else:
         expected_asset = str(request.params["id"])
-        if any(str(value) != expected_asset for value in frame[asset_column]):
-            return f"response contains assets other than {expected_asset}"
+        checks.append(
+            (pl.col(asset_column).cast(pl.String) != expected_asset)
+            .any()
+            .alias("wrong_asset")
+        )
         request_date_column = spec.request_date_field or time_column
         if request_date_column not in frame.columns:
             return f"response missing request date column: {request_date_column}"
-        request_dates = frame.select(
-            _date_expr(request_date_column).alias("value")
-        ).get_column("value")
-        if request_dates.null_count():
+        request_dates = _date_expr(request_date_column)
+        lower = _date_value(request.params["start"])
+        upper = _date_value(request.params["end"])
+        checks.extend(
+            (
+                request_dates.is_null().any().alias("invalid_request_dates"),
+                (
+                    (request_dates < pl.lit(lower, dtype=pl.Date))
+                    | (request_dates > pl.lit(upper, dtype=pl.Date))
+                )
+                .any()
+                .alias("outside_requested_range"),
+            )
+        )
+    payload = [field for field in frame.columns if field not in required]
+    if payload:
+        checks.append(
+            pl.any_horizontal(pl.col(field).is_not_null() for field in payload)
+            .any()
+            .alias("has_payload")
+        )
+    summary = frame.select(checks).row(0, named=True)
+    if summary["null_primary_keys"]:
+        return "response contains null primary keys"
+    if summary["invalid_dates"]:
+        return "response contains invalid dates"
+    if spec.update_type == "by_daily":
+        if summary["outside_requested_date"]:
+            return (
+                f"response contains dates outside requested date {expected.isoformat()}"
+            )
+    else:
+        if summary["wrong_asset"]:
+            return f"response contains assets other than {expected_asset}"
+        if summary["invalid_request_dates"]:
+            return "response contains invalid request dates"
+        if summary["outside_requested_range"]:
+            return "response contains dates outside requested range"
+    if payload and not summary["has_payload"]:
+        return "response payload is entirely null"
+    return None
+
+
+def _validate_single_row_response(
+    spec: DatasetSpec,
+    request: LedgerRequest,
+    frame: pl.DataFrame,
+    *,
+    required: list[str],
+    time_column: str,
+    asset_column: str,
+) -> str | None:
+    row = frame.row(0, named=True)
+    if any(row[field] is None for field in required):
+        return "response contains null primary keys"
+    try:
+        response_date = _date_value(row[time_column])
+    except (TypeError, ValueError):
+        return "response contains invalid dates"
+    if spec.update_type == "by_daily":
+        expected = _date_value(request.target_end)
+        if response_date != expected:
+            return (
+                f"response contains dates outside requested date {expected.isoformat()}"
+            )
+    else:
+        expected_asset = str(request.params["id"])
+        if str(row[asset_column]) != expected_asset:
+            return f"response contains assets other than {expected_asset}"
+        request_date_column = spec.request_date_field or time_column
+        if request_date_column not in row:
+            return f"response missing request date column: {request_date_column}"
+        try:
+            request_date = _date_value(row[request_date_column])
+        except (TypeError, ValueError):
             return "response contains invalid request dates"
         lower = _date_value(request.params["start"])
         upper = _date_value(request.params["end"])
-        if any(value < lower or value > upper for value in request_dates):
+        if request_date < lower or request_date > upper:
             return "response contains dates outside requested range"
     payload = [field for field in frame.columns if field not in required]
-    if payload and all(frame[field].null_count() == frame.height for field in payload):
+    if payload and all(row[field] is None for field in payload):
         return "response payload is entirely null"
     return None
 
 
 def _fail_buffered(pipeline: IngestionPipeline, state: _RunState, message: str) -> None:
+    _flush_api_calls(pipeline, state)
     for _, request in list(state.buffered):
         _transition(pipeline, state, request, "failed", message)
     state.buffered.clear()
@@ -714,9 +812,7 @@ def _fail_running(pipeline: IngestionPipeline, state: _RunState, message: str) -
     )
 
 
-def _remaining_scope_count(
-    pipeline: IngestionPipeline, state: _RunState
-) -> int:
+def _remaining_scope_count(pipeline: IngestionPipeline, state: _RunState) -> int:
     rows = pipeline.metadata.update_scopes(
         source=state.work.spec.source,
         dataset=state.work.spec.name,
@@ -726,6 +822,7 @@ def _remaining_scope_count(
 
 
 def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
+    _flush_api_calls(pipeline, state)
     remaining = _remaining_scope_count(pipeline, state)
     error = state.fatal_error or ("; ".join(state.errors[:5]) if state.errors else None)
     if state.cancelled and error is None:
@@ -775,8 +872,11 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         fetch_seconds=state.fetch_seconds,
         commit_seconds=state.commit_seconds,
         metadata_seconds=state.metadata_seconds,
+        planning_seconds=state.work.planning_seconds,
         commit_count=state.commit_count,
         partitions_rewritten=state.partitions_rewritten,
+        partitions_skipped=state.partitions_skipped,
+        bytes_written=state.bytes_written,
         peak_in_flight=state.peak_in_flight,
         error_message=error,
     )
@@ -794,8 +894,11 @@ def _combine(
         fetch_seconds=sum(report.fetch_seconds for report in reports),
         commit_seconds=sum(report.commit_seconds for report in reports),
         metadata_seconds=sum(report.metadata_seconds for report in reports),
+        planning_seconds=sum(report.planning_seconds for report in reports),
         commit_count=sum(report.commit_count for report in reports),
         partitions_rewritten=sum(report.partitions_rewritten for report in reports),
+        partitions_skipped=sum(report.partitions_skipped for report in reports),
+        bytes_written=sum(report.bytes_written for report in reports),
         peak_in_flight=max((report.peak_in_flight for report in reports), default=0),
     )
 
@@ -830,6 +933,36 @@ def _retry_first(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
     retries = [task for task in tasks if task[1].request_kind == "retry"]
     incremental = [task for task in tasks if task[1].request_kind != "retry"]
     return [*retries, *incremental]
+
+
+def _partition_affinity_order(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
+    """Keep retry priority while making physical partition work contiguous."""
+
+    retries = [task for task in tasks if task[1].request_kind == "retry"]
+    incremental = [task for task in tasks if task[1].request_kind != "retry"]
+    return [
+        *sorted(retries, key=_partition_affinity),
+        *sorted(incremental, key=_partition_affinity),
+    ]
+
+
+def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:
+    work, request = task
+    spec = work.spec
+    if spec.update_type == "by_daily":
+        value = request.target_end or request.params.get(spec.date_param or "date")
+        if value is None:
+            return (0, "", "")
+        day = _date_value(value)
+        return (0, f"{day.year:04d}-{day.month:02d}", day.isoformat())
+    if spec.update_type == "by_asset":
+        asset_id = str(request.params["id"])
+        return (
+            1,
+            f"{stable_bucket(asset_id, spec.asset_bucket_count):08d}",
+            asset_id,
+        )
+    return (2, "", "")
 
 
 def _fetch_request_pages(
@@ -928,20 +1061,19 @@ def _fetch_one(
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            if attempt + 1 < max_retries:
-                if not _cooperative_backoff(
-                    retry_backoff_seconds, cancel_requested=cancel_requested
-                ):
-                    return FetchPage(
-                        request_key,
-                        request,
-                        None,
-                        "cancelled",
-                        0,
-                        attempt,
-                        "update cancelled during provider retry backoff",
-                        _request_asset(request),
-                    )
+            if attempt + 1 < max_retries and not _cooperative_backoff(
+                retry_backoff_seconds, cancel_requested=cancel_requested
+            ):
+                return FetchPage(
+                    request_key,
+                    request,
+                    None,
+                    "cancelled",
+                    0,
+                    attempt,
+                    "update cancelled during provider retry backoff",
+                    _request_asset(request),
+                )
     return FetchPage(
         request_key,
         request,
@@ -1031,9 +1163,9 @@ def _date_value(value: object) -> date:
     if isinstance(value, date):
         return value
     text = str(value).split("T", maxsplit=1)[0]
-    return datetime.strptime(
-        text, "%Y%m%d" if len(text) == 8 and text.isdigit() else "%Y-%m-%d"
-    ).date()
+    if len(text) == 8 and text.isdigit():
+        return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+    return date.fromisoformat(text)
 
 
 def _request_asset(request: dict[str, Any]) -> str | None:
@@ -1046,24 +1178,11 @@ def _request_asset(request: dict[str, Any]) -> str | None:
     return None if value is None else str(value)
 
 
-def _partition_count(frame: pl.DataFrame, spec: DatasetSpec) -> int:
-    if spec.update_type == "general" or not frame.height:
-        return int(bool(frame.height))
-    time_column = _source_column(spec, "time")
-    if spec.update_type == "by_daily":
-        return len({str(value).replace("-", "")[:6] for value in frame[time_column]})
-    asset_column = _source_column(spec, "asset_id")
-    return len(
-        {
-            (
-                str(value).replace("-", "")[:4],
-                stable_bucket(str(asset), ASSET_BUCKET_COUNT),
-            )
-            for value, asset in frame.select(time_column, asset_column)
-            .unique()
-            .iter_rows()
-        }
-    )
+def _flush_api_calls(pipeline: IngestionPipeline, state: _RunState) -> None:
+    if not state.pending_api_calls:
+        return
+    pipeline.metadata.record_api_calls(state.pending_api_calls)
+    state.pending_api_calls.clear()
 
 
 def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:

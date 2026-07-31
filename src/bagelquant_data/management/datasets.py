@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bagelquant_data.core.dataset import (
+    ASSET_BUCKET_COUNT,
     DatasetSpec,
     RequestDiscoverySpec,
     dataset_key,
@@ -34,6 +35,20 @@ class DatasetManager:
 
     def register(self, spec: DatasetSpec) -> DatasetSpec:
         self.validate_spec(spec)
+        existing = self.metadata.get_dataset(spec.source, spec.name)
+        if existing is not None:
+            current = _spec_from_mapping(json.loads(existing["spec_json"]), stored=True)
+            if (
+                current.update_type == "by_asset"
+                and spec.update_type == "by_asset"
+                and current.asset_bucket_count != spec.asset_bucket_count
+                and self.metadata.manifest(spec.source, spec.name)
+            ):
+                raise DatasetSpecError(
+                    f"{spec.source}/{spec.name} asset_bucket_count cannot change "
+                    "while canonical data exists; clear the dataset before registering "
+                    "the new partition layout"
+                )
         self._specs[dataset_key(spec)] = spec
         self.metadata.upsert_dataset(spec)
         return spec
@@ -117,6 +132,21 @@ class DatasetManager:
         if spec.update_type == "by_asset" and not spec.asset_list:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} by_asset requires asset_list"
+            )
+        if (
+            not isinstance(spec.asset_bucket_count, int)
+            or isinstance(spec.asset_bucket_count, bool)
+            or spec.asset_bucket_count <= 0
+        ):
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} asset_bucket_count must be a positive integer"
+            )
+        if (
+            spec.update_type != "by_asset"
+            and spec.asset_bucket_count != ASSET_BUCKET_COUNT
+        ):
+            raise DatasetSpecError(
+                f"{spec.source}/{spec.name} asset_bucket_count is only valid for by_asset"
             )
         if spec.update_type != "by_asset" and (
             spec.revision_lookback_days != 730 or spec.revision_refresh_days != 30
@@ -223,6 +253,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "source_api_param_sets",
         "request_discovery",
         "field_mappings",
+        "asset_bucket_count",
         "revision_lookback_days",
         "revision_refresh_days",
         "historical_empty_is_error",
@@ -286,6 +317,11 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
             result_field=str(discovery_value["result_field"]),
             target_param=str(discovery_value["target_param"]),
         )
+    asset_bucket_count = value.get("asset_bucket_count", ASSET_BUCKET_COUNT)
+    if not isinstance(asset_bucket_count, int) or isinstance(
+        asset_bucket_count, bool
+    ):
+        raise DatasetSpecError("asset_bucket_count must be a positive integer")
     field_mapping_tables = value.get("field_mappings")
     if field_mapping_tables is None:
         field_mappings: dict[str, str] = {}
@@ -319,6 +355,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         ),
         request_discovery=request_discovery,
         field_mappings=field_mappings,
+        asset_bucket_count=asset_bucket_count,
         revision_lookback_days=int(value.get("revision_lookback_days", 730)),
         revision_refresh_days=int(value.get("revision_refresh_days", 30)),
         historical_empty_is_error=bool(value.get("historical_empty_is_error", False)),

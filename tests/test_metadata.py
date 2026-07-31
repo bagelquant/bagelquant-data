@@ -23,7 +23,24 @@ def test_metadata_store_rejects_incompatible_unversioned_schema(tmp_path) -> Non
     with sqlite3.connect(path) as db:
         db.execute("create table datasets (category text not null)")
 
-    with pytest.raises(ConfigurationError, match="Incompatible data-lake metadata schema"):
+    with pytest.raises(
+        ConfigurationError, match="Incompatible data-lake metadata schema"
+    ):
+        MetadataStore(path)
+
+
+def test_metadata_store_rejects_schema_v2_without_migration(tmp_path) -> None:
+    path = tmp_path / "metadata" / "lake.db"
+    path.parent.mkdir()
+    with sqlite3.connect(path) as db:
+        db.execute("create table metadata_state (key text primary key, value text)")
+        db.execute(
+            "insert into metadata_state(key,value) values ('schema_version','2')"
+        )
+
+    with pytest.raises(
+        ConfigurationError, match="Incompatible data-lake metadata schema"
+    ):
         MetadataStore(path)
 
 
@@ -193,6 +210,58 @@ def test_update_scopes_claim_transition_and_reset(tmp_path) -> None:
     assert metadata.update_scopes()[0]["status"] == "pending"
 
 
+def test_scope_resynchronization_does_not_touch_unchanged_rows(tmp_path) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    scope = {
+        "source": "tushare",
+        "dataset": "daily",
+        "scope_kind": "date",
+        "scope_key": "2025-01-02",
+        "variant_hash": "variant",
+        "initial_start": "2025-01-02",
+        "spec_hash": "spec",
+    }
+    metadata.synchronize_update_scopes([scope])
+    before = metadata.update_scopes()[0]
+
+    metadata.synchronize_update_scopes([scope])
+    after = metadata.update_scopes()[0]
+
+    assert after["updated_at"] == before["updated_at"]
+
+
+def test_writer_session_reuses_one_physical_connection(
+    tmp_path, monkeypatch
+) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    opened = 0
+    original = metadata._new_connection
+
+    def counted_connect() -> sqlite3.Connection:
+        nonlocal opened
+        opened += 1
+        return original()
+
+    monkeypatch.setattr(metadata, "_new_connection", counted_connect)
+    with metadata.writer_session():
+        metadata.synchronize_update_scopes(
+            [
+                {
+                    "source": "tushare",
+                    "dataset": "daily",
+                    "scope_kind": "date",
+                    "scope_key": "2025-01-02",
+                    "variant_hash": "variant",
+                    "initial_start": "2025-01-02",
+                    "spec_hash": "spec",
+                }
+            ]
+        )
+        assert metadata.update_scopes()[0]["status"] == "pending"
+
+    assert opened == 1
+
+
 def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) -> None:
     metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
     metadata.synchronize_update_scopes(
@@ -280,7 +349,9 @@ def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) 
     assert run["request_count"] == 0
 
 
-def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(tmp_path) -> None:
+def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(
+    tmp_path,
+) -> None:
     metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
     metadata.synchronize_update_scopes(
         {

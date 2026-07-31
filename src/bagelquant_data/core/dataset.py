@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 ASSET_BUCKET_COUNT = 32
 
 
@@ -33,6 +32,7 @@ class DatasetSpec:
     date_param: str | None = None
     request_date_field: str | None = None
     field_mappings: dict[str, str] = field(default_factory=dict)
+    asset_bucket_count: int = ASSET_BUCKET_COUNT
     revision_lookback_days: int = 730
     revision_refresh_days: int = 30
     historical_empty_is_error: bool = False

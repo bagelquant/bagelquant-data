@@ -7,6 +7,10 @@ import json
 from collections.abc import Iterable
 
 import polars as pl
+import pyarrow as pa
+from pyarrow import ipc
+
+CONTENT_HASH_ALGORITHM = "arrow-ipc-v1"
 
 
 def stable_bucket(asset_id: str, bucket_count: int) -> int:
@@ -24,9 +28,13 @@ def stable_record_hash(values: dict[str, object]) -> str:
 
 
 def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None) -> str:
-    """Hash a dataframe deterministically after sorting selected fields."""
+    """Hash logical dataframe content without materializing rows as Python objects."""
 
     selected = list(fields or frame.columns)
-    rows = frame.select(selected).sort(selected).to_dicts()
-    payload = json.dumps(rows, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+    canonical = frame.select(selected).sort(selected).rechunk()
+    table = canonical.to_arrow().combine_chunks()
+    sink = pa.BufferOutputStream()
+    with ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    digest = hashlib.blake2b(sink.getvalue(), digest_size=16).hexdigest()
+    return f"{CONTENT_HASH_ALGORITHM}:{digest}"

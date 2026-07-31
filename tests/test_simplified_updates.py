@@ -331,8 +331,8 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
         {"id": "000002.SZ", "start": "2025-01-01", "end": "2025-01-04", "limit": 25},
     ]
     expected = {
-        f"year=2025/batch={stable_bucket('000001.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
-        f"year=2025/batch={stable_bucket('000002.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
+        f"year=2025/bucket={stable_bucket('000001.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
+        f"year=2025/bucket={stable_bucket('000002.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
     }
     assert {
         row["partition_path"]

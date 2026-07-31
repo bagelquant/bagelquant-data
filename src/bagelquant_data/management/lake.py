@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from collections.abc import Callable, Sequence
 from typing import Any
 
 import polars as pl
@@ -67,7 +68,7 @@ class DataLake:
         )
 
     @classmethod
-    def open(cls, root: str | Path = "data") -> "DataLake":
+    def open(cls, root: str | Path = "data") -> DataLake:
         """Open or create a local data lake."""
 
         return cls(root)
@@ -178,6 +179,7 @@ class LakeUpdater:
         adapter = self.lake.admin.sources.get(source)
         works: list[DatasetUpdateWork] = []
         for dataset in dict.fromkeys(datasets):
+            planning_started = time.perf_counter()
             spec = self.lake.admin.datasets.get(dataset, source=source)
             context = _request_context(
                 source=source,
@@ -211,6 +213,7 @@ class LakeUpdater:
                     discovery_calls=(
                         () if discovery_call is None else (discovery_call,)
                     ),
+                    planning_seconds=time.perf_counter() - planning_started,
                 )
             )
 

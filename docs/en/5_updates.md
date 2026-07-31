@@ -51,13 +51,20 @@ records without repeatedly downloading the full history.
 Selected datasets run sequentially. Each dataset owns one bounded provider
 thread pool, so `workers` controls concurrency inside that dataset and never
 multiplies across datasets. Results are committed on the scheduler thread. A
-nonempty scope becomes successful only after the
+single SQLite writer connection is reused on that thread, while every durable
+outcome retains its own transaction boundary. A nonempty scope becomes successful only after the
 corresponding Parquet batch commits. If the write fails, the scope becomes
 failed and its local watermark does not advance. A validated empty response
 writes the API audit (`result_kind = 'empty'`), provider check, `empty` scope
 transition, and durable run `empty_count` in one SQLite transaction. It does not
 increment `success_count`, update `last_success_at`, or move `data_max_time`.
 An all-empty valid run has status `no_data` and no local data change.
+
+Before publishing a partition, the lake hashes its sorted, rechunked Arrow IPC
+logical content. If the existing manifest has the same hash, the Parquet file
+and manifest row are left untouched while the scope, provider check, and run
+still complete normally. `partitions_rewritten` therefore counts physical
+writes, while `partitions_skipped` counts no-op partitions.
 
 Every validated empty response is a terminal `empty` scope. It is not retried
 automatically; reset the scope or change the dataset definition to check it
@@ -80,7 +87,11 @@ not block unrelated scopes.
 
 Omit `batch_size` to commit when the dataset completes or its buffer reaches
 `max_buffer_mb` (512 MiB by default). Setting `batch_size` explicitly keeps a
-request-count commit boundary. `max_in_flight` bounds queued calls:
+request-count commit boundary. Within retry and incremental work, requests are
+ordered by physical partition affinity: daily scopes by month and asset scopes
+by stable asset bucket. This bounds repeated partition rewrites when a full
+rebuild crosses multiple buffer commits without changing retry priority.
+`max_in_flight` bounds queued calls:
 
 ```python
 report = lake.update.source(
@@ -94,7 +105,9 @@ report = lake.update.source(
 
 Applications can observe `sync`, `claim`, `fetch`, `commit`, and `complete`
 progress through `progress_callback`. Reports include changed partition hashes
-for downstream invalidation.
+for downstream invalidation, `planning_seconds`, and separate rewritten and
+skipped partition counts. `bytes_written` is the cumulative size of physically
+rewritten Parquet files and is zero for a fully no-op update.
 
 Pass provider-specific values with `params`. The normalized parameter variant
 is part of the scope identity; ledger-owned date, asset, and range values still

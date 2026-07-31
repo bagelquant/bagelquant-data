@@ -39,9 +39,16 @@ ts_code = "asset_id"
 ```toml
 update_type = "by_asset"
 asset_list = "stock_basic"
+asset_bucket_count = 32
 revision_lookback_days = 730
 revision_refresh_days = 30
 ```
+
+`asset_bucket_count` controls the stable hash buckets inside each year. A new
+asset rewrites only its year/bucket partition rather than one file for the
+entire year. The default is 32. Once canonical data exists, changing the count
+is rejected because it changes the physical layout; clear the dataset and
+rebuild it before registering a different count.
 
 The lake stores provider checks separately from commit-backed `data_max_time`.
 This prevents sparse event data from being downloaded repeatedly while the
@@ -53,6 +60,11 @@ the dataset definition changes.
 Mappings are true renames, so provider columns named `trade_date` and
 `ts_code` are stored as `time` and `asset_id`. A mapping may rename other
 columns as well, but incremental datasets must map both canonical key fields.
+
+The lake also stores a canonical dataset schema. All-null input columns remain
+untyped until an actual value establishes their type; compatible integer and
+floating inputs are promoted deterministically. New columns are added to the
+canonical schema, and strict numeric parsing rejects incompatible string data.
 
 Use the optional `source_api_params` table for provider parameters that should
 be sent unchanged on every update of a dataset. List values in this table are

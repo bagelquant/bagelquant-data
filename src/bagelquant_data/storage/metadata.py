@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterable
+import zlib
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import local
 from typing import Any
 
 from bagelquant_data.core.dataset import DatasetSpec
@@ -19,20 +22,43 @@ class MetadataStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "2"
+    SCHEMA_VERSION = "3"
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._thread_state = local()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
+        active = getattr(self._thread_state, "writer_connection", None)
+        if isinstance(active, sqlite3.Connection):
+            return active
+        return self._new_connection()
+
+    def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA synchronous=NORMAL")
         return connection
+
+    @contextmanager
+    def writer_session(self) -> Iterator[sqlite3.Connection]:
+        """Reuse one scheduler-thread connection while preserving transactions."""
+
+        active = getattr(self._thread_state, "writer_connection", None)
+        if isinstance(active, sqlite3.Connection):
+            yield active
+            return
+        connection = self._new_connection()
+        self._thread_state.writer_connection = connection
+        try:
+            yield connection
+        finally:
+            del self._thread_state.writer_connection
+            connection.close()
 
     def upsert_source(
         self,
@@ -126,6 +152,10 @@ class MetadataStore:
     def remove_dataset(self, source: str, dataset: str) -> None:
         with self.connect() as db:
             db.execute(
+                "delete from dataset_schemas where source = ? and dataset = ?",
+                (source, dataset),
+            )
+            db.execute(
                 "delete from datasets where source = ? and name = ?", (source, dataset)
             )
 
@@ -151,6 +181,10 @@ class MetadataStore:
             ).fetchone()
             db.execute(
                 "delete from partition_manifest where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from dataset_schemas where source=? and dataset=?",
                 (source, dataset),
             )
             db.execute(
@@ -186,6 +220,114 @@ class MetadataStore:
             (source, dataset),
         )
         return rows[0] if rows else None
+
+    def dataset_schema(self, source: str, dataset: str) -> bytes | None:
+        """Return the serialized canonical Arrow schema for a dataset."""
+
+        rows = self._rows(
+            "select schema_ipc from dataset_schemas where source=? and dataset=?",
+            (source, dataset),
+        )
+        if not rows:
+            return None
+        return bytes(rows[0]["schema_ipc"])
+
+    def upsert_dataset_schema(
+        self,
+        source: str,
+        dataset: str,
+        *,
+        schema_ipc: bytes,
+        schema_hash: str,
+    ) -> None:
+        """Persist the current canonical schema after canonical files commit."""
+
+        with self.connect() as db:
+            db.execute(
+                """
+                insert into dataset_schemas(
+                    source,dataset,schema_ipc,schema_hash,updated_at
+                ) values (?, ?, ?, ?, ?)
+                on conflict(source,dataset) do update set
+                    schema_ipc=excluded.schema_ipc,
+                    schema_hash=excluded.schema_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (source, dataset, schema_ipc, schema_hash, _now()),
+            )
+
+    def commit_dataset_metadata(
+        self,
+        source: str,
+        dataset: str,
+        *,
+        manifests: Iterable[dict[str, Any]],
+        schema_ipc: bytes,
+        schema_hash: str,
+        replace_manifests: bool = False,
+    ) -> None:
+        """Commit changed manifests and the canonical schema atomically."""
+
+        rows = list(manifests)
+        now = _now()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            if replace_manifests:
+                db.execute(
+                    "delete from partition_manifest where source=? and dataset=?",
+                    (source, dataset),
+                )
+            if rows:
+                db.executemany(
+                    """
+                    insert into partition_manifest(
+                        source,dataset,partition_path,partition_values,row_count,
+                        file_size_bytes,min_time,max_time,content_hash,schema_hash,
+                        updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(source,dataset,partition_path) do update set
+                        partition_values=excluded.partition_values,
+                        row_count=excluded.row_count,
+                        file_size_bytes=excluded.file_size_bytes,
+                        min_time=excluded.min_time,
+                        max_time=excluded.max_time,
+                        content_hash=excluded.content_hash,
+                        schema_hash=excluded.schema_hash,
+                        updated_at=excluded.updated_at
+                    """,
+                    [
+                        (
+                            row["source"],
+                            row["dataset"],
+                            str(row["partition_path"]),
+                            json.dumps(
+                                row["partition_values"],
+                                sort_keys=True,
+                                default=str,
+                            ),
+                            int(row["row_count"]),
+                            int(row["file_size_bytes"]),
+                            row.get("min_time"),
+                            row.get("max_time"),
+                            row["content_hash"],
+                            row["schema_hash"],
+                            now,
+                        )
+                        for row in rows
+                    ],
+                )
+            db.execute(
+                """
+                insert into dataset_schemas(
+                    source,dataset,schema_ipc,schema_hash,updated_at
+                ) values (?, ?, ?, ?, ?)
+                on conflict(source,dataset) do update set
+                    schema_ipc=excluded.schema_ipc,
+                    schema_hash=excluded.schema_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (source, dataset, schema_ipc, schema_hash, now),
+            )
 
     def upsert_manifest(
         self,
@@ -536,7 +678,12 @@ class MetadataStore:
                     row["dataset"],
                     str(row["request_key"]),
                     row.get("asset_id"),
-                    json.dumps(row["request_params"], sort_keys=True, default=str),
+                    zlib.compress(
+                        json.dumps(
+                            row["request_params"], sort_keys=True, default=str
+                        ).encode("utf-8"),
+                        level=1,
+                    ),
                     row["status"],
                     row.get("result_kind") or _api_result_kind(row),
                     int(row.get("row_count", 0)),
@@ -559,20 +706,16 @@ class MetadataStore:
             return
         now = _now()
         with self.connect() as db:
-            for row in rows:
+            identities = {
+                (str(row["source"]), str(row["dataset"]), str(row["spec_hash"]))
+                for row in rows
+            }
+            for source, dataset, spec_hash in identities:
                 db.execute(
                     "delete from provider_scope_checks where scope_id in ("
                     "select id from update_scopes where source=? and dataset=? "
-                    "and scope_kind=? and scope_key=? and variant_hash=? "
                     "and spec_hash != ?)",
-                    (
-                        row["source"],
-                        row["dataset"],
-                        row["scope_kind"],
-                        row["scope_key"],
-                        row["variant_hash"],
-                        row["spec_hash"],
-                    ),
+                    (source, dataset, spec_hash),
                 )
             db.executemany(
                 """
@@ -601,6 +744,8 @@ class MetadataStore:
                     end,
                     spec_hash=excluded.spec_hash,
                     updated_at=excluded.updated_at
+                where update_scopes.spec_hash != excluded.spec_hash
+                   or update_scopes.initial_start is not excluded.initial_start
                 """,
                 [
                     (
@@ -813,7 +958,9 @@ class MetadataStore:
                         f"Scope {scope_id} is not claimed by ingestion run {run_id}"
                     )
                 if checked_through is None:
-                    raise ValueError("An incremental empty result needs checked_through")
+                    raise ValueError(
+                        "An incremental empty result needs checked_through"
+                    )
             self._insert_api_calls(db, rows, recorded_at=now)
             if scope_id is not None:
                 assert checked_through is not None
@@ -889,6 +1036,26 @@ class MetadataStore:
             "from provider_scope_checks c join update_scopes s on s.id=c.scope_id"
             f"{where} order by s.source,s.dataset,s.scope_key,s.variant_hash",
             params,
+        )
+
+    def update_scopes_with_checks(
+        self, *, source: str, dataset: str, scope_kind: str
+    ) -> list[dict[str, Any]]:
+        """Return update scopes and provider observations in one indexed query."""
+
+        return self._rows(
+            """
+            select s.*,
+                c.checked_through as provider_checked_through,
+                c.last_checked_at as provider_last_checked_at,
+                c.recheck_after as provider_recheck_after,
+                c.last_result as provider_last_result
+            from update_scopes s
+            left join provider_scope_checks c on c.scope_id=s.id
+            where s.source=? and s.dataset=? and s.scope_kind=?
+            order by s.scope_key,s.variant_hash
+            """,
+            (source, dataset, scope_kind),
         )
 
     def reset_update_scopes(
@@ -982,14 +1149,14 @@ class MetadataStore:
             if run_ids:
                 placeholders = ",".join("?" for _ in run_ids)
                 cursor = db.execute(
-                    f"update update_scopes set status='failed',active_run_id=null,"  # noqa: S608
+                    f"update update_scopes set status='failed',active_run_id=null,"
                     f"last_error=?,updated_at=? where status='running' "
                     f"and active_run_id in ({placeholders})",
                     (reason, now, *sorted(run_ids)),
                 )
                 scope_count = int(cursor.rowcount)
                 db.execute(
-                    f"update ingestion_runs set status='cancelled',finished_at=?,"  # noqa: S608
+                    f"update ingestion_runs set status='cancelled',finished_at=?,"
                     f"error_message=? where status='running' and run_id in ({placeholders})",
                     (now, reason, *sorted(run_ids)),
                 )
@@ -1065,7 +1232,7 @@ class MetadataStore:
             if stale_runs:
                 placeholders = ",".join("?" for _ in stale_runs)
                 db.execute(
-                    f"update ingestion_runs set status='cancelled',finished_at=?,"  # noqa: S608
+                    f"update ingestion_runs set status='cancelled',finished_at=?,"
                     f"error_message='writer lease expired' where status='running' "
                     f"and run_id in ({placeholders})",
                     (now, *stale_runs),
@@ -1089,7 +1256,12 @@ class MetadataStore:
 
     def _rows(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute(sql, tuple(params)).fetchall()]
+            rows = [dict(row) for row in db.execute(sql, tuple(params)).fetchall()]
+        for row in rows:
+            request_params = row.get("request_params")
+            if isinstance(request_params, bytes):
+                row["request_params"] = zlib.decompress(request_params).decode("utf-8")
+        return rows
 
     def _initialize(self) -> None:
         with self.connect() as db:
@@ -1158,7 +1330,7 @@ class MetadataStore:
                     dataset text not null,
                     request_key text not null,
                     asset_id text,
-                    request_params text not null,
+                    request_params blob not null,
                     status text not null,
                     result_kind text not null check(result_kind in (
                         'nonempty','empty','transport_failure','invalid','cancelled'
@@ -1199,7 +1371,9 @@ class MetadataStore:
                     unique(source,dataset,scope_kind,scope_key,variant_hash)
                 );
                 create index if not exists idx_update_scopes_eligibility
-                    on update_scopes(source,dataset,status,scope_key);
+                    on update_scopes(
+                        source,dataset,scope_kind,spec_hash,status,scope_key
+                    );
                 create table if not exists provider_scope_checks (
                     scope_id integer primary key,
                     checked_through text not null,
@@ -1234,6 +1408,14 @@ class MetadataStore:
                     schema_hash text not null,
                     updated_at text not null,
                     primary key(source, dataset, partition_path)
+                );
+                create table if not exists dataset_schemas (
+                    source text not null,
+                    dataset text not null,
+                    schema_ipc blob not null,
+                    schema_hash text not null,
+                    updated_at text not null,
+                    primary key(source,dataset)
                 );
                 create table if not exists rejected_summary (
                     run_id text not null,

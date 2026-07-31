@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from itertools import product
@@ -50,13 +50,15 @@ def discover_request_param_sets(
         return (), None
     try:
         frame = source_adapter.fetch(discovery.api, dict(discovery.params))  # type: ignore[attr-defined]
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         raise DataSourceError(
             f"request discovery failed for {spec.source}/{spec.name} "
             f"via {discovery.api}: {error}"
         ) from error
     if not isinstance(frame, pl.DataFrame):
-        raise DataSourceError("request discovery source adapter must return a Polars DataFrame")
+        raise DataSourceError(
+            "request discovery source adapter must return a Polars DataFrame"
+        )
     if discovery.result_field not in frame.columns:
         raise DataSourceError(
             f"request discovery response for {spec.source}/{spec.name} is missing "
@@ -90,12 +92,13 @@ def synchronize_requests(
     today: DateLike | None = None,
     ids: Sequence[str] | None = None,
     params: dict[str, object] | None = None,
-    discovered_param_sets: Sequence[dict[str, object]] = (),
+    discovered_param_sets: Sequence[Mapping[str, object]] = (),
 ) -> tuple[LedgerRequest, ...]:
     """Synchronize declared scopes and return only currently eligible work."""
 
-    final_day = _date_value(end or today or date.today())
-    execution_day = _date_value(today or date.today())
+    current_day = datetime.now(UTC).date()
+    final_day = _date_value(end or today or current_day)
+    execution_day = _date_value(today or current_day)
     variants = _base_variants(spec, params, discovered_param_sets)
     if spec.update_type == "general":
         requests = []
@@ -153,6 +156,7 @@ def _daily_requests(
         for value in _calendar_dates(spec, raw)
         if value <= final_day and (lower is None or value >= lower)
     ]
+    selected_dates = set(dates)
     metadata.synchronize_update_scopes(
         {
             "source": spec.source,
@@ -170,27 +174,21 @@ def _daily_requests(
         source=spec.source, dataset=spec.name, spec_hash=spec_hash
     )
     variant_params = dict(variants)
-    rows = metadata.update_scopes(
+    rows = metadata.update_scopes_with_checks(
         source=spec.source, dataset=spec.name, scope_kind="date"
     )
-    checks = {
-        int(row["scope_id"]): row
-        for row in metadata.provider_scope_checks(
-            source=spec.source, dataset=spec.name
-        )
-    }
     selected = []
     for row in rows:
         if str(row["variant_hash"]) not in variant_params:
             continue
         scope_day = _date_value(row["scope_key"])
-        if scope_day not in dates:
+        if scope_day not in selected_dates:
             continue
-        check = checks.get(int(row["id"]))
+        has_check = row["provider_checked_through"] is not None
         check_due = (
-            check is not None
-            and check["recheck_after"] is not None
-            and _date_value(check["recheck_after"]) <= execution_day
+            has_check
+            and row["provider_recheck_after"] is not None
+            and _date_value(row["provider_recheck_after"]) <= execution_day
         )
         status = str(row["status"])
         eligible = status in {"pending", "failed"} or (
@@ -208,7 +206,7 @@ def _daily_requests(
                     "retry"
                     if status == "failed"
                     else "historical_recheck"
-                    if check is not None
+                    if has_check
                     else "forward"
                 ),
                 target_end=scope_day.isoformat(),
@@ -265,15 +263,9 @@ def _asset_requests(
         source=spec.source, dataset=spec.name, spec_hash=spec_hash
     )
     variant_params = dict(variants)
-    rows = metadata.update_scopes(
+    rows = metadata.update_scopes_with_checks(
         source=spec.source, dataset=spec.name, scope_kind="asset"
     )
-    checks = {
-        int(row["scope_id"]): row
-        for row in metadata.provider_scope_checks(
-            source=spec.source, dataset=spec.name
-        )
-    }
     requests = []
     for row in rows:
         if str(row["variant_hash"]) not in variant_params:
@@ -286,18 +278,16 @@ def _asset_requests(
         }:
             continue
         initial_start, target_end = bounds[asset_id]
-        check = checks.get(int(row["id"]))
-        checked = _optional_date(None if check is None else check["checked_through"])
+        has_check = row["provider_checked_through"] is not None
+        checked = _optional_date(row["provider_checked_through"])
         forward_start = (
             checked + timedelta(days=1) if checked is not None else initial_start
         )
-        last_revision = _optional_datetime(
-            None if check is None else check["last_checked_at"]
-        )
+        last_revision = _optional_datetime(row["provider_last_checked_at"])
         recheck_due = bool(
-            check is not None
-            and check["recheck_after"] is not None
-            and _date_value(check["recheck_after"]) <= execution_day
+            has_check
+            and row["provider_recheck_after"] is not None
+            and _date_value(row["provider_recheck_after"]) <= execution_day
         )
         revision_due = recheck_due or (
             last_revision is None
@@ -358,7 +348,7 @@ def _asset_requests(
 def _base_variants(
     spec: DatasetSpec,
     params: dict[str, object] | None,
-    discovered_param_sets: Sequence[dict[str, object]],
+    discovered_param_sets: Sequence[Mapping[str, object]],
 ) -> list[tuple[str, dict[str, object]]]:
     defaults = dict(spec.source_api_params)
     overrides = dict(params or {})
@@ -453,9 +443,9 @@ def _date_value(value: object) -> date:
     if isinstance(value, date):
         return value
     text = str(value).split("T", maxsplit=1)[0]
-    return datetime.strptime(
-        text, "%Y%m%d" if len(text) == 8 and text.isdigit() else "%Y-%m-%d"
-    ).date()
+    if len(text) == 8 and text.isdigit():
+        return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+    return date.fromisoformat(text)
 
 
 def _optional_datetime(value: object) -> datetime | None:
