@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -23,10 +24,14 @@ from bagelquant_data.core.schema import (
 from bagelquant_data.core.validation import Validator
 from bagelquant_data.storage.parquet import (
     ParquetStore,
+    PartitionWriteContext,
     PartitionWriteResult,
     finalize_partition_writes,
+    partition_write_context,
     rollback_partition_writes,
 )
+
+MAX_PARQUET_WRITE_WORKERS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +78,7 @@ def commit_frame(
         str(row["partition_path"]): row
         for row in parquet.metadata.manifest(spec.source, spec.name)
     }
+    write_context = partition_write_context(canonical_schema)
     if spec.update_type == "general":
         final = _deduplicate(data, spec)
         final = _sort(final, spec)
@@ -83,6 +89,7 @@ def commit_frame(
             {},
             existing_manifest=manifests.get("data.parquet"),
             retain_backup=True,
+            write_context=write_context,
         )
         try:
             parquet.commit_metadata(
@@ -90,6 +97,7 @@ def commit_frame(
                 canonical_schema,
                 [result.manifest] if result.rewritten else [],
                 replace_manifests=result.rewritten,
+                write_context=write_context,
             )
         except BaseException:
             rollback_partition_writes([result])
@@ -109,6 +117,7 @@ def commit_frame(
             ("year", "month"),
             canonical_schema,
             manifests,
+            write_context,
         )
     elif spec.update_type == "by_asset":
         commit = _write_grouped(
@@ -118,6 +127,7 @@ def commit_frame(
             ("year", "bucket"),
             canonical_schema,
             manifests,
+            write_context,
         )
     else:
         raise ValueError(f"Unsupported update_type: {spec.update_type}")
@@ -131,6 +141,7 @@ def _write_grouped(
     group_columns: tuple[str, ...],
     canonical_schema: pl.Schema,
     existing_manifests: dict[str, dict[str, Any]],
+    write_context: PartitionWriteContext,
 ) -> CommitResult:
     row_count = 0
     manifests: list[dict[str, Any]] = []
@@ -139,45 +150,88 @@ def _write_grouped(
     bytes_written = 0
     present_times: set[str] = set()
     asset_max_times: dict[str, str] = {}
-    writes: list[PartitionWriteResult] = []
+    writes_by_index: dict[int, PartitionWriteResult] = {}
+    futures: dict[Future[PartitionWriteResult], int] = {}
+    failure: BaseException | None = None
+    executor = ThreadPoolExecutor(
+        max_workers=MAX_PARQUET_WRITE_WORKERS,
+        thread_name_prefix="bagelquant-parquet",
+    )
     try:
-        for values, group in data.group_by(group_columns, maintain_order=True):
-            if not isinstance(values, tuple):
-                values = (values,)
-            partition_values: dict[str, object] = dict(
-                zip(group_columns, values, strict=True)
-            )
-            path = _partition_path(spec, partition_values)
-            final = _merge_partition(
-                existing=_read_existing(parquet, spec, path),
-                incoming=group,
-                spec=spec,
-            )
-            final = align_frame(final, canonical_schema)
-            final = _sort(final, spec)
-            _accumulate_coverage(
-                final,
-                spec,
-                present_times=present_times,
-                asset_max_times=asset_max_times,
-            )
-            result = parquet.write_partition_file_result(
-                spec,
-                final,
-                path,
-                partition_values,
-                existing_manifest=existing_manifests.get(path.as_posix()),
-                retain_backup=True,
-            )
-            writes.append(result)
-            if result.rewritten:
-                manifests.append(result.manifest)
-                rewritten += 1
-                bytes_written += result.bytes_written
-            else:
-                skipped += 1
-            row_count += final.height
-        parquet.commit_metadata(spec, canonical_schema, manifests)
+        try:
+            for index, (values, group) in enumerate(
+                data.group_by(group_columns, maintain_order=True)
+            ):
+                if len(futures) >= MAX_PARQUET_WRITE_WORKERS:
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    failure = _collect_write_results(
+                        completed, futures, writes_by_index, failure
+                    )
+                else:
+                    completed = {future for future in futures if future.done()}
+                    failure = _collect_write_results(
+                        completed, futures, writes_by_index, failure
+                    )
+                if failure is not None:
+                    break
+                if not isinstance(values, tuple):
+                    values = (values,)
+                partition_values: dict[str, object] = dict(
+                    zip(group_columns, values, strict=True)
+                )
+                path = _partition_path(spec, partition_values)
+                final = _merge_partition(
+                    existing=_read_existing(parquet, spec, path),
+                    incoming=group,
+                    spec=spec,
+                )
+                final = align_frame(final, canonical_schema)
+                final = _sort(final, spec)
+                _accumulate_coverage(
+                    final,
+                    spec,
+                    present_times=present_times,
+                    asset_max_times=asset_max_times,
+                )
+                future = executor.submit(
+                    parquet.write_partition_file_result,
+                    spec,
+                    final,
+                    path,
+                    partition_values,
+                    existing_manifest=existing_manifests.get(path.as_posix()),
+                    retain_backup=True,
+                    write_context=write_context,
+                )
+                futures[future] = index
+                row_count += final.height
+        except BaseException as error:
+            failure = error
+        completed, _ = wait(futures)
+        failure = _collect_write_results(
+            completed, futures, writes_by_index, failure
+        )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    writes = [writes_by_index[index] for index in sorted(writes_by_index)]
+    if failure is not None:
+        rollback_partition_writes(writes)
+        raise failure
+    for result in writes:
+        if result.rewritten:
+            manifests.append(result.manifest)
+            rewritten += 1
+            bytes_written += result.bytes_written
+        else:
+            skipped += 1
+    try:
+        parquet.commit_metadata(
+            spec,
+            canonical_schema,
+            manifests,
+            write_context=write_context,
+        )
     except BaseException:
         rollback_partition_writes(writes)
         raise
@@ -190,6 +244,24 @@ def _write_grouped(
         present_times=frozenset(present_times),
         asset_max_times=tuple(sorted(asset_max_times.items())),
     )
+
+
+def _collect_write_results(
+    completed: set[Future[PartitionWriteResult]],
+    futures: dict[Future[PartitionWriteResult], int],
+    results: dict[int, PartitionWriteResult],
+    failure: BaseException | None,
+) -> BaseException | None:
+    """Collect every settled writer while retaining the first failure."""
+
+    for future in completed:
+        index = futures.pop(future)
+        try:
+            results[index] = future.result()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    return failure
 
 
 def _accumulate_coverage(

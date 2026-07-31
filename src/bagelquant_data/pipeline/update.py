@@ -195,6 +195,12 @@ def _update_datasets(
         workers, int(works[0].context.options.get("max_in_flight", workers * 2))
     )
     states = {work.spec.name: _RunState(work) for work in works}
+    initial_asset_build = (
+        works[0].spec.update_type == "by_asset"
+        and not pipeline.metadata.manifest(
+            works[0].spec.source, works[0].spec.name
+        )
+    )
     callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
     progresses = {
         work.spec.name: _progress_bar(
@@ -223,18 +229,46 @@ def _update_datasets(
             _emit_progress(callbacks[work.spec.name], states[work.spec.name], "sync", 0)
             tasks.extend((work, request) for request in work.requests)
         totals = {name: len(states[name].work.requests) for name in states}
+        ordered_tasks = _partition_affinity_order(_fair_tasks(tasks))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            _run_fetches(
-                _partition_affinity_order(_fair_tasks(tasks)),
-                executor=executor,
-                source_adapter=source_adapter,
-                pipeline=pipeline,
-                states=states,
-                callbacks=callbacks,
-                totals=totals,
-                completed=completed,
-                max_in_flight=max_in_flight,
-            )
+            if initial_asset_build:
+                request_index_offset = 0
+                for group in _initial_asset_task_groups(ordered_tasks):
+                    _run_fetches(
+                        group,
+                        executor=executor,
+                        source_adapter=source_adapter,
+                        pipeline=pipeline,
+                        states=states,
+                        callbacks=callbacks,
+                        totals=totals,
+                        completed=completed,
+                        max_in_flight=max_in_flight,
+                        request_index_offset=request_index_offset,
+                    )
+                    state = states[works[0].spec.name]
+                    _commit_state(
+                        pipeline,
+                        state,
+                        callbacks[state.work.spec.name],
+                        completed[state.work.spec.name],
+                        totals[state.work.spec.name],
+                    )
+                    request_index_offset += len(group)
+                    if state.cancelled:
+                        break
+            else:
+                _run_fetches(
+                    ordered_tasks,
+                    executor=executor,
+                    source_adapter=source_adapter,
+                    pipeline=pipeline,
+                    states=states,
+                    callbacks=callbacks,
+                    totals=totals,
+                    completed=completed,
+                    max_in_flight=max_in_flight,
+                )
         for state in states.values():
             _commit_state(
                 pipeline,
@@ -289,8 +323,9 @@ def _run_fetches(
     totals: dict[str, int],
     completed: dict[str, int],
     max_in_flight: int,
+    request_index_offset: int = 0,
 ) -> None:
-    task_iter = iter(enumerate(tasks))
+    task_iter = iter(enumerate(tasks, start=request_index_offset))
     ready: deque[tuple[int, UpdateTask]] = deque()
     futures: dict[Future[list[FetchPage]], tuple[float, UpdateTask]] = {}
     stop_submission = False
@@ -944,6 +979,32 @@ def _partition_affinity_order(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
         *sorted(retries, key=_partition_affinity),
         *sorted(incremental, key=_partition_affinity),
     ]
+
+
+def _initial_asset_task_groups(
+    tasks: Sequence[UpdateTask],
+) -> list[list[UpdateTask]]:
+    """Group a clean asset build at retry/forward and bucket boundaries."""
+
+    groups: list[list[UpdateTask]] = []
+    current: list[UpdateTask] = []
+    current_key: tuple[bool, int] | None = None
+    for task in tasks:
+        work, request = task
+        key = (
+            request.request_kind != "retry",
+            stable_bucket(
+                str(request.params["id"]), work.spec.asset_bucket_count
+            ),
+        )
+        if current and key != current_key:
+            groups.append(current)
+            current = []
+        current_key = key
+        current.append(task)
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:

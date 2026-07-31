@@ -13,6 +13,7 @@ from bagelquant_data.core.request import RequestContext
 from bagelquant_data.pipeline.scopes import LedgerRequest
 from bagelquant_data.pipeline.update import (
     DatasetUpdateWork,
+    _initial_asset_task_groups,
     _partition_affinity_order,
     _validate_response,
 )
@@ -331,7 +332,9 @@ def test_by_asset_default_rewrites_each_touched_partition_once(tmp_path) -> None
 
     files = lake.admin.status.files("income", source="custom")
     assert report.request_count == 150
-    assert report.commit_count == 1
+    assert report.commit_count == len(
+        {stable_bucket(asset, 32) for asset in assets}
+    )
     assert report.partitions_rewritten == len(files)
 
 
@@ -368,9 +371,24 @@ def test_partition_affinity_keeps_retries_first_and_sorts_each_band() -> None:
         forward_assets,
         key=lambda asset: (stable_bucket(asset, 4), asset),
     )
+    groups = _initial_asset_task_groups(ordered)
+    assert all(
+        len(
+            {
+                (
+                    request.request_kind != "retry",
+                    stable_bucket(str(request.params["id"]), 4),
+                )
+                for _, request in group
+            }
+        )
+        == 1
+        for group in groups
+    )
+    assert [task for group in groups for task in group] == ordered
 
 
-def test_asset_affinity_bounds_rewrites_across_memory_batches(
+def test_clean_asset_build_writes_each_physical_partition_once(
     tmp_path, monkeypatch
 ) -> None:
     assets = [f"{index:06d}.SZ" for index in range(320)]
@@ -421,10 +439,55 @@ def test_asset_affinity_bounds_rewrites_across_memory_batches(
     )
     files = lake.admin.status.files("income", source="custom")
 
-    assert report.commit_count > 1
+    assert report.commit_count == len(
+        {stable_bucket(asset, 32) for asset in assets}
+    )
     assert writes
-    assert max(writes.values()) <= 2
-    assert sum(writes.values()) <= len(files) * 2
+    assert max(writes.values()) == 1
+    assert sum(writes.values()) == len(files)
+    assert report.partitions_rewritten == len(files)
+
+
+def test_clean_asset_build_still_splits_an_oversized_bucket(tmp_path) -> None:
+    assets = [f"{index:06d}.SZ" for index in range(80)]
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(WideAssetSource())
+    lake.ingest(
+        DatasetSpec(
+            "stock_basic",
+            "general",
+            field_mappings={"ts_code": "asset_id"},
+        ),
+        pl.DataFrame(
+            {
+                "ts_code": assets,
+                "list_date": ["20240101"] * len(assets),
+            }
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            asset_bucket_count=1,
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    report = lake.update.dataset(
+        "income",
+        source="custom",
+        start="2024-01-01",
+        end="2025-12-31",
+        workers=1,
+        max_buffer_mb=1,
+        progress=False,
+    )
+    files = lake.admin.status.files("income", source="custom")
+
+    assert report.commit_count > 1
+    assert report.partitions_rewritten > len(files)
 
 
 def test_committed_coverage_does_not_rescan_canonical_parquet(

@@ -8,7 +8,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import polars as pl
@@ -22,6 +22,16 @@ from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
 
 logger = logging.getLogger(__name__)
+_LOAD_EXISTING_MANIFEST = object()
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionWriteContext:
+    """Schema values shared by every file write in one canonical commit."""
+
+    schema_hash: str
+    arrow_schema: pa.Schema
+    schema_ipc: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,8 +88,9 @@ class ParquetStore:
         relative_path: Path,
         partition_values: dict[str, Any] | None = None,
         *,
-        existing_manifest: dict[str, Any] | None = None,
+        existing_manifest: dict[str, Any] | None | object = _LOAD_EXISTING_MANIFEST,
         retain_backup: bool = False,
+        write_context: PartitionWriteContext | None = None,
     ) -> PartitionWriteResult:
         """Write one changed partition and retain a byte-identical manifest on no-op."""
 
@@ -92,7 +103,7 @@ class ParquetStore:
             else (None, None)
         )
         content_hash = frame_content_hash(frame)
-        if existing_manifest is None:
+        if existing_manifest is _LOAD_EXISTING_MANIFEST:
             existing_manifest = next(
                 (
                     row
@@ -101,6 +112,10 @@ class ParquetStore:
                 ),
                 None,
             )
+        else:
+            existing_manifest = cast(dict[str, Any] | None, existing_manifest)
+        if write_context is None:
+            write_context = partition_write_context(pl.Schema(frame.schema))
         if (
             existing_manifest is not None
             and existing_manifest.get("content_hash") == content_hash
@@ -117,7 +132,11 @@ class ParquetStore:
             )
             os.link(path, backup_path)
         try:
-            atomic_write_parquet(frame, path)
+            atomic_write_parquet(
+                frame,
+                path,
+                expected_schema=write_context.arrow_schema,
+            )
         except BaseException:
             if backup_path is not None:
                 backup_path.unlink(missing_ok=True)
@@ -132,7 +151,7 @@ class ParquetStore:
             "min_time": str(time_values[0]) if time_values[0] is not None else None,
             "max_time": str(time_values[1]) if time_values[1] is not None else None,
             "content_hash": content_hash,
-            "schema_hash": _schema_hash(frame),
+            "schema_hash": write_context.schema_hash,
         }
         return PartitionWriteResult(
             path,
@@ -172,16 +191,17 @@ class ParquetStore:
         manifests: list[dict[str, Any]],
         *,
         replace_manifests: bool = False,
+        write_context: PartitionWriteContext | None = None,
     ) -> None:
         """Publish manifest and schema metadata in one SQLite transaction."""
 
-        arrow_schema = schema.to_arrow()
+        context = write_context or partition_write_context(schema)
         self.metadata.commit_dataset_metadata(
             spec.source,
             spec.name,
             manifests=manifests,
-            schema_ipc=arrow_schema.serialize().to_pybytes(),
-            schema_hash=_schema_payload_hash(schema),
+            schema_ipc=context.schema_ipc,
+            schema_hash=context.schema_hash,
             replace_manifests=replace_manifests,
         )
 
@@ -217,6 +237,17 @@ class ParquetStore:
 
 def _schema_hash(frame: pl.DataFrame) -> str:
     return _schema_payload_hash(pl.Schema(frame.schema))
+
+
+def partition_write_context(schema: pl.Schema) -> PartitionWriteContext:
+    """Build the canonical physical schema once for a multi-file commit."""
+
+    arrow_schema = pl.DataFrame(schema=schema).to_arrow().schema
+    return PartitionWriteContext(
+        schema_hash=_schema_payload_hash(schema),
+        arrow_schema=arrow_schema,
+        schema_ipc=arrow_schema.serialize().to_pybytes(),
+    )
 
 
 def _schema_payload_hash(schema: pl.Schema) -> str:

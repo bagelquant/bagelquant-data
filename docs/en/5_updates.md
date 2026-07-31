@@ -89,8 +89,14 @@ Omit `batch_size` to commit when the dataset completes or its buffer reaches
 `max_buffer_mb` (512 MiB by default). Setting `batch_size` explicitly keeps a
 request-count commit boundary. Within retry and incremental work, requests are
 ordered by physical partition affinity: daily scopes by month and asset scopes
-by stable asset bucket. This bounds repeated partition rewrites when a full
-rebuild crosses multiple buffer commits without changing retry priority.
+by stable asset bucket. When a `by_asset` dataset has an empty manifest, the
+initial build also commits at retry/forward and bucket boundaries. A bucket
+smaller than the configured buffer is therefore written once; explicit
+`batch_size` and `max_buffer_mb` limits can still split an oversized bucket.
+Up to four internal workers hash, write, validate, and publish independent
+Parquet partitions in parallel. Schema reconciliation, manifest publication,
+and scope transitions remain serialized, and any writer failure settles the
+remaining in-flight work before the whole batch is rolled back.
 `max_in_flight` bounds queued calls:
 
 ```python

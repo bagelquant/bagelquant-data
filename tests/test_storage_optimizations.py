@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from datetime import date
 
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core import DatasetSpecError, ValidationError
 from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
+from bagelquant_data.pipeline import commit as commit_module
 from bagelquant_data.storage import parquet as parquet_module
+from bagelquant_data.storage import atomic as atomic_module
+from bagelquant_data.storage.atomic import atomic_write_parquet
 
 
 class StableDailySource:
@@ -365,12 +371,14 @@ def test_batch_write_failure_restores_all_old_partitions(
     writes = 0
     real_write = parquet_module.atomic_write_parquet
 
-    def fail_second_write(frame: pl.DataFrame, path) -> None:
+    def fail_second_write(
+        frame: pl.DataFrame, path, *, expected_schema=None
+    ) -> None:
         nonlocal writes
         writes += 1
         if writes == 2:
             raise PermissionError("fault injection")
-        real_write(frame, path)
+        real_write(frame, path, expected_schema=expected_schema)
 
     monkeypatch.setattr(
         parquet_module, "atomic_write_parquet", fail_second_write
@@ -392,7 +400,191 @@ def test_batch_write_failure_restores_all_old_partitions(
         pl.read_parquet(root / relative).equals(frame)
         for relative, frame in before_frames.items()
     )
+    assert not list(root.rglob("*.tmp"))
     assert not list(root.rglob("*.rollback"))
+
+
+def test_grouped_commit_parallelizes_writers_without_worker_sqlite(
+    tmp_path, monkeypatch
+) -> None:
+    lake = DataLake.open(tmp_path)
+    main_thread = threading.get_ident()
+    manifest_calls: list[int] = []
+    context_calls = 0
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    rendezvous = threading.Barrier(4)
+    real_manifest = lake.metadata.manifest
+    real_context = commit_module.partition_write_context
+    real_write = parquet_module.atomic_write_parquet
+
+    def checked_manifest(source: str, dataset: str):
+        manifest_calls.append(threading.get_ident())
+        assert threading.get_ident() == main_thread
+        return real_manifest(source, dataset)
+
+    def tracked_context(schema):
+        nonlocal context_calls
+        context_calls += 1
+        return real_context(schema)
+
+    def tracked_write(frame, path, *, expected_schema=None):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            rendezvous.wait(timeout=5)
+            real_write(frame, path, expected_schema=expected_schema)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(lake.metadata, "manifest", checked_manifest)
+    monkeypatch.setattr(
+        commit_module, "partition_write_context", tracked_context
+    )
+    monkeypatch.setattr(parquet_module, "atomic_write_parquet", tracked_write)
+
+    result = lake.ingest(
+        _daily_spec(),
+        pl.DataFrame(
+            {
+                "trade_date": [
+                    "20250102",
+                    "20250203",
+                    "20250303",
+                    "20250401",
+                    "20250502",
+                    "20250602",
+                    "20250701",
+                    "20250801",
+                ],
+                "ts_code": ["A"] * 8,
+                "value": list(range(8)),
+            }
+        ),
+    )
+
+    assert result.partitions_rewritten == 8
+    assert 2 <= peak <= 4
+    assert manifest_calls
+    assert set(manifest_calls) == {main_thread}
+    assert context_calls == 1
+
+
+def test_partition_write_context_matches_parquet_physical_schema(tmp_path) -> None:
+    schema = pl.Schema(
+        {
+            "text": pl.String,
+            "day": pl.Date,
+            "missing": pl.Null,
+            "values": pl.List(pl.Int64),
+        }
+    )
+    frame = pl.DataFrame(
+        {
+            "text": ["x"],
+            "day": [date(2025, 1, 2)],
+            "missing": [None],
+            "values": [[1, 2]],
+        },
+        schema=schema,
+    )
+    context = parquet_module.partition_write_context(schema)
+    path = tmp_path / "physical.parquet"
+
+    atomic_write_parquet(frame, path, expected_schema=context.arrow_schema)
+
+    parquet_file = pq.ParquetFile(path)
+    try:
+        assert parquet_file.schema_arrow.equals(context.arrow_schema)
+    finally:
+        parquet_file.close()
+
+
+def test_hash_failure_drains_writers_and_removes_temporary_files(
+    tmp_path, monkeypatch
+) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = _daily_spec()
+    original = pl.DataFrame(
+        {
+            "trade_date": ["20250102", "20250203", "20250303", "20250401"],
+            "ts_code": ["A"] * 4,
+            "value": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    lake.ingest(spec, original)
+    root = lake.paths.dataset_root("custom", "daily")
+    before_manifest = lake.metadata.manifest("custom", "daily")
+    before_frames = {
+        str(row["partition_path"]): pl.read_parquet(
+            root / str(row["partition_path"])
+        )
+        for row in before_manifest
+    }
+    real_hash = parquet_module.frame_content_hash
+    calls = 0
+    lock = threading.Lock()
+
+    def fail_one_hash(frame):
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            raise RuntimeError("hash fault injection")
+        return real_hash(frame)
+
+    monkeypatch.setattr(parquet_module, "frame_content_hash", fail_one_hash)
+    with pytest.raises(RuntimeError, match="hash fault injection"):
+        lake.ingest(
+            spec,
+            original.with_columns(pl.col("value") + 10),
+        )
+
+    assert 2 <= calls <= 4
+    assert lake.metadata.manifest("custom", "daily") == before_manifest
+    assert all(
+        pl.read_parquet(root / relative).equals(frame)
+        for relative, frame in before_frames.items()
+    )
+    assert not list(root.rglob("*.tmp"))
+    assert not list(root.rglob("*.rollback"))
+
+
+@pytest.mark.parametrize("failure_stage", ["read_back", "replace"])
+def test_atomic_failures_preserve_old_file_and_remove_temporary_file(
+    tmp_path, monkeypatch, failure_stage
+) -> None:
+    path = tmp_path / "data.parquet"
+    original = pl.DataFrame({"value": [1]})
+    atomic_write_parquet(original, path)
+    if failure_stage == "read_back":
+        monkeypatch.setattr(
+            atomic_module.pq,
+            "ParquetFile",
+            lambda _: (_ for _ in ()).throw(RuntimeError("read-back fault")),
+        )
+    else:
+        monkeypatch.setattr(
+            atomic_module.os,
+            "replace",
+            lambda *_: (_ for _ in ()).throw(
+                PermissionError("replace fault")
+            ),
+        )
+        monkeypatch.setattr(atomic_module.time, "sleep", lambda _: None)
+
+    with pytest.raises(
+        (RuntimeError, PermissionError), match=f"{failure_stage.split('_')[0]}"
+    ):
+        atomic_write_parquet(pl.DataFrame({"value": [2]}), path)
+
+    assert pl.read_parquet(path).equals(original)
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_metadata_commit_failure_restores_parquet_manifest_and_schema(

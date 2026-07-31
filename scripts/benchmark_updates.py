@@ -11,16 +11,21 @@ import argparse
 import io
 import json
 import tempfile
+import threading
 import time
 from contextlib import redirect_stdout
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
+import pyarrow as pa
 
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
+from bagelquant_data.pipeline.commit import MAX_PARQUET_WRITE_WORKERS
 from bagelquant_data.query.scanner import manifest_rows
+from bagelquant_data.storage import parquet as parquet_module
 
 
 class DelayedSource:
@@ -388,7 +393,31 @@ def _bulk_asset_benchmark(
             field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
         )
     )
-    with redirect_stdout(io.StringIO()):
+    active_writers = 0
+    peak_writers = 0
+    writer_lock = threading.Lock()
+    real_write = parquet_module.atomic_write_parquet
+
+    def tracked_write(
+        frame: pl.DataFrame,
+        path: Path,
+        *,
+        expected_schema: pa.Schema | None = None,
+    ) -> None:
+        nonlocal active_writers, peak_writers
+        with writer_lock:
+            active_writers += 1
+            peak_writers = max(peak_writers, active_writers)
+        try:
+            real_write(frame, path, expected_schema=expected_schema)
+        finally:
+            with writer_lock:
+                active_writers -= 1
+
+    with (
+        patch.object(parquet_module, "atomic_write_parquet", tracked_write),
+        redirect_stdout(io.StringIO()),
+    ):
         report = lake.update.dataset(
             "bulk_income",
             source="bulk_asset",
@@ -417,6 +446,8 @@ def _bulk_asset_benchmark(
         "rows": asset_count * rows_per_asset,
         "rows_per_asset": rows_per_asset,
         "unique_partitions": unique_partitions,
+        "writer_concurrency_limit": MAX_PARQUET_WRITE_WORKERS,
+        "writer_peak_concurrency": peak_writers,
     }
 
 
