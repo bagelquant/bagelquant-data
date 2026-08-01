@@ -57,6 +57,11 @@ class DatasetManager:
         with Path(path).open("rb") as file:
             return self.register(_spec_from_mapping(tomllib.load(file)))
 
+    def register_toml_text(self, text: str) -> DatasetSpec:
+        """Register a TOML declaration supplied by a non-filesystem authority."""
+
+        return self.register(_spec_from_mapping(tomllib.loads(text)))
+
     def get(self, dataset: str, *, source: str) -> DatasetSpec:
         key = (source, dataset)
         if key in self._specs:

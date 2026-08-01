@@ -124,6 +124,19 @@ class ParquetStore:
             return PartitionWriteResult(
                 path, _manifest_payload(existing_manifest), False, 0
             )
+        if (
+            spec.update_type == "general"
+            and existing_manifest is not None
+            and path.is_file()
+            and pl.read_parquet(path).equals(frame)
+        ):
+            # Some foreign producers use a different in-memory Arrow buffer
+            # layout for the same logical values.  A general dataset is small
+            # enough to compare directly when hashes disagree, avoiding a
+            # spurious rewrite and downstream invalidation.
+            return PartitionWriteResult(
+                path, _manifest_payload(existing_manifest), False, 0
+            )
         existed_before = path.is_file()
         backup_path = None
         if retain_backup and existed_before:
@@ -141,6 +154,10 @@ class ParquetStore:
             if backup_path is not None:
                 backup_path.unlink(missing_ok=True)
             raise
+        if spec.update_type == "general":
+            # Hash the durable representation.  Parquet normalizes foreign
+            # Arrow buffers, so this is the value a later deep scan will see.
+            content_hash = frame_content_hash(pl.read_parquet(path))
         manifest = {
             "source": spec.source,
             "dataset": spec.name,

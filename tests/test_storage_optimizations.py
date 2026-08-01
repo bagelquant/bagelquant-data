@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from datetime import date
 
+import pandas as pd
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
@@ -80,6 +81,57 @@ def test_arrow_content_hash_is_logical_and_schema_sensitive() -> None:
     assert frame_content_hash(base) != frame_content_hash(
         base.with_columns(pl.col("value") + 1)
     )
+
+
+def test_arrow_content_hash_survives_foreign_strings_parquet_roundtrip(
+    tmp_path,
+) -> None:
+    foreign = pl.from_pandas(
+        pd.DataFrame(
+            {
+                "asset_id": ["A", "B", "C"],
+                "name": ["alpha", "beta", "gamma"],
+                "nullable": [None, "value", None],
+            }
+        )
+    )
+    path = tmp_path / "foreign.parquet"
+    foreign.write_parquet(path)
+
+    assert frame_content_hash(foreign) == frame_content_hash(
+        pl.read_parquet(path)
+    )
+
+
+def test_general_foreign_frame_manifest_matches_durable_parquet(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = DatasetSpec(
+        "trade_cal",
+        "general",
+        source="tushare",
+        field_mappings={"cal_date": "time"},
+    )
+    foreign = pl.from_pandas(
+        pd.DataFrame(
+            {
+                "exchange": ["SSE", "SSE", "SSE"],
+                "cal_date": ["20260101", "20260102", "20260103"],
+                "is_open": [0, 1, 1],
+                "pretrade_date": ["20251231", "20251231", "20260102"],
+            }
+        )
+    )
+
+    first = lake.ingest(spec, foreign)
+    health = lake.admin.validate_manifest(
+        "trade_cal", source="tushare", deep=True
+    )
+    second = lake.ingest(spec, foreign)
+
+    assert health["valid"]
+    assert first.partitions_rewritten == 1
+    assert second.partitions_rewritten == 0
+    assert second.partitions_skipped == 1
 
 
 def test_identical_ingest_skips_partition_and_preserves_manifest_and_file(

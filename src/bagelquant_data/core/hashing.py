@@ -32,6 +32,19 @@ def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None)
 
     selected = frame.columns if fields is None else list(fields)
     candidate = frame if fields is None else frame.select(selected)
+    # Foreign Arrow producers (notably pandas via ``pl.from_pandas``) can leave
+    # logically identical strings with different offset/validity buffers than a
+    # Parquet round-trip.  IPC hashes those physical buffers, so rebuild only
+    # variable-width strings in Polars before serialization.  This keeps the
+    # fast columnar path while making the hash stable across persistence.
+    string_fields = [
+        name for name, dtype in candidate.schema.items() if dtype == pl.String
+    ]
+    if string_fields:
+        candidate = candidate.with_columns(
+            pl.concat_str([pl.col(name), pl.lit("")]).alias(name)
+            for name in string_fields
+        )
     canonical = candidate.sort(selected).rechunk()
     table = canonical.to_arrow().combine_chunks()
     sink = pa.BufferOutputStream()
