@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +17,45 @@ def test_metadata_store_initializes_wal_mode(tmp_path) -> None:
         journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
 
     assert journal_mode == "wal"
+
+
+def test_metadata_connection_is_closed_after_context_exit(tmp_path) -> None:
+    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+
+    with metadata.connect() as connection:
+        connection.execute("SELECT 1").fetchone()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="resource limits are POSIX-only")
+def test_repeated_manifest_reads_do_not_exhaust_file_descriptors() -> None:
+    script = """
+import resource
+import sqlite3
+import tempfile
+from pathlib import Path
+from bagelquant_data import DataLake
+
+_, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+root = Path(tempfile.mkdtemp())
+lake = DataLake.open(root / "lake")
+for _ in range(200):
+    lake.metadata.manifest("custom", "missing")
+with sqlite3.connect(root / "probe.sqlite") as connection:
+    connection.execute("CREATE TABLE probe (value INTEGER)")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_metadata_store_rejects_incompatible_unversioned_schema(tmp_path) -> None:

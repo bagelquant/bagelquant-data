@@ -243,6 +243,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "name",
         "update_type",
         "source",
+        "description",
         "source_api",
         "calendar",
         "date_param",
@@ -335,6 +336,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         name=str(value["name"]),
         update_type=str(value["update_type"]),
         source=str(value.get("source", "custom")),
+        description=str(value.get("description", "")),
         source_api=(
             None if value.get("source_api") is None else str(value["source_api"])
         ),

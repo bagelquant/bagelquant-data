@@ -24,6 +24,7 @@ class DatasetSpec:
     name: str
     update_type: str
     source: str = "custom"
+    description: str = ""
     calendar: str | None = None
     asset_list: str | None = None
     primary_key_extra: tuple[str, ...] = ()

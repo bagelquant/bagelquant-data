@@ -30,11 +30,21 @@ class MetadataStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield one transactional connection and close owned connections."""
+
         active = getattr(self._thread_state, "writer_connection", None)
         if isinstance(active, sqlite3.Connection):
-            return active
-        return self._new_connection()
+            with active as connection:
+                yield connection
+            return
+        connection = self._new_connection()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)

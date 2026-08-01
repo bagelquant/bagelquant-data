@@ -23,6 +23,7 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
         "name",
         "update_type",
         "source",
+        "description",
         "calendar",
         "asset_list",
         "primary_key_extra",
@@ -61,6 +62,23 @@ def test_historical_empty_policy_round_trips_from_toml(tmp_path) -> None:
         .historical_empty_is_error
         is True
     )
+
+
+def test_dataset_description_round_trips_from_toml_and_metadata(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    path = tmp_path / "general.toml"
+    path.write_text(
+        'name = "stock_basic"\nupdate_type = "general"\n'
+        'description = "Listed equity reference data."\n'
+    )
+
+    registered = lake.admin.datasets.register_toml(path)
+    reopened = DataLake.open(tmp_path).admin.datasets.get(
+        "stock_basic", source="custom"
+    )
+
+    assert registered.description == "Listed equity reference data."
+    assert reopened.description == registered.description
 
 
 def test_historical_empty_policy_is_daily_only(tmp_path) -> None:
