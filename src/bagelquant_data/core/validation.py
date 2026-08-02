@@ -26,3 +26,11 @@ class FrameworkValidator:
         missing = sorted(required - names)
         if missing:
             raise ValidationError(f"{spec.source}/{spec.name} missing fields: {missing}")
+        if required and frame.select(
+            pl.any_horizontal(
+                pl.col(column).is_null() for column in sorted(required)
+            ).any()
+        ).collect().item():
+            raise ValidationError(
+                f"{spec.source}/{spec.name} contains null primary key values"
+            )

@@ -258,6 +258,27 @@ def test_general_and_incremental_ingestion(tmp_path) -> None:
         )
 
 
+def test_incremental_ingestion_rejects_null_primary_key_values(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = DatasetSpec(
+        "daily",
+        "by_daily",
+        calendar="trade_cal",
+        field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+    )
+    frame = pl.DataFrame(
+        {
+            "trade_date": ["20250102"],
+            "ts_code": [None],
+            "close": [1.0],
+        },
+        schema_overrides={"ts_code": pl.String},
+    )
+
+    with pytest.raises(ValidationError, match="null primary key values"):
+        lake.ingest(spec, frame)
+
+
 def test_field_mappings_reject_missing_sources_and_unmapped_collisions(
     tmp_path,
 ) -> None:
