@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import sqlite3
 
 import polars as pl
@@ -262,7 +262,7 @@ def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_pat
     )
 
 
-def test_dense_historical_empty_is_terminal_even_with_legacy_flag(tmp_path) -> None:
+def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> None:
     source = LedgerSource(empty=True)
     lake = DataLake.open(tmp_path)
     lake.admin.sources.register(source)
@@ -311,7 +311,14 @@ def test_dense_historical_empty_is_terminal_even_with_legacy_flag(tmp_path) -> N
         end="2025-01-02",
         progress=False,
     )
-    assert source.requests == []
+    assert [request[1]["date"] for request in source.requests] == ["2025-01-02"]
+    assert lake.admin.status.update_scopes(
+        dataset="daily", source="custom"
+    )[0]["status"] == "empty"
+    api_call = lake.metadata._rows(
+        "select request_kind,result_kind from api_calls order by rowid desc limit 1"
+    )[0]
+    assert api_call == {"request_kind": "empty_recheck", "result_kind": "empty"}
 
 
 def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
@@ -351,6 +358,125 @@ def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
     )[0]
     assert check["checked_through"] == today.isoformat()
     assert check["recheck_after"] is None
+
+
+def test_daily_update_rechecks_only_empty_scopes_in_last_twenty_sessions(
+    tmp_path,
+) -> None:
+    class SelectiveSource(LedgerSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.empty_dates: set[str] = set()
+
+        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            value = str(request["date"])
+            if value in self.empty_dates:
+                self.requests.append((dataset, dict(request)))
+                return pl.DataFrame()
+            return super().fetch(dataset, request)
+
+    source = SelectiveSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(25)]
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": sessions, "is_open": [1] * len(sessions)}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    source.empty_dates = {value.isoformat() for value in sessions}
+    lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        workers=4,
+        progress=False,
+    )
+
+    source.empty_dates.clear()
+    source.requests.clear()
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        workers=4,
+        progress=False,
+    )
+
+    requested = {str(request["date"]) for _, request in source.requests}
+    assert requested == {value.isoformat() for value in sessions[-20:]}
+    assert report.success_count == 20
+    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    assert [row["status"] for row in scopes[:5]] == ["empty"] * 5
+    assert [row["status"] for row in scopes[5:]] == ["success"] * 20
+
+
+def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> None:
+    class PhaseSource(LedgerSource):
+        def __init__(self) -> None:
+            super().__init__(empty=True)
+            self.lake: DataLake | None = None
+
+        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            request_date = str(request["date"])
+            if request_date == "2025-01-03":
+                assert self.lake is not None
+                repaired = self.lake.admin.status.update_scopes(
+                    dataset="daily", source="custom"
+                )
+                assert next(
+                    row for row in repaired if row["scope_key"] == "2025-01-02"
+                )["status"] == "success"
+            return super().fetch(dataset, request)
+
+    source = PhaseSource()
+    lake = DataLake.open(tmp_path)
+    source.lake = lake
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    lake.update.dataset(
+        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+    )
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
+    )
+    source.empty = False
+    source.requests.clear()
+
+    lake.update.dataset(
+        "daily",
+        source="custom",
+        start="2025-01-02",
+        end="2025-01-03",
+        workers=4,
+        progress=False,
+    )
+
+    assert [request["date"] for _, request in source.requests] == [
+        "2025-01-02",
+        "2025-01-03",
+    ]
 
 
 def test_incompatible_old_schema_is_rejected_without_migration(tmp_path) -> None:

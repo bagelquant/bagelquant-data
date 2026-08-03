@@ -66,10 +66,14 @@ and manifest row are left untouched while the scope, provider check, and run
 still complete normally. `partitions_rewritten` therefore counts physical
 writes, while `partitions_skipped` counts no-op partitions.
 
-Every validated empty response is a terminal `empty` scope. It is not retried
-automatically; reset the scope or change the dataset definition to check it
-again. The legacy `historical_empty_is_error` declaration remains readable but
-does not change this behavior.
+For every `by_daily` dataset, an update first rechecks existing `empty` scopes
+that fall within the latest 20 requested trading sessions. These calls are
+audited as `empty_recheck`. A repeated empty stays `empty`; a nonempty response
+commits canonically and changes the scope to `success`. Failed scopes and these
+recent empty scopes form a repair phase that finishes and commits before any
+new forward work starts. Older daily empties and empty `by_asset` scopes remain
+terminal until reset or a definition change. Empties first observed during a
+run are considered for repair on the next run, not twice in the same run.
 
 Each selected dataset has a writer lease tied to a workflow owner. A second
 process cannot update that dataset until the first process finishes or its

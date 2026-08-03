@@ -281,18 +281,45 @@ def _update_datasets(
                     if state.cancelled:
                         break
             else:
-                _run_fetches(
-                    ordered_tasks,
-                    executor=executor,
-                    source_adapter=source_adapter,
-                    pipeline=pipeline,
-                    states=states,
-                    callbacks=callbacks,
-                    totals=totals,
-                    completed=completed,
-                    max_in_flight=max_in_flight,
-                    writer_executor=writer_executor,
-                )
+                repair_tasks = [
+                    task
+                    for task in ordered_tasks
+                    if task[1].request_kind in {"retry", "empty_recheck"}
+                ]
+                incremental_tasks = [
+                    task
+                    for task in ordered_tasks
+                    if task[1].request_kind not in {"retry", "empty_recheck"}
+                ]
+                request_index_offset = 0
+                for phase in (repair_tasks, incremental_tasks):
+                    if not phase:
+                        continue
+                    _run_fetches(
+                        phase,
+                        executor=executor,
+                        source_adapter=source_adapter,
+                        pipeline=pipeline,
+                        states=states,
+                        callbacks=callbacks,
+                        totals=totals,
+                        completed=completed,
+                        max_in_flight=max_in_flight,
+                        writer_executor=writer_executor,
+                        request_index_offset=request_index_offset,
+                    )
+                    for state in states.values():
+                        _commit_state(
+                            pipeline,
+                            state,
+                            callbacks[state.work.spec.name],
+                            completed[state.work.spec.name],
+                            totals[state.work.spec.name],
+                            writer_executor,
+                        )
+                    request_index_offset += len(phase)
+                    if any(state.cancelled for state in states.values()):
+                        break
         for state in states.values():
             _commit_state(
                 pipeline,
@@ -999,18 +1026,20 @@ def _fair_tasks(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
 
 
 def _retry_first(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
-    """Run durable failed scopes before forward or revision work."""
+    """Run durable repair scopes before forward or revision work."""
 
-    retries = [task for task in tasks if task[1].request_kind == "retry"]
-    incremental = [task for task in tasks if task[1].request_kind != "retry"]
+    repair_kinds = {"retry", "empty_recheck"}
+    retries = [task for task in tasks if task[1].request_kind in repair_kinds]
+    incremental = [task for task in tasks if task[1].request_kind not in repair_kinds]
     return [*retries, *incremental]
 
 
 def _partition_affinity_order(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
     """Keep retry priority while making physical partition work contiguous."""
 
-    retries = [task for task in tasks if task[1].request_kind == "retry"]
-    incremental = [task for task in tasks if task[1].request_kind != "retry"]
+    repair_kinds = {"retry", "empty_recheck"}
+    retries = [task for task in tasks if task[1].request_kind in repair_kinds]
+    incremental = [task for task in tasks if task[1].request_kind not in repair_kinds]
     return [
         *sorted(retries, key=_partition_affinity),
         *sorted(incremental, key=_partition_affinity),

@@ -54,8 +54,10 @@ The lake stores provider checks separately from commit-backed `data_max_time`.
 This prevents sparse event data from being downloaded repeatedly while the
 revision window still captures later restatements.
 `historical_empty_is_error` is retained only so older declarations continue to
-load. All validated empty responses are terminal until their scope is reset or
-the dataset definition changes.
+load. For every `by_daily` dataset, validated empty scopes in the latest 20
+requested calendar sessions are rechecked on the next update. Older empty
+daily scopes and empty `by_asset` scopes remain terminal until reset or a
+definition change.
 
 Mappings are true renames, so provider columns named `trade_date` and
 `ts_code` are stored as `time` and `asset_id`. A mapping may rename other

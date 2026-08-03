@@ -18,6 +18,9 @@ from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.metadata import MetadataStore
 
 
+DAILY_EMPTY_RECHECK_SESSIONS = 20
+
+
 @dataclass(frozen=True, slots=True)
 class LedgerRequest:
     """One claimed ledger scope and the provider request that checks it."""
@@ -158,6 +161,7 @@ def _daily_requests(
         if value <= final_day and (lower is None or value >= lower)
     ]
     selected_dates = set(dates)
+    recent_dates = set(dates[-DAILY_EMPTY_RECHECK_SESSIONS:])
     metadata.synchronize_update_scopes(
         {
             "source": spec.source,
@@ -192,8 +196,10 @@ def _daily_requests(
             and _date_value(row["provider_recheck_after"]) <= execution_day
         )
         status = str(row["status"])
-        eligible = status in {"pending", "failed"} or (
-            status == "success" and check_due
+        eligible = (
+            status in {"pending", "failed"}
+            or (status == "empty" and scope_day in recent_dates)
+            or (status == "success" and check_due)
         )
         if not eligible:
             continue
@@ -206,6 +212,8 @@ def _daily_requests(
                 request_kind=(
                     "retry"
                     if status == "failed"
+                    else "empty_recheck"
+                    if status == "empty"
                     else "historical_recheck"
                     if has_check
                     else "forward"

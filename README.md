@@ -35,7 +35,9 @@ records one scope per asset and request variant. A scope becomes successful
 only after its canonical Parquet commit succeeds. Provider-only range checks
 are stored separately in `provider_scope_checks` and never advance local data
 coverage. Validated empty responses are durable `empty` scope outcomes and are
-skipped until their forward or revision check is due. `by_asset` data uses
+rechecked on the next update while their dates remain within the latest 20
+requested trading sessions. Older empty daily scopes stay terminal. Repair
+requests finish and commit before new daily scopes begin. `by_asset` data uses
 stable year/asset-bucket partitions (32 buckets by default), so a new asset
 does not rewrite one whole-year file. Old metadata schemas are rejected rather
 than migrated; metadata schema v3 requires a fresh lake root.
