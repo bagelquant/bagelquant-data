@@ -235,7 +235,12 @@ class LakeUpdater:
         ]
         if not selected:
             return combine_reports(source, [])
-        before = _manifest_map(self.lake.metadata, source)
+        selected_datasets = tuple(work.spec.name for work in selected)
+        before = _manifest_map(
+            self.lake.metadata,
+            source,
+            selected_datasets,
+        )
         leases = [(work.spec.source, work.spec.name, work.run_id) for work in selected]
         owner_id = next(
             (
@@ -254,7 +259,11 @@ class LakeUpdater:
             )
         finally:
             self.lake.metadata.release_update_leases(work.run_id for work in selected)
-        after = _manifest_map(self.lake.metadata, source)
+        after = _manifest_map(
+            self.lake.metadata,
+            source,
+            selected_datasets,
+        )
         return replace(report, changed_partitions=_partition_changes(before, after))
 
     def source(
@@ -402,11 +411,14 @@ def _request_context(
 
 
 def _manifest_map(
-    metadata: MetadataStore, source: str
+    metadata: MetadataStore,
+    source: str,
+    datasets: Sequence[str],
 ) -> dict[tuple[str, str], dict[str, Any]]:
     return {
         (str(row["dataset"]), str(row["partition_path"])): row
-        for row in metadata.manifest(source)
+        for dataset in dict.fromkeys(datasets)
+        for row in metadata.manifest(source, dataset)
     }
 
 
@@ -422,19 +434,24 @@ def _partition_changes(
         new_hash = None if new is None else str(new["content_hash"])
         if old_hash == new_hash:
             continue
-        row = new or old or {}
+        time_starts = [
+            str(row["min_time"])
+            for row in (old, new)
+            if row is not None and row.get("min_time") is not None
+        ]
+        time_ends = [
+            str(row["max_time"])
+            for row in (old, new)
+            if row is not None and row.get("max_time") is not None
+        ]
         changes.append(
             PartitionChange(
                 dataset=key[0],
                 partition_path=key[1],
                 before_hash=old_hash,
                 after_hash=new_hash,
-                min_time=(
-                    None if row.get("min_time") is None else str(row["min_time"])
-                ),
-                max_time=(
-                    None if row.get("max_time") is None else str(row["max_time"])
-                ),
+                min_time=min(time_starts, default=None),
+                max_time=max(time_ends, default=None),
             )
         )
     return tuple(changes)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 from threading import Event, Lock
 
 import polars as pl
@@ -8,6 +8,57 @@ import polars as pl
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core import ASSET_BUCKET_COUNT
 from bagelquant_data.core.hashing import stable_bucket
+from bagelquant_data.management.lake import _manifest_map, _partition_changes
+
+
+def test_partition_change_coordinates_cover_deleted_boundary_rows() -> None:
+    key = ("daily", "year=2025/month=01/data.parquet")
+    before: dict[tuple[str, str], dict[str, Any]] = {
+        key: {
+            "content_hash": "before",
+            "min_time": "2025-01-02",
+            "max_time": "2025-01-31",
+        }
+    }
+    after: dict[tuple[str, str], dict[str, Any]] = {
+        key: {
+            "content_hash": "after",
+            "min_time": "2025-01-03",
+            "max_time": "2025-01-30",
+        }
+    }
+
+    change = _partition_changes(before, after)[0]
+
+    assert change.min_time == "2025-01-02"
+    assert change.max_time == "2025-01-31"
+
+
+def test_update_manifest_snapshot_reads_only_selected_datasets() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Metadata:
+        def manifest(self, source: str, dataset: str):  # noqa: ANN201
+            calls.append((source, dataset))
+            return [
+                {
+                    "dataset": dataset,
+                    "partition_path": f"{dataset}.parquet",
+                    "content_hash": dataset,
+                }
+            ]
+
+    result = _manifest_map(
+        cast(Any, Metadata()),
+        "custom",
+        ("daily", "income"),
+    )
+
+    assert calls == [("custom", "daily"), ("custom", "income")]
+    assert set(result) == {
+        ("daily", "daily.parquet"),
+        ("income", "income.parquet"),
+    }
 
 
 class StaticSource:
