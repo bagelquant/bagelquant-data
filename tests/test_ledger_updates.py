@@ -714,3 +714,14 @@ def test_atomic_parquet_replace_retries_transient_permission_errors(
 
     assert attempts == 3
     assert pl.read_parquet(path).to_dicts() == [{"value": 1}]
+
+
+def test_atomic_parquet_write_supports_long_paths(tmp_path) -> None:
+    directory = tmp_path
+    while len(str(directory / "data.parquet")) < 242:
+        directory /= "p"
+    path = directory / "data.parquet"
+
+    atomic_write_parquet(pl.DataFrame({"value": [1]}), path)
+
+    assert pl.read_parquet(path).to_dicts() == [{"value": 1}]

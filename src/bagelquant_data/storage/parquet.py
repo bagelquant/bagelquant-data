@@ -17,7 +17,7 @@ import pyarrow as pa
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.core.schema import compatible_schema
-from bagelquant_data.storage.atomic import atomic_write_parquet
+from bagelquant_data.storage.atomic import _filesystem_path, atomic_write_parquet
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
 
@@ -119,7 +119,7 @@ class ParquetStore:
         if (
             existing_manifest is not None
             and existing_manifest.get("content_hash") == content_hash
-            and path.is_file()
+            and _is_file(path)
         ):
             return PartitionWriteResult(
                 path, _manifest_payload(existing_manifest), False, 0
@@ -127,8 +127,8 @@ class ParquetStore:
         if (
             spec.update_type == "general"
             and existing_manifest is not None
-            and path.is_file()
-            and pl.read_parquet(path).equals(frame)
+            and _is_file(path)
+            and pl.read_parquet(_filesystem_path(path)).equals(frame)
         ):
             # Some foreign producers use a different in-memory Arrow buffer
             # layout for the same logical values.  A general dataset is small
@@ -137,13 +137,13 @@ class ParquetStore:
             return PartitionWriteResult(
                 path, _manifest_payload(existing_manifest), False, 0
             )
-        existed_before = path.is_file()
+        existed_before = _is_file(path)
         backup_path = None
         if retain_backup and existed_before:
             backup_path = path.with_name(
                 f".{path.name}.{uuid4().hex}.rollback"
             )
-            os.link(path, backup_path)
+            os.link(_filesystem_path(path), _filesystem_path(backup_path))
         try:
             atomic_write_parquet(
                 frame,
@@ -152,19 +152,22 @@ class ParquetStore:
             )
         except BaseException:
             if backup_path is not None:
-                backup_path.unlink(missing_ok=True)
+                _unlink_missing(backup_path)
             raise
         if spec.update_type == "general":
             # Hash the durable representation.  Parquet normalizes foreign
             # Arrow buffers, so this is the value a later deep scan will see.
-            content_hash = frame_content_hash(pl.read_parquet(path))
+            content_hash = frame_content_hash(
+                pl.read_parquet(_filesystem_path(path))
+            )
+        file_size = os.stat(_filesystem_path(path)).st_size
         manifest = {
             "source": spec.source,
             "dataset": spec.name,
             "partition_path": relative_path.as_posix(),
             "partition_values": partition_values or {},
             "row_count": frame.height,
-            "file_size_bytes": path.stat().st_size,
+            "file_size_bytes": file_size,
             "min_time": str(time_values[0]) if time_values[0] is not None else None,
             "max_time": str(time_values[1]) if time_values[1] is not None else None,
             "content_hash": content_hash,
@@ -174,7 +177,7 @@ class ParquetStore:
             path,
             manifest,
             True,
-            path.stat().st_size,
+            file_size,
             backup_path,
             existed_before,
         )
@@ -297,7 +300,7 @@ def finalize_partition_writes(results: list[PartitionWriteResult]) -> None:
         if result.backup_path is None:
             continue
         try:
-            result.backup_path.unlink(missing_ok=True)
+            _unlink_missing(result.backup_path)
         except OSError as error:
             logger.warning(
                 "Could not remove committed partition rollback link %s: %s",
@@ -314,16 +317,19 @@ def rollback_partition_writes(results: list[PartitionWriteResult]) -> None:
         if not result.rewritten:
             continue
         try:
-            if result.backup_path is not None and result.backup_path.exists():
-                os.replace(result.backup_path, result.path)
+            if result.backup_path is not None and _exists(result.backup_path):
+                os.replace(
+                    _filesystem_path(result.backup_path),
+                    _filesystem_path(result.path),
+                )
             elif not result.existed_before:
-                result.path.unlink(missing_ok=True)
+                _unlink_missing(result.path)
         except OSError as error:
             failures.append(f"{result.path}: {error}")
     for result in results:
         if result.backup_path is not None:
             try:
-                result.backup_path.unlink(missing_ok=True)
+                _unlink_missing(result.backup_path)
             except OSError as error:
                 failures.append(f"{result.backup_path}: {error}")
     if failures:
@@ -331,3 +337,18 @@ def rollback_partition_writes(results: list[PartitionWriteResult]) -> None:
             "Failed to roll back canonical partition publication: "
             + "; ".join(failures)
         )
+
+
+def _is_file(path: Path) -> bool:
+    return os.path.isfile(_filesystem_path(path))
+
+
+def _exists(path: Path) -> bool:
+    return os.path.exists(_filesystem_path(path))
+
+
+def _unlink_missing(path: Path) -> None:
+    try:
+        os.unlink(_filesystem_path(path))
+    except FileNotFoundError:
+        pass

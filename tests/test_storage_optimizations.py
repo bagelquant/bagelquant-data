@@ -722,6 +722,38 @@ def test_atomic_failures_preserve_old_file_and_remove_temporary_file(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_partition_rewrite_supports_long_rollback_paths(tmp_path) -> None:
+    root = tmp_path
+    rollback_suffix = (
+        "lake/custom/daily/year=2025/month=01/"
+        ".data.parquet.00000000000000000000000000000000.rollback"
+    )
+    while len(str(root / rollback_suffix)) < 270:
+        root /= "p"
+    lake = DataLake.open(root)
+    spec = _daily_spec()
+    original = pl.DataFrame(
+        {"trade_date": ["20250102"], "ts_code": ["A"], "value": [1.0]}
+    )
+
+    lake.ingest(spec, original)
+    lake.ingest(spec, original.with_columns(pl.lit(2.0).alias("value")))
+
+    values = (
+        lake.query.query(
+            "daily",
+            source="custom",
+            start="2025-01-02",
+            end="2025-01-02",
+            assets=["A"],
+        )
+        .collect()
+        .get_column("value")
+        .to_list()
+    )
+    assert values == [2.0]
+
+
 def test_metadata_commit_failure_restores_parquet_manifest_and_schema(
     tmp_path, monkeypatch
 ) -> None:
