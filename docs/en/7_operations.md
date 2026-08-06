@@ -28,10 +28,25 @@ Complete provider request parameters remain available through the admin
 facade. Metadata schema v3 stores their JSON as zlib-compressed SQLite blobs
 and decodes them transparently when read.
 
-Use `rebuild_manifest` after repairing local Parquet files and
-`validate_manifest` to compare metadata with stored files. These integrity
-tools do not mutate the update ledger. If external storage changes invalidate
-the ledger, reset the affected scopes explicitly before updating.
+Use `validate_manifest` for a fast metadata/file comparison. For a complete
+contract check, call
+`lake.admin.validate_dataset("daily", source="tushare", deep=True)`. The deep
+validator also reads every canonical Parquet partition and checks its hash,
+schema, primary-key columns, null and duplicate keys, and physical partition
+ownership. Orphan Parquet files are reported but are never adopted implicitly.
+
+Confirmed corrupt partitions can be moved out of the canonical lake with
+`lake.admin.quarantine_partitions(...)`. Pass `confirm=True`, a reason, and an
+optional repair ID. The operation uses atomic same-lake moves, updates the
+manifest in one transaction, rolls both changes back on failure, and writes a
+recovery journal under
+`.health-repair-quarantine/<repair-id>/<source>/<dataset>/journal.json`.
+Quarantined files are retained until an operator removes them. These integrity
+APIs deliberately do not guess which provider scopes to retry; the application
+layer must reset the affected scopes before its normal update workflow.
+
+Use `rebuild_manifest` only after an intentional external storage repair. It
+adopts the files it finds and therefore is not part of automatic health repair.
 
 ## Fresh-lake schema contract
 

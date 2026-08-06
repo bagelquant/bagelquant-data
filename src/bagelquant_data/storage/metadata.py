@@ -451,6 +451,41 @@ class MetadataStore:
                     ],
                 )
 
+    def remove_manifests(
+        self, source: str, dataset: str, partition_paths: Iterable[str]
+    ) -> list[dict[str, Any]]:
+        """Remove selected manifest rows while no dataset writer is active."""
+
+        paths = tuple(dict.fromkeys(str(path) for path in partition_paths))
+        if not paths:
+            return []
+        placeholders = ",".join("?" for _ in paths)
+        with self.connect() as db:
+            db.execute("begin immediate")
+            lease = db.execute(
+                "select 1 from update_leases where source=? and dataset=?",
+                (source, dataset),
+            ).fetchone()
+            if lease is not None:
+                raise RuntimeError(f"Dataset update is active: {source}/{dataset}")
+            rows = db.execute(
+                "select * from partition_manifest where source=? and dataset=? "
+                f"and partition_path in ({placeholders}) order by partition_path",
+                (source, dataset, *paths),
+            ).fetchall()
+            db.execute(
+                "delete from partition_manifest where source=? and dataset=? "
+                f"and partition_path in ({placeholders})",
+                (source, dataset, *paths),
+            )
+        return [
+            {
+                **dict(row),
+                "partition_values": json.loads(str(row["partition_values"])),
+            }
+            for row in rows
+        ]
+
     def manifest(
         self, source: str | None = None, dataset: str | None = None
     ) -> list[dict[str, Any]]:

@@ -1,6 +1,8 @@
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
+from bagelquant_data.sources.tushare.client import build_client
 from bagelquant_data.sources.tushare.source import TushareSource, _to_tushare_params
 
 
@@ -60,3 +62,21 @@ def test_tushare_builds_one_client_per_worker_thread(monkeypatch) -> None:
 
     assert all(result.height == 1 for result in results)
     assert 1 <= len(clients) <= 2
+
+
+def test_tushare_client_passes_token_without_writing_user_home(monkeypatch) -> None:
+    calls: list[str] = []
+    expected = object()
+    module = SimpleNamespace(
+        pro_api=lambda token: calls.append(token) or expected,
+        set_token=lambda _token: (_ for _ in ()).throw(
+            AssertionError("set_token must not persist credentials")
+        ),
+    )
+    monkeypatch.setattr(
+        "bagelquant_data.sources.tushare.client.importlib.import_module",
+        lambda _name: module,
+    )
+
+    assert build_client("secret") is expected
+    assert calls == ["secret"]

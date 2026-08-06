@@ -16,5 +16,7 @@ def build_client(token: str | None = None) -> Any:
         tushare = importlib.import_module("tushare")
     except ImportError as exc:
         raise DataSourceError("Install Tushare support with: uv sync --extra tushare") from exc
-    tushare.set_token(resolve_token(token))
-    return tushare.pro_api()
+    # Pass the token directly.  ``tushare.set_token`` persists it to
+    # ``~/tk.csv`` and makes otherwise isolated workers depend on a writable
+    # user home directory.
+    return tushare.pro_api(resolve_token(token))

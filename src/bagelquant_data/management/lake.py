@@ -99,6 +99,35 @@ class LakeAdmin:
     ) -> dict[str, Any]:
         return self.status.validate_manifest(dataset, source=source, deep=deep)
 
+    def validate_dataset(
+        self, dataset: str, *, source: str, deep: bool = True
+    ) -> dict[str, Any]:
+        """Validate files, schema, keys, and partition contracts."""
+
+        spec = self.datasets.get(dataset, source=source)
+        return self.status.validate_dataset(spec, deep=deep)
+
+    def quarantine_partitions(
+        self,
+        dataset: str,
+        *,
+        source: str,
+        partition_paths: Sequence[str],
+        reason: str,
+        confirm: bool = False,
+        repair_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Quarantine suspect canonical partitions without deleting them."""
+
+        spec = self.datasets.get(dataset, source=source)
+        return self.status.quarantine_partitions(
+            spec,
+            partition_paths,
+            reason=reason,
+            confirm=confirm,
+            repair_id=repair_id,
+        )
+
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.status.runs(limit)
 
