@@ -60,6 +60,22 @@ class StatusManager:
             "deep": deep,
         }
 
+    def datasets(
+        self,
+        datasets: Iterable[str] | None = None,
+        *,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return exact manifest-backed status for multiple datasets in one read."""
+
+        return [
+            {**row, "deep": False}
+            for row in self.metadata.dataset_statuses(
+                source=source,
+                datasets=datasets,
+            )
+        ]
+
     def partitions(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.metadata.manifest(source, dataset)
 
@@ -404,6 +420,156 @@ class StatusManager:
             "valid": not issues,
         }
 
+    def validate_datasets(
+        self, specs: Iterable[DatasetSpec], *, deep: bool = False
+    ) -> dict[str, Any]:
+        """Validate datasets together, using one manifest read and file inventory.
+
+        Deep validation retains the existing per-file contract checks. Shallow
+        validation is metadata-driven and inventories physical Parquet paths only
+        once per source.
+        """
+
+        available_specs = tuple(specs)
+        selected = tuple(
+            dict.fromkeys((spec.source, spec.name) for spec in available_specs)
+        )
+        selected_specs = [
+            next(
+                spec
+                for spec in available_specs
+                if (spec.source, spec.name) == selected_key
+            )
+            for selected_key in selected
+        ]
+        if not selected_specs:
+            return _validation_batch_report([], deep=deep)
+        sources = {spec.source for spec in selected_specs}
+        if len(sources) != 1:
+            raise ValueError("bulk validation requires datasets from one source")
+        if deep:
+            reports = []
+            for spec in selected_specs:
+                try:
+                    reports.append(self.validate_dataset(spec, deep=True))
+                except Exception as error:  # noqa: BLE001 - isolate one dataset.
+                    issue = _health_issue(
+                        "scan_error",
+                        str(error),
+                        path=None,
+                    )
+                    reports.append(
+                        {
+                            "source": spec.source,
+                            "dataset": spec.name,
+                            "update_type": spec.update_type,
+                            "manifest_files": 0,
+                            "files_scanned": 0,
+                            "bytes_read": 0,
+                            "issues": [issue],
+                            "issue_counts": {"scan_error": 1},
+                            "repairable_issue_count": int(issue["repairable"]),
+                            "deep": True,
+                            "valid": False,
+                        }
+                    )
+            return _validation_batch_report(
+                reports,
+                deep=True,
+            )
+
+        source = selected_specs[0].source
+        selected_names = {spec.name for spec in selected_specs}
+        rows = [
+            row
+            for row in self.metadata.manifest(source)
+            if str(row["dataset"]) in selected_names
+        ]
+        grouped: dict[str, list[dict[str, Any]]] = {
+            spec.name: [] for spec in selected_specs
+        }
+        for row in rows:
+            grouped[str(row["dataset"])].append(row)
+        physical = self._physical_inventory(source, selected_names)
+        schema_hashes = self.metadata.dataset_schema_hashes(source)
+        reports = []
+        for spec in selected_specs:
+            manifest_rows = grouped[spec.name]
+            manifested = {
+                str(row["partition_path"]) for row in manifest_rows
+            }
+            actual = physical[spec.name]
+            issues = [
+                _health_issue(
+                    "missing_file",
+                    "manifest file is missing",
+                    path=path,
+                )
+                for path in sorted(manifested - actual)
+            ]
+            issues.extend(
+                _health_issue(
+                    "orphan_file",
+                    "file is not manifested",
+                    path=path,
+                )
+                for path in sorted(actual - manifested)
+            )
+            if manifest_rows and spec.name not in schema_hashes:
+                issues.append(
+                    _health_issue(
+                        "canonical_schema_missing",
+                        "canonical dataset schema is missing",
+                        path=None,
+                    )
+                )
+            reports.append(
+                {
+                    "source": source,
+                    "dataset": spec.name,
+                    "update_type": spec.update_type,
+                    "manifest_files": len(manifest_rows),
+                    "files_scanned": 0,
+                    "bytes_read": 0,
+                    "issues": issues,
+                    "issue_counts": dict(
+                        Counter(str(issue["code"]) for issue in issues)
+                    ),
+                    "repairable_issue_count": sum(
+                        bool(issue["repairable"]) for issue in issues
+                    ),
+                    "deep": False,
+                    "valid": not issues,
+                }
+            )
+        return _validation_batch_report(reports, deep=False)
+
+    def _physical_inventory(
+        self, source: str, datasets: set[str]
+    ) -> dict[str, set[str]]:
+        """Inventory selected dataset files with one traversal of the source root."""
+
+        inventory = {dataset: set() for dataset in datasets}
+        source_root = (self.paths.root / "lake" / source).resolve()
+        if not source_root.is_dir():
+            return inventory
+        roots: list[tuple[tuple[str, ...], str]] = []
+        for dataset in datasets:
+            dataset_root = self.paths.dataset_root(source, dataset).resolve()
+            if not dataset_root.is_relative_to(source_root):
+                raise ValueError(f"dataset path escapes source root: {dataset}")
+            roots.append((dataset_root.relative_to(source_root).parts, dataset))
+        roots.sort(key=lambda item: len(item[0]), reverse=True)
+        for path in source_root.rglob("*.parquet"):
+            parts = path.relative_to(source_root).parts
+            for root_parts, dataset in roots:
+                if parts[: len(root_parts)] == root_parts:
+                    inventory[dataset].add(
+                        Path(*parts[len(root_parts) :]).as_posix()
+                    )
+                    break
+        return inventory
+
     def quarantine_partitions(
         self,
         spec: DatasetSpec,
@@ -669,6 +835,23 @@ def _manifest_issue_code(issue: dict[str, Any]) -> str:
         "mismatch": "manifest_mismatch",
         "unreadable": "unreadable_file",
     }.get(str(issue.get("kind")), str(issue.get("kind", "manifest_issue")))
+
+
+def _validation_batch_report(
+    reports: list[dict[str, Any]], *, deep: bool
+) -> dict[str, Any]:
+    """Build the stable aggregate envelope for bulk validation."""
+
+    return {
+        "dataset_count": len(reports),
+        "valid_dataset_count": sum(bool(report["valid"]) for report in reports),
+        "issue_count": sum(len(report["issues"]) for report in reports),
+        "files_scanned": sum(int(report["files_scanned"]) for report in reports),
+        "bytes_read": sum(int(report["bytes_read"]) for report in reports),
+        "deep": deep,
+        "valid": all(bool(report["valid"]) for report in reports),
+        "datasets": reports,
+    }
 
 
 def _health_issue(

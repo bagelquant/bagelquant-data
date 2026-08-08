@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from datetime import date
 from threading import Event, Lock
+from typing import Any, cast
 
 import polars as pl
 
@@ -161,6 +162,62 @@ class PaginatedDailySource:
                 "ts_code": [f"{offset + index:06d}.SZ" for index in range(count)],
             }
         )
+
+
+class AdaptiveAssetSource:
+    name = "custom"
+
+    def __init__(self, rows: list[tuple[str, str]]) -> None:
+        self.rows = rows
+        self.requests: list[dict[str, object]] = []
+
+    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+        self.requests.append(dict(request))
+        lower = date.fromisoformat(str(request["start"]))
+        upper = date.fromisoformat(str(request["end"]))
+        selected = [
+            (announcement, period)
+            for announcement, period in self.rows
+            if lower <= date.fromisoformat(announcement) <= upper
+        ]
+        truncated = selected[-2:]
+        return pl.DataFrame(
+            {
+                "ann_date": [value[0].replace("-", "") for value in truncated],
+                "ts_code": [str(request["id"])] * len(truncated),
+                "end_date": [value[1].replace("-", "") for value in truncated],
+            }
+        )
+
+
+def _adaptive_asset_lake(tmp_path, source: AdaptiveAssetSource) -> DataLake:
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec(
+            "stock_basic",
+            "general",
+            field_mappings={"ts_code": "asset_id"},
+        ),
+        pl.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "list_date": ["20200101"],
+                "delist_date": [None],
+            }
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "financial",
+            "by_asset",
+            asset_list="stock_basic",
+            request_date_field="ann_date",
+            primary_key_extra=("end_date",),
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    return lake
 
 
 def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
@@ -751,3 +808,76 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
         )
         == []
     )
+
+
+def test_adaptive_date_range_discards_saturated_parents_and_commits_all_leaves(
+    tmp_path,
+) -> None:
+    source = AdaptiveAssetSource(
+        [
+            ("2020-01-01", "2019-12-31"),
+            ("2020-01-02", "2019-09-30"),
+            ("2020-01-03", "2019-06-30"),
+            ("2020-01-04", "2019-03-31"),
+        ]
+    )
+    lake = _adaptive_asset_lake(tmp_path, source)
+
+    report = lake.update.dataset(
+        "financial",
+        source="custom",
+        start="2020-01-01",
+        end="2020-01-04",
+        source_options={
+            "pagination": "adaptive_date_range",
+            "row_limit": 2,
+        },
+        progress=False,
+    )
+
+    assert report.status == "success"
+    result = lake.query.query("financial", source="custom").collect().sort("time")
+    assert result.height == 4
+    assert result.get_column("time").to_list() == [
+        date(2020, 1, 1),
+        date(2020, 1, 2),
+        date(2020, 1, 3),
+        date(2020, 1, 4),
+    ]
+    calls = lake.metadata._rows(
+        "select request_key,row_count,status from api_calls "
+        "where dataset='financial' order by rowid"
+    )
+    assert calls[0]["row_count"] == 2
+    assert len(calls) == 7
+    assert all(row["status"] == "success" for row in calls)
+
+
+def test_adaptive_date_range_rejects_a_saturated_minimum_window(tmp_path) -> None:
+    source = AdaptiveAssetSource(
+        [
+            ("2020-01-01", "2019-12-31"),
+            ("2020-01-01", "2019-09-30"),
+        ]
+    )
+    lake = _adaptive_asset_lake(tmp_path, source)
+
+    report = lake.update.dataset(
+        "financial",
+        source="custom",
+        start="2020-01-01",
+        end="2020-01-01",
+        source_options={
+            "pagination": "adaptive_date_range",
+            "row_limit": 2,
+        },
+        progress=False,
+    )
+
+    assert report.status == "failed"
+    assert lake.admin.status.files("financial", source="custom") == []
+    invalid = lake.admin.status.update_scopes(
+        dataset="financial", source="custom", status="invalid"
+    )
+    assert len(invalid) == 1
+    assert "still returned 2 rows" in str(invalid[0]["last_error"])

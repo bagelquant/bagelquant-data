@@ -6,8 +6,8 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
@@ -1145,7 +1145,19 @@ def _fetch_request_pages(
     retry_backoff_seconds: float,
     cancel_requested: Callable[[], bool] | None,
 ) -> list[FetchPage]:
-    if request_options.get("pagination") != "offset":
+    pagination = request_options.get("pagination")
+    if pagination == "adaptive_date_range":
+        return _fetch_adaptive_date_range(
+            spec=spec,
+            source_adapter=source_adapter,
+            request=request,
+            request_index=request_index,
+            request_options=request_options,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            cancel_requested=cancel_requested,
+        )
+    if pagination != "offset":
         return [
             _fetch_one(
                 spec,
@@ -1191,6 +1203,135 @@ def _fetch_request_pages(
         )
     )
     return pages
+
+
+def _fetch_adaptive_date_range(
+    *,
+    spec: DatasetSpec,
+    source_adapter: object,
+    request: dict[str, Any],
+    request_index: int,
+    request_options: dict[str, Any],
+    max_retries: int,
+    retry_backoff_seconds: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> list[FetchPage]:
+    """Bisect saturated date ranges without publishing their parent responses."""
+
+    row_limit = int(request_options.get("row_limit", 0))
+    start_param = str(request_options.get("start_param", "start"))
+    end_param = str(request_options.get("end_param", "end"))
+    minimum_window_days = int(request_options.get("minimum_window_days", 0))
+    max_pages = int(request_options.get("max_pages", 10_000))
+    if row_limit <= 0 or minimum_window_days < 0 or max_pages <= 0:
+        return [
+            _invalid_pagination_page(
+                request_index,
+                request,
+                "adaptive date pagination requires positive row_limit/max_pages "
+                "and non-negative minimum_window_days",
+            )
+        ]
+    if start_param not in request or end_param not in request:
+        return [
+            _invalid_pagination_page(
+                request_index,
+                request,
+                f"adaptive date pagination requires {start_param!r} and {end_param!r}",
+            )
+        ]
+    try:
+        request_start = _date_value(request[start_param])
+        request_end = _date_value(request[end_param])
+    except (TypeError, ValueError) as error:
+        return [
+            _invalid_pagination_page(
+                request_index,
+                request,
+                f"adaptive date pagination received invalid bounds: {error}",
+            )
+        ]
+    if request_start > request_end:
+        return [
+            _invalid_pagination_page(
+                request_index,
+                request,
+                "adaptive date pagination start is after end",
+            )
+        ]
+
+    pending: deque[tuple[date, date, str]] = deque(
+        [(request_start, request_end, str(request_index))]
+    )
+    pages: list[FetchPage] = []
+    while pending:
+        lower, upper, request_key = pending.popleft()
+        if len(pages) >= max_pages:
+            pages.append(
+                _invalid_pagination_page(
+                    f"{request_index}:exhausted",
+                    request,
+                    "adaptive date pagination exhausted configured max_pages",
+                )
+            )
+            return pages
+        ranged = {
+            **request,
+            start_param: lower.isoformat(),
+            end_param: upper.isoformat(),
+        }
+        page = _fetch_one(
+            spec,
+            source_adapter,
+            ranged,
+            request_key,
+            max_retries,
+            retry_backoff_seconds,
+            cancel_requested,
+        )
+        pages.append(page)
+        if page.status != "success":
+            return pages
+        if page.row_count < row_limit:
+            continue
+        span_days = (upper - lower).days
+        if span_days <= minimum_window_days:
+            pages.append(
+                _invalid_pagination_page(
+                    f"{request_key}:saturated",
+                    ranged,
+                    (
+                        f"adaptive date range {lower.isoformat()} to "
+                        f"{upper.isoformat()} still returned {page.row_count} rows "
+                        f"at configured limit {row_limit}"
+                    ),
+                )
+            )
+            return pages
+        midpoint = lower + timedelta(days=span_days // 2)
+        pages[-1] = replace(page, frame=None)
+        pending.appendleft(
+            (midpoint + timedelta(days=1), upper, f"{request_key}:1")
+        )
+        pending.appendleft((lower, midpoint, f"{request_key}:0"))
+    return pages
+
+
+def _invalid_pagination_page(
+    request_key: str | int,
+    request: dict[str, Any],
+    message: str,
+) -> FetchPage:
+    return FetchPage(
+        str(request_key),
+        request,
+        None,
+        "invalid",
+        0,
+        0,
+        message,
+        _request_asset(request),
+    )
 
 
 def _fetch_one(
@@ -1264,9 +1405,13 @@ def _request_options(context: RequestContext) -> dict[str, Any]:
     for key in (
         "pagination",
         "page_size",
+        "row_limit",
         "limit_param",
         "offset_param",
         "offset_start",
+        "start_param",
+        "end_param",
+        "minimum_window_days",
         "max_pages",
     ):
         if key in context.options:

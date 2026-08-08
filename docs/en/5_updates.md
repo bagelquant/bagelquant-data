@@ -128,6 +128,16 @@ Pass provider-specific values with `params`. The normalized parameter variant
 is part of the scope identity; ledger-owned date, asset, and range values still
 take precedence.
 
+Provider endpoints that silently cap a date-range response can opt into
+`source_options.pagination = "adaptive_date_range"`. Configure `row_limit`,
+`start_param`, `end_param`, `minimum_window_days`, and `max_pages`. When a
+response reaches `row_limit`, the lake keeps its API audit record but discards
+its rows, bisects the requested date range, and fetches both children. Only
+validated, unsaturated leaves are eligible for the scope's atomic commit. A
+leaf that still reaches the limit at the minimum window is marked `invalid`,
+so a truncated response can never advance local coverage or appear as a
+successful complete scope.
+
 Inspect and reset state through the status facade:
 
 ```python

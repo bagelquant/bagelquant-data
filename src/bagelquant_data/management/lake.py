@@ -107,6 +107,23 @@ class LakeAdmin:
         spec = self.datasets.get(dataset, source=source)
         return self.status.validate_dataset(spec, deep=deep)
 
+    def validate_datasets(
+        self,
+        datasets: Sequence[str] | None = None,
+        *,
+        source: str,
+        deep: bool = False,
+    ) -> dict[str, Any]:
+        """Validate several registered datasets with shared metadata and inventory."""
+
+        names = (
+            [str(row["name"]) for row in self.datasets.list(source)]
+            if datasets is None
+            else list(dict.fromkeys(datasets))
+        )
+        specs = [self.datasets.get(dataset, source=source) for dataset in names]
+        return self.status.validate_datasets(specs, deep=deep)
+
     def quarantine_partitions(
         self,
         dataset: str,

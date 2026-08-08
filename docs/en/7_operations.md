@@ -5,6 +5,7 @@ Inspect a lake through `lake.admin`:
 ```python
 print(lake.admin.summary())
 print(lake.admin.status.dataset("daily", source="tushare"))
+print(lake.admin.status.datasets(source="tushare"))
 print(lake.admin.runs())
 print(lake.admin.status.update_summary(source="tushare"))
 ```
@@ -34,6 +35,14 @@ contract check, call
 validator also reads every canonical Parquet partition and checks its hash,
 schema, primary-key columns, null and duplicate keys, and physical partition
 ownership. Orphan Parquet files are reported but are never adopted implicitly.
+
+Catalogs should use `lake.admin.status.datasets(...)`: it loads the manifest
+once and returns exact row counts, partition counts, byte sizes, and observed
+minimum/maximum dates for every selected registered dataset. Use
+`lake.admin.validate_datasets(..., deep=False)` for a bulk shallow health scan;
+it loads manifests once and inventories the source's physical Parquet files in
+one traversal. Deep bulk validation intentionally retains the full per-file
+contract checks.
 
 Confirmed corrupt partitions can be moved out of the canonical lake with
 `lake.admin.quarantine_partitions(...)`. Pass `confirm=True`, a reason, and an

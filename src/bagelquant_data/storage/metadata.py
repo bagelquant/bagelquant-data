@@ -242,6 +242,58 @@ class MetadataStore:
             return None
         return bytes(rows[0]["schema_ipc"])
 
+    def dataset_schema_hashes(self, source: str) -> dict[str, str]:
+        """Return canonical schema hashes for a source in one read."""
+
+        return {
+            str(row["dataset"]): str(row["schema_hash"])
+            for row in self._rows(
+                "select dataset, schema_hash from dataset_schemas "
+                "where source = ? order by dataset",
+                (source,),
+            )
+        }
+
+    def dataset_statuses(
+        self,
+        *,
+        source: str | None = None,
+        datasets: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Aggregate exact manifest-backed status in one SQLite query."""
+
+        selected = None if datasets is None else tuple(dict.fromkeys(datasets))
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if source is not None:
+            clauses.append("d.source = ?")
+            parameters.append(source)
+        if selected is not None:
+            if not selected:
+                return []
+            clauses.append(f"d.name IN ({','.join('?' for _ in selected)})")
+            parameters.extend(selected)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._rows(
+            f"""
+            SELECT d.source AS source, d.name AS dataset,
+                   COUNT(m.partition_path) AS file_count,
+                   COUNT(m.partition_path) AS partition_count,
+                   COALESCE(SUM(m.file_size_bytes), 0) AS total_size,
+                   COALESCE(SUM(m.row_count), 0) AS row_count,
+                   MIN(m.min_time) AS minimum_time,
+                   MAX(m.max_time) AS maximum_time,
+                   MAX(m.updated_at) AS last_update
+            FROM datasets AS d
+            LEFT JOIN partition_manifest AS m
+              ON m.source = d.source AND m.dataset = d.name
+            {where}
+            GROUP BY d.source, d.name
+            ORDER BY d.source, d.name
+            """,
+            tuple(parameters),
+        )
+
     def upsert_dataset_schema(
         self,
         source: str,
