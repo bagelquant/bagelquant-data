@@ -42,6 +42,7 @@ htmlcov/
 .nox/
 .test-tmp/
 .validation-tmp/
+.codex-validation/
 .coverage
 .coverage.*
 .cache
