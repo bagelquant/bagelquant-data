@@ -1,6 +1,8 @@
 # Updates
 
-Run one dataset, a list of datasets, or every enabled dataset for a source.
+Run one dataset or an explicit ordered list of datasets. The update facade does
+not discover and run every dataset for a provider; the application owns that
+selection.
 
 ```python
 lake.update.dataset("daily", source="tushare", end="2026-07-10")
@@ -8,7 +10,6 @@ lake.update.datasets(
     ["daily", "income"], source="tushare",
     start="1999-12-31", end="2026-07-10", workers=4,
 )
-lake.update.source("tushare", end="2026-07-10", confirm=False)
 ```
 
 ## Authoritative update scopes
@@ -109,12 +110,12 @@ remaining in-flight work before the whole batch is rolled back.
 `max_in_flight` bounds queued calls:
 
 ```python
-report = lake.update.source(
-    "tushare",
+report = lake.update.datasets(
+    ["trade_cal", "stock_basic", "daily", "income"],
+    source="tushare",
     workers=4,
     max_in_flight=8,
     max_buffer_mb=512,
-    confirm=False,
 )
 ```
 

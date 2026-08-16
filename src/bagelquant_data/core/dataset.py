@@ -36,7 +36,6 @@ class DatasetSpec:
     asset_bucket_count: int = ASSET_BUCKET_COUNT
     revision_lookback_days: int = 730
     revision_refresh_days: int = 30
-    historical_empty_is_error: bool = False
     source_api: str | None = None
     request_discovery: RequestDiscoverySpec | None = None
 

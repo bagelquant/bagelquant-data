@@ -695,37 +695,6 @@ class MetadataStore:
             params,
         )
 
-    def record_api_call(
-        self,
-        *,
-        run_id: str,
-        source: str,
-        dataset: str,
-        request_key: str,
-        request_params: dict[str, Any],
-        status: str,
-        row_count: int = 0,
-        retry_count: int = 0,
-        error_message: str | None = None,
-        asset_id: str | None = None,
-    ) -> None:
-        self.record_api_calls(
-            [
-                {
-                    "run_id": run_id,
-                    "source": source,
-                    "dataset": dataset,
-                    "request_key": request_key,
-                    "request_params": request_params,
-                    "status": status,
-                    "row_count": row_count,
-                    "retry_count": retry_count,
-                    "error_message": error_message,
-                    "asset_id": asset_id,
-                }
-            ]
-        )
-
     def record_api_calls(self, calls: Iterable[dict[str, Any]]) -> None:
         rows = list(calls)
         if not rows:

@@ -63,7 +63,7 @@ def test_daily_ledger_synchronizes_and_commits_before_success(tmp_path) -> None:
     lake = _daily_lake(tmp_path, source)
 
     report = lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
 
     assert report.status == "success"
@@ -80,7 +80,7 @@ def test_wrong_daily_date_is_invalid_and_requires_reset(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource(wrong_date=True))
 
     report = lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
 
     assert report.status == "failed"
@@ -111,7 +111,7 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
     )
 
     report = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
     row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
     assert report.status == "no_data"
@@ -136,7 +136,7 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
 
     source.requests.clear()
     lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
     assert source.requests == []
 
@@ -147,7 +147,7 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
         dataset="income", source="custom"
     ) == []
     lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
     assert len(source.requests) == 1
 
@@ -169,7 +169,7 @@ def test_empty_recheck_preserves_existing_committed_coverage(tmp_path) -> None:
         )
     )
     first = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
     committed = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
     preserved = {
@@ -184,7 +184,7 @@ def test_empty_recheck_preserves_existing_committed_coverage(tmp_path) -> None:
     source.requests.clear()
 
     second = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
 
     row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
@@ -227,7 +227,6 @@ def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_pat
         workers=1,
         max_in_flight=1,
         cancel_requested=lambda: len(source.requests) >= 1,
-        progress=False,
     )
 
     scopes = lake.admin.status.update_scopes(
@@ -248,7 +247,6 @@ def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_pat
         end="2025-01-31",
         workers=1,
         max_in_flight=1,
-        progress=False,
     )
 
     assert resumed.status == "no_data"
@@ -276,7 +274,6 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
             "by_daily",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-            historical_empty_is_error=True,
         )
     )
 
@@ -287,7 +284,6 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
         end="2025-01-02",
         max_retries=2,
         retry_backoff_seconds=0,
-        progress=False,
     )
 
     scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
@@ -309,7 +305,6 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
         source="custom",
         start="2025-01-02",
         end="2025-01-02",
-        progress=False,
     )
     assert [request[1]["date"] for request in source.requests] == ["2025-01-02"]
     assert lake.admin.status.update_scopes(
@@ -336,7 +331,6 @@ def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
             "by_daily",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-            historical_empty_is_error=True,
         )
     )
 
@@ -345,7 +339,6 @@ def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
         source="custom",
         start=today,
         end=today,
-        progress=False,
     )
 
     assert report.status == "no_data"
@@ -398,7 +391,6 @@ def test_daily_update_rechecks_only_empty_scopes_in_last_twenty_sessions(
         start=sessions[0],
         end=sessions[-1],
         workers=4,
-        progress=False,
     )
 
     source.empty_dates.clear()
@@ -409,7 +401,6 @@ def test_daily_update_rechecks_only_empty_scopes_in_last_twenty_sessions(
         start=sessions[0],
         end=sessions[-1],
         workers=4,
-        progress=False,
     )
 
     requested = {str(request["date"]) for _, request in source.requests}
@@ -455,7 +446,7 @@ def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> No
         )
     )
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
     lake.ingest(
         DatasetSpec("trade_cal", "general"),
@@ -470,7 +461,6 @@ def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> No
         start="2025-01-02",
         end="2025-01-03",
         workers=4,
-        progress=False,
     )
 
     assert [request["date"] for _, request in source.requests] == [
@@ -523,7 +513,7 @@ def test_asset_request_date_field_is_distinct_from_pit_time(tmp_path) -> None:
     )
 
     report = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31", progress=False
+        "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
 
     assert report.status == "success"
@@ -542,7 +532,7 @@ def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
     source = LedgerSource()
     lake = _daily_lake(tmp_path, source)
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
     before_runs = lake.admin.status.runs(20)
 
@@ -576,7 +566,7 @@ def test_clear_dataset_data_restores_files_on_metadata_failure(
 ) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
     root = lake.paths.dataset_root("custom", "daily")
     files = sorted(path.relative_to(root) for path in root.rglob("*.parquet"))
@@ -596,7 +586,7 @@ def test_clear_dataset_data_restores_files_on_metadata_failure(
 def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
     healthy = lake.admin.status.validate_manifest(
         "daily", source="custom", deep=True
@@ -628,7 +618,7 @@ def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> No
 def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
 
     def fail(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
@@ -646,7 +636,7 @@ def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -
 def test_deep_manifest_validation_isolates_unreadable_file(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
     lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-02", progress=False
+        "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
     path = next(lake.paths.dataset_root("custom", "daily").rglob("*.parquet"))
     path.write_bytes(b"not parquet")
@@ -674,7 +664,6 @@ def test_commit_failure_cannot_publish_buffered_daily_success(
             source="custom",
             start="2025-01-02",
             end="2025-01-03",
-            progress=False,
         )
 
     rows = lake.admin.status.update_scopes(dataset="daily", source="custom")

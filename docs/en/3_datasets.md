@@ -27,7 +27,6 @@ Store the same compact mapping in TOML and register it with `register_toml`.
 name = "daily"
 update_type = "by_daily"
 calendar = "trade_cal"
-historical_empty_is_error = true # legacy-compatible no-op
 
 [field_mappings]
 trade_date = "time"
@@ -53,8 +52,7 @@ rebuild it before registering a different count.
 The lake stores provider checks separately from commit-backed `data_max_time`.
 This prevents sparse event data from being downloaded repeatedly while the
 revision window still captures later restatements.
-`historical_empty_is_error` is retained only so older declarations continue to
-load. For every `by_daily` dataset, validated empty scopes in the latest 20
+For every `by_daily` dataset, validated empty scopes in the latest 20
 requested calendar sessions are rechecked on the next update. Older empty
 daily scopes and empty `by_asset` scopes remain terminal until reset or a
 definition change.

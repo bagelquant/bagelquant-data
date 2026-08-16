@@ -223,14 +223,6 @@ def _update_datasets(
         )
     )
     callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
-    progresses = {
-        work.spec.name: _progress_bar(
-            work.spec.name,
-            len(work.requests),
-            enabled=bool(work.context.options.get("progress", True)),
-        )
-        for work in works
-    }
     tasks: list[UpdateTask] = []
     begun: set[str] = set()
     totals = dict.fromkeys(states, 0)
@@ -338,9 +330,6 @@ def _update_datasets(
             _fail_buffered(pipeline, state, str(exc))
             _fail_running(pipeline, state, str(exc))
     finally:
-        for progress in progresses.values():
-            if progress is not None:
-                progress.close()
         finished_reports = tuple(
             _finish_state(pipeline, state)
             for name, state in states.items()
@@ -1497,16 +1486,6 @@ def _flush_api_calls(pipeline: IngestionPipeline, state: _RunState) -> None:
         return
     pipeline.metadata.record_api_calls(state.pending_api_calls)
     state.pending_api_calls.clear()
-
-
-def _progress_bar(dataset: str, total: int, *, enabled: bool) -> Any | None:
-    if not enabled:
-        return None
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        return None
-    return tqdm(total=total, desc=dataset, unit="scope")  # type: ignore[no-any-return]
 
 
 def _progress_callback(context: RequestContext) -> UpdateProgressCallback | None:

@@ -110,7 +110,6 @@ def test_scheduler_bounds_in_flight_and_reports_timings(tmp_path) -> None:
         end="2025-01-10",
         workers=2,
         max_in_flight=3,
-        progress=False,
     )
 
     assert report.peak_in_flight <= 3
@@ -127,7 +126,6 @@ def test_one_batch_rewrites_one_shared_partition(tmp_path) -> None:
         source="custom",
         end="2025-01-04",
         batch_size=100,
-        progress=False,
     )
 
     assert report.commit_count == 1
@@ -155,7 +153,6 @@ def test_single_page_response_avoids_request_level_concat(
         "daily",
         source="custom",
         end="2025-01-02",
-        progress=False,
     )
 
     assert calls == 1
@@ -308,7 +305,6 @@ def test_default_buffer_does_not_commit_every_hundred_requests(tmp_path) -> None
         "daily",
         source="custom",
         end="2025-05-30",
-        progress=False,
     )
 
     assert report.request_count == 150
@@ -348,7 +344,6 @@ def test_by_asset_default_rewrites_each_touched_partition_once(tmp_path) -> None
         start="2024-01-01",
         end="2025-12-31",
         workers=8,
-        progress=False,
     )
 
     files = lake.admin.status.files("income", source="custom")
@@ -476,7 +471,6 @@ def test_clean_asset_build_writes_each_physical_partition_once(
         end="2025-12-31",
         workers=1,
         max_buffer_mb=1,
-        progress=False,
     )
     files = lake.admin.status.files("income", source="custom")
 
@@ -539,8 +533,6 @@ def test_update_reuses_one_internal_writer_pool_across_bucket_commits(
         source="custom",
         start="2024-01-01",
         end="2025-12-31",
-        confirm=False,
-        progress=False,
     )
 
     assert len(report.runs) == 2
@@ -583,7 +575,6 @@ def test_response_validation_runs_in_fetch_worker_but_sqlite_stays_on_scheduler(
         start="2025-01-02",
         end="2025-01-03",
         workers=2,
-        progress=False,
     )
 
     assert validation_threads
@@ -625,7 +616,6 @@ def test_response_processing_failure_settles_fetches_without_committing(
             end="2025-01-05",
             workers=4,
             max_in_flight=4,
-            progress=False,
         )
 
     scopes = lake.admin.status.update_scopes(
@@ -670,7 +660,6 @@ def test_clean_asset_build_still_splits_an_oversized_bucket(tmp_path) -> None:
         end="2025-12-31",
         workers=1,
         max_buffer_mb=1,
-        progress=False,
     )
     files = lake.admin.status.files("income", source="custom")
 
@@ -697,7 +686,6 @@ def test_committed_coverage_does_not_rescan_canonical_parquet(
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-02",
-        progress=False,
     )
     second = lake.update.dataset(
         "daily",
@@ -705,7 +693,6 @@ def test_committed_coverage_does_not_rescan_canonical_parquet(
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-03",
-        progress=False,
     )
     scope = lake.admin.status.update_scopes(
         dataset="daily", source="custom"
@@ -752,7 +739,6 @@ def test_asset_commit_coverage_uses_maximum_across_years(
         start="2024-01-01",
         end="2025-12-31",
         today="2025-12-31",
-        progress=False,
     )
     scope = lake.admin.status.update_scopes(
         dataset="income", source="custom"
@@ -791,7 +777,6 @@ def test_asset_revision_of_older_year_does_not_regress_watermark(
         start="2024-01-01",
         end="2025-12-31",
         today="2025-12-31",
-        progress=False,
     )
     source.dates = ["20240630"]
 
@@ -801,7 +786,6 @@ def test_asset_revision_of_older_year_does_not_regress_watermark(
         start="2024-01-01",
         end="2025-12-31",
         today="2026-01-02",
-        progress=False,
     )
     scope = lake.admin.status.update_scopes(
         dataset="income", source="custom"

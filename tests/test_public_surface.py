@@ -9,6 +9,7 @@ def test_public_surface_is_limited_to_three_facades(tmp_path) -> None:
     assert isinstance(lake.admin, LakeAdmin)
     assert isinstance(lake.update, LakeUpdater)
     assert isinstance(lake.query, LakeQuery)
+    assert not hasattr(lake.update, "source")
     assert not hasattr(lake, "sources")
     assert not hasattr(lake, "datasets")
     assert not hasattr(lake, "status")

@@ -52,7 +52,7 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
         )
     )
 
-    lake.update.dataset("logical_membership", source="custom", progress=False)
+    lake.update.dataset("logical_membership", source="custom")
 
     assert source.calls[0] == ("discover_codes", {"level": "L1"})
     assert sorted(source.calls[1:], key=lambda item: (str(item[1]["code"]), str(item[1]["region"]))) == [
@@ -123,7 +123,7 @@ def test_discovery_empty_result_and_parameter_conflict_are_rejected(tmp_path) ->
     )
 
     with pytest.raises(DataSourceError, match="no usable"):
-        lake.update.dataset("logical", source="custom", progress=False)
+        lake.update.dataset("logical", source="custom")
     with pytest.raises(DatasetSpecError, match="conflicts"):
         lake.admin.datasets.register(
             DatasetSpec(

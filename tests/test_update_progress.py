@@ -59,7 +59,6 @@ def test_progress_callback_reports_ledger_phases_and_completion(tmp_path) -> Non
         "daily",
         source="custom",
         end="2025-01-02",
-        progress=False,
         progress_callback=events.append,
     )
 
@@ -82,7 +81,6 @@ def test_progress_callback_counts_paginated_request_as_one_scope(tmp_path) -> No
         source="custom",
         end="2025-01-02",
         source_options={"pagination": "offset", "page_size": 2},
-        progress=False,
         progress_callback=events.append,
     )
 
@@ -100,8 +98,6 @@ def test_progress_callback_reports_multiple_datasets_and_failure(tmp_path) -> No
         ["daily", "daily_basic"],
         source="custom",
         end="2025-01-02",
-        confirm=False,
-        progress=False,
         progress_callback=events.append,
     )
 
@@ -116,7 +112,6 @@ def test_progress_callback_reports_multiple_datasets_and_failure(tmp_path) -> No
         source="custom",
         end="2025-01-02",
         max_retries=1,
-        progress=False,
         progress_callback=failed_events.append,
     )
 

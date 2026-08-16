@@ -20,7 +20,6 @@ from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.scopes import (
-    LedgerRequest,
     discover_request_param_sets,
     synchronize_requests,
 )
@@ -203,7 +202,6 @@ class LakeUpdater:
             source=source,
             start=start,
             end=end,
-            confirm=False,
             progress_callback=progress_callback,
             **kwargs,
         )
@@ -216,7 +214,6 @@ class LakeUpdater:
         source: str,
         start: DateLike = "1999-12-31",
         end: DateLike | None = None,
-        confirm: bool = True,
         progress_callback: Callable[[UpdateProgress], None] | None = None,
         **kwargs: Any,
     ) -> UpdateReport:
@@ -263,35 +260,19 @@ class LakeUpdater:
                 )
             )
 
-        _print_job_summary(works)
-        selected_type = _confirm_update_jobs() if confirm else "all"
-        if selected_type == "quit":
+        if not works:
             return combine_reports(source, [])
-        selected = [
-            work
-            for work in works
-            if (
-                selected_type == "all"
-                or (
-                    selected_type == "incremental"
-                    and work.spec.update_type in {"by_daily", "by_asset"}
-                )
-            )
-            or work.spec.update_type == selected_type
-        ]
-        if not selected:
-            return combine_reports(source, [])
-        selected_datasets = tuple(work.spec.name for work in selected)
+        selected_datasets = tuple(work.spec.name for work in works)
         before = _manifest_map(
             self.lake.metadata,
             source,
             selected_datasets,
         )
-        leases = [(work.spec.source, work.spec.name, work.run_id) for work in selected]
+        leases = [(work.spec.source, work.spec.name, work.run_id) for work in works]
         owner_id = next(
             (
                 str(work.context.options["owner_id"])
-                for work in selected
+                for work in works
                 if work.context.options.get("owner_id") is not None
             ),
             None,
@@ -301,99 +282,16 @@ class LakeUpdater:
             report = update_datasets(
                 source_adapter=adapter,
                 pipeline=self.lake._pipeline,
-                works=tuple(selected),
+                works=tuple(works),
             )
         finally:
-            self.lake.metadata.release_update_leases(work.run_id for work in selected)
+            self.lake.metadata.release_update_leases(work.run_id for work in works)
         after = _manifest_map(
             self.lake.metadata,
             source,
             selected_datasets,
         )
         return replace(report, changed_partitions=_partition_changes(before, after))
-
-    def source(
-        self,
-        source: str,
-        *,
-        start: DateLike = "1999-12-31",
-        end: DateLike | None = None,
-        confirm: bool = True,
-        progress_callback: Callable[[UpdateProgress], None] | None = None,
-        **kwargs: Any,
-    ) -> UpdateReport:
-        names = [
-            row["name"]
-            for row in self.lake.admin.datasets.list(source)
-            if row["enabled"]
-        ]
-        return self.datasets(
-            names,
-            source=source,
-            start=start,
-            end=end,
-            confirm=confirm,
-            progress_callback=progress_callback,
-            **kwargs,
-        )
-
-
-def _print_job_summary(
-    works: Sequence[DatasetUpdateWork],
-) -> None:
-    print("Eligible update scopes:")
-    for work in works:
-        details = _request_range(work.spec, work.requests)
-        suffix = f", {details}" if details else ""
-        print(
-            f"- {work.spec.name} ({work.spec.update_type}): "
-            f"{len(work.requests)} scope(s){suffix}"
-        )
-
-
-def _request_range(spec: DatasetSpec, requests: tuple[LedgerRequest, ...]) -> str:
-    if not requests:
-        return "no work"
-    if spec.update_type == "by_daily":
-        key = spec.date_param or "date"
-        values = [
-            str(request.params[key]) for request in requests if key in request.params
-        ]
-        return f"dates {min(values)} to {max(values)}" if values else ""
-    if spec.update_type == "by_asset":
-        assets = {
-            str(request.params["id"]) for request in requests if "id" in request.params
-        }
-        starts = [
-            str(request.params["start"])
-            for request in requests
-            if "start" in request.params
-        ]
-        ends = [
-            str(request.params["end"])
-            for request in requests
-            if "end" in request.params
-        ]
-        date_range = f", dates {min(starts)} to {max(ends)}" if starts and ends else ""
-        return f"{len(assets)} asset(s){date_range}"
-    return "full refresh"
-
-
-def _confirm_update_jobs() -> str:
-    choices = {
-        "1": "all",
-        "2": "by_daily",
-        "3": "by_asset",
-        "4": "general",
-        "5": "quit",
-    }
-    while True:
-        print("1. all\n2. by daily only\n3. by asset only\n4. refresh general\n5. quit")
-        choice = input("Select update jobs: ").strip()
-        if choice in choices:
-            return choices[choice]
-        print("Invalid selection. Enter a number from 1 to 5.")
-
 
 def _request_context(
     source: str, dataset: str, kwargs: dict[str, Any]
@@ -408,7 +306,6 @@ def _request_context(
     max_in_flight = kwargs.pop("max_in_flight", None)
     max_buffer_mb = kwargs.pop("max_buffer_mb", None)
     source_options = kwargs.pop("source_options", None)
-    progress = kwargs.pop("progress", None)
     progress_callback = kwargs.pop("progress_callback", None)
     max_retries = kwargs.pop("max_retries", None)
     retry_backoff_seconds = kwargs.pop("retry_backoff_seconds", None)
@@ -431,8 +328,6 @@ def _request_context(
         options["max_buffer_mb"] = max_buffer_mb
     if source_options is not None:
         options["source_options"] = source_options
-    if progress is not None:
-        options["progress"] = progress
     if progress_callback is not None:
         if not callable(progress_callback):
             raise ConfigurationError("progress_callback must be callable")

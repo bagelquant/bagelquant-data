@@ -237,10 +237,9 @@ def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
         "stock_basic",
         source="custom",
         params={"exchange": "SZSE", "list_status": "P"},
-        progress=False,
     )
     source.responses["stock_basic"] = pl.DataFrame({"code": ["B"]})
-    lake.update.dataset("stock_basic", source="custom", progress=False)
+    lake.update.dataset("stock_basic", source="custom")
 
     frame = cast(
         pl.DataFrame, lake.query.query_general("stock_basic", source="custom").collect()
@@ -267,7 +266,7 @@ def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(
         )
     )
 
-    lake.update.dataset("stock_basic", source="custom", progress=False)
+    lake.update.dataset("stock_basic", source="custom")
 
     assert sorted(source.requests, key=lambda request: str(request["list_status"])) == sorted([
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "L"},
@@ -294,7 +293,7 @@ def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset("stock_basic", source="custom", workers=1, progress=False)
+    lake.update.dataset("stock_basic", source="custom", workers=1)
 
     assert source.requests == [
         {"list_status": "L", "exchange": "SSE"},
@@ -321,7 +320,6 @@ def test_general_update_retains_existing_data_when_parameter_set_call_fails(
         source="custom",
         max_retries=1,
         retry_backoff_seconds=0,
-        progress=False,
     )
 
     assert report.status == "failed"
@@ -360,7 +358,6 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(
         source="custom",
         today="2025-01-04",
         params={"exchange": "SZSE"},
-        progress=False,
     )
 
     assert source.requests == [
@@ -394,7 +391,7 @@ def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset("st", source="custom", today="2025-01-02", progress=False)
+    lake.update.dataset("st", source="custom", today="2025-01-02")
 
     assert source.requests == [{"pub_date": "2025-01-02"}]
 
@@ -431,7 +428,6 @@ def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
         start="2025-01-01",
         today="2025-01-04",
         params={"limit": 25},
-        progress=False,
     )
 
     assert source.requests == [
@@ -477,7 +473,7 @@ def test_by_daily_ledger_checks_every_untracked_date(
     )
 
     lake.update.dataset(
-        "daily", source="custom", start="20250101", end="20250104", progress=False
+        "daily", source="custom", start="20250101", end="20250104"
     )
 
     assert sorted(source.requests, key=lambda request: str(request["date"])) == [
@@ -505,58 +501,13 @@ def test_empty_incremental_dataset_accepts_compact_fallback_dates(tmp_path) -> N
     )
 
     lake.update.dataset(
-        "daily", source="custom", start="19991231", end="19991231", progress=False
+        "daily", source="custom", start="19991231", end="19991231"
     )
 
     assert source.requests == [{"date": "1999-12-31"}]
 
 
-def test_batch_update_confirmation_filters_jobs_and_quit_is_safe(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    lake = DataLake.open(tmp_path)
-    source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec("trade_cal", "general"),
-        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
-    )
-    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "daily",
-            "by_daily",
-            calendar="trade_cal",
-            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-        )
-    )
-
-    answers = iter(["invalid", "4"])
-    monkeypatch.setattr("builtins.input", lambda _: next(answers))
-    report = lake.update.datasets(
-        ["stock_basic", "daily"],
-        source="custom",
-        end="20250102",
-        progress=False,
-    )
-
-    assert report.datasets == ("stock_basic",)
-    assert source.requests == [{}]
-    assert "Invalid selection" in capsys.readouterr().out
-
-    source.requests.clear()
-    monkeypatch.setattr("builtins.input", lambda _: "5")
-    report = lake.update.datasets(
-        ["stock_basic", "daily"],
-        source="custom",
-        end="20250102",
-        progress=False,
-    )
-    assert report.datasets == ()
-    assert source.requests == []
-
-
-def test_noninteractive_selection_includes_explicit_general_refresh(tmp_path) -> None:
+def test_explicit_dataset_list_includes_general_refresh(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
     lake.admin.sources.register(source)
@@ -578,8 +529,6 @@ def test_noninteractive_selection_includes_explicit_general_refresh(tmp_path) ->
         ["stock_basic", "daily"],
         source="custom",
         end="20250102",
-        confirm=False,
-        progress=False,
     )
 
     assert report.datasets == ("stock_basic", "daily")
@@ -602,7 +551,6 @@ def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -
         "stock_basic",
         source="custom",
         retry_backoff_seconds=60,
-        progress=False,
     )
 
     assert report.failure_count == 1
@@ -637,9 +585,7 @@ def test_datasets_run_sequentially_with_workers_inside_each_dataset(tmp_path) ->
         ["daily", "daily_basic"],
         source="custom",
         end="2025-01-05",
-        confirm=False,
         workers=4,
-        progress=False,
     )
 
     assert source.maximum_active == 4
@@ -674,7 +620,6 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
         end="2025-01-03",
         workers=2,
         max_retries=1,
-        progress=False,
     )
     assert first.status == "partial"
     assert first.remaining_scope_count == 1
@@ -696,7 +641,6 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
         end="2025-01-04",
         workers=2,
         max_retries=1,
-        progress=False,
     )
 
     assert second.status == "success"
@@ -734,7 +678,6 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
         source="custom",
         end="2025-01-03",
         max_retries=1,
-        progress=False,
     )
     lake.ingest(
         calendar,
@@ -749,7 +692,6 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
         source="custom",
         end="2025-01-04",
         max_retries=1,
-        progress=False,
     )
 
     assert report.status == "partial"
@@ -784,7 +726,6 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
         "end": "2025-01-02",
         "source_options": {"pagination": "offset", "page_size": 2},
         "max_retries": 1,
-        "progress": False,
     }
 
     first = lake.update.dataset("daily", **options)
@@ -832,7 +773,6 @@ def test_adaptive_date_range_discards_saturated_parents_and_commits_all_leaves(
             "pagination": "adaptive_date_range",
             "row_limit": 2,
         },
-        progress=False,
     )
 
     assert report.status == "success"
@@ -871,7 +811,6 @@ def test_adaptive_date_range_rejects_a_saturated_minimum_window(tmp_path) -> Non
             "pagination": "adaptive_date_range",
             "row_limit": 2,
         },
-        progress=False,
     )
 
     assert report.status == "failed"

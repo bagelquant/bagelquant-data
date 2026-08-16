@@ -85,7 +85,7 @@ def test_metadata_store_rejects_schema_v2_without_migration(tmp_path) -> None:
         MetadataStore(path)
 
 
-def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) -> None:
+def test_record_api_calls_inserts_batch(tmp_path) -> None:
     metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
 
     metadata.record_api_calls(
@@ -115,17 +115,6 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
             },
         ]
     )
-    metadata.record_api_call(
-        run_id="run-1",
-        source="tushare",
-        dataset="income",
-        request_key="2",
-        asset_id="000003.SZ",
-        request_params={"ts_code": "000003.SZ"},
-        status="success",
-        row_count=1,
-    )
-
     rows = metadata._rows(
         """
         select request_key, asset_id, request_params, status, result_kind,
@@ -155,16 +144,6 @@ def test_record_api_calls_inserts_batch_and_single_call_compatibility(tmp_path) 
             "row_count": 0,
             "retry_count": 2,
             "error_message": "limit",
-        },
-        {
-            "request_key": "2",
-            "asset_id": "000003.SZ",
-            "request_params": '{"ts_code": "000003.SZ"}',
-            "status": "success",
-            "result_kind": "nonempty",
-            "row_count": 1,
-            "retry_count": 0,
-            "error_message": None,
         },
     ]
 

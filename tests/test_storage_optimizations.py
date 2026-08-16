@@ -245,7 +245,6 @@ def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-02",
-        progress=False,
     )
     manifest_before = lake.metadata.manifest("custom", "daily")
     second = lake.update.dataset(
@@ -254,7 +253,6 @@ def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-03",
-        progress=False,
     )
     scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
 
@@ -797,15 +795,19 @@ def test_metadata_commit_failure_restores_parquet_manifest_and_schema(
 def test_api_request_json_is_compressed_and_transparently_decoded(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     params = {"fields": ",".join(f"field_{index}" for index in range(200))}
-    lake.metadata.record_api_call(
-        run_id="run",
-        source="custom",
-        dataset="daily",
-        request_key="0",
-        asset_id=None,
-        request_params=params,
-        status="success",
-        row_count=1,
+    lake.metadata.record_api_calls(
+        (
+            {
+                "run_id": "run",
+                "source": "custom",
+                "dataset": "daily",
+                "request_key": "0",
+                "asset_id": None,
+                "request_params": params,
+                "status": "success",
+                "row_count": 1,
+            },
+        )
     )
 
     with lake.metadata.connect() as db:
