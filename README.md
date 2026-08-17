@@ -37,7 +37,10 @@ are stored separately in `provider_scope_checks` and never advance local data
 coverage. Validated empty responses are durable `empty` scope outcomes and are
 rechecked on the next update while their dates remain within the latest 20
 requested trading sessions. Older empty daily scopes stay terminal. Repair
-requests finish and commit before new daily scopes begin. `by_asset` data uses
+requests finish and commit before new daily scopes begin. Applications may
+compact untouched historical `by_daily` backlog into provider date-range calls;
+the response is still committed and recorded as individual daily scope outcomes,
+so later incremental updates never repeat completed history. `by_asset` data uses
 stable year/asset-bucket partitions (32 buckets by default), so a new asset
 does not rewrite one whole-year file. Old metadata schemas are rejected rather
 than migrated; metadata schema v3 requires a fresh lake root.

@@ -22,6 +22,15 @@ DAILY_EMPTY_RECHECK_SESSIONS = 20
 
 
 @dataclass(frozen=True, slots=True)
+class DailyScope:
+    """One daily ledger outcome covered by a physical provider request."""
+
+    scope_id: int
+    scope_key: str
+    recheck_after: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LedgerRequest:
     """One claimed ledger scope and the provider request that checks it."""
 
@@ -33,6 +42,10 @@ class LedgerRequest:
     recheck_after: str | None = None
     overlaps_existing: bool = False
     previous_data_max_time: str | None = None
+    daily_scopes: tuple[DailyScope, ...] = ()
+    scope_ordinal: int | None = None
+    variant_hash: str | None = None
+    range_backfill_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +156,77 @@ def synchronize_requests(
     )
 
 
+def compact_daily_range_backfill(
+    spec: DatasetSpec,
+    requests: Sequence[LedgerRequest],
+    source_options: Mapping[str, object] | None,
+) -> tuple[LedgerRequest, ...]:
+    """Compact untouched daily backlog into bounded physical range requests."""
+
+    if spec.update_type != "by_daily" or not source_options:
+        return tuple(requests)
+    raw_policy = source_options.get("daily_range_backfill")
+    if raw_policy is None:
+        return tuple(requests)
+    if not isinstance(raw_policy, Mapping):
+        raise ConfigurationError("daily_range_backfill must be a mapping")
+    start_param = _nonempty_option(raw_policy, "start_param", "start")
+    end_param = _nonempty_option(raw_policy, "end_param", "end")
+    if start_param == end_param:
+        raise ConfigurationError(
+            "daily_range_backfill start_param and end_param must differ"
+        )
+    max_scopes = _positive_option(raw_policy, "max_scopes", 1024)
+    _positive_option(raw_policy, "row_limit")
+    _positive_option(raw_policy, "max_pages", 10_000)
+
+    result = [request for request in requests if not request.range_backfill_eligible]
+    eligible_by_variant: dict[str, list[LedgerRequest]] = {}
+    for request in requests:
+        if request.range_backfill_eligible:
+            eligible_by_variant.setdefault(request.variant_hash or "", []).append(request)
+
+    def append_groups(pending: list[LedgerRequest]) -> None:
+        cursor = 0
+        while cursor < len(pending):
+            group = [pending[cursor]]
+            cursor += 1
+            while (
+                cursor < len(pending)
+                and len(group) < max_scopes
+                and group[-1].scope_ordinal is not None
+                and pending[cursor].scope_ordinal == group[-1].scope_ordinal + 1
+            ):
+                group.append(pending[cursor])
+                cursor += 1
+            if len(group) == 1:
+                result.append(group[0])
+                continue
+            first = group[0]
+            last = group[-1]
+            params = dict(first.params)
+            params.pop(spec.date_param or "date", None)
+            params[start_param] = first.daily_scopes[0].scope_key
+            params[end_param] = last.daily_scopes[-1].scope_key
+            result.append(
+                LedgerRequest(
+                    params=params,
+                    request_kind="initial_range_backfill",
+                    target_end=last.daily_scopes[-1].scope_key,
+                    daily_scopes=tuple(
+                        scope for request in group for scope in request.daily_scopes
+                    ),
+                    scope_ordinal=first.scope_ordinal,
+                    variant_hash=first.variant_hash,
+                    range_backfill_eligible=True,
+                )
+            )
+
+    for pending in eligible_by_variant.values():
+        append_groups(pending)
+    return tuple(result)
+
+
 def _daily_requests(
     spec: DatasetSpec,
     *,
@@ -161,6 +245,7 @@ def _daily_requests(
         if value <= final_day and (lower is None or value >= lower)
     ]
     selected_dates = set(dates)
+    ordinals = {value: index for index, value in enumerate(dates)}
     recent_dates = set(dates[-DAILY_EMPTY_RECHECK_SESSIONS:])
     metadata.synchronize_update_scopes(
         {
@@ -205,6 +290,19 @@ def _daily_requests(
             continue
         request = dict(variant_params[str(row["variant_hash"])])
         request[spec.date_param or "date"] = scope_day.isoformat()
+        interrupted_backfill = bool(
+            status == "failed"
+            and row["provider_checked_through"] is None
+            and row["data_max_time"] is None
+            and _interrupted_backfill_error(row.get("last_error"))
+        )
+        daily_scope = DailyScope(
+            scope_id=int(row["id"]),
+            scope_key=scope_day.isoformat(),
+            recheck_after=(scope_day + timedelta(days=1)).isoformat()
+            if scope_day >= execution_day
+            else None,
+        )
         selected.append(
             LedgerRequest(
                 request,
@@ -219,9 +317,18 @@ def _daily_requests(
                     else "forward"
                 ),
                 target_end=scope_day.isoformat(),
-                recheck_after=(scope_day + timedelta(days=1)).isoformat()
-                if scope_day >= execution_day
-                else None,
+                recheck_after=daily_scope.recheck_after,
+                daily_scopes=(daily_scope,),
+                scope_ordinal=ordinals[scope_day],
+                variant_hash=str(row["variant_hash"]),
+                range_backfill_eligible=(
+                    (
+                        status == "pending"
+                        and int(row["attempt_count"]) == 0
+                        and scope_day < execution_day
+                    )
+                    or interrupted_backfill
+                ),
             )
         )
     return tuple(selected)
@@ -467,3 +574,26 @@ def _optional_datetime(value: object) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(str(value))
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _positive_option(
+    policy: Mapping[str, object], name: str, default: int | None = None
+) -> int:
+    value = policy.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigurationError(f"daily_range_backfill {name} must be positive")
+    return value
+
+
+def _nonempty_option(
+    policy: Mapping[str, object], name: str, default: str
+) -> str:
+    value = policy.get(name, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"daily_range_backfill {name} cannot be empty")
+    return value.strip()
+
+
+def _interrupted_backfill_error(value: object) -> bool:
+    text = "" if value is None else str(value).lower()
+    return "cancel" in text or "lease expired" in text or "forced termination" in text

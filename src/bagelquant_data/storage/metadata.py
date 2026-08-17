@@ -1007,13 +1007,46 @@ class MetadataStore:
         therefore expose either the complete empty outcome or none of it.
         """
 
+        scope_results = (
+            []
+            if scope_id is None
+            else [
+                {
+                    "scope_id": scope_id,
+                    "checked_through": checked_through,
+                    "recheck_after": recheck_after,
+                }
+            ]
+        )
+        self.record_empty_scope_results(
+            calls=calls,
+            scope_results=scope_results,
+            run_id=run_id,
+            empty_outcome_count=1,
+        )
+
+    def record_empty_scope_results(
+        self,
+        *,
+        calls: Iterable[dict[str, Any]],
+        scope_results: Iterable[dict[str, Any]],
+        run_id: str,
+        empty_outcome_count: int | None = None,
+    ) -> None:
+        """Atomically audit one physical call and persist its empty daily scopes."""
+
         rows = list(calls)
         if not rows:
             raise ValueError("An empty result must include at least one API audit row")
+        outcomes = list(scope_results)
+        count = len(outcomes) if empty_outcome_count is None else empty_outcome_count
+        if count <= 0:
+            raise ValueError("An empty result must include at least one outcome")
         now = _now()
         with self.connect() as db:
             db.execute("begin immediate")
-            if scope_id is not None:
+            for outcome in outcomes:
+                scope_id = int(outcome["scope_id"])
                 claimed = db.execute(
                     "select id from update_scopes where id=? and status='running' "
                     "and active_run_id=?",
@@ -1023,18 +1056,19 @@ class MetadataStore:
                     raise RuntimeError(
                         f"Scope {scope_id} is not claimed by ingestion run {run_id}"
                     )
-                if checked_through is None:
+                if outcome.get("checked_through") is None:
                     raise ValueError(
                         "An incremental empty result needs checked_through"
                     )
             self._insert_api_calls(db, rows, recorded_at=now)
-            if scope_id is not None:
-                assert checked_through is not None
+            for outcome in outcomes:
+                scope_id = int(outcome["scope_id"])
+                checked_through = str(outcome["checked_through"])
                 self._upsert_provider_scope_check(
                     db,
                     scope_id=scope_id,
                     checked_through=checked_through,
-                    recheck_after=recheck_after,
+                    recheck_after=outcome.get("recheck_after"),
                     result="empty",
                     checked_at=now,
                 )
@@ -1046,13 +1080,17 @@ class MetadataStore:
                     """,
                     (now, scope_id, run_id),
                 )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"Scope {scope_id} is not claimed by ingestion run {run_id}"
+                    )
             cursor = db.execute(
                 """
                 update ingestion_runs set request_count=request_count+?,
-                    empty_count=empty_count+1
+                    empty_count=empty_count+?
                 where run_id=? and status='running'
                 """,
-                (len(rows), run_id),
+                (len(rows), count, run_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"Ingestion run {run_id} is not running")

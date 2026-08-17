@@ -22,7 +22,7 @@ from bagelquant_data.pipeline.commit import (
     CommitResult,
 )
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
-from bagelquant_data.pipeline.scopes import DiscoveryCall, LedgerRequest
+from bagelquant_data.pipeline.scopes import DailyScope, DiscoveryCall, LedgerRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +145,17 @@ class _RunState:
 type UpdateTask = tuple[DatasetUpdateWork, LedgerRequest]
 
 
+def _scope_ids(request: LedgerRequest) -> tuple[int, ...]:
+    if request.daily_scopes:
+        return tuple(scope.scope_id for scope in request.daily_scopes)
+    return () if request.scope_id is None else (request.scope_id,)
+
+
+def _scope_count(request: LedgerRequest) -> int:
+    ids = _scope_ids(request)
+    return len(ids) if ids else 1
+
+
 def update_dataset(
     *,
     spec: DatasetSpec,
@@ -225,7 +236,10 @@ def _update_datasets(
     callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
     tasks: list[UpdateTask] = []
     begun: set[str] = set()
-    totals = dict.fromkeys(states, 0)
+    totals = {
+        name: sum(_scope_count(request) for request in states[name].work.requests)
+        for name in states
+    }
     completed = dict.fromkeys(states, 0)
     caught: BaseException | None = None
     try:
@@ -239,9 +253,14 @@ def _update_datasets(
             )
             pipeline.metadata.record_api_calls(_discovery_api_call_rows(work))
             begun.add(work.spec.name)
-            _emit_progress(callbacks[work.spec.name], states[work.spec.name], "sync", 0)
+            _emit_progress(
+                callbacks[work.spec.name],
+                states[work.spec.name],
+                "sync",
+                0,
+                total=totals[work.spec.name],
+            )
             tasks.extend((work, request) for request in work.requests)
-        totals = {name: len(states[name].work.requests) for name in states}
         ordered_tasks = _partition_affinity_order(_fair_tasks(tasks))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             if initial_asset_build:
@@ -399,19 +418,24 @@ def _run_fetches(
             return False
         by_run: dict[str, list[int]] = {}
         for _, (work, request) in candidates:
-            if request.scope_id is not None:
-                by_run.setdefault(work.run_id, []).append(request.scope_id)
+            by_run.setdefault(work.run_id, []).extend(_scope_ids(request))
         claimed_by_run = {
             run_id: set(pipeline.metadata.claim_update_scopes(scope_ids, run_id=run_id))
             for run_id, scope_ids in by_run.items()
         }
         for candidate in candidates:
             _, (work, request) = candidate
-            if (
-                request.scope_id is not None
-                and request.scope_id not in claimed_by_run.get(work.run_id, set())
-            ):
-                totals[work.spec.name] = max(0, totals[work.spec.name] - 1)
+            ids = _scope_ids(request)
+            claimed = claimed_by_run.get(work.run_id, set())
+            if ids and not all(scope_id in claimed for scope_id in ids):
+                partially_claimed = [scope_id for scope_id in ids if scope_id in claimed]
+                if partially_claimed:
+                    raise RuntimeError(
+                        "A physical request claimed only part of its logical scopes"
+                    )
+                totals[work.spec.name] = max(
+                    0, totals[work.spec.name] - _scope_count(request)
+                )
                 continue
             ready.append(candidate)
         return bool(ready)
@@ -468,7 +492,7 @@ def _run_fetches(
             started = time.perf_counter()
             _harvest_request(pipeline, state, request, prepared)
             state.metadata_seconds += time.perf_counter() - started
-            completed[work.spec.name] += 1
+            completed[work.spec.name] += _scope_count(request)
             _emit_progress(
                 callbacks[work.spec.name],
                 state,
@@ -544,6 +568,32 @@ def _harvest_request(
             prepared.validation_error,
         )
         return
+    if state.work.spec.update_type == "by_daily" and request.daily_scopes:
+        nonempty, empty = _split_daily_scope_results(
+            state.work.spec, request, frame
+        )
+        if empty:
+            pipeline.metadata.record_empty_scope_results(
+                calls=calls,
+                scope_results=(
+                    {
+                        "scope_id": scope.scope_id,
+                        "checked_through": scope.scope_key,
+                        "recheck_after": None,
+                    }
+                    for scope in empty
+                ),
+                run_id=state.work.run_id,
+            )
+            state.empty_count += len(empty)
+        else:
+            state.pending_api_calls.extend(calls)
+        state.request_count += request_count
+        state.rows_downloaded += downloaded
+        for scope_frame, scope_request in nonempty:
+            state.buffered.append((scope_frame, scope_request))
+            state.buffered_bytes += int(scope_frame.estimated_size())
+        return
     if frame.is_empty():
         pipeline.metadata.record_empty_scope_result(
             calls=({**call, "result_kind": "empty"} for call in calls),
@@ -561,6 +611,43 @@ def _harvest_request(
     state.rows_downloaded += downloaded
     state.buffered.append((frame, request))
     state.buffered_bytes += int(frame.estimated_size())
+
+
+def _split_daily_scope_results(
+    spec: DatasetSpec,
+    request: LedgerRequest,
+    frame: pl.DataFrame,
+) -> tuple[list[tuple[pl.DataFrame, LedgerRequest]], list[DailyScope]]:
+    """Split one validated daily response into commit-backed and empty scopes."""
+
+    if frame.is_empty():
+        return [], list(request.daily_scopes)
+    time_column = _source_column(spec, "time")
+    scoped = frame.with_columns(_date_expr(time_column).alias("__scope_date"))
+    nonempty: list[tuple[pl.DataFrame, LedgerRequest]] = []
+    empty: list[DailyScope] = []
+    for scope in request.daily_scopes:
+        scope_day = _date_value(scope.scope_key)
+        scope_frame = scoped.filter(
+            pl.col("__scope_date") == pl.lit(scope_day, dtype=pl.Date)
+        ).drop("__scope_date")
+        if scope_frame.is_empty():
+            empty.append(scope)
+            continue
+        nonempty.append(
+            (
+                scope_frame,
+                replace(
+                    request,
+                    scope_id=scope.scope_id,
+                    target_end=scope.scope_key,
+                    recheck_after=scope.recheck_after,
+                    daily_scopes=(scope,),
+                    range_backfill_eligible=False,
+                ),
+            )
+        )
+    return nonempty, empty
 
 
 def _api_call_rows(
@@ -582,6 +669,13 @@ def _api_call_rows(
             "asset_id": page.asset_id,
             "scope_id": request.scope_id,
             "request_kind": request.request_kind,
+            "result_kind": (
+                None
+                if page.status != "success"
+                else "empty"
+                if page.row_count == 0
+                else "nonempty"
+            ),
         }
         for page in pages
     ]
@@ -676,22 +770,25 @@ def _transition(
     status: str,
     error: str | None,
 ) -> None:
-    if request.scope_id is not None:
+    scope_ids = _scope_ids(request)
+    if scope_ids:
         pipeline.metadata.transition_update_scopes(
-            [
+            (
                 {
-                    "scope_id": request.scope_id,
+                    "scope_id": scope_id,
                     "status": status,
                     "last_error": error,
                 }
-            ],
+                for scope_id in scope_ids
+            ),
             run_id=state.work.run_id,
         )
+    outcome_count = len(scope_ids) if scope_ids else 1
     if status == "invalid":
-        state.invalid_count += 1
+        state.invalid_count += outcome_count
         state.errors.append(error or "invalid response")
     elif status == "failed":
-        state.failure_count += 1
+        state.failure_count += outcome_count
         state.errors.append(error or "failed request")
 
 
@@ -779,9 +876,11 @@ def _validate_response(
         time_values.is_null().any().alias("invalid_dates"),
     ]
     if spec.update_type == "by_daily":
-        expected = _date_value(request.target_end)
+        expected_dates = {
+            _date_value(scope.scope_key) for scope in request.daily_scopes
+        } or {_date_value(request.target_end)}
         checks.append(
-            (time_values != pl.lit(expected, dtype=pl.Date))
+            (~time_values.is_in(sorted(expected_dates)))
             .any()
             .alias("outside_requested_date")
         )
@@ -818,9 +917,11 @@ def _validate_response(
         return "response contains invalid dates"
     if spec.update_type == "by_daily":
         if summary["outside_requested_date"]:
-            return (
-                f"response contains dates outside requested date {expected.isoformat()}"
-            )
+            lower = min(expected_dates).isoformat()
+            upper = max(expected_dates).isoformat()
+            if len(expected_dates) == 1:
+                return f"response contains dates outside requested date {lower}"
+            return f"response contains dates outside requested daily scopes {lower} to {upper}"
     else:
         if summary["wrong_asset"]:
             return f"response contains assets other than {expected_asset}"
@@ -850,10 +951,16 @@ def _validate_single_row_response(
     except (TypeError, ValueError):
         return "response contains invalid dates"
     if spec.update_type == "by_daily":
-        expected = _date_value(request.target_end)
-        if response_date != expected:
+        expected_dates = {
+            _date_value(scope.scope_key) for scope in request.daily_scopes
+        } or {_date_value(request.target_end)}
+        if response_date not in expected_dates:
+            if len(expected_dates) == 1:
+                expected = next(iter(expected_dates)).isoformat()
+                return f"response contains dates outside requested date {expected}"
             return (
-                f"response contains dates outside requested date {expected.isoformat()}"
+                "response contains dates outside requested daily scopes "
+                f"{min(expected_dates).isoformat()} to {max(expected_dates).isoformat()}"
             )
     else:
         expected_asset = str(request.params["id"])
@@ -1094,6 +1201,8 @@ def _fetch_and_prepare_request(
     """Fetch, combine, and validate one logical request in its fetch worker."""
 
     request = ledger_request.params
+    if ledger_request.request_kind == "initial_range_backfill":
+        request_options = _daily_range_request_options(request_options)
     pages = _fetch_request_pages(
         spec=spec,
         source_adapter=source_adapter,
@@ -1406,6 +1515,18 @@ def _request_options(context: RequestContext) -> dict[str, Any]:
         if key in context.options:
             options[key] = context.options[key]
     return options
+
+
+def _daily_range_request_options(options: dict[str, Any]) -> dict[str, Any]:
+    raw = options.get("daily_range_backfill")
+    if not isinstance(raw, dict):
+        raise ValueError("initial range backfill requires daily_range_backfill options")
+    return {
+        **options,
+        **raw,
+        "pagination": "adaptive_date_range",
+        "minimum_window_days": 0,
+    }
 
 
 def _owner_id(context: RequestContext) -> str | None:

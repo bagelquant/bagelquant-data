@@ -76,6 +76,55 @@ new forward work starts. Older daily empties and empty `by_asset` scopes remain
 terminal until reset or a definition change. Empties first observed during a
 run are considered for repair on the next run, not twice in the same run.
 
+## Initial daily range backfill
+
+A provider endpoint that supports complete date-range queries can compact its
+untouched historical `by_daily` backlog with
+`source_options.daily_range_backfill`:
+
+```python
+lake.update.dataset(
+    "sparse_daily",
+    source="custom",
+    end="2026-07-10",
+    source_options={
+        "daily_range_backfill": {
+            "start_param": "start_date",
+            "end_param": "end_date",
+            "row_limit": 1000,
+            "max_scopes": 1024,
+            "max_pages": 4096,
+        }
+    },
+)
+```
+
+Only never-checked historical `pending` scopes are compacted. A range that was
+interrupted by cancellation, forced worker termination, or lease expiry may be
+formed again when it has no durable provider result. Ordinary forward daily
+work, real provider or validation failures, and recent-empty rechecks retain
+the one-day request path. Variants are grouped independently and only adjacent
+trading-calendar scopes are combined, up to `max_scopes`.
+
+Every range response must contain canonical dates only from its requested
+daily scopes and valid primary keys. The lake splits the validated response by
+canonical `time`: nonempty dates become `success` only after their Parquet
+commit, while missing dates become durable `empty` provider checks. Missing
+date fields, invalid keys, or unrequested dates invalidate every scope in the
+physical range without advancing coverage.
+
+`row_limit` activates the same adaptive date bisection used by explicit asset
+ranges. Saturated parent rows are audited and discarded. Only complete,
+unsaturated leaves are combined; saturation at one day invalidates the whole
+logical range, so truncated data is never published.
+
+`api_calls` continues to represent physical provider calls and records these
+calls with `request_kind = 'initial_range_backfill'`, including actual leaf
+bounds and saturated parents. `ingestion_runs.request_count` is therefore a
+physical-call count, while `success_count`, `empty_count`, and `failure_count`
+count daily scope outcomes. Progress `total` and `completed` also count daily
+scopes, so one completed range can advance progress by many steps.
+
 Each selected dataset has a writer lease tied to a workflow owner. A second
 process cannot update that dataset until the first process finishes or its
 lease expires. Scopes are claimed only when entering the bounded in-flight

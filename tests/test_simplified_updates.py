@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from threading import Event, Lock
 from typing import Any, cast
 
@@ -188,6 +188,87 @@ class AdaptiveAssetSource:
                 "end_date": [value[1].replace("-", "") for value in truncated],
             }
         )
+
+
+class DailyRangeSource:
+    name = "custom"
+
+    def __init__(
+        self,
+        rows: dict[str, tuple[str, ...]],
+        *,
+        truncate_at: int | None = None,
+    ) -> None:
+        self.rows = rows
+        self.truncate_at = truncate_at
+        self.fail = False
+        self.requests: list[dict[str, object]] = []
+
+    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+        self.requests.append(dict(request))
+        if self.fail:
+            raise RuntimeError("range provider failed")
+        if "date" in request:
+            dates = [str(request["date"])]
+        else:
+            lower = date.fromisoformat(str(request["start_date"]))
+            upper = date.fromisoformat(str(request["end_date"]))
+            dates = [
+                value
+                for value in self.rows
+                if lower <= date.fromisoformat(value) <= upper
+            ]
+        values = [
+            (scope_day, str(request.get("index_code", asset_id)))
+            for scope_day in dates
+            for asset_id in self.rows.get(scope_day, ())
+        ]
+        if self.truncate_at is not None:
+            values = values[-self.truncate_at :]
+        return pl.DataFrame(
+            {
+                "trade_date": [value[0].replace("-", "") for value in values],
+                "ts_code": [value[1] for value in values],
+            },
+            schema={"trade_date": pl.String, "ts_code": pl.String},
+        )
+
+
+def _daily_range_lake(
+    tmp_path, source: DailyRangeSource, sessions: list[date]
+) -> DataLake:
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame(
+            {
+                "time": [value.isoformat() for value in sessions],
+                "is_open": [1] * len(sessions),
+            }
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    return lake
+
+
+def _daily_range_options() -> dict[str, Any]:
+    return {
+        "daily_range_backfill": {
+            "start_param": "start_date",
+            "end_param": "end_date",
+            "row_limit": 1_000,
+            "max_scopes": 1_024,
+            "max_pages": 4_096,
+        }
+    }
 
 
 def _adaptive_asset_lake(tmp_path, source: AdaptiveAssetSource) -> DataLake:
@@ -820,3 +901,267 @@ def test_adaptive_date_range_rejects_a_saturated_minimum_window(tmp_path) -> Non
     )
     assert len(invalid) == 1
     assert "still returned 2 rows" in str(invalid[0]["last_error"])
+
+
+def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(25)]
+    rows = {
+        value.isoformat(): (() if index < 2 else (f"{index:06d}.SZ",))
+        for index, value in enumerate(sessions)
+    }
+    source = DailyRangeSource(rows)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+
+    first = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert first.status == "success"
+    assert first.request_count == 1
+    assert first.success_count == 23
+    assert first.empty_count == 2
+    assert source.requests == [
+        {
+            "start_date": sessions[0].isoformat(),
+            "end_date": sessions[-1].isoformat(),
+        }
+    ]
+    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    assert [row["status"] for row in scopes[:2]] == ["empty", "empty"]
+    assert all(row["status"] == "success" for row in scopes[2:])
+    assert all(row["commit_run_id"] == first.run_id for row in scopes[2:])
+    checks = lake.admin.status.provider_scope_checks(
+        dataset="daily", source="custom"
+    )
+    assert [row["checked_through"] for row in checks[:2]] == [
+        sessions[0].isoformat(),
+        sessions[1].isoformat(),
+    ]
+    calls = lake.metadata._rows(
+        "select request_kind,scope_id,request_params from api_calls "
+        "where dataset='daily' order by rowid"
+    )
+    assert len(calls) == 1
+    assert calls[0]["request_kind"] == "initial_range_backfill"
+    assert calls[0]["scope_id"] is None
+
+    source.requests.clear()
+    second = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert second.request_count == 0
+    assert source.requests == []
+
+
+def test_daily_initial_range_requests_only_new_pending_tail(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(6)]
+    rows = {value.isoformat(): (f"{index:06d}.SZ",) for index, value in enumerate(sessions)}
+    source = DailyRangeSource(rows)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+    lake.update.dataset(
+        "daily", source="custom", start=sessions[0], end=sessions[2]
+    )
+    source.requests.clear()
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert report.request_count == 1
+    assert report.success_count == 3
+    assert source.requests == [
+        {
+            "start_date": sessions[3].isoformat(),
+            "end_date": sessions[-1].isoformat(),
+        }
+    ]
+
+
+def test_daily_initial_range_groups_each_variant_independently(tmp_path) -> None:
+    sessions = [date(2025, 1, 3), date(2025, 1, 6), date(2025, 1, 7)]
+    rows = {value.isoformat(): ("ignored",) for value in sessions}
+    source = DailyRangeSource(rows)
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame(
+            {
+                "time": [value.isoformat() for value in sessions],
+                "is_open": [1] * len(sessions),
+            }
+        ),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            source_api_param_sets=({"index_code": ["IDX-A", "IDX-B"]},),
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert report.request_count == 2
+    assert report.success_count == 6
+    assert {
+        (request["index_code"], request["start_date"], request["end_date"])
+        for request in source.requests
+    } == {
+        ("IDX-A", sessions[0].isoformat(), sessions[-1].isoformat()),
+        ("IDX-B", sessions[0].isoformat(), sessions[-1].isoformat()),
+    }
+
+
+def test_daily_initial_range_discards_saturated_parents(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(4)]
+    rows = {value.isoformat(): (f"{index:06d}.SZ",) for index, value in enumerate(sessions)}
+    source = DailyRangeSource(rows, truncate_at=2)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+    options = _daily_range_options()
+    options["daily_range_backfill"]["row_limit"] = 2
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=options,
+    )
+
+    assert report.status == "success"
+    assert report.request_count == 7
+    assert report.success_count == 4
+    assert lake.query.query("daily", source="custom").collect().height == 4
+    calls = lake.metadata._rows(
+        "select row_count,status,request_kind from api_calls "
+        "where dataset='daily' order by rowid"
+    )
+    assert len(calls) == 7
+    assert all(row["request_kind"] == "initial_range_backfill" for row in calls)
+    assert all(row["status"] == "success" for row in calls)
+
+
+def test_daily_initial_range_saturated_leaf_invalidates_whole_group(tmp_path) -> None:
+    sessions = [date(2025, 1, 1), date(2025, 1, 2)]
+    rows = {
+        sessions[0].isoformat(): ("000001.SZ", "000002.SZ"),
+        sessions[1].isoformat(): (),
+    }
+    source = DailyRangeSource(rows, truncate_at=2)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+    options = _daily_range_options()
+    options["daily_range_backfill"]["row_limit"] = 2
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=options,
+    )
+
+    assert report.status == "failed"
+    assert lake.admin.status.files("daily", source="custom") == []
+    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    assert [row["status"] for row in scopes] == ["invalid", "invalid"]
+    assert all("still returned 2 rows" in str(row["last_error"]) for row in scopes)
+
+
+def test_daily_initial_range_resumes_after_cooperative_cancel(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(3)]
+    rows = {value.isoformat(): (f"{index:06d}.SZ",) for index, value in enumerate(sessions)}
+    source = DailyRangeSource(rows)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+
+    canceled = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+        cancel_requested=lambda: True,
+    )
+
+    assert canceled.status == "cancelled"
+    assert source.requests == []
+    assert all(
+        row["status"] == "pending"
+        for row in lake.admin.status.update_scopes(
+            dataset="daily", source="custom"
+        )
+    )
+
+    resumed = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert resumed.status == "success"
+    assert resumed.request_count == 1
+    assert source.requests == [
+        {
+            "start_date": sessions[0].isoformat(),
+            "end_date": sessions[-1].isoformat(),
+        }
+    ]
+
+
+def test_daily_range_transport_failure_retries_as_individual_days(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(3)]
+    rows = {value.isoformat(): (f"{index:06d}.SZ",) for index, value in enumerate(sessions)}
+    source = DailyRangeSource(rows)
+    source.fail = True
+    lake = _daily_range_lake(tmp_path, source, sessions)
+
+    failed = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+        max_retries=1,
+    )
+
+    assert failed.status == "failed"
+    assert failed.failure_count == 3
+    source.fail = False
+    source.requests.clear()
+
+    retried = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=_daily_range_options(),
+    )
+
+    assert retried.status == "success"
+    assert retried.request_count == 3
+    assert [request["date"] for request in source.requests] == [
+        value.isoformat() for value in sessions
+    ]

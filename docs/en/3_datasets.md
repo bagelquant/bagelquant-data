@@ -20,6 +20,11 @@ the provider-to-canonical field mapping; general datasets do not require one.
 `date_param` when a provider API uses a different date parameter, such as
 `date_param = "pub_date"` for Tushare's `st` API. The generated date always
 overrides a conflicting value in `source_api_params` or runtime `params`.
+The daily scope remains the logical coverage unit even when an application
+enables the optional `source_options.daily_range_backfill` transport policy.
+That policy may combine untouched historical scopes for one parameter variant
+into a physical date-range call, but it never changes dataset identity or the
+daily ledger model.
 
 Store the same compact mapping in TOML and register it with `register_toml`.
 

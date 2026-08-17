@@ -20,6 +20,7 @@ from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.management.status import StatusManager
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.scopes import (
+    compact_daily_range_backfill,
     discover_request_param_sets,
     synchronize_requests,
 )
@@ -247,6 +248,11 @@ class LakeUpdater:
                 ids=context.options.get("ids"),
                 params=context.options.get("params"),
                 discovered_param_sets=discovered_param_sets,
+            )
+            requests = compact_daily_range_backfill(
+                spec,
+                requests,
+                context.options.get("source_options"),
             )
             works.append(
                 DatasetUpdateWork(
