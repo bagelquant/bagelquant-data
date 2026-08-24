@@ -18,7 +18,10 @@ payload did not satisfy the dataset contract.
 
 Use `reset_update_scopes` to retry selected terminal state deliberately. A
 dataset declaration or parameter-variant change automatically invalidates its
-old scope identities and creates pending work.
+old scope identities and creates pending work. The narrow exception is a
+`by_daily` update with `source_options.allow_all_null_payload = true`: it
+automatically retries only scopes invalidated by the exact all-null-payload
+error, while all other invalid reasons remain terminal.
 
 Update reports include elapsed, fetch, commit, and metadata timings, commit and
 partition counts, planning time, skipped no-op partitions, and peak in-flight

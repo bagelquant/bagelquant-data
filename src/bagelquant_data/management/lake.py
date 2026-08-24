@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -238,6 +238,11 @@ class LakeUpdater:
             discovered_param_sets, discovery_call = discover_request_param_sets(
                 spec, adapter
             )
+            raw_source_options = context.options.get("source_options")
+            if raw_source_options is not None and not isinstance(
+                raw_source_options, Mapping
+            ):
+                raise ConfigurationError("source_options must be a mapping")
             requests = synchronize_requests(
                 spec=spec,
                 raw=raw,
@@ -248,6 +253,7 @@ class LakeUpdater:
                 ids=context.options.get("ids"),
                 params=context.options.get("params"),
                 discovered_param_sets=discovered_param_sets,
+                source_options=raw_source_options,
             )
             requests = compact_daily_range_backfill(
                 spec,

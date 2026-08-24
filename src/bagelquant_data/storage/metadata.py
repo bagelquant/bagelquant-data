@@ -901,7 +901,7 @@ class MetadataStore:
                 int(row["id"])
                 for row in db.execute(
                     f"select id from update_scopes where id in ({placeholders}) "
-                    "and status in ('pending','failed','success','empty')",
+                    "and status in ('pending','failed','invalid','success','empty')",
                     ids,
                 ).fetchall()
             ]

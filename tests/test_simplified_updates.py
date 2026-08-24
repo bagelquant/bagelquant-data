@@ -737,6 +737,139 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
     )
 
 
+def test_all_null_payload_policy_retries_only_matching_invalid_scope(tmp_path) -> None:
+    class SparseEventSource:
+        name = "custom"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def fetch(self, _dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            self.requests.append(dict(request))
+            return pl.DataFrame(
+                {
+                    "trade_date": [str(request["date"]).replace("-", "")],
+                    "ts_code": ["000001.SZ"],
+                    "suspend_type": ["S"],
+                    "suspend_timing": pl.Series([None], dtype=pl.String),
+                }
+            )
+
+    source = SparseEventSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "suspend_d",
+            "by_daily",
+            calendar="trade_cal",
+            primary_key_extra=("suspend_type",),
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+
+    first = lake.update.dataset(
+        "suspend_d",
+        source="custom",
+        end="2025-01-02",
+        max_retries=1,
+    )
+
+    assert first.status == "failed"
+    invalid = lake.admin.status.update_scopes(
+        dataset="suspend_d",
+        source="custom",
+        status="invalid",
+    )
+    assert len(invalid) == 1
+    assert invalid[0]["last_error"] == "response payload is entirely null"
+
+    second = lake.update.dataset(
+        "suspend_d",
+        source="custom",
+        end="2025-01-02",
+        max_retries=1,
+        source_options={"allow_all_null_payload": True},
+    )
+
+    assert second.status == "success"
+    assert len(source.requests) == 2
+    assert source.requests[-1] == {"date": "2025-01-02"}
+    scopes = lake.admin.status.update_scopes(
+        dataset="suspend_d",
+        source="custom",
+    )
+    assert [row["status"] for row in scopes] == ["success"]
+    frame = lake.query.query("suspend_d", source="custom").collect()
+    assert frame.select("suspend_type", "suspend_timing").to_dicts() == [
+        {"suspend_type": "S", "suspend_timing": None}
+    ]
+
+
+def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -> None:
+    class NullKeySource:
+        name = "custom"
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def fetch(self, _dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            self.requests += 1
+            return pl.DataFrame(
+                {
+                    "trade_date": [str(request["date"]).replace("-", "")],
+                    "ts_code": pl.Series([None], dtype=pl.String),
+                    "value": [1.0],
+                }
+            )
+
+    source = NullKeySource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("trade_cal", "general"),
+        pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "daily",
+            "by_daily",
+            calendar="trade_cal",
+            field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    first = lake.update.dataset(
+        "daily",
+        source="custom",
+        end="2025-01-02",
+        max_retries=1,
+    )
+
+    assert first.status == "failed"
+    assert source.requests == 1
+
+    second = lake.update.dataset(
+        "daily",
+        source="custom",
+        end="2025-01-02",
+        max_retries=1,
+        source_options={"allow_all_null_payload": True},
+    )
+
+    assert second.status == "success"
+    assert second.request_count == 0
+    assert source.requests == 1
+    assert lake.admin.status.update_scopes(
+        dataset="daily",
+        source="custom",
+        status="invalid",
+    )
+
+
 def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     source = ConcurrentDailySource(failures={"2025-01-02"})

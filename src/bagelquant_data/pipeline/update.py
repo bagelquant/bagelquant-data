@@ -22,7 +22,12 @@ from bagelquant_data.pipeline.commit import (
     CommitResult,
 )
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
-from bagelquant_data.pipeline.scopes import DailyScope, DiscoveryCall, LedgerRequest
+from bagelquant_data.pipeline.scopes import (
+    ALL_NULL_PAYLOAD_ERROR,
+    DailyScope,
+    DiscoveryCall,
+    LedgerRequest,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,7 +851,11 @@ def _canonical_data_maxima(
 
 
 def _validate_response(
-    spec: DatasetSpec, request: LedgerRequest, frame: pl.DataFrame
+    spec: DatasetSpec,
+    request: LedgerRequest,
+    frame: pl.DataFrame,
+    *,
+    allow_all_null_payload: bool = False,
 ) -> str | None:
     if frame.is_empty():
         return None
@@ -867,6 +876,7 @@ def _validate_response(
             required=required,
             time_column=time_column,
             asset_column=asset_column,
+            allow_all_null_payload=allow_all_null_payload,
         )
     null_counts = frame.null_count().row(0, named=True)
     if any(int(null_counts[field]) for field in required):
@@ -929,8 +939,8 @@ def _validate_response(
             return "response contains invalid request dates"
         if summary["outside_requested_range"]:
             return "response contains dates outside requested range"
-    if payload and not has_payload:
-        return "response payload is entirely null"
+    if payload and not has_payload and not allow_all_null_payload:
+        return ALL_NULL_PAYLOAD_ERROR
     return None
 
 
@@ -942,6 +952,7 @@ def _validate_single_row_response(
     required: list[str],
     time_column: str,
     asset_column: str,
+    allow_all_null_payload: bool,
 ) -> str | None:
     row = frame.row(0, named=True)
     if any(row[field] is None for field in required):
@@ -978,8 +989,12 @@ def _validate_single_row_response(
         if request_date < lower or request_date > upper:
             return "response contains dates outside requested range"
     payload = [field for field in frame.columns if field not in required]
-    if payload and all(row[field] is None for field in payload):
-        return "response payload is entirely null"
+    if (
+        payload
+        and all(row[field] is None for field in payload)
+        and not allow_all_null_payload
+    ):
+        return ALL_NULL_PAYLOAD_ERROR
     return None
 
 
@@ -1225,10 +1240,18 @@ def _fetch_and_prepare_request(
         if len(frames) == 1
         else concat_compatible_frames(frames)
     )
+    allow_all_null_payload = request_options.get("allow_all_null_payload", False)
+    if not isinstance(allow_all_null_payload, bool):
+        raise ValueError("source_options.allow_all_null_payload must be boolean")
     return PreparedFetch(
         tuple(pages),
         frame,
-        _validate_response(spec, ledger_request, frame),
+        _validate_response(
+            spec,
+            ledger_request,
+            frame,
+            allow_all_null_payload=allow_all_null_payload,
+        ),
     )
 
 

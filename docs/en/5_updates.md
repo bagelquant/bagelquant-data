@@ -40,7 +40,18 @@ when no local rows exist. The separate provider check controls when that scope
 is eligible again, while `data_max_time`, `last_success_at`, `row_count`, and
 `commit_run_id` continue to describe only committed local data. Successful
 current-day daily scopes are checked once more after the date becomes
-historical. Invalid responses require an explicit operator reset.
+historical. Invalid responses normally require an explicit operator reset.
+
+Sparse-event endpoints whose complete primary key is meaningful even when all
+non-key fields are null may opt into
+`source_options.allow_all_null_payload = true`. The default remains `false`.
+This option relaxes only the all-null payload check: null primary keys,
+out-of-range dates, wrong asset identities, and every other response contract
+remain invalid. For `by_daily`, enabling the option also selects existing
+`invalid` scopes whose exact error is `response payload is entirely null` for
+an ordinary one-day retry. Those retries never participate in historical range
+backfill, and invalid scopes with any other error remain terminal until an
+explicit reset or definition change.
 
 For `by_asset`, normal work starts after the provider-check watermark. Once every
 `revision_refresh_days`, the request also includes the preceding
@@ -102,9 +113,10 @@ lake.update.dataset(
 Only never-checked historical `pending` scopes are compacted. A range that was
 interrupted by cancellation, forced worker termination, or lease expiry may be
 formed again when it has no durable provider result. Ordinary forward daily
-work, real provider or validation failures, and recent-empty rechecks retain
-the one-day request path. Variants are grouped independently and only adjacent
-trading-calendar scopes are combined, up to `max_scopes`.
+work, real provider or validation failures, `allow_all_null_payload` recovery
+retries, and recent-empty rechecks retain the one-day request path. Variants
+are grouped independently and only adjacent trading-calendar scopes are
+combined, up to `max_scopes`.
 
 Every range response must contain canonical dates only from its requested
 daily scopes and valid primary keys. The lake splits the validated response by

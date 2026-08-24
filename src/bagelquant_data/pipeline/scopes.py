@@ -19,6 +19,7 @@ from bagelquant_data.storage.metadata import MetadataStore
 
 
 DAILY_EMPTY_RECHECK_SESSIONS = 20
+ALL_NULL_PAYLOAD_ERROR = "response payload is entirely null"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +111,17 @@ def synchronize_requests(
     ids: Sequence[str] | None = None,
     params: dict[str, object] | None = None,
     discovered_param_sets: Sequence[Mapping[str, object]] = (),
+    source_options: Mapping[str, object] | None = None,
 ) -> tuple[LedgerRequest, ...]:
     """Synchronize declared scopes and return only currently eligible work."""
 
     current_day = datetime.now(UTC).date()
     final_day = _date_value(end or today or current_day)
     execution_day = _date_value(today or current_day)
+    allow_all_null_payload = _boolean_source_option(
+        source_options,
+        "allow_all_null_payload",
+    )
     variants = _base_variants(spec, params, discovered_param_sets)
     if spec.update_type == "general":
         requests = []
@@ -138,6 +144,7 @@ def synchronize_requests(
             final_day=final_day,
             execution_day=execution_day,
             spec_hash=spec_hash,
+            allow_all_null_payload=allow_all_null_payload,
         )
     if spec.update_type == "by_asset":
         return _asset_requests(
@@ -237,6 +244,7 @@ def _daily_requests(
     final_day: date,
     execution_day: date,
     spec_hash: str,
+    allow_all_null_payload: bool,
 ) -> tuple[LedgerRequest, ...]:
     lower = _date_value(start) if start is not None else None
     dates = [
@@ -281,8 +289,14 @@ def _daily_requests(
             and _date_value(row["provider_recheck_after"]) <= execution_day
         )
         status = str(row["status"])
+        retry_all_null_payload = bool(
+            allow_all_null_payload
+            and status == "invalid"
+            and row.get("last_error") == ALL_NULL_PAYLOAD_ERROR
+        )
         eligible = (
             status in {"pending", "failed"}
+            or retry_all_null_payload
             or (status == "empty" and scope_day in recent_dates)
             or (status == "success" and check_due)
         )
@@ -309,7 +323,7 @@ def _daily_requests(
                 scope_id=int(row["id"]),
                 request_kind=(
                     "retry"
-                    if status == "failed"
+                    if status in {"failed", "invalid"}
                     else "empty_recheck"
                     if status == "empty"
                     else "historical_recheck"
@@ -582,6 +596,18 @@ def _positive_option(
     value = policy.get(name, default)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ConfigurationError(f"daily_range_backfill {name} must be positive")
+    return value
+
+
+def _boolean_source_option(
+    source_options: Mapping[str, object] | None,
+    name: str,
+) -> bool:
+    if source_options is None or name not in source_options:
+        return False
+    value = source_options[name]
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"source_options.{name} must be boolean")
     return value
 
 

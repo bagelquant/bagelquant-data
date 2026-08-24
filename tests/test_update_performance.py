@@ -221,6 +221,52 @@ def test_daily_response_validation_uses_equivalent_vector_checks(
     assert _validate_response(_daily_spec(), request, frame) == message
 
 
+def test_daily_response_validation_can_allow_all_null_optional_payload() -> None:
+    spec = DatasetSpec(
+        "suspend_d",
+        "by_daily",
+        calendar="trade_cal",
+        primary_key_extra=("suspend_type",),
+        field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+    )
+    request = LedgerRequest({"date": "2025-01-02"}, target_end="2025-01-02")
+    valid = pl.DataFrame(
+        {
+            "trade_date": ["20250102", "20250102"],
+            "ts_code": ["A", "B"],
+            "suspend_type": ["S", "S"],
+            "suspend_timing": pl.Series([None, None], dtype=pl.String),
+        }
+    )
+    null_key = valid.with_columns(pl.lit(None).alias("suspend_type"))
+    wrong_date = valid.with_columns(pl.lit("20250103").alias("trade_date"))
+
+    assert _validate_response(spec, request, valid) == (
+        "response payload is entirely null"
+    )
+    assert (
+        _validate_response(
+            spec,
+            request,
+            valid,
+            allow_all_null_payload=True,
+        )
+        is None
+    )
+    assert _validate_response(
+        spec,
+        request,
+        null_key,
+        allow_all_null_payload=True,
+    ) == "response contains null primary keys"
+    assert _validate_response(
+        spec,
+        request,
+        wrong_date,
+        allow_all_null_payload=True,
+    ) == "response contains dates outside requested date 2025-01-02"
+
+
 @pytest.mark.parametrize(
     ("frame", "message"),
     [
@@ -550,9 +596,9 @@ def test_response_validation_runs_in_fetch_worker_but_sqlite_stays_on_scheduler(
     original_validation = update_module._validate_response
     original_transition = lake.metadata.transition_update_scopes
 
-    def tracked_validation(spec, request, frame):
+    def tracked_validation(spec, request, frame, **kwargs):
         validation_threads.append(threading.get_ident())
-        return original_validation(spec, request, frame)
+        return original_validation(spec, request, frame, **kwargs)
 
     def tracked_transition(*args, **kwargs):
         transition_threads.append(threading.get_ident())
