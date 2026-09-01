@@ -122,6 +122,10 @@ def synchronize_requests(
         source_options,
         "allow_all_null_payload",
     )
+    asset_recent_recheck_days = _nonnegative_source_option(
+        source_options,
+        "asset_recent_recheck_days",
+    )
     variants = _base_variants(spec, params, discovered_param_sets)
     if spec.update_type == "general":
         requests = []
@@ -157,6 +161,7 @@ def synchronize_requests(
             final_day=final_day,
             execution_day=execution_day,
             spec_hash=spec_hash,
+            recent_recheck_days=asset_recent_recheck_days,
         )
     raise ConfigurationError(
         f"{spec.source}/{spec.name} unsupported update_type: {spec.update_type}"
@@ -359,6 +364,7 @@ def _asset_requests(
     final_day: date,
     execution_day: date,
     spec_hash: str,
+    recent_recheck_days: int,
 ) -> tuple[LedgerRequest, ...]:
     requested_start = _date_value(start) if start is not None else None
     assets = _asset_bounds(spec, raw, ids)
@@ -405,6 +411,7 @@ def _asset_requests(
             "pending",
             "failed",
             "success",
+            "empty",
         }:
             continue
         initial_start, target_end = bounds[asset_id]
@@ -429,6 +436,15 @@ def _asset_requests(
         if not eligible:
             continue
         request_start = forward_start
+        if forward_due and recent_recheck_days:
+            recent_start = target_end - timedelta(days=recent_recheck_days - 1)
+            if initial_start is not None:
+                recent_start = max(recent_start, initial_start)
+            request_start = (
+                recent_start
+                if request_start is None
+                else min(request_start, recent_start)
+            )
         if revision_due:
             revision_start = target_end - timedelta(
                 days=spec.revision_lookback_days - 1
@@ -608,6 +624,20 @@ def _boolean_source_option(
     value = source_options[name]
     if not isinstance(value, bool):
         raise ConfigurationError(f"source_options.{name} must be boolean")
+    return value
+
+
+def _nonnegative_source_option(
+    source_options: Mapping[str, object] | None,
+    name: str,
+) -> int:
+    if source_options is None or name not in source_options:
+        return 0
+    value = source_options[name]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ConfigurationError(
+            f"source_options.{name} must be a non-negative integer"
+        )
     return value
 
 

@@ -59,8 +59,9 @@ This prevents sparse event data from being downloaded repeatedly while the
 revision window still captures later restatements.
 For every `by_daily` dataset, validated empty scopes in the latest 20
 requested calendar sessions are rechecked on the next update. Older empty
-daily scopes and empty `by_asset` scopes remain terminal until reset or a
-definition change.
+daily scopes remain terminal until reset or a definition change. Empty
+`by_asset` scopes remain quiet at the same target, then become eligible when
+the requested target advances or their revision check is due.
 
 Mappings are true renames, so provider columns named `trade_date` and
 `ts_code` are stored as `time` and `asset_id`. A mapping may rename other

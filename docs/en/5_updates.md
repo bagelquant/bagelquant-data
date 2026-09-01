@@ -56,7 +56,11 @@ explicit reset or definition change.
 For `by_asset`, normal work starts after the provider-check watermark. Once every
 `revision_refresh_days`, the request also includes the preceding
 `revision_lookback_days`, allowing later provider revisions to upsert canonical
-records without repeatedly downloading the full history.
+records without repeatedly downloading the full history. Applications may set
+`source_options.asset_recent_recheck_days` to a non-negative integer. When the
+target advances, the ordinary forward request then overlaps that many recent
+calendar days, catching rows that were published after an earlier provider
+check without changing Dataset identity or resetting committed scopes.
 
 ## Commit and failure semantics
 

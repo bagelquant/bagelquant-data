@@ -140,6 +140,14 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
     )
     assert source.requests == []
 
+    lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-02-01"
+    )
+    assert len(source.requests) == 1
+    assert source.requests[0][1]["start"] == "2025-02-01"
+    assert source.requests[0][1]["end"] == "2025-02-01"
+    source.requests.clear()
+
     assert lake.admin.status.reset_update_scopes(
         [int(row["id"])], clear_watermark=True
     ) == 1
@@ -150,6 +158,67 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
         "income", source="custom", start="2025-01-01", end="2025-01-31"
     )
     assert len(source.requests) == 1
+
+
+def test_asset_forward_update_rechecks_recent_days_for_late_rows(tmp_path) -> None:
+    class LateFinancialSource:
+        name = "custom"
+
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict[str, object]]] = []
+            self.publish_late = False
+
+        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+            self.requests.append((dataset, dict(request)))
+            if not self.publish_late:
+                return pl.DataFrame()
+            return pl.DataFrame(
+                {
+                    "ann_date": ["20250131"],
+                    "ts_code": [str(request["id"])],
+                    "value": [1.0],
+                }
+            )
+
+    source = LateFinancialSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.ingest(
+        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
+        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
+    )
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "income",
+            "by_asset",
+            asset_list="stock_basic",
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
+        )
+    )
+    lake.update.dataset(
+        "income",
+        source="custom",
+        start="2025-01-01",
+        end="2025-01-31",
+        source_options={"asset_recent_recheck_days": 3},
+    )
+    source.publish_late = True
+    source.requests.clear()
+
+    report = lake.update.dataset(
+        "income",
+        source="custom",
+        start="2025-01-01",
+        end="2025-02-01",
+        source_options={"asset_recent_recheck_days": 3},
+    )
+
+    assert report.status == "success"
+    assert source.requests[0][1]["start"] == "2025-01-30"
+    assert source.requests[0][1]["end"] == "2025-02-01"
+    assert lake.query.query("income", source="custom").collect()["time"].item() == date(
+        2025, 1, 31
+    )
 
 
 def test_empty_recheck_preserves_existing_committed_coverage(tmp_path) -> None:

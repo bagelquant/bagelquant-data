@@ -34,9 +34,11 @@ Incremental local coverage is owned by the lake's `update_scopes` ledger.
 records one scope per asset and request variant. A scope becomes successful
 only after its canonical Parquet commit succeeds. Provider-only range checks
 are stored separately in `provider_scope_checks` and never advance local data
-coverage. Validated empty responses are durable `empty` scope outcomes and are
-rechecked on the next update while their dates remain within the latest 20
-requested trading sessions. Older empty daily scopes stay terminal. Repair
+coverage. Validated empty responses are durable `empty` scope outcomes. Daily
+empties are rechecked on the next update while their dates remain within the
+latest 20 requested trading sessions. Empty `by_asset` scopes become eligible
+again when the requested target advances or their revision check is due. Older
+empty daily scopes stay terminal. Repair
 requests finish and commit before new daily scopes begin. Applications may
 compact untouched historical `by_daily` backlog into provider date-range calls;
 the response is still committed and recorded as individual daily scope outcomes,
