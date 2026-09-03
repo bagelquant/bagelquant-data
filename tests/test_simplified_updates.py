@@ -329,6 +329,57 @@ def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
     assert source.requests[0] == {"exchange": "SZSE", "list_status": "P"}
 
 
+def test_dated_general_update_trusts_snapshot_ledger_and_only_fetches_new_target(
+    tmp_path,
+) -> None:
+    source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
+
+    first = lake.update.dataset(
+        "stock_basic", source="custom", end="2025-01-03"
+    )
+    repeated = lake.update.dataset(
+        "stock_basic", source="custom", end="2025-01-03"
+    )
+    advanced = lake.update.dataset(
+        "stock_basic", source="custom", end="2025-01-04"
+    )
+
+    assert first.request_count == 1
+    assert repeated.request_count == 0
+    assert advanced.request_count == 1
+    assert len(source.requests) == 2
+    scopes = lake.admin.status.update_scopes(
+        source="custom", dataset="stock_basic"
+    )
+    assert [(row["scope_key"], row["status"]) for row in scopes] == [
+        ("2025-01-03", "success"),
+        ("2025-01-04", "success"),
+    ]
+
+
+def test_dated_general_update_adopts_existing_manifest_without_provider_read(
+    tmp_path,
+) -> None:
+    source = StaticSource({"stock_basic": pl.DataFrame({"code": ["new"]})})
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    spec = DatasetSpec("stock_basic", "general")
+    lake.ingest(spec, pl.DataFrame({"code": ["stored"]}))
+
+    report = lake.update.dataset(
+        "stock_basic", source="custom", end="2025-01-03"
+    )
+
+    assert report.request_count == 0
+    assert source.requests == []
+    assert lake.query.query_general(
+        "stock_basic", source="custom"
+    ).collect()["code"].to_list() == ["stored"]
+
+
 def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(
     tmp_path,
 ) -> None:
@@ -407,6 +458,45 @@ def test_general_update_retains_existing_data_when_parameter_set_call_fails(
     assert lake.query.query_general("stock_basic", source="custom").collect()[
         "status"
     ].to_list() == ["old"]
+
+
+def test_dated_general_failure_leaves_every_snapshot_scope_retryable(
+    tmp_path,
+) -> None:
+    source = FanoutSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    spec = DatasetSpec(
+        "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D"]},)
+    )
+    lake.admin.datasets.register(spec)
+    initial = lake.update.dataset(
+        "stock_basic",
+        source="custom",
+        end="2025-01-02",
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+    source.failed_status = "D"
+
+    report = lake.update.dataset(
+        "stock_basic",
+        source="custom",
+        end="2025-01-03",
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+
+    scopes = lake.admin.status.update_scopes(
+        dataset="stock_basic", source="custom"
+    )
+    assert initial.status == "success"
+    assert report.status == "failed"
+    assert {str(scope["status"]) for scope in scopes} == {"failed", "success"}
+    assert not any(scope["status"] == "running" for scope in scopes)
+    assert lake.query.query_general("stock_basic", source="custom").collect()[
+        "status"
+    ].sort().to_list() == ["D", "L"]
 
 
 def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(

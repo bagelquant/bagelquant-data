@@ -1162,6 +1162,67 @@ class MetadataStore:
             (source, dataset, scope_kind),
         )
 
+    def adopt_general_snapshot(
+        self,
+        *,
+        source: str,
+        dataset: str,
+        checked_through: str,
+        spec_hash: str,
+        row_count: int,
+    ) -> None:
+        """Adopt an existing manifest as one trusted general-snapshot checkpoint.
+
+        This is a metadata-only bridge for lakes created before general datasets
+        participated in the update-scope ledger.  The manifest remains the
+        committed content authority; ordinary updates do not rescan Parquet.
+        """
+
+        now = _now()
+        variant_hash = f"manifest:{spec_hash}"
+        with self.connect() as db:
+            db.execute("begin immediate")
+            db.execute(
+                """
+                insert into update_scopes(
+                    source,dataset,scope_kind,scope_key,variant_hash,status,
+                    initial_start,checked_through,data_max_time,row_count,
+                    last_success_at,spec_hash,created_at,updated_at
+                ) values (?, ?, 'general_snapshot', ?, ?, 'success', null, ?, ?, ?,
+                          ?, ?, ?, ?)
+                on conflict(source,dataset,scope_kind,scope_key,variant_hash)
+                do nothing
+                """,
+                (
+                    source,
+                    dataset,
+                    checked_through,
+                    variant_hash,
+                    checked_through,
+                    checked_through,
+                    int(row_count),
+                    now,
+                    spec_hash,
+                    now,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "select id from update_scopes where source=? and dataset=? "
+                "and scope_kind='general_snapshot' and scope_key=? "
+                "and variant_hash=?",
+                (source, dataset, checked_through, variant_hash),
+            ).fetchone()
+            assert row is not None
+            self._upsert_provider_scope_check(
+                db,
+                scope_id=int(row["id"]),
+                checked_through=checked_through,
+                recheck_after=None,
+                result="nonempty",
+                checked_at=now,
+            )
+
     def reset_update_scopes(
         self, scope_ids: Iterable[int], *, clear_watermark: bool = False
     ) -> int:

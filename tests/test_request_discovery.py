@@ -74,6 +74,32 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
     ]
 
 
+def test_dated_general_discovery_is_skipped_for_completed_snapshot(tmp_path) -> None:
+    source = DiscoverySource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.admin.datasets.register(
+        DatasetSpec(
+            "logical_membership",
+            "general",
+            source_api="provider_target",
+            source_api_param_sets=({"region": "north"},),
+            request_discovery=_discovery(),
+        )
+    )
+
+    lake.update.dataset(
+        "logical_membership", source="custom", end="2025-01-03"
+    )
+    call_count = len(source.calls)
+    report = lake.update.dataset(
+        "logical_membership", source="custom", end="2025-01-03"
+    )
+
+    assert report.request_count == 0
+    assert len(source.calls) == call_count
+
+
 def test_discovery_values_expand_daily_and_asset_ledger_variants(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     lake.ingest(

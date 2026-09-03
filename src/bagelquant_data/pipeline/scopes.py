@@ -128,14 +128,49 @@ def synchronize_requests(
     )
     variants = _base_variants(spec, params, discovered_param_sets)
     if spec.update_type == "general":
-        requests = []
-        for _, request in variants:
-            if start is not None:
-                request["start"] = _date_value(start).isoformat()
-            if end is not None:
-                request["end"] = final_day.isoformat()
-            requests.append(LedgerRequest(request))
-        return tuple(requests)
+        # An omitted target preserves the explicit refresh API.  A dated
+        # workflow, such as Automation, instead records one immutable snapshot
+        # checkpoint per request variant and never repeats a completed target.
+        if end is None:
+            return tuple(LedgerRequest(request) for _, request in variants)
+        target = final_day.isoformat()
+        spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
+        metadata.synchronize_update_scopes(
+            {
+                "source": spec.source,
+                "dataset": spec.name,
+                "scope_kind": "general_snapshot",
+                "scope_key": target,
+                "variant_hash": variant_hash,
+                "initial_start": None,
+                "spec_hash": spec_hash,
+            }
+            for variant_hash, _ in variants
+        )
+        metadata.remove_obsolete_update_scopes(
+            source=spec.source, dataset=spec.name, spec_hash=spec_hash
+        )
+        params_by_variant = dict(variants)
+        rows = metadata.update_scopes_with_checks(
+            source=spec.source,
+            dataset=spec.name,
+            scope_kind="general_snapshot",
+        )
+        return tuple(
+            LedgerRequest(
+                dict(params_by_variant[str(row["variant_hash"])]),
+                scope_id=int(row["id"]),
+                request_kind=(
+                    "retry" if row["status"] in {"failed", "invalid"} else "forward"
+                ),
+                target_end=target,
+                variant_hash=str(row["variant_hash"]),
+            )
+            for row in rows
+            if str(row["scope_key"]) == target
+            and str(row["variant_hash"]) in params_by_variant
+            and row["status"] in {"pending", "failed", "invalid"}
+        )
 
     spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
     if spec.update_type == "by_daily":

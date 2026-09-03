@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +236,24 @@ class LakeUpdater:
                     "progress_callback": progress_callback,
                 },
             )
+            if (
+                spec.update_type == "general"
+                and context.end is not None
+                and _general_snapshot_is_current(
+                    self.lake,
+                    spec,
+                    context.end,
+                )
+            ):
+                works.append(
+                    DatasetUpdateWork(
+                        spec=spec,
+                        context=context,
+                        requests=(),
+                        planning_seconds=time.perf_counter() - planning_started,
+                    )
+                )
+                continue
             discovered_param_sets, discovery_call = discover_request_param_sets(
                 spec, adapter
             )
@@ -248,7 +267,7 @@ class LakeUpdater:
                 raw=raw,
                 metadata=self.lake.metadata,
                 start=context.start if spec.update_type != "general" else None,
-                end=context.end if spec.update_type != "general" else None,
+                end=context.end,
                 today=context.options.get("today"),
                 ids=context.options.get("ids"),
                 params=context.options.get("params"),
@@ -304,6 +323,50 @@ class LakeUpdater:
             selected_datasets,
         )
         return replace(report, changed_partitions=_partition_changes(before, after))
+
+
+def _general_snapshot_is_current(
+    lake: DataLake,
+    spec: DatasetSpec,
+    end: DateLike,
+) -> bool:
+    """Trust the dated general-snapshot ledger, adopting legacy manifests once."""
+
+    target = _as_date(end).isoformat()
+    spec_hash = lake.metadata.dataset_spec_hash(spec.source, spec.name)
+    all_rows = lake.metadata.update_scopes_with_checks(
+        source=spec.source,
+        dataset=spec.name,
+        scope_kind="general_snapshot",
+    )
+    rows = [
+        row
+        for row in all_rows
+        if str(row["scope_key"]) == target and str(row["spec_hash"]) == spec_hash
+    ]
+    if rows:
+        return all(str(row["status"]) in {"success", "empty"} for row in rows)
+    if all_rows:
+        return False
+    manifests = lake.metadata.manifest(spec.source, spec.name)
+    if not manifests:
+        return False
+    lake.metadata.adopt_general_snapshot(
+        source=spec.source,
+        dataset=spec.name,
+        checked_through=target,
+        spec_hash=spec_hash,
+        row_count=sum(int(row.get("row_count", 0)) for row in manifests),
+    )
+    return True
+
+
+def _as_date(value: DateLike) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 def _request_context(
     source: str, dataset: str, kwargs: dict[str, Any]

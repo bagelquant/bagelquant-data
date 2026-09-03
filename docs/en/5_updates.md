@@ -23,12 +23,17 @@ eligible rows. It never infers completeness from the maximum date in Parquet.
 - `data_max_time` and scope success are local, commit-backed facts.
 - `provider_scope_checks.checked_through` records the end of a validated
   provider check independently from the latest returned observation.
-- `general` datasets remain explicit replacement refreshes and do not use
-  incremental scopes.
+- `general` datasets without an explicit `end` remain replacement refreshes.
+  A dated update instead owns one immutable snapshot scope per parameter
+  variant. Repeating the same target date trusts successful/empty scope rows
+  and makes no Provider call; advancing the target date creates only the new
+  snapshot scopes. An existing general manifest is adopted into this ledger
+  once, without rereading Parquet or calling the Provider.
 
-For a dataset with `request_discovery`, discovery runs once per explicit update
-before scopes are synchronized. Its normalized values participate in the same
-variant identity as static parameters, so daily and asset ledgers retain
+For a dataset with `request_discovery`, discovery runs before scopes are
+synchronized when the requested target does not already have complete ledger
+state. Its normalized values participate in the same variant identity as
+static parameters, so daily, asset, and dated general ledgers retain
 independent recoverable scopes for every discovered value. The discovery call
 is recorded in the target dataset's API audit with `request_kind = 'discovery'`.
 If discovery fails, produces no values, or a general fan-out request fails, the

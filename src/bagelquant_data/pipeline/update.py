@@ -716,8 +716,11 @@ def _commit_state(
     if state.work.spec.update_type == "general" and (
         state.failure_count or state.invalid_count
     ):
-        state.buffered.clear()
-        state.buffered_bytes = 0
+        _fail_buffered(
+            pipeline,
+            state,
+            "general snapshot incomplete because another request failed",
+        )
         return
     _emit_progress(callback, state, "commit", completed, total=total)
     buffered = list(state.buffered)
@@ -825,7 +828,11 @@ def _canonical_data_maxima(
     buffered: Sequence[tuple[pl.DataFrame, LedgerRequest]],
 ) -> dict[int | None, str]:
     if spec.update_type == "general":
-        return {}
+        return {
+            request.scope_id: str(request.target_end)
+            for _, request in buffered
+            if request.scope_id is not None and request.target_end is not None
+        }
     requests = [request for _, request in buffered]
     if spec.update_type == "by_asset":
         maxima = dict(commit.asset_max_times)
