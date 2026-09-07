@@ -1,22 +1,33 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      POLARS_MAX_THREADS: '4'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v5
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-      - name: Set up Python
-        uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-      - name: Install dependencies
-        run: uv sync --all-groups --extra tushare
-      - name: Pytest
-        run: uv run pytest
+          path: bagelquant-data
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+      - name: Validate package
+        working-directory: bagelquant-data
+        run: |
+          uv sync --locked --extra tushare
+          uv run --no-sync ruff check .
+          uv run --no-sync python -m pytest --basetemp=.test-tmp/ci -o cache_dir=.test-tmp/cache
+          uv run --no-sync pyright

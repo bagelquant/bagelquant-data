@@ -1473,7 +1473,11 @@ def _fetch_one(
 ) -> FetchPage:
     last_error: Exception | None = None
     for attempt in range(max_retries):
-        if cancel_requested is not None and cancel_requested():
+        admission = getattr(source_adapter, "wait_for_request", None)
+        canceled = cancel_requested is not None and cancel_requested()
+        if not canceled and callable(admission):
+            canceled = not admission(spec.source_api or spec.name, cancel_requested)
+        if canceled:
             return FetchPage(
                 request_key,
                 request,

@@ -1,13 +1,55 @@
 import pandas as pd
+import pytest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from bagelquant_data.sources.tushare.client import build_client
 from bagelquant_data.sources.tushare.source import TushareSource, _to_tushare_params
+from bagelquant_data.sources.tushare import source as source_module
 
 
 def test_tushare_maps_default_daily_date_to_trade_date() -> None:
     assert _to_tushare_params({"date": "2025-01-02"}) == {"trade_date": "20250102"}
+
+
+def test_provider_quota_coordinates_cooldown_and_pacing(monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(source_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Limited:
+        def balancesheet(self):
+            raise RuntimeError("接口频率超限(500次/分钟)")
+
+    source = TushareSource(client=Limited())
+    with pytest.raises(RuntimeError, match="500"):
+        source.fetch("balancesheet", {})
+    assert source.wait_for_request("income")  # independent endpoint
+    assert clock[0] == 100.0
+    assert source.wait_for_request("balancesheet")
+    assert clock[0] >= 161.0
+    before = clock[0]
+    assert source.wait_for_request("balancesheet")
+    assert clock[0] - before >= 60 / 450 - 1e-9
+
+
+def test_provider_admission_is_cancelable_without_calling_provider(monkeypatch) -> None:
+    from bagelquant_data.core.dataset import DatasetSpec
+    from bagelquant_data.pipeline.update import _fetch_one
+
+    source = TushareSource(client=object())
+    source._rate_limits["balancesheet"] = (1.0, source_module.time.monotonic() + 60)
+    checks = [0]
+
+    def canceled():
+        checks[0] += 1
+        return checks[0] > 2
+
+    result = _fetch_one(
+        DatasetSpec(name="balancesheet", source="tushare", update_type="by_asset"),
+        source, {"id": "A"}, "request", 3, 60.0, canceled,
+    )
+    assert result.status == "cancelled"
 
 
 def test_tushare_preserves_configured_daily_date_parameter() -> None:

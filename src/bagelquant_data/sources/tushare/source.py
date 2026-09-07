@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+import re
+import time
 from threading import Lock, local
 from typing import Any
 
@@ -27,6 +29,8 @@ class TushareSource:
         self._provided_client = client
         self._clients = local()
         self._client_lock = Lock()
+        self._rate_lock = Lock()
+        self._rate_limits: dict[str, tuple[float, float]] = {}
 
     @property
     def name(self) -> str:
@@ -57,14 +61,42 @@ class TushareSource:
         client = self._ensure_client()
         params = _to_tushare_params(request)
         method = getattr(client, dataset, None)
-        if callable(method):
-            result = method(**params)
-        else:
-            query = getattr(client, "query", None)
-            if not callable(query):
-                raise DataSourceError(f"Tushare API is not available: {dataset}")
-            result = query(dataset, **params)
+        try:
+            if callable(method):
+                result = method(**params)
+            else:
+                query = getattr(client, "query", None)
+                if not callable(query):
+                    raise DataSourceError(f"Tushare API is not available: {dataset}")
+                result = query(dataset, **params)
+        except Exception as error:
+            # The provider reports the account's actual quota. Share the
+            # cooldown and subsequent paced admission across all fetch threads.
+            match = re.search(r"(\d+)\s*次\s*/\s*分钟", str(error))
+            if match and int(match[1]) > 0:
+                interval = 60.0 / (int(match[1]) * 0.9)
+                with self._rate_lock:
+                    self._rate_limits[dataset] = (interval, time.monotonic() + 61.0)
+            raise
         return _from_pandas(result)
+
+    def wait_for_request(
+        self, dataset: str, cancel_requested: Callable[[], bool] | None = None
+    ) -> bool:
+        """Admit a physical request, with cancelable shared provider throttling."""
+
+        while True:
+            if cancel_requested is not None and cancel_requested():
+                return False
+            with self._rate_lock:
+                interval, next_request = self._rate_limits.get(dataset, (0.0, 0.0))
+                now = time.monotonic()
+                delay = next_request - now
+                if delay <= 0:
+                    if interval:
+                        self._rate_limits[dataset] = (interval, now + interval)
+                    return True
+            time.sleep(min(delay, 0.1))
 
     def _ensure_client(self) -> Any:
         if self._provided_client is not None:
