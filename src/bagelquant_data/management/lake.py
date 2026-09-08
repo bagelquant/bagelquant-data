@@ -225,6 +225,8 @@ class LakeUpdater:
         works: list[DatasetUpdateWork] = []
         for dataset in dict.fromkeys(datasets):
             planning_started = time.perf_counter()
+            if progress_callback is not None:
+                progress_callback(UpdateProgress(dataset, "planning", 0, 0, 0, 0, 0, "running"))
             spec = self.lake.admin.datasets.get(dataset, source=source)
             context = _request_context(
                 source=source,
@@ -254,6 +256,8 @@ class LakeUpdater:
                     )
                 )
                 continue
+            if progress_callback is not None:
+                progress_callback(UpdateProgress(dataset, "discovery", 0, 0, 0, 0, 0, "running"))
             discovered_param_sets, discovery_call = discover_request_param_sets(
                 spec, adapter
             )
@@ -330,7 +334,7 @@ def _general_snapshot_is_current(
     spec: DatasetSpec,
     end: DateLike,
 ) -> bool:
-    """Trust the dated general-snapshot ledger, adopting legacy manifests once."""
+    """Reuse a dated snapshot only while its canonical files still exist."""
 
     target = _as_date(end).isoformat()
     spec_hash = lake.metadata.dataset_spec_hash(spec.source, spec.name)
@@ -344,21 +348,17 @@ def _general_snapshot_is_current(
         for row in all_rows
         if str(row["scope_key"]) == target and str(row["spec_hash"]) == spec_hash
     ]
-    if rows:
-        return all(str(row["status"]) in {"success", "empty"} for row in rows)
-    if all_rows:
-        return False
     manifests = lake.metadata.manifest(spec.source, spec.name)
-    if not manifests:
+    root = lake.paths.dataset_root(spec.source, spec.name)
+    if not manifests or any(
+        not (root / str(row["partition_path"])).is_file() for row in manifests
+    ):
         return False
-    lake.metadata.adopt_general_snapshot(
-        source=spec.source,
-        dataset=spec.name,
-        checked_through=target,
-        spec_hash=spec_hash,
-        row_count=sum(int(row.get("row_count", 0)) for row in manifests),
+    return bool(rows) and all(
+        str(row["status"]) in {"success", "empty"}
+        and not str(row["variant_hash"]).startswith("manifest:")
+        for row in rows
     )
-    return True
 
 
 def _as_date(value: DateLike) -> date:

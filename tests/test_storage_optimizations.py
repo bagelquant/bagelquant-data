@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import os
+import subprocess
+import sys
 from datetime import date
 
 import pandas as pd
@@ -81,6 +84,25 @@ def test_arrow_content_hash_is_logical_and_schema_sensitive() -> None:
     assert frame_content_hash(base) != frame_content_hash(
         base.with_columns(pl.col("value") + 1)
     )
+
+
+def test_arrow_hash_ignores_validity_padding_across_worker_counts(tmp_path) -> None:
+    frame = pl.DataFrame({
+        "time": pl.date_range(date(1990, 12, 19), date(2027, 12, 31), eager=True),
+    }).with_columns(
+        pl.lit("SSE").alias("exchange"),
+        pl.col("time").dt.strftime("%Y%m%d").shift(1).alias("previous"),
+        pl.lit("custom").alias("source"),
+    )
+    path = tmp_path / "calendar.parquet"
+    frame.write_parquet(path)
+    code = "import sys,polars as pl;from bagelquant_data.core.hashing import frame_content_hash;print(frame_content_hash(pl.read_parquet(sys.argv[1])))"
+    hashes = {
+        subprocess.check_output([sys.executable, "-c", code, str(path)],
+            env={**os.environ, "POLARS_MAX_THREADS": str(n)}, text=True).strip()
+        for n in (1, 2, 4, 7, 8)
+    }
+    assert hashes == {frame_content_hash(frame)}
 
 
 def test_arrow_content_hash_survives_foreign_strings_parquet_roundtrip(

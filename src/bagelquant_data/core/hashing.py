@@ -47,8 +47,41 @@ def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None)
         )
     canonical = candidate.sort(selected).rechunk()
     table = canonical.to_arrow().combine_chunks()
+    table = pa.Table.from_arrays(
+        [_canonical_bitmap(column.chunk(0)) for column in table.columns],
+        schema=table.schema,
+    ) if table.num_rows else table
     sink = pa.BufferOutputStream()
     with ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     digest = hashlib.blake2b(sink.getvalue(), digest_size=16).hexdigest()
     return f"{CONTENT_HASH_ALGORITHM}:{digest}"
+
+
+def _canonical_bitmap(array: pa.Array) -> pa.Array:
+    """Exclude unused validity bits from IPC's physical representation.
+
+    Arrow leaves padding bits unspecified. Parallel Polars sorts can set them
+    differently for equal logical arrays; IPC serializes the final byte as-is.
+    Rebuild only that bitmap, retaining the columnar value buffers.
+    """
+    if pa.types.is_dictionary(array.type):
+        return pa.DictionaryArray.from_arrays(
+            _canonical_bitmap(array.indices), array.dictionary,
+            ordered=array.type.ordered,
+        )
+    children = None
+    if pa.types.is_struct(array.type):
+        children = [_canonical_bitmap(array.field(i)) for i in range(array.type.num_fields)]
+    elif pa.types.is_list(array.type) or pa.types.is_large_list(array.type) or pa.types.is_fixed_size_list(array.type) or pa.types.is_map(array.type):
+        children = [_canonical_bitmap(array.values)]
+    buffers = list(array.buffers()[:array.type.num_buffers])
+    end = array.offset + len(array)
+    if buffers and buffers[0] is not None and end % 8:
+        validity = bytearray(buffers[0])
+        validity[(end - 1) // 8] &= (1 << (end % 8)) - 1
+        buffers[0] = pa.py_buffer(validity)
+    return pa.Array.from_buffers(
+        array.type, len(array), buffers, null_count=array.null_count,
+        offset=array.offset, children=children,
+    )

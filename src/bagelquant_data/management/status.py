@@ -8,7 +8,7 @@ import os
 import uuid
 from collections import Counter
 from collections.abc import Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ import polars as pl
 from bagelquant_data.core.dataset import DatasetSpec, incremental_key
 from bagelquant_data.core.exceptions import DestructiveOperationError
 from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
+from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
 
@@ -128,7 +129,9 @@ class StatusManager:
                 row
             )
         summaries = []
+        datasets = DatasetManager(self.metadata, self.paths)
         for (row_source, row_dataset), scopes in sorted(grouped.items()):
+            spec = datasets.get(row_dataset, source=row_source)
             counts = Counter(str(scope["status"]) for scope in scopes)
             pending_keys = [
                 str(scope["scope_key"])
@@ -152,7 +155,8 @@ class StatusManager:
             ]
             revision_due = sum(
                 _revision_due(
-                    scope, provider_checks.get(int(scope["id"]))
+                    scope, provider_checks.get(int(scope["id"])),
+                    refresh_days=spec.revision_refresh_days,
                 )
                 for scope in scopes
             )
@@ -162,7 +166,7 @@ class StatusManager:
                 if scope["status"] in {"success", "empty"}
                 and (check := provider_checks.get(int(scope["id"]))) is not None
                 and check["recheck_after"] is not None
-                and date.fromisoformat(str(check["recheck_after"])) > date.today()
+                and date.fromisoformat(str(check["recheck_after"])) > datetime.now(UTC).date()
             ]
             summaries.append(
                 {
@@ -896,10 +900,19 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _revision_due(
-    scope: dict[str, Any], provider_check: dict[str, Any] | None
+    scope: dict[str, Any], provider_check: dict[str, Any] | None,
+    *, refresh_days: int,
 ) -> bool:
     if scope["scope_kind"] != "asset" or scope["status"] == "running":
         return False
-    if provider_check is None or provider_check["recheck_after"] is None:
+    if provider_check is None or provider_check["last_checked_at"] is None:
         return True
-    return date.fromisoformat(str(provider_check["recheck_after"])) <= date.today()
+    recheck = provider_check["recheck_after"]
+    last_checked = datetime.fromisoformat(str(provider_check["last_checked_at"]))
+    if last_checked.tzinfo is None:
+        last_checked = last_checked.replace(tzinfo=UTC)
+    # Empty responses are terminal checks too. A missing explicit schedule uses
+    # the same refresh interval as the request planner, not an immediate retry.
+    return bool(
+        recheck is not None and date.fromisoformat(str(recheck)) <= datetime.now(UTC).date()
+    ) or (datetime.now(UTC) - last_checked).days >= refresh_days

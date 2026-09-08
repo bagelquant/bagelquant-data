@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -79,6 +79,11 @@ class UpdateProgress:
     empty_count: int = 0
     invalid_count: int = 0
     remaining_count: int = 0
+    current_scope: str = ""
+    in_flight: int = 0
+    request_count: int = 0
+    wait_reason: str = ""
+    wait_seconds: float = 0.0
 
 
 type UpdateProgressCallback = Callable[[UpdateProgress], None]
@@ -130,6 +135,10 @@ class _RunState:
     invalid_count: int = 0
     rows_downloaded: int = 0
     rows_committed: int = 0
+    current_scope: str = ""
+    in_flight: int = 0
+    wait_reason: str = ""
+    wait_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
     buffered: list[tuple[pl.DataFrame, LedgerRequest]] = field(default_factory=list)
     buffered_bytes: int = 0
@@ -154,6 +163,13 @@ def _scope_ids(request: LedgerRequest) -> tuple[int, ...]:
     if request.daily_scopes:
         return tuple(scope.scope_id for scope in request.daily_scopes)
     return () if request.scope_id is None else (request.scope_id,)
+
+
+def _request_detail(request: LedgerRequest) -> str:
+    return ", ".join(
+        f"{key}={value}" for key, value in request.params.items()
+        if key in {"date", "trade_date", "ex_date", "ann_date", "start", "end", "start_date", "end_date", "period", "id", "ts_code", "l1_code", "is_new", "list_status"}
+    )
 
 
 def _scope_count(request: LedgerRequest) -> int:
@@ -396,6 +412,7 @@ def _run_fetches(
     futures: dict[Future[PreparedFetch], tuple[float, UpdateTask]] = {}
     stop_submission = False
     next_heartbeat = time.monotonic() + 30.0
+    next_activity = time.monotonic()
 
     def cancellation_requested() -> bool:
         return any(_cancel_requested(state.work.context) for state in states.values())
@@ -450,6 +467,9 @@ def _run_fetches(
             return False
         index, task = ready.popleft()
         work, request = task
+        state = states[work.spec.name]
+        state.current_scope = _request_detail(request)
+        state.in_flight = len(futures) + 1
         _emit_progress(
             callbacks[work.spec.name],
             states[work.spec.name],
@@ -479,6 +499,20 @@ def _run_fetches(
     while len(futures) < max_in_flight and submit_next():
         pass
     while futures:
+        if time.monotonic() >= next_activity:
+            request_status = getattr(source_adapter, "request_status", None)
+            for state in states.values():
+                active = [request for _, (work, request) in futures.values() if work.spec.name == state.work.spec.name]
+                state.in_flight = len(active)
+                state.current_scope = _request_detail(active[0]) if active else ""
+                observed_status = request_status(state.work.spec.source_api or state.work.spec.name) if callable(request_status) else {}
+                activity = observed_status if isinstance(observed_status, Mapping) else {}
+                state.wait_reason = str(activity.get("wait_reason", ""))
+                state.wait_seconds = float(activity.get("wait_seconds", 0.0))
+                _emit_progress(callbacks[state.work.spec.name], state,
+                               "waiting" if state.wait_reason else "fetch",
+                               completed[state.work.spec.name], total=totals[state.work.spec.name])
+            next_activity = time.monotonic() + 3.0
         if time.monotonic() >= next_heartbeat:
             for state in states.values():
                 pipeline.metadata.refresh_update_lease(run_id=state.work.run_id)
@@ -492,6 +526,9 @@ def _run_fetches(
         for future in done:
             submitted_at, (work, request) = futures.pop(future)
             state = states[work.spec.name]
+            state.in_flight = len(futures)
+            state.wait_reason = ""
+            state.wait_seconds = 0.0
             prepared = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
             started = time.perf_counter()
@@ -605,7 +642,10 @@ def _harvest_request(
             scope_id=request.scope_id,
             run_id=state.work.run_id,
             checked_through=request.target_end,
-            recheck_after=None,
+            recheck_after=(
+                request.recheck_after
+                if state.work.spec.update_type == "by_asset" else None
+            ),
         )
         state.request_count += request_count
         state.rows_downloaded += downloaded
@@ -1034,6 +1074,11 @@ def _remaining_scope_count(pipeline: IngestionPipeline, state: _RunState) -> int
         dataset=state.work.spec.name,
         status=("pending", "failed"),
     )
+    if state.work.spec.update_type == "general":
+        # Dated General checkpoints replace one canonical snapshot. An older
+        # unsuccessful attempt is history, not work left in this refresh.
+        targets = {request.target_end for request in state.work.requests}
+        rows = [row for row in rows if row["scope_key"] in targets]
     return len(rows)
 
 
@@ -1674,5 +1719,10 @@ def _emit_progress(
             empty_count=state.empty_count,
             invalid_count=state.invalid_count,
             remaining_count=max(0, final_total - completed),
+            current_scope=state.current_scope,
+            in_flight=state.in_flight,
+            request_count=state.request_count,
+            wait_reason=state.wait_reason,
+            wait_seconds=state.wait_seconds,
         )
     )

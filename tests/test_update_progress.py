@@ -84,8 +84,9 @@ def test_progress_callback_reports_ledger_phases_and_completion(tmp_path) -> Non
     )
 
     assert report.status == "success"
-    assert events[0].phase == "sync"
-    assert events[1].phase == "claim"
+    assert events[0].phase == "planning"
+    phases = [event.phase for event in events]
+    assert phases.index("planning") < phases.index("sync") < phases.index("claim")
     assert any(event.phase == "fetch" and event.completed == 1 for event in events)
     assert any(event.phase == "commit" for event in events)
     assert events[-1].phase == "complete"
@@ -105,7 +106,7 @@ def test_progress_callback_counts_paginated_request_as_one_scope(tmp_path) -> No
         progress_callback=events.append,
     )
 
-    assert events[0].total == 1
+    assert next(event for event in events if event.phase == "sync").total == 1
     assert any(event.completed == 1 and event.total == 1 for event in events)
     assert events[-1].total == 1
 
@@ -149,7 +150,7 @@ def test_range_backfill_progress_counts_logical_daily_scopes(tmp_path) -> None:
         progress_callback=events.append,
     )
 
-    assert events[0].total == 3
+    assert next(event for event in events if event.phase == "sync").total == 3
     assert any(event.phase == "fetch" and event.completed == 3 for event in events)
     assert events[-1].total == 3
     assert events[-1].success_count == 3

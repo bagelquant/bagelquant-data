@@ -68,3 +68,15 @@ database fails with a clear incompatibility error; the library never migrates,
 repairs, backs up, or rewrites an old lake automatically. Stop all workers,
 delete or archive the old lake, and create a fresh lake root before downloading
 again.
+
+## Snapshot repair and activity
+
+A General snapshot is current only when its canonical manifest and files exist and all current parameter variants have terminal provider scopes. Missing snapshots or unfinished variants cause an explicit update to refetch the entire fanout before replacing the snapshot. Legacy manifest-only scopes are never adopted as provider coverage.
+
+The arrow-ipc-v1 logical hash normalizes unused trailing validity bits before serialization, so identical nullable data has the same checksum across worker counts. Actual values, schema and null positions remain covered.
+
+UpdateProgress includes planning and discovery callbacks before scope counts are known. Fetch activity includes current_scope, in_flight, request_count, wait_reason and wait_seconds. Optional source request_status reports quota waiting without contacting the provider. Completed counts represent logical processed scopes; rows_committed separately tracks publication. Heartbeat pulses never advance either count.
+
+For dated General updates, completion counts belong to the requested snapshot; an unfinished older checkpoint remains attempt history and does not make a successful later full refresh partial.
+
+Asset-level empty provider responses retain their revision recheck schedule. Status uses the same UTC refresh interval as request planning when a prior check has no explicit recheck date; a completed empty response is not immediately revision-due.

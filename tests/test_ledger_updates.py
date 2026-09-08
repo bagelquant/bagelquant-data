@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 import sqlite3
 
 import polars as pl
@@ -128,6 +128,13 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
     assert len(checks) == 1
     assert checks[0]["checked_through"] == "2025-01-31"
     assert checks[0]["last_result"] == "empty"
+    assert checks[0]["recheck_after"] == (datetime.now(UTC).date() + timedelta(days=30)).isoformat()
+    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
+    # Previously recorded empty checks omitted the explicit schedule. Status
+    # must agree with the planner's last-check-based fallback for these rows.
+    with sqlite3.connect(lake.metadata.path) as connection:
+        connection.execute("UPDATE provider_scope_checks SET recheck_after=NULL")
+    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
     stored_run = next(
         run for run in lake.admin.status.runs() if run["run_id"] == report.run_id
     )
@@ -146,6 +153,19 @@ def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> N
     assert len(source.requests) == 1
     assert source.requests[0][1]["start"] == "2025-02-01"
     assert source.requests[0][1]["end"] == "2025-02-01"
+    source.requests.clear()
+
+    with sqlite3.connect(lake.metadata.path) as connection:
+        connection.execute(
+            "UPDATE provider_scope_checks SET recheck_after=NULL,last_checked_at=?",
+            ((datetime.now(UTC) - timedelta(days=31)).isoformat(),),
+        )
+    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 1
+    lake.update.dataset(
+        "income", source="custom", start="2025-01-01", end="2025-02-01"
+    )
+    assert len(source.requests) == 1
+    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
     source.requests.clear()
 
     assert lake.admin.status.reset_update_scopes(

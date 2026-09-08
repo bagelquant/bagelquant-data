@@ -98,6 +98,14 @@ class TushareSource:
                     return True
             time.sleep(min(delay, 0.1))
 
+    def request_status(self, dataset: str) -> dict[str, object]:
+        """Return endpoint admission state without waiting or calling a provider."""
+        with self._rate_lock:
+            _, next_request = self._rate_limits.get(dataset, (0.0, 0.0))
+            remaining = max(0.0, next_request - time.monotonic())
+        return {"wait_reason": "provider_rate_limit" if remaining > 1 else "",
+                "wait_seconds": round(remaining, 1)}
+
     def _ensure_client(self) -> Any:
         if self._provided_client is not None:
             return self._provided_client

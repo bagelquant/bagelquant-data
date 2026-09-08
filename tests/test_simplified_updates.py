@@ -360,7 +360,7 @@ def test_dated_general_update_trusts_snapshot_ledger_and_only_fetches_new_target
     ]
 
 
-def test_dated_general_update_adopts_existing_manifest_without_provider_read(
+def test_dated_general_update_requires_a_real_snapshot_checkpoint(
     tmp_path,
 ) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["new"]})})
@@ -373,11 +373,45 @@ def test_dated_general_update_adopts_existing_manifest_without_provider_read(
         "stock_basic", source="custom", end="2025-01-03"
     )
 
-    assert report.request_count == 0
-    assert source.requests == []
+    assert report.request_count == 1
+    assert source.requests == [{}]
     assert lake.query.query_general(
         "stock_basic", source="custom"
-    ).collect()["code"].to_list() == ["stored"]
+    ).collect()["code"].to_list() == ["new"]
+
+
+def test_dated_general_update_refetches_after_quarantine(tmp_path) -> None:
+    source = FanoutSource()
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.admin.datasets.register(DatasetSpec(
+        "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D", "P"]},),
+    ))
+    first = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
+    assert first.request_count == 3
+    lake.admin.quarantine_partitions("stock_basic", source="custom",
+        partition_paths=["data.parquet"], reason="fixture damage", repair_id="test", confirm=True)
+    repaired = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
+    assert repaired.request_count == 3
+    assert repaired.status == "success"
+    assert lake.admin.validate_dataset("stock_basic", source="custom", deep=True)["valid"]
+
+
+def test_new_general_snapshot_supersedes_an_unfinished_older_attempt(tmp_path) -> None:
+    source = FanoutSource(failed_status="D")
+    lake = DataLake.open(tmp_path)
+    lake.admin.sources.register(source)
+    lake.admin.datasets.register(DatasetSpec(
+        "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D", "P"]},),
+    ))
+    failed = lake.update.dataset("stock_basic", source="custom", end="2025-01-02", max_retries=1)
+    assert failed.status == "failed"
+    source.failed_status = None
+    repaired = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
+    assert repaired.request_count == 3
+    assert repaired.status == "success"
+    assert repaired.remaining_scope_count == 0
+    assert lake.admin.validate_dataset("stock_basic", source="custom", deep=True)["valid"]
 
 
 def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(

@@ -156,6 +156,23 @@ def synchronize_requests(
             dataset=spec.name,
             scope_kind="general_snapshot",
         )
+        current = [row for row in rows if str(row["scope_key"]) == target
+                   and str(row["variant_hash"]) in params_by_variant]
+        # General publication replaces the complete snapshot. Never retry only
+        # part of its variants, or trust terminal scopes after file quarantine.
+        manifests = metadata.manifest(spec.source, spec.name)
+        root = raw.parquet.paths.dataset_root(spec.source, spec.name)
+        missing_snapshot = not manifests or any(
+            not (root / str(row["partition_path"])).is_file() for row in manifests
+        )
+        if missing_snapshot or any(row["status"] in {"pending", "failed", "invalid"} for row in current):
+            metadata.reset_update_scopes(
+                [int(row["id"]) for row in current if row["status"] in {"success", "empty"}],
+                clear_watermark=True,
+            )
+            rows = metadata.update_scopes_with_checks(
+                source=spec.source, dataset=spec.name, scope_kind="general_snapshot",
+            )
         return tuple(
             LedgerRequest(
                 dict(params_by_variant[str(row["variant_hash"])]),
