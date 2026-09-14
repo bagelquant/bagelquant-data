@@ -26,9 +26,10 @@ class FrameworkValidator:
         missing = sorted(required - names)
         if missing:
             raise ValidationError(f"{spec.source}/{spec.name} missing fields: {missing}")
-        if required and frame.select(
+        non_nullable = required - set(spec.nullable_primary_key_extra)
+        if non_nullable and frame.select(
             pl.any_horizontal(
-                pl.col(column).is_null() for column in sorted(required)
+                pl.col(column).is_null() for column in sorted(non_nullable)
             ).any()
         ).collect().item():
             raise ValidationError(

@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from bagelquant_data.core.dataset import (
-    ASSET_BUCKET_COUNT,
     DatasetSpec,
     RequestDiscoverySpec,
     dataset_key,
@@ -35,20 +34,6 @@ class DatasetManager:
 
     def register(self, spec: DatasetSpec) -> DatasetSpec:
         self.validate_spec(spec)
-        existing = self.metadata.get_dataset(spec.source, spec.name)
-        if existing is not None:
-            current = _spec_from_mapping(json.loads(existing["spec_json"]), stored=True)
-            if (
-                current.update_type == "by_asset"
-                and spec.update_type == "by_asset"
-                and current.asset_bucket_count != spec.asset_bucket_count
-                and self.metadata.manifest(spec.source, spec.name)
-            ):
-                raise DatasetSpecError(
-                    f"{spec.source}/{spec.name} asset_bucket_count cannot change "
-                    "while canonical data exists; clear the dataset before registering "
-                    "the new partition layout"
-                )
         self._specs[dataset_key(spec)] = spec
         self.metadata.upsert_dataset(spec)
         return spec
@@ -82,8 +67,9 @@ class DatasetManager:
     def disable(self, dataset: str, *, source: str) -> None:
         self.metadata.set_dataset_enabled(source, dataset, False)
 
-    def validate_spec(self, spec: DatasetSpec) -> None:
-        if spec.update_type not in {"general", "by_daily", "by_asset"}:
+    @staticmethod
+    def validate_spec(spec: DatasetSpec) -> None:
+        if spec.update_type not in {"general", "by_daily"}:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}"
             )
@@ -115,7 +101,11 @@ class DatasetManager:
                 raise DatasetSpecError(
                     "request_discovery.target_param conflicts with target request parameters"
                 )
-        if spec.update_type == "by_daily" and not spec.calendar:
+        if (
+            spec.update_type == "by_daily"
+            and spec.date_kind == "trading"
+            and not spec.calendar
+        ):
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} by_daily requires calendar"
             )
@@ -123,46 +113,27 @@ class DatasetManager:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} date_param is only valid for by_daily"
             )
+        if spec.update_type == "general" and (spec.date_params or spec.request_date_field):
+            raise DatasetSpecError("date_params and request_date_field are only valid for by_daily")
         if spec.date_param is not None and not spec.date_param:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} date_param cannot be empty"
             )
-        if spec.request_date_field is not None and (
-            spec.update_type != "by_asset" or not spec.request_date_field
+        if spec.date_kind not in {"trading", "calendar"}:
+            raise DatasetSpecError("date_kind must be trading or calendar")
+        if spec.recent_recheck_days < 0:
+            raise DatasetSpecError("recent_recheck_days cannot be negative")
+        if not isinstance(spec.request_options, dict):
+            raise DatasetSpecError("request_options must be a mapping")
+        if spec.parameter_dataset and not all(
+            (spec.parameter_name, spec.parameter_field)
         ):
             raise DatasetSpecError(
-                f"{spec.source}/{spec.name} request_date_field is only valid "
-                "for by_asset and cannot be empty"
+                "parameter fanout requires a field and parameter name"
             )
-        if spec.update_type == "by_asset" and not spec.asset_list:
-            raise DatasetSpecError(
-                f"{spec.source}/{spec.name} by_asset requires asset_list"
-            )
-        if (
-            not isinstance(spec.asset_bucket_count, int)
-            or isinstance(spec.asset_bucket_count, bool)
-            or spec.asset_bucket_count <= 0
-        ):
-            raise DatasetSpecError(
-                f"{spec.source}/{spec.name} asset_bucket_count must be a positive integer"
-            )
-        if (
-            spec.update_type != "by_asset"
-            and spec.asset_bucket_count != ASSET_BUCKET_COUNT
-        ):
-            raise DatasetSpecError(
-                f"{spec.source}/{spec.name} asset_bucket_count is only valid for by_asset"
-            )
-        if spec.update_type != "by_asset" and (
-            spec.revision_lookback_days != 730 or spec.revision_refresh_days != 30
-        ):
-            raise DatasetSpecError(
-                f"{spec.source}/{spec.name} revision settings are only valid for by_asset"
-            )
-        if spec.revision_lookback_days <= 0 or spec.revision_refresh_days <= 0:
-            raise DatasetSpecError(
-                f"{spec.source}/{spec.name} revision settings must be positive"
-            )
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(spec.availability_timezone)
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
@@ -174,6 +145,17 @@ class DatasetManager:
         if len(set(mappings.values())) != len(mappings):
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} field_mappings cannot reuse destinations"
+            )
+        nullable_keys = set(spec.nullable_primary_key_extra)
+        extra_keys = set(spec.primary_key_extra)
+        if len(nullable_keys) != len(spec.nullable_primary_key_extra):
+            raise DatasetSpecError(
+                "nullable_primary_key_extra cannot contain duplicate fields"
+            )
+        if missing_nullable := sorted(nullable_keys - extra_keys):
+            raise DatasetSpecError(
+                "nullable_primary_key_extra must be a subset of primary_key_extra: "
+                + ", ".join(missing_nullable)
             )
         if spec.update_type != "general":
             missing_targets = sorted({"time", "asset_id"} - set(mappings.values()))
@@ -248,15 +230,22 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "calendar",
         "date_param",
         "request_date_field",
-        "asset_list",
         "primary_key_extra",
+        "nullable_primary_key_extra",
         "source_api_params",
         "source_api_param_sets",
         "request_discovery",
         "field_mappings",
-        "asset_bucket_count",
-        "revision_lookback_days",
-        "revision_refresh_days",
+        "date_kind",
+        "date_params",
+        "source_time_fields",
+        "parameter_dataset",
+        "parameter_field",
+        "parameter_name",
+        "recent_recheck_days",
+        "request_options",
+        "availability_timezone",
+        "availability_day_offset",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -269,6 +258,9 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
     extra = value.get("primary_key_extra", ())
     if isinstance(extra, str):
         extra = (extra,)
+    nullable_extra = value.get("nullable_primary_key_extra", ())
+    if isinstance(nullable_extra, str):
+        nullable_extra = (nullable_extra,)
     source_api_params = value.get("source_api_params", {})
     if not isinstance(source_api_params, dict):
         raise DatasetSpecError("source_api_params must be a TOML table")
@@ -317,11 +309,6 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
             result_field=str(discovery_value["result_field"]),
             target_param=str(discovery_value["target_param"]),
         )
-    asset_bucket_count = value.get("asset_bucket_count", ASSET_BUCKET_COUNT)
-    if not isinstance(asset_bucket_count, int) or isinstance(
-        asset_bucket_count, bool
-    ):
-        raise DatasetSpecError("asset_bucket_count must be a positive integer")
     field_mapping_tables = value.get("field_mappings")
     if field_mapping_tables is None:
         field_mappings: dict[str, str] = {}
@@ -346,17 +333,22 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         request_date_field=None
         if value.get("request_date_field") is None
         else str(value["request_date_field"]),
-        asset_list=None
-        if value.get("asset_list") is None
-        else str(value["asset_list"]),
         primary_key_extra=tuple(str(field) for field in extra),
+        nullable_primary_key_extra=tuple(str(field) for field in nullable_extra),
         source_api_params=dict(source_api_params),
         source_api_param_sets=tuple(
             dict(param_set) for param_set in source_api_param_sets
         ),
         request_discovery=request_discovery,
         field_mappings=field_mappings,
-        asset_bucket_count=asset_bucket_count,
-        revision_lookback_days=int(value.get("revision_lookback_days", 730)),
-        revision_refresh_days=int(value.get("revision_refresh_days", 30)),
+        date_kind=str(value.get("date_kind", "trading")),
+        date_params=tuple(value.get("date_params", ())),
+        source_time_fields=tuple(value.get("source_time_fields", ())),
+        parameter_dataset=value.get("parameter_dataset"),
+        parameter_field=str(value.get("parameter_field", "asset_id")),
+        parameter_name=str(value.get("parameter_name", "ts_code")),
+        recent_recheck_days=int(value.get("recent_recheck_days", 3)),
+        request_options=dict(value.get("request_options", {})),
+        availability_timezone=str(value.get("availability_timezone", "UTC")),
+        availability_day_offset=int(value.get("availability_day_offset", 0)),
     )

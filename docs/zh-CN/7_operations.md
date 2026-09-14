@@ -1,15 +1,11 @@
 # 运维
 
-通过 `lake.admin` 查看数据集、manifest、scope 和 ingestion run。显式浅扫描检查元数据及文件；深扫描读取 canonical Parquet 并验证内容哈希、schema、主键和分区归属。扫描不会收养孤立文件，也不会调用 Provider。隔离保留原文件及恢复日志，应用层显式重置受影响 scope 后重试正常更新流程。
+通过 `lake.admin` 查看数据集、manifest、日期 × 参数 scope、ingestion run、版本批次与恢复状态。浅扫描核对元数据和文件清单；深扫描读取 canonical Parquet，验证内容哈希、schema、业务键、月分区和恢复日志。扫描不会接管孤立文件，也不会调用 Provider。
 
-## 快照修复与活动
+General 的显式更新在完整快照内容变化时生成新快照；内容未变时只记录检查。同一日期可以有多个不同内容的快照 ID；部分参数或分页失败时，上一份完整快照继续可见。`by_daily` 的覆盖必须包含请求范围内每个声明日期和参数 variant 的终态 `success` 或 `empty`，不以物理行密度或最后一条观测日期推断覆盖。
 
-General 快照只有在 canonical manifest 和文件存在、当前所有参数组合都有终态 Provider scope 时才是最新。快照缺失或参数组合尚未完成时，显式更新会重取全部组合，再替换完整快照。仅有 manifest 的旧 scope 不会被收养为 Provider 覆盖记录。
+每个月分区旁保存 `recovery.sqlite`，其中是已提交的不可变压缩 Arrow 批次。Parquet 损坏而恢复证据完整时，`lake.admin.repair_partitions()` 只重放已登记批次，保留原 PIT 日期、入库时间、提交序号和内容身份，也不触发 Provider。恢复日志损坏时，只有完整且已验证的 Parquet 能按原批次 schema 和哈希重建它；两侧证据都不足时，深扫描将该问题标为不可自动修复，并阻止伪造历史。
 
-`arrow-ipc-v1` 逻辑哈希在序列化前规范化空值位图尾部未使用位，让不同 worker 数量下相同数据的校验和一致；实际值、schema 和空值位置仍参与校验。
+尚未完成的日期 scope 可通过普通显式更新补取。供应商返回的新值或历史刷新发现的变化都形成新版本，不会替代既有版本。无变化检查只记录检查结果，不改变 manifest 或下游内容 generation。
 
-`UpdateProgress` 在 scope 数量尚未知时也报告 planning、discovery。请求活动包含 `current_scope`、`in_flight`、`request_count`、`wait_reason` 和 `wait_seconds`。数据源可通过 `request_status` 报告配额等待且不调用 Provider。完成量仍代表逻辑 scope，不由心跳推进。
-
-按日期更新 General 时，完成统计只针对本次快照。旧 checkpoint 的未完成记录保留为历史，不会把后来成功的完整刷新误判为 partial。
-
-资产级空响应保留修订复查时间。已有检查未设复查日期时，状态汇总使用与请求计划相同的 UTC 复查周期；已完成的空响应不会立即被标为到期。
+旧数据库 schema 会在任何写入之前被拒绝。请先备份并重建数据根；本包不提供迁移或兼容读取。

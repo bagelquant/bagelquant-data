@@ -1,132 +1,41 @@
-# Datasets
+# Dataset declarations
 
-Register a dataset with the name, update type, and only the options its update
-scope synchronizer needs.
+A dataset declares its provider API, date parameters, source date fields, business
+keys, date kind, fixed parameters, parameter expansion, and transport options.
 
 ```python
 from bagelquant_data import DatasetSpec
 
-lake.admin.datasets.register(DatasetSpec("trade_cal", "general"))
-lake.admin.datasets.register(DatasetSpec("daily", "by_daily", calendar="trade_cal", field_mappings={"trade_date": "time", "ts_code": "asset_id"}))
-lake.admin.datasets.register(DatasetSpec("st", "by_daily", calendar="trade_cal", date_param="pub_date", field_mappings={"trade_date": "time", "ts_code": "asset_id"}))
-lake.admin.datasets.register(DatasetSpec("balancesheet", "by_asset", asset_list="stock_basic", primary_key_extra=("period",), field_mappings={"ann_date": "time", "ts_code": "asset_id"}))
+income = DatasetSpec(
+    "income", "by_daily", source="tushare", source_api="income_vip",
+    date_kind="calendar", date_params=("f_ann_date",),
+    source_time_fields=("f_ann_date",),
+    primary_key_extra=(
+        "ann_date", "end_date", "report_type", "comp_type", "end_type", "update_flag"
+    ),
+    nullable_primary_key_extra=("ann_date", "comp_type", "end_type"),
+    field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
+    availability_timezone="Asia/Shanghai", availability_day_offset=-1,
+    request_options={"pagination": "offset", "page_size": 1000, "max_pages": 10000},
+)
 ```
 
-The pipeline derives the incremental key from `time`, `asset_id`, and optional
-`primary_key_extra` fields. Each incremental dataset must explicitly declare
-the provider-to-canonical field mapping; general datasets do not require one.
+`date_kind="trading"` requires a General calendar. `calendar` dates include
+weekends. Multiple `date_params` produce independent date/parameter scopes.
+`source_time_fields` uses the first non-null source date; original fields remain
+available. The business key is `source_time`, `asset_id`, and `primary_key_extra`.
+`nullable_primary_key_extra` explicitly names provider qualifiers whose missing value
+still participates in identity; time, asset, and every other key remain strict. The
+version key adds ingestion time and commit sequence.
 
-`by_daily` datasets send each missing calendar day under `date` by default. Set
-`date_param` when a provider API uses a different date parameter, such as
-`date_param = "pub_date"` for Tushare's `st` API. The generated date always
-overrides a conflicting value in `source_api_params` or runtime `params`.
-The daily scope remains the logical coverage unit even when an application
-enables the optional `source_options.daily_range_backfill` transport policy.
-That policy may combine untouched historical scopes for one parameter variant
-into a physical date-range call, but it never changes dataset identity or the
-daily ledger model.
+`source_api_param_sets` expands list values as a Cartesian product. A registered
+General catalog can supply `parameter_dataset`, `parameter_field`, and
+`parameter_name`; this creates date × parameter requests and no asset watermark.
+`request_discovery` can discover parameter values through a declared provider API.
+Transport options are definition data, including pagination and null-payload rules.
 
-Store the same compact mapping in TOML and register it with `register_toml`.
-
-```toml
-name = "daily"
-update_type = "by_daily"
-calendar = "trade_cal"
-
-[field_mappings]
-trade_date = "time"
-ts_code = "asset_id"
-```
-
-`by_asset` declarations may configure later-revision refreshes:
-
-```toml
-update_type = "by_asset"
-asset_list = "stock_basic"
-asset_bucket_count = 32
-revision_lookback_days = 730
-revision_refresh_days = 30
-```
-
-`asset_bucket_count` controls the stable hash buckets inside each year. A new
-asset rewrites only its year/bucket partition rather than one file for the
-entire year. The default is 32. Once canonical data exists, changing the count
-is rejected because it changes the physical layout; clear the dataset and
-rebuild it before registering a different count.
-
-The lake stores provider checks separately from commit-backed `data_max_time`.
-This prevents sparse event data from being downloaded repeatedly while the
-revision window still captures later restatements.
-For every `by_daily` dataset, validated empty scopes in the latest 20
-requested calendar sessions are rechecked on the next update. Older empty
-daily scopes remain terminal until reset or a definition change. Empty
-`by_asset` scopes remain quiet at the same target, then become eligible when
-the requested target advances or their revision check is due.
-
-Mappings are true renames, so provider columns named `trade_date` and
-`ts_code` are stored as `time` and `asset_id`. A mapping may rename other
-columns as well, but incremental datasets must map both canonical key fields.
-
-The lake also stores a canonical dataset schema. All-null input columns remain
-untyped until an actual value establishes their type; compatible integer and
-floating inputs are promoted deterministically. New columns are added to the
-canonical schema, and strict numeric parsing rejects incompatible string data.
-
-Use the optional `source_api_params` table for provider parameters that should
-be sent unchanged on every update of a dataset. List values in this table are
-passed through to the provider as one parameter value.
-
-```toml
-name = "stock_basic"
-update_type = "general"
-source = "tushare"
-
-[source_api_params]
-exchange = "SSE"
-list_status = "L"
-```
-
-Use `source_api_param_sets` when one dataset refresh needs several provider
-calls. Each table expands list values into independent calls; list values in
-the same table form a Cartesian product.
-
-```toml
-[source_api_params]
-exchange = "SSE"
-
-[[source_api_param_sets]]
-list_status = ["L", "D", "P"]
-```
-
-## Provider API and request discovery
-
-By default, the declared dataset name is also the provider API name. Set
-`source_api` when a stable local dataset name must call a differently named
-provider API. The local name remains the raw-data identity, while `source_api`
-controls only the request sent to the configured adapter.
-
-`request_discovery` performs one provider request at planning time and turns a
-non-empty result column into target request variants. Its values are deduplicated
-and sorted, then form a Cartesian product with `source_api_params` and
-`source_api_param_sets`. The discovery target parameter must not also appear in
-either static parameter declaration.
-
-```toml
-name = "sw_l1_industry_membership"
-source = "tushare"
-source_api = "index_member_all"
-update_type = "general"
-
-[source_api_params]
-is_new = "N"
-
-[request_discovery]
-api = "index_classify"
-params = { level = "L1" }
-result_field = "index_code"
-target_param = "l1_code"
-```
-
-Discovery is declarative: adapters receive only an API name and request
-parameters. A missing result field, an empty result, or a discovery error fails
-the update before any target request is made.
+General needs no numerical key and stores each changed complete snapshot from an
+explicit update. An unchanged refresh records only a check. A failed variant or page
+cannot replace its last complete snapshot.
+The old asset update type, year/bucket layout, and revision-watermark options are
+unsupported. TOML registration and form-generated declarations use the same validator.

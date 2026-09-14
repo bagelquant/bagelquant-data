@@ -1,35 +1,23 @@
-"""Deterministic JSON benchmark for update planning, hashing, and lake I/O.
+"""Deterministic JSON benchmark for current PIT update and query paths.
 
 Run with: ``python scripts/benchmark_updates.py --requests 2000 --workers 8``.
-The benchmark includes scaled daily and wide by-asset full rebuilds and uses
-only a temporary lake with in-memory fake providers.
+Every case uses a temporary lake and an in-memory provider.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import tempfile
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
 
 import polars as pl
-import pyarrow as pa
 
 from bagelquant_data import DataLake, DatasetSpec
-from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
-from bagelquant_data.pipeline import commit as commit_module
-from bagelquant_data.pipeline import update as update_module
-from bagelquant_data.pipeline.commit import MAX_PARQUET_WRITE_WORKERS
+from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.query.scanner import manifest_rows
-from bagelquant_data.storage import parquet as parquet_module
 
 
 class DelayedSource:
@@ -40,7 +28,7 @@ class DelayedSource:
 
     def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
         time.sleep(self.delay)
-        value = str(request["date"])
+        value = str(request["trade_date"])
         return pl.DataFrame(
             {"trade_date": [value.replace("-", "")], "ts_code": ["000001.SZ"]}
         )
@@ -51,19 +39,17 @@ class BulkDailySource:
 
     def __init__(self, rows_per_request: int) -> None:
         self.rows_per_request = rows_per_request
-        self.assets = [
-            f"{index:06d}.SZ" for index in range(self.rows_per_request)
-        ]
+        self.assets = [f"{index:06d}.SZ" for index in range(rows_per_request)]
         self.values = {
             f"value_{column:02d}": [
                 float((row * (column + 1)) % 100_003)
-                for row in range(self.rows_per_request)
+                for row in range(rows_per_request)
             ]
             for column in range(20)
         }
 
     def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
-        value = str(request["date"]).replace("-", "")
+        value = str(request["trade_date"]).replace("-", "")
         return pl.DataFrame(
             {
                 "trade_date": [value] * self.rows_per_request,
@@ -73,32 +59,23 @@ class BulkDailySource:
         )
 
 
-class BulkAssetSource:
-    name = "bulk_asset"
-
-    def __init__(self, rows_per_asset: int) -> None:
-        self.rows_per_asset = rows_per_asset
-        self.dates = [
-            f"{2009 + index // 2}{'0630' if index % 2 == 0 else '1231'}"
-            for index in range(self.rows_per_asset)
-        ]
-        self.values = {
-            f"value_{column:02d}": [
-                float((row * (column + 1)) % 100_003)
-                for row in range(self.rows_per_asset)
-            ]
-            for column in range(96)
-        }
+class ParameterizedDailySource:
+    name = "parameterized_daily"
 
     def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
-        asset = str(request["id"])
+        asset = str(request["ts_code"])
+        announcement = str(request["ann_date"]).replace("-", "")
         return pl.DataFrame(
             {
-                "f_ann_date": self.dates,
-                "ann_date": self.dates,
-                "ts_code": [asset] * self.rows_per_asset,
-                "end_date": self.dates,
-                **self.values,
+                "ann_date": [announcement],
+                "ts_code": [asset],
+                "end_date": [announcement],
+                **{
+                    f"value_{column:02d}": [
+                        float((int(asset[:6]) * (column + 1)) % 100_003)
+                    ]
+                    for column in range(32)
+                },
             }
         )
 
@@ -111,15 +88,19 @@ def main() -> None:
     parser.add_argument("--hash-rows", type=int, default=125_000)
     parser.add_argument("--bulk-daily-requests", type=int, default=120)
     parser.add_argument("--bulk-daily-rows", type=int, default=1_000)
-    parser.add_argument("--bulk-assets", type=int, default=320)
-    parser.add_argument("--bulk-asset-rows", type=int, default=34)
+    parser.add_argument("--parameter-assets", type=int, default=320)
+    parser.add_argument("--parameter-days", type=int, default=34)
     args = parser.parse_args()
-    if args.bulk_daily_requests <= 0 or args.bulk_daily_rows <= 0:
-        parser.error("bulk daily requests and rows must be positive")
-    if args.bulk_assets <= 0:
-        parser.error("bulk assets must be positive")
-    if not 1 <= args.bulk_asset_rows <= 34:
-        parser.error("bulk asset rows must be between 1 and 34")
+    positive = {
+        "requests": args.requests,
+        "hash rows": args.hash_rows,
+        "bulk daily requests": args.bulk_daily_requests,
+        "bulk daily rows": args.bulk_daily_rows,
+        "parameter assets": args.parameter_assets,
+        "parameter days": args.parameter_days,
+    }
+    if any(value <= 0 for value in positive.values()):
+        parser.error("all benchmark sizes must be positive")
 
     results = {"hash": _hash_benchmark(args.hash_rows)}
     with tempfile.TemporaryDirectory(
@@ -138,10 +119,10 @@ def main() -> None:
             rows_per_request=args.bulk_daily_rows,
             workers=args.workers,
         )
-        results["bulk_asset"] = _bulk_asset_benchmark(
+        results["parameterized_daily"] = _parameterized_daily_benchmark(
             lake,
-            asset_count=args.bulk_assets,
-            rows_per_asset=args.bulk_asset_rows,
+            asset_count=args.parameter_assets,
+            day_count=args.parameter_days,
             workers=args.workers,
         )
         results["query"] = _query_benchmark(lake)
@@ -188,29 +169,30 @@ def _update_benchmark(
             "by_daily",
             source="benchmark",
             calendar="trade_cal",
+            date_kind="trading",
+            date_param="trade_date",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
-    with redirect_stdout(io.StringIO()):
-        report = lake.update.dataset(
-            "daily",
-            source="benchmark",
-            start=days[0],
-            end=days[-1],
-            today=days[-1],
-            workers=workers,
-            batch_size=requests,
-            progress=False,
-        )
-        noop = lake.update.dataset(
-            "daily",
-            source="benchmark",
-            start=days[-1],
-            end=days[-1],
-            today=days[-1] + timedelta(days=1),
-            workers=workers,
-            progress=False,
-        )
+    report = lake.update.dataset(
+        "daily",
+        source="benchmark",
+        start=days[0],
+        end=days[-1],
+        today=days[-1],
+        mode="initialize",
+        ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        workers=workers,
+        batch_size=requests,
+    )
+    noop = lake.update.dataset(
+        "daily",
+        source="benchmark",
+        start=days[-1],
+        end=days[-1],
+        today=days[-1] + timedelta(days=1),
+        workers=workers,
+    )
     ideal = delay * ((requests + workers - 1) // workers)
     return {
         "commit_seconds": report.commit_seconds,
@@ -227,90 +209,6 @@ def _update_benchmark(
     }
 
 
-def _query_benchmark(lake: DataLake) -> dict[str, object]:
-    monthly_dates = [
-        date(1999 + index // 12, index % 12 + 1, 1) for index in range(319)
-    ]
-    daily_spec = DatasetSpec(
-        "daily_query",
-        "by_daily",
-        source="benchmark",
-        calendar="trade_cal",
-        field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-    )
-    lake.ingest(
-        daily_spec,
-        pl.DataFrame(
-            {
-                "trade_date": [value.strftime("%Y%m%d") for value in monthly_dates],
-                "ts_code": ["000001.SZ"] * len(monthly_dates),
-                "value": list(range(len(monthly_dates))),
-            }
-        ),
-    )
-    month = monthly_dates[len(monthly_dates) // 2]
-    month_end = (month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(
-        days=1
-    )
-    date_rows = manifest_rows(
-        lake.metadata,
-        "benchmark",
-        "daily_query",
-        start=month,
-        end=month_end,
-    )
-    started = time.perf_counter()
-    lake.query.query(
-        "daily_query",
-        source="benchmark",
-        start=month,
-        end=month_end,
-    ).collect()
-    date_seconds = time.perf_counter() - started
-
-    target = "000001.SZ"
-    other = next(
-        f"{value:06d}.SZ"
-        for value in range(2, 10_000)
-        if stable_bucket(f"{value:06d}.SZ", 32) != stable_bucket(target, 32)
-    )
-    years = range(2009, 2026)
-    asset_spec = DatasetSpec(
-        "income_query",
-        "by_asset",
-        source="benchmark",
-        asset_list="stock_basic",
-        field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-    )
-    lake.ingest(
-        asset_spec,
-        pl.DataFrame(
-            {
-                "ann_date": [f"{year}0630" for year in years for _ in (target, other)],
-                "ts_code": [asset for _ in years for asset in (target, other)],
-                "value": [float(index) for index in range(len(years) * 2)],
-            }
-        ),
-    )
-    asset_rows = manifest_rows(
-        lake.metadata,
-        "benchmark",
-        "income_query",
-        buckets={stable_bucket(target, 32)},
-    )
-    started = time.perf_counter()
-    lake.query.query("income_query", source="benchmark", assets=[target]).collect()
-    asset_seconds = time.perf_counter() - started
-    return {
-        "asset_query_files": len(asset_rows),
-        "asset_query_seconds": asset_seconds,
-        "date_query_files": len(date_rows),
-        "date_query_seconds": date_seconds,
-        "total_asset_files": len(lake.metadata.manifest("benchmark", "income_query")),
-        "total_daily_files": len(lake.metadata.manifest("benchmark", "daily_query")),
-    }
-
-
 def _bulk_daily_benchmark(
     lake: DataLake,
     *,
@@ -320,35 +218,27 @@ def _bulk_daily_benchmark(
 ) -> dict[str, object]:
     first_day = date(2020, 1, 1)
     days = [first_day + timedelta(days=index) for index in range(requests)]
-    dates = [value.strftime("%Y%m%d") for value in days]
     lake.admin.sources.register(BulkDailySource(rows_per_request))
-    lake.ingest(
-        DatasetSpec(
-            "bulk_trade_cal",
-            "general",
-            source="bulk_daily",
-        ),
-        pl.DataFrame({"time": dates, "is_open": [1] * len(dates)}),
-    )
     lake.admin.datasets.register(
         DatasetSpec(
             "bulk_daily",
             "by_daily",
             source="bulk_daily",
-            calendar="bulk_trade_cal",
+            date_kind="calendar",
+            date_param="trade_date",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
-    with redirect_stdout(io.StringIO()):
-        report = lake.update.dataset(
-            "bulk_daily",
-            source="bulk_daily",
-            start=days[0],
-            end=days[-1],
-            today=days[-1],
-            workers=workers,
-            progress=False,
-        )
+    report = lake.update.dataset(
+        "bulk_daily",
+        source="bulk_daily",
+        start=days[0],
+        end=days[-1],
+        today=days[-1],
+        mode="initialize",
+        ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        workers=workers,
+    )
     files = lake.metadata.manifest("bulk_daily", "bulk_daily")
     return {
         "bytes_written": report.bytes_written,
@@ -363,126 +253,96 @@ def _bulk_daily_benchmark(
     }
 
 
-def _bulk_asset_benchmark(
-    lake: DataLake,
-    *,
-    asset_count: int,
-    rows_per_asset: int,
-    workers: int,
+def _parameterized_daily_benchmark(
+    lake: DataLake, *, asset_count: int, day_count: int, workers: int
 ) -> dict[str, object]:
     assets = [f"{index:06d}.SZ" for index in range(asset_count)]
-    lake.admin.sources.register(BulkAssetSource(rows_per_asset))
-    lake.ingest(
-        DatasetSpec(
-            "bulk_stock_basic",
-            "general",
-            source="bulk_asset",
-            field_mappings={"ts_code": "asset_id"},
-        ),
-        pl.DataFrame(
-            {
-                "ts_code": assets,
-                "list_date": ["20090101"] * asset_count,
-            }
-        ),
-    )
+    first_day = date(2020, 1, 1)
+    last_day = first_day + timedelta(days=day_count - 1)
+    lake.admin.sources.register(ParameterizedDailySource())
     lake.admin.datasets.register(
         DatasetSpec(
-            "bulk_income",
-            "by_asset",
-            source="bulk_asset",
-            asset_list="bulk_stock_basic",
-            request_date_field="ann_date",
+            "parameterized_income",
+            "by_daily",
+            source="parameterized_daily",
+            date_kind="calendar",
+            date_param="ann_date",
+            source_api_param_sets=({"ts_code": assets},),
             primary_key_extra=("end_date",),
-            field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
+            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
         )
     )
-    active_writers = 0
-    peak_writers = 0
-    writer_lock = threading.Lock()
-    real_write = parquet_module.atomic_write_parquet
-    real_deduplicate = commit_module._deduplicate
-    real_coverage = commit_module._coverage
-    real_executor = update_module.ThreadPoolExecutor
-    deduplicate_calls = 0
-    coverage_calls = 0
-    writer_pool_creations = 0
-
-    def tracked_write(
-        frame: pl.DataFrame,
-        path: Path,
-        *,
-        expected_schema: pa.Schema | None = None,
-    ) -> None:
-        nonlocal active_writers, peak_writers
-        with writer_lock:
-            active_writers += 1
-            peak_writers = max(peak_writers, active_writers)
-        try:
-            real_write(frame, path, expected_schema=expected_schema)
-        finally:
-            with writer_lock:
-                active_writers -= 1
-
-    def tracked_deduplicate(frame: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
-        nonlocal deduplicate_calls
-        deduplicate_calls += 1
-        return real_deduplicate(frame, spec)
-
-    def tracked_coverage(
-        frames: list[pl.DataFrame],
-        spec: DatasetSpec,
-    ) -> tuple[set[str], dict[str, str]]:
-        nonlocal coverage_calls
-        coverage_calls += 1
-        return real_coverage(frames, spec)
-
-    def tracked_executor(*args: Any, **kwargs: Any) -> ThreadPoolExecutor:
-        nonlocal writer_pool_creations
-        if kwargs.get("thread_name_prefix") == "bagelquant-parquet":
-            writer_pool_creations += 1
-        return real_executor(*args, **kwargs)
-
-    with (
-        patch.object(parquet_module, "atomic_write_parquet", tracked_write),
-        patch.object(commit_module, "_deduplicate", tracked_deduplicate),
-        patch.object(commit_module, "_coverage", tracked_coverage),
-        patch.object(update_module, "ThreadPoolExecutor", tracked_executor),
-        redirect_stdout(io.StringIO()),
-    ):
-        report = lake.update.dataset(
-            "bulk_income",
-            source="bulk_asset",
-            start="2009-01-01",
-            end="2025-12-31",
-            today="2025-12-31",
-            workers=workers,
-            max_buffer_mb=1,
-            progress=False,
-        )
-    files = lake.metadata.manifest("bulk_asset", "bulk_income")
-    unique_partitions = len(files)
+    report = lake.update.dataset(
+        "parameterized_income",
+        source="parameterized_daily",
+        start=first_day,
+        end=last_day,
+        today=last_day,
+        mode="initialize",
+        ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        workers=workers,
+    )
+    files = lake.metadata.manifest("parameterized_daily", "parameterized_income")
     return {
         "assets": asset_count,
         "bytes_written": report.bytes_written,
-        "columns": 100,
         "commit_count": report.commit_count,
         "commit_seconds": report.commit_seconds,
-        "coverage_calls": coverage_calls,
-        "deduplicate_calls": deduplicate_calls,
+        "days": day_count,
         "elapsed_seconds": report.elapsed_seconds,
         "partitions_rewritten": report.partitions_rewritten,
-        "rewrite_amplification": (
-            0.0
-            if unique_partitions == 0
-            else report.partitions_rewritten / unique_partitions
+        "rows": asset_count * day_count,
+        "unique_partitions": len(files),
+    }
+
+
+def _query_benchmark(lake: DataLake) -> dict[str, object]:
+    monthly_dates = [
+        date(1999 + index // 12, index % 12 + 1, 1) for index in range(319)
+    ]
+    spec = DatasetSpec(
+        "monthly_query",
+        "by_daily",
+        source="benchmark",
+        date_kind="calendar",
+        date_param="trade_date",
+        field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+    )
+    lake.ingest(
+        spec,
+        pl.DataFrame(
+            {
+                "trade_date": [value.strftime("%Y%m%d") for value in monthly_dates],
+                "ts_code": ["000001.SZ"] * len(monthly_dates),
+                "value": list(range(len(monthly_dates))),
+            }
         ),
-        "rows": asset_count * rows_per_asset,
-        "rows_per_asset": rows_per_asset,
-        "unique_partitions": unique_partitions,
-        "writer_concurrency_limit": MAX_PARQUET_WRITE_WORKERS,
-        "writer_peak_concurrency": peak_writers,
-        "writer_pool_creations": writer_pool_creations,
+        mode="initialize",
+        ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    month = monthly_dates[len(monthly_dates) // 2]
+    month_end = (month.replace(day=28) + timedelta(days=4)).replace(
+        day=1
+    ) - timedelta(days=1)
+    selected_rows = manifest_rows(
+        lake.metadata,
+        "benchmark",
+        "monthly_query",
+        start=month,
+        end=month_end,
+    )
+    started = time.perf_counter()
+    result = lake.query.query(
+        "monthly_query",
+        source="benchmark",
+        start=month,
+        end=month_end,
+    ).collect()
+    return {
+        "query_files": len(selected_rows),
+        "query_rows": result.height,
+        "query_seconds": time.perf_counter() - started,
+        "total_files": len(lake.metadata.manifest("benchmark", "monthly_query")),
     }
 
 

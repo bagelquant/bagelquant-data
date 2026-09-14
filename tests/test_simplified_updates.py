@@ -7,8 +7,6 @@ from typing import Any, cast
 import polars as pl
 
 from bagelquant_data import DataLake, DatasetSpec
-from bagelquant_data.core import ASSET_BUCKET_COUNT
-from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.management.lake import _manifest_map, _partition_changes
 
 
@@ -164,32 +162,6 @@ class PaginatedDailySource:
         )
 
 
-class AdaptiveAssetSource:
-    name = "custom"
-
-    def __init__(self, rows: list[tuple[str, str]]) -> None:
-        self.rows = rows
-        self.requests: list[dict[str, object]] = []
-
-    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
-        self.requests.append(dict(request))
-        lower = date.fromisoformat(str(request["start"]))
-        upper = date.fromisoformat(str(request["end"]))
-        selected = [
-            (announcement, period)
-            for announcement, period in self.rows
-            if lower <= date.fromisoformat(announcement) <= upper
-        ]
-        truncated = selected[-2:]
-        return pl.DataFrame(
-            {
-                "ann_date": [value[0].replace("-", "") for value in truncated],
-                "ts_code": [str(request["id"])] * len(truncated),
-                "end_date": [value[1].replace("-", "") for value in truncated],
-            }
-        )
-
-
 class DailyRangeSource:
     name = "custom"
 
@@ -223,7 +195,11 @@ class DailyRangeSource:
             for scope_day in dates
             for asset_id in self.rows.get(scope_day, ())
         ]
-        if self.truncate_at is not None:
+        if "offset" in request:
+            offset = cast(int, request["offset"])
+            limit = cast(int, request["limit"])
+            values = values[offset : offset + limit]
+        elif self.truncate_at is not None:
             values = values[-self.truncate_at :]
         return pl.DataFrame(
             {
@@ -271,36 +247,6 @@ def _daily_range_options() -> dict[str, Any]:
     }
 
 
-def _adaptive_asset_lake(tmp_path, source: AdaptiveAssetSource) -> DataLake:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec(
-            "stock_basic",
-            "general",
-            field_mappings={"ts_code": "asset_id"},
-        ),
-        pl.DataFrame(
-            {
-                "ts_code": ["000001.SZ"],
-                "list_date": ["20200101"],
-                "delist_date": [None],
-            }
-        ),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "financial",
-            "by_asset",
-            asset_list="stock_basic",
-            request_date_field="ann_date",
-            primary_key_extra=("end_date",),
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-    return lake
-
-
 def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
     lake = DataLake.open(tmp_path)
@@ -329,7 +275,7 @@ def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
     assert source.requests[0] == {"exchange": "SZSE", "list_status": "P"}
 
 
-def test_dated_general_update_trusts_snapshot_ledger_and_only_fetches_new_target(
+def test_each_explicit_general_update_commits_a_new_snapshot(
     tmp_path,
 ) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
@@ -348,9 +294,9 @@ def test_dated_general_update_trusts_snapshot_ledger_and_only_fetches_new_target
     )
 
     assert first.request_count == 1
-    assert repeated.request_count == 0
+    assert repeated.request_count == 1
     assert advanced.request_count == 1
-    assert len(source.requests) == 2
+    assert len(source.requests) == 3
     scopes = lake.admin.status.update_scopes(
         source="custom", dataset="stock_basic"
     )
@@ -461,13 +407,14 @@ def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
 
     lake.update.dataset("stock_basic", source="custom", workers=1)
 
-    assert source.requests == [
+    assert sorted(source.requests, key=str) == sorted([
         {"list_status": "L", "exchange": "SSE"},
         {"list_status": "L", "exchange": "SZSE"},
         {"list_status": "D", "exchange": "SSE"},
         {"list_status": "D", "exchange": "SZSE"},
         {"list_status": "P"},
-    ]
+    ], key=str)
+
 
 
 def test_general_update_retains_existing_data_when_parameter_set_call_fails(
@@ -601,52 +548,6 @@ def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
     assert source.requests == [{"pub_date": "2025-01-02"}]
 
 
-def test_by_asset_uses_asset_list_and_fixed_batch_paths(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    source = StaticSource({})
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["000001.SZ", "000002.SZ"]}),
-    )
-    lake.ingest(
-        DatasetSpec(
-            "fundamental",
-            "by_asset",
-            asset_list="stock_basic",
-            source_api_params={
-                "id": "wrong",
-                "start": "wrong",
-                "end": "wrong",
-                "limit": 10,
-            },
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        ),
-        pl.DataFrame(
-            {"ann_date": ["20250102"], "ts_code": ["000001.SZ"], "value": [0.5]}
-        ),
-    )
-
-    lake.update.dataset(
-        "fundamental",
-        source="custom",
-        start="2025-01-01",
-        today="2025-01-04",
-        params={"limit": 25},
-    )
-
-    assert source.requests == [
-        {"id": "000001.SZ", "start": "2025-01-01", "end": "2025-01-04", "limit": 25},
-        {"id": "000002.SZ", "start": "2025-01-01", "end": "2025-01-04", "limit": 25},
-    ]
-    expected = {
-        f"year=2025/bucket={stable_bucket('000001.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
-        f"year=2025/bucket={stable_bucket('000002.SZ', ASSET_BUCKET_COUNT):02d}/data.parquet",
-    }
-    assert {
-        row["partition_path"]
-        for row in lake.admin.status.partitions("fundamental", source="custom")
-    } == expected
 
 
 def test_by_daily_ledger_checks_every_untracked_date(
@@ -851,6 +752,7 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
     assert second.status == "success"
     assert [request["date"] for _, request in source.requests] == [
         "2025-01-02",
+        "2025-01-03",
         "2025-01-04",
     ]
     assert (
@@ -984,9 +886,9 @@ def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -
         source_options={"allow_all_null_payload": True},
     )
 
-    assert second.status == "success"
-    assert second.request_count == 0
-    assert source.requests == 1
+    assert second.status == "failed"
+    assert second.request_count == 1
+    assert source.requests == 2
     assert lake.admin.status.update_scopes(
         dataset="daily",
         source="custom",
@@ -1035,6 +937,7 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
     assert report.status == "partial"
     assert [request["date"] for _, request in source.requests] == [
         "2025-01-02",
+        "2025-01-03",
         "2025-01-04",
     ]
     assert report.remaining_scope_count == 1
@@ -1089,75 +992,8 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
     )
 
 
-def test_adaptive_date_range_discards_saturated_parents_and_commits_all_leaves(
-    tmp_path,
-) -> None:
-    source = AdaptiveAssetSource(
-        [
-            ("2020-01-01", "2019-12-31"),
-            ("2020-01-02", "2019-09-30"),
-            ("2020-01-03", "2019-06-30"),
-            ("2020-01-04", "2019-03-31"),
-        ]
-    )
-    lake = _adaptive_asset_lake(tmp_path, source)
-
-    report = lake.update.dataset(
-        "financial",
-        source="custom",
-        start="2020-01-01",
-        end="2020-01-04",
-        source_options={
-            "pagination": "adaptive_date_range",
-            "row_limit": 2,
-        },
-    )
-
-    assert report.status == "success"
-    result = lake.query.query("financial", source="custom").collect().sort("time")
-    assert result.height == 4
-    assert result.get_column("time").to_list() == [
-        date(2020, 1, 1),
-        date(2020, 1, 2),
-        date(2020, 1, 3),
-        date(2020, 1, 4),
-    ]
-    calls = lake.metadata._rows(
-        "select request_key,row_count,status from api_calls "
-        "where dataset='financial' order by rowid"
-    )
-    assert calls[0]["row_count"] == 2
-    assert len(calls) == 7
-    assert all(row["status"] == "success" for row in calls)
 
 
-def test_adaptive_date_range_rejects_a_saturated_minimum_window(tmp_path) -> None:
-    source = AdaptiveAssetSource(
-        [
-            ("2020-01-01", "2019-12-31"),
-            ("2020-01-01", "2019-09-30"),
-        ]
-    )
-    lake = _adaptive_asset_lake(tmp_path, source)
-
-    report = lake.update.dataset(
-        "financial",
-        source="custom",
-        start="2020-01-01",
-        end="2020-01-01",
-        source_options={
-            "pagination": "adaptive_date_range",
-            "row_limit": 2,
-        },
-    )
-
-    assert report.status == "failed"
-    assert lake.admin.status.files("financial", source="custom") == []
-    invalid = lake.admin.status.update_scopes(
-        dataset="financial", source="custom", status="invalid"
-    )
-    assert len(invalid) == 1
-    assert "still returned 2 rows" in str(invalid[0]["last_error"])
 
 
 def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> None:
@@ -1215,8 +1051,12 @@ def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> N
         source_options=_daily_range_options(),
     )
 
-    assert second.request_count == 0
-    assert source.requests == []
+    assert second.request_count == 3
+    assert sorted(str(request["date"]) for request in source.requests) == [
+        "2025-01-23",
+        "2025-01-24",
+        "2025-01-25",
+    ]
 
 
 def test_daily_initial_range_requests_only_new_pending_tail(tmp_path) -> None:
@@ -1320,7 +1160,7 @@ def test_daily_initial_range_discards_saturated_parents(tmp_path) -> None:
     assert all(row["status"] == "success" for row in calls)
 
 
-def test_daily_initial_range_saturated_leaf_invalidates_whole_group(tmp_path) -> None:
+def test_daily_initial_range_saturated_leaf_uses_offset_pagination(tmp_path) -> None:
     sessions = [date(2025, 1, 1), date(2025, 1, 2)]
     rows = {
         sessions[0].isoformat(): ("000001.SZ", "000002.SZ"),
@@ -1339,11 +1179,11 @@ def test_daily_initial_range_saturated_leaf_invalidates_whole_group(tmp_path) ->
         source_options=options,
     )
 
-    assert report.status == "failed"
-    assert lake.admin.status.files("daily", source="custom") == []
+    assert report.status == "success"
+    assert report.request_count == 5
+    assert lake.query.query("daily", source="custom").collect().height == 2
     scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
-    assert [row["status"] for row in scopes] == ["invalid", "invalid"]
-    assert all("still returned 2 rows" in str(row["last_error"]) for row in scopes)
+    assert [row["status"] for row in scopes] == ["success", "empty"]
 
 
 def test_daily_initial_range_resumes_after_cooperative_cancel(tmp_path) -> None:

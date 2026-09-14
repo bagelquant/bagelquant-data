@@ -25,7 +25,6 @@ def atomic_write_parquet(
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     filesystem_tmp = _filesystem_path(tmp)
-    filesystem_path = _filesystem_path(path)
     try:
         frame.write_parquet(
             filesystem_tmp,
@@ -52,16 +51,7 @@ def atomic_write_parquet(
             raise ValidationError(
                 "Atomic parquet write failed read-back row count check"
             )
-        for attempt in range(8):
-            try:
-                os.replace(filesystem_tmp, filesystem_path)
-                break
-            except PermissionError as error:
-                if attempt == 7:
-                    raise PermissionError(
-                        f"atomic parquet replace failed for {path}: {error}"
-                    ) from error
-                time.sleep(0.05 * (2**attempt))
+        replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(filesystem_tmp)
@@ -77,3 +67,17 @@ def _filesystem_path(path: Path) -> str:
     if os.name == "nt" and not resolved.startswith("\\\\?\\"):
         return f"\\\\?\\{resolved}"
     return resolved
+
+
+def replace_with_retry(source: Path, target: Path) -> None:
+    """Publish a local file with bounded retries for transient Windows locks."""
+    import logging
+    for attempt in range(8):
+        try:
+            os.replace(_filesystem_path(source), _filesystem_path(target))
+            return
+        except PermissionError:
+            if attempt == 7:
+                raise
+            logging.getLogger(__name__).warning("File replacement locked: %s, retry %s", target, attempt + 1)
+            time.sleep(0.05 * (2**attempt))

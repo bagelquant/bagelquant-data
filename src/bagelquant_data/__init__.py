@@ -10,7 +10,6 @@ from bagelquant_data.core import (
     SourceNotFoundError,
     RequestDiscoverySpec,
     ValidationError,
-    stable_bucket,
 )
 from bagelquant_data.management import DataLake, LakeAdmin, LakeUpdater
 from bagelquant_data.pipeline import (
@@ -39,5 +38,4 @@ __all__ = [
     "UpdateProgress",
     "UpdateReport",
     "ValidationError",
-    "stable_bucket",
 ]

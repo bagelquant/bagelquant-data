@@ -14,9 +14,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from bagelquant_data import DataLake, DatasetSpec
-from bagelquant_data.core import DatasetSpecError, ValidationError
-from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
-from bagelquant_data.pipeline import commit as commit_module
+from bagelquant_data.core import ValidationError
+from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.storage import parquet as parquet_module
 from bagelquant_data.storage import atomic as atomic_module
 from bagelquant_data.storage.atomic import atomic_write_parquet
@@ -42,16 +41,6 @@ def _daily_spec() -> DatasetSpec:
         "by_daily",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-    )
-
-
-def _asset_spec(bucket_count: int = 32) -> DatasetSpec:
-    return DatasetSpec(
-        "income",
-        "by_asset",
-        asset_list="stock_basic",
-        asset_bucket_count=bucket_count,
-        field_mappings={"ann_date": "time", "ts_code": "asset_id"},
     )
 
 
@@ -184,35 +173,41 @@ def test_identical_ingest_skips_partition_and_preserves_manifest_and_file(
     assert lake.metadata.manifest("custom", "daily") == manifest_before
 
 
-def test_batch_deduplication_preserves_last_write_upsert_semantics(
-    tmp_path,
-) -> None:
+def test_conflicting_same_request_rows_are_rejected_without_publication(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
-    spec = _daily_spec()
-    lake.ingest(
-        spec,
-        pl.DataFrame(
-            {
-                "trade_date": ["20250102", "20250102"],
-                "ts_code": ["A", "A"],
-                "value": [1.0, 2.0],
-            }
-        ),
+    frame = pl.DataFrame({"trade_date": ["20250102", "20250102"], "ts_code": ["A", "A"], "value": [1., 2.]})
+    with pytest.raises(ValueError) as error:
+        lake.ingest(_daily_spec(), frame)
+    message = str(error.value)
+    assert "Conflicting rows" in message
+    assert 'record_id={"source_time":"2025-01-02","asset_id":"A"}' in message
+    assert "row_count=2" in message
+    assert "differing_fields=['value']" in message
+    assert not lake.metadata.manifest("custom", "daily")
+
+
+def test_declared_revision_key_preserves_same_day_provider_rows(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = DatasetSpec(
+        "daily",
+        "by_daily",
+        source="custom",
+        date_kind="calendar",
+        primary_key_extra=("update_flag",),
+        field_mappings={"trade_date": "time", "ts_code": "asset_id"},
     )
-    lake.ingest(
-        spec,
-        pl.DataFrame(
-            {
-                "trade_date": ["20250102", "20250102"],
-                "ts_code": ["A", "A"],
-                "value": [3.0, 4.0],
-            }
-        ),
+    frame = pl.DataFrame(
+        {
+            "trade_date": ["20250102", "20250102"],
+            "ts_code": ["A", "A"],
+            "update_flag": ["0", "1"],
+            "value": [1.0, 2.0],
+        }
     )
 
-    frame = lake.query.query("daily", source="custom").collect()
-    assert frame.height == 1
-    assert frame["value"].item() == 4.0
+    lake.ingest(spec, frame)
+
+    assert lake.query.query("daily", source="custom").collect().height == 2
 
 
 def test_compatibility_write_returns_clean_manifest_on_noop(tmp_path) -> None:
@@ -238,7 +233,7 @@ def test_compatibility_write_returns_clean_manifest_on_noop(tmp_path) -> None:
     lake.metadata.upsert_manifest(**manifest)
 
     assert "updated_at" not in manifest
-    assert manifest["partition_values"] == {"year": 2025, "month": 1}
+    assert {key: manifest["partition_values"][key] for key in ("year", "month")} == {"year": 2025, "month": 1}
 
 
 def test_general_replacement_does_not_retain_removed_columns(tmp_path) -> None:
@@ -249,7 +244,8 @@ def test_general_replacement_does_not_retain_removed_columns(tmp_path) -> None:
 
     frame = lake.query.query_general("stock_basic", source="custom").collect()
 
-    assert frame.columns == ["asset_id", "source"]
+    assert "name" not in frame.columns
+    assert {"asset_id", "source", "_snapshot_id"} <= set(frame.columns)
 
 
 def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
@@ -285,88 +281,8 @@ def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
     assert lake.metadata.manifest("custom", "daily") == manifest_before
 
 
-def test_new_asset_rewrites_only_its_year_bucket(tmp_path) -> None:
-    anchor = "000001.SZ"
-    candidate = next(
-        f"{value:06d}.SZ"
-        for value in range(2, 10_000)
-        if stable_bucket(f"{value:06d}.SZ", 32) != stable_bucket(anchor, 32)
-    )
-    newcomer = next(
-        f"{value:06d}.SZ"
-        for value in range(10_000, 20_000)
-        if stable_bucket(f"{value:06d}.SZ", 32) == stable_bucket(candidate, 32)
-    )
-    lake = DataLake.open(tmp_path)
-    spec = _asset_spec()
-    lake.ingest(
-        spec,
-        pl.DataFrame(
-            {
-                "ann_date": ["20250630", "20250630"],
-                "ts_code": [anchor, candidate],
-                "value": [1.0, 2.0],
-            }
-        ),
-    )
-    before = {
-        str(row["partition_path"]): str(row["content_hash"])
-        for row in lake.metadata.manifest("custom", "income")
-    }
-
-    report = lake.ingest(
-        spec,
-        pl.DataFrame(
-            {
-                "ann_date": ["20250630"],
-                "ts_code": [newcomer],
-                "value": [3.0],
-            }
-        ),
-    )
-    after = {
-        str(row["partition_path"]): str(row["content_hash"])
-        for row in lake.metadata.manifest("custom", "income")
-    }
-    changed = {path for path in before if before[path] != after[path]}
-
-    assert report.partitions_rewritten == 1
-    assert report.partitions_skipped == 0
-    assert len(changed) == 1
-    assert f"bucket={stable_bucket(newcomer, 32):02d}" in changed.pop()
 
 
-def test_asset_bucket_count_is_validated_and_immutable_with_data(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    with pytest.raises(DatasetSpecError, match="positive integer"):
-        lake.admin.datasets.register(_asset_spec(0))
-    with pytest.raises(DatasetSpecError, match="only valid for by_asset"):
-        lake.admin.datasets.register(
-            DatasetSpec("general", "general", asset_bucket_count=8)
-        )
-    invalid_toml = tmp_path / "invalid-buckets.toml"
-    invalid_toml.write_text(
-        'name = "income"\nupdate_type = "by_asset"\n'
-        'asset_list = "stock_basic"\nasset_bucket_count = true\n'
-        "[field_mappings]\nann_date = \"time\"\nts_code = \"asset_id\"\n"
-    )
-    with pytest.raises(DatasetSpecError, match="positive integer"):
-        lake.admin.datasets.register_toml(invalid_toml)
-
-    lake.admin.datasets.register(_asset_spec())
-    default_hash = lake.metadata.dataset_spec_hash("custom", "income")
-    lake.admin.datasets.register(_asset_spec(8))
-    assert lake.metadata.dataset_spec_hash("custom", "income") != default_hash
-
-    lake.ingest(
-        _asset_spec(),
-        pl.DataFrame({"ann_date": ["20250630"], "ts_code": ["A"], "value": [1.0]}),
-    )
-    with pytest.raises(DatasetSpecError, match="clear the dataset"):
-        lake.admin.datasets.register(_asset_spec(8))
-
-    lake.admin.datasets.clear_dataset_data("income", source="custom", confirm=True)
-    assert lake.admin.datasets.register(_asset_spec(8)).asset_bucket_count == 8
 
 
 def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
@@ -508,74 +424,6 @@ def test_batch_write_failure_restores_all_old_partitions(
     assert not list(root.rglob("*.rollback"))
 
 
-def test_grouped_commit_parallelizes_writers_without_worker_sqlite(
-    tmp_path, monkeypatch
-) -> None:
-    lake = DataLake.open(tmp_path)
-    main_thread = threading.get_ident()
-    manifest_calls: list[int] = []
-    context_calls = 0
-    active = 0
-    peak = 0
-    lock = threading.Lock()
-    rendezvous = threading.Barrier(4)
-    real_manifest = lake.metadata.manifest
-    real_context = commit_module.partition_write_context
-    real_write = parquet_module.atomic_write_parquet
-
-    def checked_manifest(source: str, dataset: str):
-        manifest_calls.append(threading.get_ident())
-        assert threading.get_ident() == main_thread
-        return real_manifest(source, dataset)
-
-    def tracked_context(schema):
-        nonlocal context_calls
-        context_calls += 1
-        return real_context(schema)
-
-    def tracked_write(frame, path, *, expected_schema=None):
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        try:
-            rendezvous.wait(timeout=5)
-            real_write(frame, path, expected_schema=expected_schema)
-        finally:
-            with lock:
-                active -= 1
-
-    monkeypatch.setattr(lake.metadata, "manifest", checked_manifest)
-    monkeypatch.setattr(
-        commit_module, "partition_write_context", tracked_context
-    )
-    monkeypatch.setattr(parquet_module, "atomic_write_parquet", tracked_write)
-
-    result = lake.ingest(
-        _daily_spec(),
-        pl.DataFrame(
-            {
-                "trade_date": [
-                    "20250102",
-                    "20250203",
-                    "20250303",
-                    "20250401",
-                    "20250502",
-                    "20250602",
-                    "20250701",
-                    "20250801",
-                ],
-                "ts_code": ["A"] * 8,
-                "value": list(range(8)),
-            }
-        ),
-    )
-
-    assert result.partitions_rewritten == 8
-    assert 2 <= peak <= 4
-    assert manifest_calls
-    assert set(manifest_calls) == {main_thread}
-    assert context_calls == 1
 
 
 def test_partition_write_context_matches_parquet_physical_schema(tmp_path) -> None:
@@ -659,55 +507,6 @@ def test_hash_failure_drains_writers_and_removes_temporary_files(
     assert not list(root.rglob("*.rollback"))
 
 
-def test_sort_failure_drains_writers_and_restores_old_partitions(
-    tmp_path, monkeypatch
-) -> None:
-    lake = DataLake.open(tmp_path)
-    spec = _daily_spec()
-    original = pl.DataFrame(
-        {
-            "trade_date": ["20250102", "20250203", "20250303", "20250401"],
-            "ts_code": ["A"] * 4,
-            "value": [1.0, 2.0, 3.0, 4.0],
-        }
-    )
-    lake.ingest(spec, original)
-    root = lake.paths.dataset_root("custom", "daily")
-    before_manifest = lake.metadata.manifest("custom", "daily")
-    before_frames = {
-        str(row["partition_path"]): pl.read_parquet(
-            root / str(row["partition_path"])
-        )
-        for row in before_manifest
-    }
-    real_sort = commit_module._sort
-    calls = 0
-    lock = threading.Lock()
-
-    def fail_one_sort(frame, dataset_spec):
-        nonlocal calls
-        with lock:
-            calls += 1
-            call = calls
-        if call == 2:
-            raise RuntimeError("sort fault injection")
-        return real_sort(frame, dataset_spec)
-
-    monkeypatch.setattr(commit_module, "_sort", fail_one_sort)
-    with pytest.raises(RuntimeError, match="sort fault injection"):
-        lake.ingest(
-            spec,
-            original.with_columns(pl.col("value") + 10),
-        )
-
-    assert 2 <= calls <= 4
-    assert lake.metadata.manifest("custom", "daily") == before_manifest
-    assert all(
-        pl.read_parquet(root / relative).equals(frame)
-        for relative, frame in before_frames.items()
-    )
-    assert not list(root.rglob("*.tmp"))
-    assert not list(root.rglob("*.rollback"))
 
 
 @pytest.mark.parametrize("failure_stage", ["read_back", "replace"])

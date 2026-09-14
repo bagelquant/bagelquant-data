@@ -31,6 +31,9 @@ class TushareSource:
         self._client_lock = Lock()
         self._rate_lock = Lock()
         self._rate_limits: dict[str, tuple[float, float]] = {}
+        self._global_interval = 60.0 / 500
+        self._global_next = 0.0
+        self._endpoint_limits = {"stock_basic": 50}
 
     @property
     def name(self) -> str:
@@ -40,6 +43,13 @@ class TushareSource:
         return f"TushareSource(name={self.name!r}, token=<redacted>)"
 
     def configure(self, **options: Any) -> None:
+        if "calls_per_minute" in options:
+            limit = int(options["calls_per_minute"])
+            if not 1 <= limit <= 500:
+                raise ValueError("calls_per_minute must be between 1 and 500")
+            self._global_interval = 60.0 / limit
+        if "endpoint_limits" in options:
+            self._endpoint_limits.update(dict(options["endpoint_limits"]))
         if "token" in options:
             with self._client_lock:
                 self._token = str(options["token"])
@@ -89,10 +99,19 @@ class TushareSource:
             if cancel_requested is not None and cancel_requested():
                 return False
             with self._rate_lock:
-                interval, next_request = self._rate_limits.get(dataset, (0.0, 0.0))
+                interval, next_request = self._rate_limits.get(
+                    dataset,
+                    (
+                        60.0 / self._endpoint_limits[dataset]
+                        if dataset in self._endpoint_limits
+                        else 0.0,
+                        0.0,
+                    ),
+                )
                 now = time.monotonic()
-                delay = next_request - now
+                delay = max(next_request, self._global_next) - now
                 if delay <= 0:
+                    self._global_next = now + self._global_interval
                     if interval:
                         self._rate_limits[dataset] = (interval, now + interval)
                     return True
@@ -103,8 +122,10 @@ class TushareSource:
         with self._rate_lock:
             _, next_request = self._rate_limits.get(dataset, (0.0, 0.0))
             remaining = max(0.0, next_request - time.monotonic())
-        return {"wait_reason": "provider_rate_limit" if remaining > 1 else "",
-                "wait_seconds": round(remaining, 1)}
+        return {
+            "wait_reason": "provider_rate_limit" if remaining > 1 else "",
+            "wait_seconds": round(remaining, 1),
+        }
 
     def _ensure_client(self) -> Any:
         if self._provided_client is not None:

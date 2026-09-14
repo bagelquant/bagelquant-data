@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-ASSET_BUCKET_COUNT = 32
-
 
 @dataclass(frozen=True, slots=True)
 class RequestDiscoverySpec:
@@ -26,18 +24,25 @@ class DatasetSpec:
     source: str = "custom"
     description: str = ""
     calendar: str | None = None
-    asset_list: str | None = None
     primary_key_extra: tuple[str, ...] = ()
+    nullable_primary_key_extra: tuple[str, ...] = ()
     source_api_params: dict[str, object] = field(default_factory=dict)
     source_api_param_sets: tuple[dict[str, object], ...] = ()
     date_param: str | None = None
     request_date_field: str | None = None
     field_mappings: dict[str, str] = field(default_factory=dict)
-    asset_bucket_count: int = ASSET_BUCKET_COUNT
-    revision_lookback_days: int = 730
-    revision_refresh_days: int = 30
     source_api: str | None = None
     request_discovery: RequestDiscoverySpec | None = None
+    date_kind: str = "trading"
+    date_params: tuple[str, ...] = ()
+    source_time_fields: tuple[str, ...] = ()
+    parameter_dataset: str | None = None
+    parameter_field: str = "asset_id"
+    parameter_name: str = "ts_code"
+    recent_recheck_days: int = 3
+    request_options: dict[str, object] = field(default_factory=dict)
+    availability_timezone: str = "UTC"
+    availability_day_offset: int = 0
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:
@@ -52,3 +57,9 @@ def incremental_key(spec: DatasetSpec) -> tuple[str, ...] | None:
     if spec.update_type == "general":
         return None
     return "time", "asset_id", *spec.primary_key_extra
+
+
+def record_key(spec: DatasetSpec) -> tuple[str, ...]:
+    """Stable observation identity, independent of when a revision was learned."""
+
+    return "source_time", "asset_id", *spec.primary_key_extra

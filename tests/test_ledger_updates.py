@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 import sqlite3
 
 import polars as pl
@@ -93,260 +93,12 @@ def test_wrong_daily_date_is_invalid_and_requires_reset(tmp_path) -> None:
     )
 
 
-def test_asset_empty_records_provider_check_without_local_success(tmp_path) -> None:
-    source = LedgerSource(empty=True)
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "income",
-            "by_asset",
-            asset_list="stock_basic",
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-
-    report = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-    row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert report.status == "no_data"
-    assert report.success_count == 0
-    assert report.empty_count == 1
-    assert report.rows_committed == 0
-    assert row["status"] == "empty"
-    assert row["checked_through"] is None
-    assert row["data_max_time"] is None
-    assert row["last_success_at"] is None
-    checks = lake.admin.status.provider_scope_checks(
-        dataset="income", source="custom"
-    )
-    assert len(checks) == 1
-    assert checks[0]["checked_through"] == "2025-01-31"
-    assert checks[0]["last_result"] == "empty"
-    assert checks[0]["recheck_after"] == (datetime.now(UTC).date() + timedelta(days=30)).isoformat()
-    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
-    # Previously recorded empty checks omitted the explicit schedule. Status
-    # must agree with the planner's last-check-based fallback for these rows.
-    with sqlite3.connect(lake.metadata.path) as connection:
-        connection.execute("UPDATE provider_scope_checks SET recheck_after=NULL")
-    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
-    stored_run = next(
-        run for run in lake.admin.status.runs() if run["run_id"] == report.run_id
-    )
-    assert stored_run["success_count"] == 0
-    assert stored_run["empty_count"] == 1
-
-    source.requests.clear()
-    lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-    assert source.requests == []
-
-    lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-02-01"
-    )
-    assert len(source.requests) == 1
-    assert source.requests[0][1]["start"] == "2025-02-01"
-    assert source.requests[0][1]["end"] == "2025-02-01"
-    source.requests.clear()
-
-    with sqlite3.connect(lake.metadata.path) as connection:
-        connection.execute(
-            "UPDATE provider_scope_checks SET recheck_after=NULL,last_checked_at=?",
-            ((datetime.now(UTC) - timedelta(days=31)).isoformat(),),
-        )
-    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 1
-    lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-02-01"
-    )
-    assert len(source.requests) == 1
-    assert lake.admin.status.update_summary("income", source="custom")[0]["revision_due_assets"] == 0
-    source.requests.clear()
-
-    assert lake.admin.status.reset_update_scopes(
-        [int(row["id"])], clear_watermark=True
-    ) == 1
-    assert lake.admin.status.provider_scope_checks(
-        dataset="income", source="custom"
-    ) == []
-    lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-    assert len(source.requests) == 1
 
 
-def test_asset_forward_update_rechecks_recent_days_for_late_rows(tmp_path) -> None:
-    class LateFinancialSource:
-        name = "custom"
-
-        def __init__(self) -> None:
-            self.requests: list[tuple[str, dict[str, object]]] = []
-            self.publish_late = False
-
-        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
-            self.requests.append((dataset, dict(request)))
-            if not self.publish_late:
-                return pl.DataFrame()
-            return pl.DataFrame(
-                {
-                    "ann_date": ["20250131"],
-                    "ts_code": [str(request["id"])],
-                    "value": [1.0],
-                }
-            )
-
-    source = LateFinancialSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "income",
-            "by_asset",
-            asset_list="stock_basic",
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-    lake.update.dataset(
-        "income",
-        source="custom",
-        start="2025-01-01",
-        end="2025-01-31",
-        source_options={"asset_recent_recheck_days": 3},
-    )
-    source.publish_late = True
-    source.requests.clear()
-
-    report = lake.update.dataset(
-        "income",
-        source="custom",
-        start="2025-01-01",
-        end="2025-02-01",
-        source_options={"asset_recent_recheck_days": 3},
-    )
-
-    assert report.status == "success"
-    assert source.requests[0][1]["start"] == "2025-01-30"
-    assert source.requests[0][1]["end"] == "2025-02-01"
-    assert lake.query.query("income", source="custom").collect()["time"].item() == date(
-        2025, 1, 31
-    )
 
 
-def test_empty_recheck_preserves_existing_committed_coverage(tmp_path) -> None:
-    source = LedgerSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "income",
-            "by_asset",
-            asset_list="stock_basic",
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-    first = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-    committed = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    preserved = {
-        key: committed[key]
-        for key in ("data_max_time", "last_success_at", "row_count", "commit_run_id")
-    }
-    with lake.metadata.connect() as db:
-        db.execute(
-            "update provider_scope_checks set recheck_after='2000-01-01'"
-        )
-    source.empty = True
-    source.requests.clear()
-
-    second = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-
-    row = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert first.status == "success"
-    assert second.status == "no_data"
-    assert row["status"] == "empty"
-    assert {key: row[key] for key in preserved} == preserved
-    assert len(source.requests) == 1
-    api_call = lake.metadata._rows(
-        "select status,result_kind from api_calls order by finished_at desc limit 1"
-    )[0]
-    assert api_call == {"status": "success", "result_kind": "empty"}
 
 
-def test_cooperative_interruption_persists_completed_empties_and_resumes(tmp_path) -> None:
-    source = LedgerSource(empty=True)
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    assets = ["A", "B", "C", "D", "E"]
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame(
-            {"ts_code": assets, "list_date": ["20250101"] * len(assets)}
-        ),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "balancesheet",
-            "by_asset",
-            asset_list="stock_basic",
-            field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-
-    interrupted = lake.update.dataset(
-        "balancesheet",
-        source="custom",
-        start="2025-01-01",
-        end="2025-01-31",
-        workers=1,
-        max_in_flight=1,
-        cancel_requested=lambda: len(source.requests) >= 1,
-    )
-
-    scopes = lake.admin.status.update_scopes(
-        dataset="balancesheet", source="custom"
-    )
-    assert interrupted.status == "cancelled"
-    assert interrupted.empty_count == 1
-    assert sum(row["status"] == "empty" for row in scopes) == 1
-    assert sum(row["status"] == "pending" for row in scopes) == 4
-    assert all(row["status"] != "running" for row in scopes)
-    assert lake.metadata.active_update_leases() == []
-
-    source.requests.clear()
-    resumed = lake.update.dataset(
-        "balancesheet",
-        source="custom",
-        start="2025-01-01",
-        end="2025-01-31",
-        workers=1,
-        max_in_flight=1,
-    )
-
-    assert resumed.status == "no_data"
-    assert resumed.empty_count == 4
-    assert len(source.requests) == 4
-    assert all(
-        row["status"] == "empty"
-        for row in lake.admin.status.update_scopes(
-            dataset="balancesheet", source="custom"
-        )
-    )
 
 
 def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> None:
@@ -442,7 +194,7 @@ def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
     assert check["recheck_after"] is None
 
 
-def test_daily_update_rechecks_only_empty_scopes_in_last_twenty_sessions(
+def test_daily_update_rechecks_all_scopes_in_last_three_calendar_days(
     tmp_path,
 ) -> None:
     class SelectiveSource(LedgerSource):
@@ -493,11 +245,11 @@ def test_daily_update_rechecks_only_empty_scopes_in_last_twenty_sessions(
     )
 
     requested = {str(request["date"]) for _, request in source.requests}
-    assert requested == {value.isoformat() for value in sessions[-20:]}
-    assert report.success_count == 20
+    assert requested == {value.isoformat() for value in sessions[-3:]}
+    assert report.success_count == 3
     scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
-    assert [row["status"] for row in scopes[:5]] == ["empty"] * 5
-    assert [row["status"] for row in scopes[5:]] == ["success"] * 20
+    assert [row["status"] for row in scopes[:-3]] == ["empty"] * 22
+    assert [row["status"] for row in scopes[-3:]] == ["success"] * 3
 
 
 def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> None:
@@ -567,54 +319,10 @@ def test_incompatible_old_schema_is_rejected_without_migration(tmp_path) -> None
             "insert into metadata_state(key,value) values ('schema_version','1')"
         )
 
-    with pytest.raises(ConfigurationError, match="automatic migration is intentionally disabled"):
+    with pytest.raises(ConfigurationError, match="Automatic migration is disabled"):
         DataLake.open(tmp_path)
 
 
-def test_asset_request_date_field_is_distinct_from_pit_time(tmp_path) -> None:
-    class FinancialSource:
-        name = "custom"
-
-        def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
-            return pl.DataFrame(
-                {
-                    "ann_date": ["20250131"],
-                    "f_ann_date": ["20241231"],
-                    "ts_code": [str(request["id"])],
-                    "value": [1.0],
-                }
-            )
-
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(FinancialSource())
-    lake.ingest(
-        DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
-        pl.DataFrame({"ts_code": ["A"], "list_date": ["20250101"]}),
-    )
-    lake.admin.datasets.register(
-        DatasetSpec(
-            "income",
-            "by_asset",
-            asset_list="stock_basic",
-            request_date_field="ann_date",
-            field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
-        )
-    )
-
-    report = lake.update.dataset(
-        "income", source="custom", start="2025-01-01", end="2025-01-31"
-    )
-
-    assert report.status == "success"
-    frame = lake.query.query("income", source="custom").collect()
-    assert frame["time"].item().isoformat() == "2024-12-31"
-    scope = lake.admin.status.update_scopes(dataset="income", source="custom")[0]
-    assert scope["checked_through"] == "2024-12-31"
-    assert scope["data_max_time"] == "2024-12-31"
-    provider_check = lake.admin.status.provider_scope_checks(
-        dataset="income", source="custom"
-    )[0]
-    assert provider_check["checked_through"] == "2025-01-31"
 
 
 def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
@@ -636,6 +344,14 @@ def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
     assert lake.admin.status.update_scopes(dataset="daily", source="custom") == []
     assert lake.admin.status.runs(20) == before_runs
     assert not lake.paths.dataset_root("custom", "daily").exists()
+    assert lake.metadata._rows(
+        "select * from version_commits where source=? and dataset=?",
+        ("custom", "daily"),
+    ) == []
+    assert lake.metadata._rows(
+        "select * from version_checks where source=? and dataset=?",
+        ("custom", "daily"),
+    ) == []
 
 
 def test_clear_dataset_data_requires_confirmation_and_rejects_escape(tmp_path) -> None:

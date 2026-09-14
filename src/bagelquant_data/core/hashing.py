@@ -13,13 +13,6 @@ from pyarrow import ipc
 CONTENT_HASH_ALGORITHM = "arrow-ipc-v1"
 
 
-def stable_bucket(asset_id: str, bucket_count: int) -> int:
-    """Return a deterministic asset bucket."""
-
-    digest = hashlib.blake2b(asset_id.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big") % bucket_count
-
-
 def stable_record_hash(values: dict[str, object]) -> str:
     """Hash a record using stable JSON encoding."""
 
@@ -29,7 +22,17 @@ def stable_record_hash(values: dict[str, object]) -> str:
 
 def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None) -> str:
     """Hash logical dataframe content without materializing rows as Python objects."""
+    table = canonical_arrow_table(frame if fields is None else frame.select(list(fields)))
+    sink = pa.BufferOutputStream()
+    with ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    digest = hashlib.blake2b(sink.getvalue(), digest_size=16).hexdigest()
+    return f"{CONTENT_HASH_ALGORITHM}:{digest}"
 
+
+def canonical_arrow_table(frame: pl.DataFrame) -> pa.Table:
+    """Canonical logical rows and bitmap buffers shared by hashing and recovery."""
+    fields = None
     selected = frame.columns if fields is None else list(fields)
     candidate = frame if fields is None else frame.select(selected)
     # Foreign Arrow producers (notably pandas via ``pl.from_pandas``) can leave
@@ -51,11 +54,7 @@ def frame_content_hash(frame: pl.DataFrame, fields: Iterable[str] | None = None)
         [_canonical_bitmap(column.chunk(0)) for column in table.columns],
         schema=table.schema,
     ) if table.num_rows else table
-    sink = pa.BufferOutputStream()
-    with ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    digest = hashlib.blake2b(sink.getvalue(), digest_size=16).hexdigest()
-    return f"{CONTENT_HASH_ALGORITHM}:{digest}"
+    return table
 
 
 def _canonical_bitmap(array: pa.Array) -> pa.Array:
@@ -81,6 +80,14 @@ def _canonical_bitmap(array: pa.Array) -> pa.Array:
         validity = bytearray(buffers[0])
         validity[(end - 1) // 8] &= (1 << (end % 8)) - 1
         buffers[0] = pa.py_buffer(validity)
+    if pa.types.is_boolean(array.type) and buffers[1] is not None:
+        values = bytearray(buffers[1])
+        if end % 8:
+            values[(end - 1) // 8] &= (1 << (end % 8)) - 1
+        if buffers[0] is not None:
+            for index, validity_byte in enumerate(bytes(buffers[0])):
+                values[index] &= validity_byte
+        buffers[1] = pa.py_buffer(values)
     return pa.Array.from_buffers(
         array.type, len(array), buffers, null_count=array.null_count,
         offset=array.offset, children=children,

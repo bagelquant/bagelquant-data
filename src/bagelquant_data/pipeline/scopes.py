@@ -18,7 +18,6 @@ from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.metadata import MetadataStore
 
 
-DAILY_EMPTY_RECHECK_SESSIONS = 20
 ALL_NULL_PAYLOAD_ERROR = "response payload is entirely null"
 
 
@@ -39,7 +38,6 @@ class LedgerRequest:
     scope_id: int | None = None
     request_kind: str = "refresh"
     target_end: str | None = None
-    revision_check: bool = False
     recheck_after: str | None = None
     overlaps_existing: bool = False
     previous_data_max_time: str | None = None
@@ -47,6 +45,7 @@ class LedgerRequest:
     scope_ordinal: int | None = None
     variant_hash: str | None = None
     range_backfill_eligible: bool = False
+    request_date_field: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +66,9 @@ def discover_request_param_sets(
     if discovery is None:
         return (), None
     try:
+        wait_for_request = getattr(source_adapter, "wait_for_request", None)
+        if callable(wait_for_request) and not wait_for_request(discovery.api):
+            raise DataSourceError("request discovery canceled before admission")
         frame = source_adapter.fetch(discovery.api, dict(discovery.params))  # type: ignore[attr-defined]
     except Exception as error:
         raise DataSourceError(
@@ -122,17 +124,55 @@ def synchronize_requests(
         source_options,
         "allow_all_null_payload",
     )
-    asset_recent_recheck_days = _nonnegative_source_option(
-        source_options,
-        "asset_recent_recheck_days",
-    )
-    variants = _base_variants(spec, params, discovered_param_sets)
+    variants = _parameter_variants(spec, raw, _base_variants(spec, params, discovered_param_sets), ids)
     if spec.update_type == "general":
-        # An omitted target preserves the explicit refresh API.  A dated
-        # workflow, such as Automation, instead records one immutable snapshot
-        # checkpoint per request variant and never repeats a completed target.
-        if end is None:
-            return tuple(LedgerRequest(request) for _, request in variants)
+        requests = _general_requests(spec, metadata, final_day, variants)
+        assert requests is not None
+        return requests
+    spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
+    if spec.update_type == "by_daily":
+        return _daily_requests(
+            spec, raw=raw, metadata=metadata, variants=variants, start=start,
+            final_day=final_day, execution_day=execution_day, spec_hash=spec_hash,
+            allow_all_null_payload=allow_all_null_payload,
+            refresh=bool(source_options and source_options.get("refresh")),
+        )
+    raise ConfigurationError(f"Unsupported update_type: {spec.update_type}")
+
+
+def _parameter_variants(spec, raw, variants, ids=None):
+    if spec.parameter_dataset:
+        source, separator, dataset = spec.parameter_dataset.partition("/")
+        if not separator:
+            source, dataset = spec.source, source
+        catalog = raw.query_general(dataset, source=source).collect()
+        values = sorted(
+            set(catalog[spec.parameter_field].drop_nulls().cast(pl.String).to_list())
+        )
+        if ids is not None:
+            values = [value for value in values if value in set(ids)]
+        variants = [
+            (
+                hashlib.blake2b(
+                    json.dumps(
+                        {**request, spec.parameter_name: value},
+                        sort_keys=True,
+                        default=str,
+                    ).encode(),
+                    digest_size=16,
+                ).hexdigest(),
+                {**request, spec.parameter_name: value},
+            )
+            for _, request in variants
+            for value in values
+        ]
+        if not values:
+            raise ConfigurationError("Parameter dataset has no registered assets")
+    return variants
+
+
+def _general_requests(spec, metadata, final_day, variants):
+    if spec.update_type == "general":
         target = final_day.isoformat()
         spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
         metadata.synchronize_update_scopes(
@@ -156,23 +196,23 @@ def synchronize_requests(
             dataset=spec.name,
             scope_kind="general_snapshot",
         )
-        current = [row for row in rows if str(row["scope_key"]) == target
-                   and str(row["variant_hash"]) in params_by_variant]
-        # General publication replaces the complete snapshot. Never retry only
-        # part of its variants, or trust terminal scopes after file quarantine.
-        manifests = metadata.manifest(spec.source, spec.name)
-        root = raw.parquet.paths.dataset_root(spec.source, spec.name)
-        missing_snapshot = not manifests or any(
-            not (root / str(row["partition_path"])).is_file() for row in manifests
+        current = [
+            row
+            for row in rows
+            if str(row["scope_key"]) == target
+            and str(row["variant_hash"]) in params_by_variant
+        ]
+        metadata.reset_update_scopes(
+            [
+                int(row["id"])
+                for row in current
+                if row["status"] in {"success", "empty"}
+            ],
+            clear_watermark=True,
         )
-        if missing_snapshot or any(row["status"] in {"pending", "failed", "invalid"} for row in current):
-            metadata.reset_update_scopes(
-                [int(row["id"]) for row in current if row["status"] in {"success", "empty"}],
-                clear_watermark=True,
-            )
-            rows = metadata.update_scopes_with_checks(
-                source=spec.source, dataset=spec.name, scope_kind="general_snapshot",
-            )
+        rows = metadata.update_scopes_with_checks(
+            source=spec.source, dataset=spec.name, scope_kind="general_snapshot"
+        )
         return tuple(
             LedgerRequest(
                 dict(params_by_variant[str(row["variant_hash"])]),
@@ -189,35 +229,41 @@ def synchronize_requests(
             and row["status"] in {"pending", "failed", "invalid"}
         )
 
-    spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
-    if spec.update_type == "by_daily":
-        return _daily_requests(
-            spec,
-            raw=raw,
-            metadata=metadata,
-            variants=variants,
-            start=start,
-            final_day=final_day,
-            execution_day=execution_day,
-            spec_hash=spec_hash,
-            allow_all_null_payload=allow_all_null_payload,
+
+
+def inspect_coverage(spec, raw, metadata, *, start, end):
+    """Read declared daily coverage without synchronizing scopes or calling a provider."""
+    first, last = _date_value(start), _date_value(end)
+    current_hash = metadata.dataset_spec_hash(spec.source, spec.name)
+    scopes = [row for row in metadata.update_scopes(source=spec.source, dataset=spec.name)
+              if row["spec_hash"] == current_hash]
+    if spec.update_type == "general":
+        commits = raw._commits(spec.source, spec.name, None, None)
+        manifests = metadata.manifest(spec.source, spec.name)
+        complete = bool(commits and commits[-1]["spec_hash"] == current_hash and manifests) and all(
+            (raw.parquet.paths.dataset_root(spec.source, spec.name) / m["partition_path"]).is_file()
+            for m in manifests
         )
-    if spec.update_type == "by_asset":
-        return _asset_requests(
-            spec,
-            raw=raw,
-            metadata=metadata,
-            variants=variants,
-            ids=ids,
-            start=start,
-            final_day=final_day,
-            execution_day=execution_day,
-            spec_hash=spec_hash,
-            recent_recheck_days=asset_recent_recheck_days,
-        )
-    raise ConfigurationError(
-        f"{spec.source}/{spec.name} unsupported update_type: {spec.update_type}"
-    )
+        return {"complete": complete, "missing": [] if complete else ["complete_snapshot"],
+                "missing_parameters": {}, "coverage_through": str(last) if complete else None}
+    dates = ([value for value in _calendar_dates(spec, raw) if first <= value <= last]
+             if spec.date_kind == "trading" else
+             [first + timedelta(days=i) for i in range((last-first).days+1)])
+    variants = _parameter_variants(spec, raw, _base_variants(spec, None, ()))
+    expected = {identity for identity, _ in variants}
+    if spec.request_discovery is not None:
+        expected = {row["variant_hash"] for row in scopes} or {"undiscovered_parameters"}
+    complete = {(row["scope_key"], row["variant_hash"]) for row in scopes
+                if row["status"] in {"success", "empty"}}
+    missing = {str(day): sorted(identity for identity in expected if (str(day), identity) not in complete)
+               for day in dates}
+    missing = {day: values for day, values in missing.items() if values}
+    coverage = last
+    if missing:
+        first_missing = _date_value(min(missing))
+        coverage = max((day for day in dates if day < first_missing), default=None)
+    return {"complete": not missing, "missing": sorted(missing), "missing_parameters": missing,
+            "coverage_through": str(coverage) if coverage is not None else None}
 
 
 def compact_daily_range_backfill(
@@ -248,7 +294,9 @@ def compact_daily_range_backfill(
     eligible_by_variant: dict[str, list[LedgerRequest]] = {}
     for request in requests:
         if request.range_backfill_eligible:
-            eligible_by_variant.setdefault(request.variant_hash or "", []).append(request)
+            eligible_by_variant.setdefault(request.variant_hash or "", []).append(
+                request
+            )
 
     def append_groups(pending: list[LedgerRequest]) -> None:
         cursor = 0
@@ -302,16 +350,26 @@ def _daily_requests(
     execution_day: date,
     spec_hash: str,
     allow_all_null_payload: bool,
+    refresh: bool = False,
 ) -> tuple[LedgerRequest, ...]:
     lower = _date_value(start) if start is not None else None
     dates = [
         value
-        for value in _calendar_dates(spec, raw)
+        for value in (
+            _calendar_dates(spec, raw)
+            if spec.date_kind == "trading"
+            else [
+                final_day - timedelta(days=i)
+                for i in range((final_day - (lower or final_day)).days, -1, -1)
+            ]
+        )
         if value <= final_day and (lower is None or value >= lower)
     ]
     selected_dates = set(dates)
     ordinals = {value: index for index, value in enumerate(dates)}
-    recent_dates = set(dates[-DAILY_EMPTY_RECHECK_SESSIONS:])
+    recent_dates = {
+        d for d in dates if d > final_day - timedelta(days=spec.recent_recheck_days)
+    }
     metadata.synchronize_update_scopes(
         {
             "source": spec.source,
@@ -352,15 +410,17 @@ def _daily_requests(
             and row.get("last_error") == ALL_NULL_PAYLOAD_ERROR
         )
         eligible = (
-            status in {"pending", "failed"}
+            status in {"pending", "failed", "invalid"}
+            or refresh
             or retry_all_null_payload
             or (status == "empty" and scope_day in recent_dates)
-            or (status == "success" and check_due)
+            or (status == "success" and (check_due or scope_day in recent_dates))
         )
         if not eligible:
             continue
         request = dict(variant_params[str(row["variant_hash"])])
-        request[spec.date_param or "date"] = scope_day.isoformat()
+        date_param = str(request.pop("__date_param", spec.date_param or "date"))
+        request[date_param] = scope_day.isoformat()
         interrupted_backfill = bool(
             status == "failed"
             and row["provider_checked_through"] is None
@@ -388,6 +448,7 @@ def _daily_requests(
                     else "forward"
                 ),
                 target_end=scope_day.isoformat(),
+                request_date_field=(spec.request_date_field or date_param),
                 recheck_after=daily_scope.recheck_after,
                 daily_scopes=(daily_scope,),
                 scope_ordinal=ordinals[scope_day],
@@ -403,149 +464,6 @@ def _daily_requests(
             )
         )
     return tuple(selected)
-
-
-def _asset_requests(
-    spec: DatasetSpec,
-    *,
-    raw: RawQueryService,
-    metadata: MetadataStore,
-    variants: list[tuple[str, dict[str, object]]],
-    ids: Sequence[str] | None,
-    start: DateLike | None,
-    final_day: date,
-    execution_day: date,
-    spec_hash: str,
-    recent_recheck_days: int,
-) -> tuple[LedgerRequest, ...]:
-    requested_start = _date_value(start) if start is not None else None
-    assets = _asset_bounds(spec, raw, ids)
-    bounds: dict[str, tuple[date | None, date]] = {}
-    scopes = []
-    for asset_id, list_date, delist_date in assets:
-        initial_start = (
-            max(value for value in (requested_start, list_date) if value is not None)
-            if requested_start is not None or list_date is not None
-            else None
-        )
-        target_end = min(final_day, delist_date) if delist_date else final_day
-        if initial_start is not None and initial_start > target_end:
-            continue
-        bounds[asset_id] = (initial_start, target_end)
-        for variant_hash, _ in variants:
-            scopes.append(
-                {
-                    "source": spec.source,
-                    "dataset": spec.name,
-                    "scope_kind": "asset",
-                    "scope_key": asset_id,
-                    "variant_hash": variant_hash,
-                    "initial_start": None
-                    if initial_start is None
-                    else initial_start.isoformat(),
-                    "spec_hash": spec_hash,
-                }
-            )
-    metadata.synchronize_update_scopes(scopes)
-    metadata.remove_obsolete_update_scopes(
-        source=spec.source, dataset=spec.name, spec_hash=spec_hash
-    )
-    variant_params = dict(variants)
-    rows = metadata.update_scopes_with_checks(
-        source=spec.source, dataset=spec.name, scope_kind="asset"
-    )
-    requests = []
-    for row in rows:
-        if str(row["variant_hash"]) not in variant_params:
-            continue
-        asset_id = str(row["scope_key"])
-        if asset_id not in bounds or row["status"] not in {
-            "pending",
-            "failed",
-            "success",
-            "empty",
-        }:
-            continue
-        initial_start, target_end = bounds[asset_id]
-        has_check = row["provider_checked_through"] is not None
-        checked = _optional_date(row["provider_checked_through"])
-        forward_start = (
-            checked + timedelta(days=1) if checked is not None else initial_start
-        )
-        last_revision = _optional_datetime(row["provider_last_checked_at"])
-        recheck_due = bool(
-            has_check
-            and row["provider_recheck_after"] is not None
-            and _date_value(row["provider_recheck_after"]) <= execution_day
-        )
-        revision_due = recheck_due or (
-            last_revision is None
-            or (datetime.now(UTC) - last_revision).days >= spec.revision_refresh_days
-        )
-        forward_due = checked is None or checked < target_end
-        status = str(row["status"])
-        eligible = status in {"pending", "failed"} or forward_due or revision_due
-        if not eligible:
-            continue
-        request_start = forward_start
-        if forward_due and recent_recheck_days:
-            recent_start = target_end - timedelta(days=recent_recheck_days - 1)
-            if initial_start is not None:
-                recent_start = max(recent_start, initial_start)
-            request_start = (
-                recent_start
-                if request_start is None
-                else min(request_start, recent_start)
-            )
-        if revision_due:
-            revision_start = target_end - timedelta(
-                days=spec.revision_lookback_days - 1
-            )
-            if initial_start is not None:
-                revision_start = max(revision_start, initial_start)
-            request_start = (
-                revision_start
-                if request_start is None
-                else min(request_start, revision_start)
-            )
-        if request_start is None:
-            raise ConfigurationError(
-                f"{spec.source}/{spec.name} needs an update start for {asset_id}"
-            )
-        request = dict(variant_params[str(row["variant_hash"])])
-        request.update(
-            id=asset_id,
-            start=request_start.isoformat(),
-            end=target_end.isoformat(),
-        )
-        requests.append(
-            LedgerRequest(
-                request,
-                scope_id=int(row["id"]),
-                request_kind=(
-                    "retry"
-                    if status == "failed"
-                    else "revision"
-                    if revision_due
-                    else "forward"
-                ),
-                target_end=target_end.isoformat(),
-                revision_check=revision_due,
-                recheck_after=(
-                    execution_day + timedelta(days=spec.revision_refresh_days)
-                ).isoformat(),
-                overlaps_existing=(
-                    row["data_max_time"] is not None
-                    and request_start <= _date_value(row["data_max_time"])
-                ),
-                previous_data_max_time=(
-                    None
-                    if row["data_max_time"] is None
-                    else str(row["data_max_time"])
-                ),
-            )
-        )
-    return tuple(requests)
 
 
 def _base_variants(
@@ -579,6 +497,17 @@ def _base_variants(
                         request,
                     )
                 )
+    if spec.date_params:
+        result = [
+            (
+                hashlib.blake2b(
+                    (identity + field).encode(), digest_size=16
+                ).hexdigest(),
+                {**request, "__date_param": field},
+            )
+            for identity, request in result
+            for field in spec.date_params
+        ]
     return result
 
 
@@ -598,30 +527,6 @@ def _calendar_dates(spec: DatasetSpec, raw: RawQueryService) -> list[date]:
         .get_column("value")
         .to_list()
     )
-
-
-def _asset_bounds(
-    spec: DatasetSpec, raw: RawQueryService, ids: Sequence[str] | None
-) -> list[tuple[str, date | None, date | None]]:
-    if not spec.asset_list:
-        raise ConfigurationError(f"{spec.source}/{spec.name} requires asset_list")
-    frame = raw.query_general(spec.asset_list, source=spec.source).collect()
-    if frame.is_empty() or "asset_id" not in frame.columns:
-        raise ConfigurationError(f"{spec.source}/{spec.asset_list} has no asset ids")
-    selected = {str(value) for value in ids} if ids is not None else None
-    result = []
-    for row in frame.iter_rows(named=True):
-        asset_id = str(row["asset_id"])
-        if selected is not None and asset_id not in selected:
-            continue
-        result.append(
-            (
-                asset_id,
-                _optional_date(row.get("list_date")),
-                _optional_date(row.get("delist_date")),
-            )
-        )
-    return sorted(set(result))
 
 
 def _date_expr(field: str) -> pl.Expr:
@@ -693,9 +598,7 @@ def _nonnegative_source_option(
     return value
 
 
-def _nonempty_option(
-    policy: Mapping[str, object], name: str, default: str
-) -> str:
+def _nonempty_option(policy: Mapping[str, object], name: str, default: str) -> str:
     value = policy.get(name, default)
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError(f"daily_range_backfill {name} cannot be empty")

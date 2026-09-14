@@ -33,23 +33,6 @@ def test_provider_quota_coordinates_cooldown_and_pacing(monkeypatch) -> None:
     assert clock[0] - before >= 60 / 450 - 1e-9
 
 
-def test_provider_admission_is_cancelable_without_calling_provider(monkeypatch) -> None:
-    from bagelquant_data.core.dataset import DatasetSpec
-    from bagelquant_data.pipeline.update import _fetch_one
-
-    source = TushareSource(client=object())
-    source._rate_limits["balancesheet"] = (1.0, source_module.time.monotonic() + 60)
-    checks = [0]
-
-    def canceled():
-        checks[0] += 1
-        return checks[0] > 2
-
-    result = _fetch_one(
-        DatasetSpec(name="balancesheet", source="tushare", update_type="by_asset"),
-        source, {"id": "A"}, "request", 3, 60.0, canceled,
-    )
-    assert result.status == "cancelled"
 
 
 def test_tushare_preserves_configured_daily_date_parameter() -> None:
@@ -122,3 +105,22 @@ def test_tushare_client_passes_token_without_writing_user_home(monkeypatch) -> N
 
     assert build_client("secret") is expected
     assert calls == ["secret"]
+
+
+def test_provider_admission_is_cancelable_without_calling_provider(monkeypatch) -> None:
+    from bagelquant_data.core.dataset import DatasetSpec
+    from bagelquant_data.pipeline.update import _fetch_one
+
+    source = TushareSource(client=object())
+    source._rate_limits["balancesheet"] = (1.0, source_module.time.monotonic() + 60)
+    checks = [0]
+
+    def canceled():
+        checks[0] += 1
+        return checks[0] > 2
+
+    result = _fetch_one(
+        DatasetSpec(name="balancesheet", source="tushare", update_type="by_daily"),
+        source, {"id": "A"}, "request", 3, 60.0, canceled,
+    )
+    assert result.status == "cancelled"

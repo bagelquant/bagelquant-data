@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 import polars as pl
@@ -11,7 +12,7 @@ import polars as pl
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.normalization import NormalizeContext, StandardNormalizer
 from bagelquant_data.core.registry import FrameworkRegistries
-from bagelquant_data.pipeline.commit import CommitResult, commit_frame
+from bagelquant_data.pipeline.commit import CommitResult
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.parquet import ParquetStore
 from bagelquant_data.storage.rejected import RejectedStore
@@ -69,19 +70,22 @@ class IngestionPipeline:
         spec: DatasetSpec,
         frame: pl.DataFrame,
         *,
-        mode: str = "upsert",
+        mode: str = "incremental",
         run_id: str | None = None,
         status: str = "success",
         request_count: int = 0,
         success_count: int = 0,
         failure_count: int = 0,
         error_message: str | None = None,
+        ingested_at: datetime | None = None,
     ) -> IngestionReport:
         run_id = run_id or uuid4().hex
         commit = self.commit_frame(
             spec,
             frame,
             run_id=run_id,
+            mode=mode,
+            ingested_at=ingested_at,
         )
         self.metadata.record_run(
             run_id=run_id,
@@ -120,9 +124,16 @@ class IngestionPipeline:
         *,
         run_id: str,
         writer_executor: ThreadPoolExecutor | None = None,
+        mode: str = "incremental",
+        ingested_at: datetime | None = None,
+        requests: list[dict] | None = None,
     ) -> CommitResult:
         """Commit a frame as part of an existing logical run."""
 
+        if frame.width == 0:
+            frame = pl.DataFrame(
+                schema={field: pl.String for field in spec.field_mappings}
+            )
         result = StandardNormalizer().normalize(
             frame.lazy(),
             spec,
@@ -140,10 +151,16 @@ class IngestionPipeline:
                 reason="normalization",
                 row_count=rejected.height,
             )
-        return commit_frame(
-            spec=spec,
-            frame=result.accepted,
-            registries=self.registries,
-            parquet=self.parquet,
-            writer_executor=writer_executor,
+        from bagelquant_data.pipeline.versions import commit_versions
+        from bagelquant_data.core.validation import FrameworkValidator
+
+        FrameworkValidator().validate(result.accepted, spec)
+        return commit_versions(
+            spec,
+            result.accepted.collect(),
+            self.parquet,
+            run_id=run_id,
+            mode=mode,
+            ingested_at=ingested_at,
+            requests=requests,
         )

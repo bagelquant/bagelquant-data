@@ -49,6 +49,7 @@ class DataLake:
         self, root: str | Path, registries: FrameworkRegistries | None = None
     ) -> None:
         self.paths = LakePaths.open(root)
+        MetadataStore.check_compatibility(self.paths.database)
         self.paths.ensure()
         self.registries = registries or default_registries()
         self.metadata = MetadataStore(self.paths.database)
@@ -74,11 +75,20 @@ class DataLake:
 
         return cls(root)
 
-    def ingest(self, spec: DatasetSpec, frame: pl.DataFrame) -> IngestionReport:
+    def ingest(
+        self,
+        spec: DatasetSpec,
+        frame: pl.DataFrame,
+        *,
+        mode: str = "incremental",
+        ingested_at=None,
+    ) -> IngestionReport:
         """Register and ingest a local frame."""
 
         self.admin.datasets.register(spec)
-        return self._pipeline.ingest_frame(spec, frame, mode=spec.update_type)
+        return self._pipeline.ingest_frame(
+            spec, frame, mode=mode, ingested_at=ingested_at
+        )
 
 
 @dataclass
@@ -88,6 +98,35 @@ class LakeAdmin:
     sources: SourceManager
     datasets: DatasetManager
     status: StatusManager
+
+    def recovery_status(self, dataset: str, *, source: str, deep: bool = False) -> list[dict]:
+        from bagelquant_data.storage.recovery import inspect_partition
+        store = ParquetStore(self.status.paths, self.status.metadata)
+        return [inspect_partition(store, source, dataset, row["partition_path"], deep=deep) for row in self.status.metadata.manifest(source, dataset)]
+
+    def repair_partitions(
+        self,
+        dataset: str,
+        *,
+        source: str,
+        partitions: Sequence[str],
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[dict]:
+        from uuid import uuid4
+        from bagelquant_data.storage.recovery import repair_partition
+        run_id = uuid4().hex
+        metadata = self.status.metadata
+        metadata.acquire_update_leases([(source, dataset, run_id)], owner_id=run_id)
+        try:
+            store = ParquetStore(self.status.paths, metadata)
+            repaired = []
+            for partition in dict.fromkeys(partitions):
+                if cancel_check is not None and cancel_check():
+                    break
+                repaired.append(repair_partition(store, source, dataset, partition))
+            return repaired
+        finally:
+            metadata.release_update_leases([run_id])
 
     def summary(self) -> dict[str, Any]:
         return self.status.summary()
@@ -179,6 +218,13 @@ class LakeAdmin:
             scope_ids, clear_watermark=clear_watermark
         )
 
+    def coverage(self, dataset: str, *, source: str, start: DateLike, end: DateLike) -> dict:
+        from bagelquant_data.pipeline.scopes import inspect_coverage
+        store = ParquetStore(self.status.paths, self.status.metadata)
+        return inspect_coverage(self.datasets.get(dataset, source=source),
+                                RawQueryService(store, self.status.metadata), self.status.metadata,
+                                start=start, end=end)
+
     def rejected(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
         return self.status.rejected(dataset, source=source)
 
@@ -226,7 +272,9 @@ class LakeUpdater:
         for dataset in dict.fromkeys(datasets):
             planning_started = time.perf_counter()
             if progress_callback is not None:
-                progress_callback(UpdateProgress(dataset, "planning", 0, 0, 0, 0, 0, "running"))
+                progress_callback(
+                    UpdateProgress(dataset, "planning", 0, 0, 0, 0, 0, "running")
+                )
             spec = self.lake.admin.datasets.get(dataset, source=source)
             context = _request_context(
                 source=source,
@@ -238,30 +286,27 @@ class LakeUpdater:
                     "progress_callback": progress_callback,
                 },
             )
-            if (
-                spec.update_type == "general"
-                and context.end is not None
-                and _general_snapshot_is_current(
-                    self.lake,
-                    spec,
-                    context.end,
-                )
-            ):
-                works.append(
-                    DatasetUpdateWork(
-                        spec=spec,
-                        context=context,
-                        requests=(),
-                        planning_seconds=time.perf_counter() - planning_started,
-                    )
-                )
-                continue
+            from bagelquant_data.pipeline.initialization import prepare_initialization
+
+            prepare_initialization(
+                self.lake.metadata,
+                spec,
+                context.options["mode"],
+                context.start,
+                context.end,
+            )
             if progress_callback is not None:
-                progress_callback(UpdateProgress(dataset, "discovery", 0, 0, 0, 0, 0, "running"))
+                progress_callback(
+                    UpdateProgress(dataset, "discovery", 0, 0, 0, 0, 0, "running")
+                )
             discovered_param_sets, discovery_call = discover_request_param_sets(
                 spec, adapter
             )
-            raw_source_options = context.options.get("source_options")
+            raw_source_options = {
+                **spec.request_options,
+                **dict(context.options.get("source_options") or {}),
+            }
+            raw_source_options["refresh"] = context.options.get("mode") == "refresh"
             if raw_source_options is not None and not isinstance(
                 raw_source_options, Mapping
             ):
@@ -281,7 +326,7 @@ class LakeUpdater:
             requests = compact_daily_range_backfill(
                 spec,
                 requests,
-                context.options.get("source_options"),
+                raw_source_options,
             )
             works.append(
                 DatasetUpdateWork(
@@ -321,44 +366,38 @@ class LakeUpdater:
             )
         finally:
             self.lake.metadata.release_update_leases(work.run_id for work in works)
+        from bagelquant_data.pipeline.initialization import finish_initialization
+
+        for run in report.runs:
+            work = next(w for w in works if w.spec.name == run.dataset)
+            if (
+                work.context.options["mode"] == "initialize"
+                and run.status in {"success", "no_data"}
+                and run.remaining_scope_count == 0
+            ):
+                finish_initialization(self.lake.metadata, source, run.dataset)
         after = _manifest_map(
             self.lake.metadata,
             source,
             selected_datasets,
         )
-        return replace(report, changed_partitions=_partition_changes(before, after))
-
-
-def _general_snapshot_is_current(
-    lake: DataLake,
-    spec: DatasetSpec,
-    end: DateLike,
-) -> bool:
-    """Reuse a dated snapshot only while its canonical files still exist."""
-
-    target = _as_date(end).isoformat()
-    spec_hash = lake.metadata.dataset_spec_hash(spec.source, spec.name)
-    all_rows = lake.metadata.update_scopes_with_checks(
-        source=spec.source,
-        dataset=spec.name,
-        scope_kind="general_snapshot",
-    )
-    rows = [
-        row
-        for row in all_rows
-        if str(row["scope_key"]) == target and str(row["spec_hash"]) == spec_hash
-    ]
-    manifests = lake.metadata.manifest(spec.source, spec.name)
-    root = lake.paths.dataset_root(spec.source, spec.name)
-    if not manifests or any(
-        not (root / str(row["partition_path"])).is_file() for row in manifests
-    ):
-        return False
-    return bool(rows) and all(
-        str(row["status"]) in {"success", "empty"}
-        and not str(row["variant_hash"]).startswith("manifest:")
-        for row in rows
-    )
+        changes = _partition_changes(before, after)
+        run_ids = {run.run_id for run in report.runs}
+        bounds = {}
+        for row in self.lake.metadata._rows(
+            "select c.dataset,c.run_id,b.partition_path,b.min_available,b.max_available,c.pit_date "
+            "from version_batches b join version_commits c on c.seq=b.commit_seq "
+            "where c.source=? and c.status='committed'", (source,),
+        ):
+            if row["run_id"] in run_ids:
+                bounds.setdefault((row["dataset"], row["partition_path"]), []).append(row)
+        return replace(report, changed_partitions=tuple(
+            replace(change,
+                    min_time=min(str(row["min_available"] or row["pit_date"]) for row in bounds[key]),
+                    max_time=max(str(row["max_available"] or row["pit_date"]) for row in bounds[key]))
+            if (key := (change.dataset, change.partition_path)) in bounds else change
+            for change in changes
+        ))
 
 
 def _as_date(value: DateLike) -> date:
@@ -368,6 +407,7 @@ def _as_date(value: DateLike) -> date:
         return value
     return date.fromisoformat(str(value)[:10])
 
+
 def _request_context(
     source: str, dataset: str, kwargs: dict[str, Any]
 ) -> RequestContext:
@@ -376,6 +416,10 @@ def _request_context(
         "end": kwargs.pop("end", None),
         "assets": None,
     }
+    mode = kwargs.pop("mode", "incremental")
+    ingested_at = kwargs.pop("ingested_at", None)
+    if mode not in {"initialize", "incremental", "refresh"}:
+        raise ConfigurationError("mode must be initialize, incremental, or refresh")
     workers = kwargs.pop("workers", None)
     batch_size = kwargs.pop("batch_size", None)
     max_in_flight = kwargs.pop("max_in_flight", None)
@@ -392,7 +436,9 @@ def _request_context(
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
-    options: dict[str, Any] = {}
+    options: dict[str, Any] = {"mode": mode}
+    if ingested_at is not None:
+        options["ingested_at"] = ingested_at
     if workers is not None:
         options["workers"] = workers
     if batch_size is not None:

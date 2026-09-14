@@ -14,7 +14,6 @@ from uuid import uuid4
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
-from bagelquant_data.core.hashing import stable_bucket
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.pipeline.commit import (
@@ -167,8 +166,25 @@ def _scope_ids(request: LedgerRequest) -> tuple[int, ...]:
 
 def _request_detail(request: LedgerRequest) -> str:
     return ", ".join(
-        f"{key}={value}" for key, value in request.params.items()
-        if key in {"date", "trade_date", "ex_date", "ann_date", "start", "end", "start_date", "end_date", "period", "id", "ts_code", "l1_code", "is_new", "list_status"}
+        f"{key}={value}"
+        for key, value in request.params.items()
+        if key
+        in {
+            "date",
+            "trade_date",
+            "ex_date",
+            "ann_date",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "period",
+            "id",
+            "ts_code",
+            "l1_code",
+            "is_new",
+            "list_status",
+        }
     )
 
 
@@ -248,12 +264,6 @@ def _update_datasets(
         workers, int(works[0].context.options.get("max_in_flight", workers * 2))
     )
     states = {work.spec.name: _RunState(work) for work in works}
-    initial_asset_build = (
-        works[0].spec.update_type == "by_asset"
-        and not pipeline.metadata.manifest(
-            works[0].spec.source, works[0].spec.name
-        )
-    )
     callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
     tasks: list[UpdateTask] = []
     begun: set[str] = set()
@@ -284,23 +294,34 @@ def _update_datasets(
             tasks.extend((work, request) for request in work.requests)
         ordered_tasks = _partition_affinity_order(_fair_tasks(tasks))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            if initial_asset_build:
-                request_index_offset = 0
-                for group in _initial_asset_task_groups(ordered_tasks):
-                    _run_fetches(
-                        group,
-                        executor=executor,
-                        source_adapter=source_adapter,
-                        pipeline=pipeline,
-                        states=states,
-                        callbacks=callbacks,
-                        totals=totals,
-                        completed=completed,
-                        max_in_flight=max_in_flight,
-                        writer_executor=writer_executor,
-                        request_index_offset=request_index_offset,
-                    )
-                    state = states[works[0].spec.name]
+            repair_tasks = [
+                task
+                for task in ordered_tasks
+                if task[1].request_kind in {"retry", "empty_recheck"}
+            ]
+            incremental_tasks = [
+                task
+                for task in ordered_tasks
+                if task[1].request_kind not in {"retry", "empty_recheck"}
+            ]
+            request_index_offset = 0
+            for phase in (repair_tasks, incremental_tasks):
+                if not phase:
+                    continue
+                _run_fetches(
+                    phase,
+                    executor=executor,
+                    source_adapter=source_adapter,
+                    pipeline=pipeline,
+                    states=states,
+                    callbacks=callbacks,
+                    totals=totals,
+                    completed=completed,
+                    max_in_flight=max_in_flight,
+                    writer_executor=writer_executor,
+                    request_index_offset=request_index_offset,
+                )
+                for state in states.values():
                     _commit_state(
                         pipeline,
                         state,
@@ -309,49 +330,9 @@ def _update_datasets(
                         totals[state.work.spec.name],
                         writer_executor,
                     )
-                    request_index_offset += len(group)
-                    if state.cancelled:
-                        break
-            else:
-                repair_tasks = [
-                    task
-                    for task in ordered_tasks
-                    if task[1].request_kind in {"retry", "empty_recheck"}
-                ]
-                incremental_tasks = [
-                    task
-                    for task in ordered_tasks
-                    if task[1].request_kind not in {"retry", "empty_recheck"}
-                ]
-                request_index_offset = 0
-                for phase in (repair_tasks, incremental_tasks):
-                    if not phase:
-                        continue
-                    _run_fetches(
-                        phase,
-                        executor=executor,
-                        source_adapter=source_adapter,
-                        pipeline=pipeline,
-                        states=states,
-                        callbacks=callbacks,
-                        totals=totals,
-                        completed=completed,
-                        max_in_flight=max_in_flight,
-                        writer_executor=writer_executor,
-                        request_index_offset=request_index_offset,
-                    )
-                    for state in states.values():
-                        _commit_state(
-                            pipeline,
-                            state,
-                            callbacks[state.work.spec.name],
-                            completed[state.work.spec.name],
-                            totals[state.work.spec.name],
-                            writer_executor,
-                        )
-                    request_index_offset += len(phase)
-                    if any(state.cancelled for state in states.values()):
-                        break
+                request_index_offset += len(phase)
+                if any(state.cancelled for state in states.values()):
+                    break
         for state in states.values():
             _commit_state(
                 pipeline,
@@ -450,7 +431,9 @@ def _run_fetches(
             ids = _scope_ids(request)
             claimed = claimed_by_run.get(work.run_id, set())
             if ids and not all(scope_id in claimed for scope_id in ids):
-                partially_claimed = [scope_id for scope_id in ids if scope_id in claimed]
+                partially_claimed = [
+                    scope_id for scope_id in ids if scope_id in claimed
+                ]
                 if partially_claimed:
                     raise RuntimeError(
                         "A physical request claimed only part of its logical scopes"
@@ -502,16 +485,30 @@ def _run_fetches(
         if time.monotonic() >= next_activity:
             request_status = getattr(source_adapter, "request_status", None)
             for state in states.values():
-                active = [request for _, (work, request) in futures.values() if work.spec.name == state.work.spec.name]
+                active = [
+                    request
+                    for _, (work, request) in futures.values()
+                    if work.spec.name == state.work.spec.name
+                ]
                 state.in_flight = len(active)
                 state.current_scope = _request_detail(active[0]) if active else ""
-                observed_status = request_status(state.work.spec.source_api or state.work.spec.name) if callable(request_status) else {}
-                activity = observed_status if isinstance(observed_status, Mapping) else {}
+                observed_status = (
+                    request_status(state.work.spec.source_api or state.work.spec.name)
+                    if callable(request_status)
+                    else {}
+                )
+                activity = (
+                    observed_status if isinstance(observed_status, Mapping) else {}
+                )
                 state.wait_reason = str(activity.get("wait_reason", ""))
                 state.wait_seconds = float(activity.get("wait_seconds", 0.0))
-                _emit_progress(callbacks[state.work.spec.name], state,
-                               "waiting" if state.wait_reason else "fetch",
-                               completed[state.work.spec.name], total=totals[state.work.spec.name])
+                _emit_progress(
+                    callbacks[state.work.spec.name],
+                    state,
+                    "waiting" if state.wait_reason else "fetch",
+                    completed[state.work.spec.name],
+                    total=totals[state.work.spec.name],
+                )
             next_activity = time.monotonic() + 3.0
         if time.monotonic() >= next_heartbeat:
             for state in states.values():
@@ -611,9 +608,7 @@ def _harvest_request(
         )
         return
     if state.work.spec.update_type == "by_daily" and request.daily_scopes:
-        nonempty, empty = _split_daily_scope_results(
-            state.work.spec, request, frame
-        )
+        nonempty, empty = _split_daily_scope_results(state.work.spec, request, frame)
         if empty:
             pipeline.metadata.record_empty_scope_results(
                 calls=calls,
@@ -636,21 +631,6 @@ def _harvest_request(
             state.buffered.append((scope_frame, scope_request))
             state.buffered_bytes += int(scope_frame.estimated_size())
         return
-    if frame.is_empty():
-        pipeline.metadata.record_empty_scope_result(
-            calls=({**call, "result_kind": "empty"} for call in calls),
-            scope_id=request.scope_id,
-            run_id=state.work.run_id,
-            checked_through=request.target_end,
-            recheck_after=(
-                request.recheck_after
-                if state.work.spec.update_type == "by_asset" else None
-            ),
-        )
-        state.request_count += request_count
-        state.rows_downloaded += downloaded
-        state.empty_count += 1
-        return
     state.pending_api_calls.extend(calls)
     state.request_count += request_count
     state.rows_downloaded += downloaded
@@ -667,7 +647,11 @@ def _split_daily_scope_results(
 
     if frame.is_empty():
         return [], list(request.daily_scopes)
-    time_column = _source_column(spec, "time")
+    time_column = (
+        request.request_date_field
+        if request.request_date_field in frame.columns
+        else _source_column(spec, "time")
+    )
     scoped = frame.with_columns(_date_expr(time_column).alias("__scope_date"))
     nonempty: list[tuple[pl.DataFrame, LedgerRequest]] = []
     empty: list[DailyScope] = []
@@ -754,7 +738,7 @@ def _commit_state(
     if not state.buffered:
         return
     if state.work.spec.update_type == "general" and (
-        state.failure_count or state.invalid_count
+        state.failure_count or state.invalid_count or state.cancelled
     ):
         _fail_buffered(
             pipeline,
@@ -773,6 +757,11 @@ def _commit_state(
             frame,
             run_id=state.work.run_id,
             writer_executor=writer_executor,
+            mode=str(state.work.context.options.get("mode", "incremental")),
+            ingested_at=state.work.context.options.get("ingested_at"),
+            requests=[
+                {"scope_id": r.scope_id, "params": r.params} for _, r in buffered
+            ],
         )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed
@@ -780,9 +769,7 @@ def _commit_state(
         state.partitions_rewritten += commit.partitions_rewritten
         state.partitions_skipped += commit.partitions_skipped
         state.bytes_written += commit.bytes_written
-        canonical_maxima = _canonical_data_maxima(
-            commit, state.work.spec, buffered
-        )
+        canonical_maxima = _canonical_data_maxima(commit, state.work.spec, buffered)
         transitions = [
             _success_transition(
                 state.work.spec,
@@ -800,7 +787,8 @@ def _commit_state(
             committed_rows=commit.rows_committed,
         )
         state.metadata_seconds += time.perf_counter() - started
-        state.success_count += len(buffered)
+        state.success_count += sum(not f.is_empty() for f, _ in buffered)
+        state.empty_count += sum(f.is_empty() for f, _ in buffered)
     except Exception as exc:
         message = f"commit failed: {exc}"
         for _, request in buffered:
@@ -853,7 +841,7 @@ def _success_transition(
         )
     return {
         "scope_id": request.scope_id,
-        "status": "success",
+        "status": "empty" if frame.is_empty() else "success",
         "data_max_time": data_max_time,
         "row_count": frame.height,
         "provider_checked_through": request.target_end,
@@ -874,27 +862,7 @@ def _canonical_data_maxima(
             if request.scope_id is not None and request.target_end is not None
         }
     requests = [request for _, request in buffered]
-    if spec.update_type == "by_asset":
-        maxima = dict(commit.asset_max_times)
-        resolved: dict[int | None, str] = {}
-        for request in requests:
-            asset_maximum = maxima.get(str(request.params["id"]))
-            candidates = [
-                value
-                for value in (
-                    request.previous_data_max_time,
-                    asset_maximum,
-                )
-                if value is not None
-            ]
-            if candidates:
-                resolved[request.scope_id] = max(candidates)
-        return resolved
-    return {
-        request.scope_id: str(request.target_end)
-        for request in requests
-        if request.target_end in commit.present_times
-    }
+    return {request.scope_id: str(request.target_end) for request in requests}
 
 
 def _validate_response(
@@ -904,142 +872,44 @@ def _validate_response(
     *,
     allow_all_null_payload: bool = False,
 ) -> str | None:
-    if frame.is_empty():
-        return None
-    if spec.update_type == "general":
+    if frame.is_empty() or spec.update_type == "general":
         return None
     time_column = _source_column(spec, "time")
     asset_column = _source_column(spec, "asset_id")
-    required = [time_column, asset_column]
-    required.extend(_source_column(spec, key) for key in spec.primary_key_extra)
-    missing = [field for field in required if field not in frame.columns]
+    required = {time_column, asset_column, *spec.primary_key_extra}
+    missing = required - set(frame.columns)
     if missing:
-        return f"response missing required key columns: {', '.join(missing)}"
-    if frame.height == 1:
-        return _validate_single_row_response(
-            spec,
-            request,
-            frame,
-            required=required,
-            time_column=time_column,
-            asset_column=asset_column,
-            allow_all_null_payload=allow_all_null_payload,
-        )
-    null_counts = frame.null_count().row(0, named=True)
-    if any(int(null_counts[field]) for field in required):
+        return f"response missing required key columns: {', '.join(sorted(missing))}"
+    non_nullable = required - set(spec.nullable_primary_key_extra)
+    if frame.select(
+        pl.any_horizontal(pl.col(c).is_null() for c in non_nullable).any()
+    ).item():
         return "response contains null primary keys"
-    time_values = _date_expr(time_column)
-    checks = [
-        time_values.is_null().any().alias("invalid_dates"),
-    ]
-    if spec.update_type == "by_daily":
-        expected_dates = {
-            _date_value(scope.scope_key) for scope in request.daily_scopes
-        } or {_date_value(request.target_end)}
-        checks.append(
-            (~time_values.is_in(sorted(expected_dates)))
-            .any()
-            .alias("outside_requested_date")
-        )
-    else:
-        expected_asset = str(request.params["id"])
-        checks.append(
-            (pl.col(asset_column).cast(pl.String) != expected_asset)
-            .any()
-            .alias("wrong_asset")
-        )
-        request_date_column = spec.request_date_field or time_column
-        if request_date_column not in frame.columns:
-            return f"response missing request date column: {request_date_column}"
-        request_dates = _date_expr(request_date_column)
-        lower = _date_value(request.params["start"])
-        upper = _date_value(request.params["end"])
-        checks.extend(
-            (
-                request_dates.is_null().any().alias("invalid_request_dates"),
-                (
-                    (request_dates < pl.lit(lower, dtype=pl.Date))
-                    | (request_dates > pl.lit(upper, dtype=pl.Date))
-                )
-                .any()
-                .alias("outside_requested_range"),
-            )
-        )
-    payload = [field for field in frame.columns if field not in required]
-    has_payload = any(
-        int(null_counts[field]) < frame.height for field in payload
+    date_field = (
+        request.request_date_field
+        if request.request_date_field in frame.columns
+        else (spec.request_date_field or time_column)
     )
-    summary = frame.select(checks).row(0, named=True)
-    if summary["invalid_dates"]:
+    if date_field not in frame.columns:
+        return f"response missing request date column: {date_field}"
+    values = frame.select(_date_expr(date_field).alias("d"))["d"]
+    if values.null_count():
         return "response contains invalid dates"
-    if spec.update_type == "by_daily":
-        if summary["outside_requested_date"]:
-            lower = min(expected_dates).isoformat()
-            upper = max(expected_dates).isoformat()
-            if len(expected_dates) == 1:
-                return f"response contains dates outside requested date {lower}"
-            return f"response contains dates outside requested daily scopes {lower} to {upper}"
-    else:
-        if summary["wrong_asset"]:
-            return f"response contains assets other than {expected_asset}"
-        if summary["invalid_request_dates"]:
-            return "response contains invalid request dates"
-        if summary["outside_requested_range"]:
-            return "response contains dates outside requested range"
-    if payload and not has_payload and not allow_all_null_payload:
-        return ALL_NULL_PAYLOAD_ERROR
-    return None
-
-
-def _validate_single_row_response(
-    spec: DatasetSpec,
-    request: LedgerRequest,
-    frame: pl.DataFrame,
-    *,
-    required: list[str],
-    time_column: str,
-    asset_column: str,
-    allow_all_null_payload: bool,
-) -> str | None:
-    row = frame.row(0, named=True)
-    if any(row[field] is None for field in required):
-        return "response contains null primary keys"
-    try:
-        response_date = _date_value(row[time_column])
-    except (TypeError, ValueError):
-        return "response contains invalid dates"
-    if spec.update_type == "by_daily":
-        expected_dates = {
-            _date_value(scope.scope_key) for scope in request.daily_scopes
-        } or {_date_value(request.target_end)}
-        if response_date not in expected_dates:
-            if len(expected_dates) == 1:
-                expected = next(iter(expected_dates)).isoformat()
-                return f"response contains dates outside requested date {expected}"
-            return (
-                "response contains dates outside requested daily scopes "
-                f"{min(expected_dates).isoformat()} to {max(expected_dates).isoformat()}"
-            )
-    else:
-        expected_asset = str(request.params["id"])
-        if str(row[asset_column]) != expected_asset:
-            return f"response contains assets other than {expected_asset}"
-        request_date_column = spec.request_date_field or time_column
-        if request_date_column not in row:
-            return f"response missing request date column: {request_date_column}"
-        try:
-            request_date = _date_value(row[request_date_column])
-        except (TypeError, ValueError):
-            return "response contains invalid request dates"
-        lower = _date_value(request.params["start"])
-        upper = _date_value(request.params["end"])
-        if request_date < lower or request_date > upper:
-            return "response contains dates outside requested range"
-    payload = [field for field in frame.columns if field not in required]
+    expected = {_date_value(scope.scope_key) for scope in request.daily_scopes} or {
+        _date_value(request.target_end)
+    }
+    if not set(values.to_list()).issubset(expected):
+        return f"response contains dates outside requested date {min(expected)} to {max(expected)}"
+    expected_asset = request.params.get("ts_code", request.params.get("id"))
+    if expected_asset is not None and set(frame[asset_column].cast(pl.String)) != {
+        str(expected_asset)
+    }:
+        return f"response contains assets other than {expected_asset}"
+    payload = set(frame.columns) - required
     if (
         payload
-        and all(row[field] is None for field in payload)
         and not allow_all_null_payload
+        and all(frame[c].null_count() == frame.height for c in payload)
     ):
         return ALL_NULL_PAYLOAD_ERROR
     return None
@@ -1209,32 +1079,6 @@ def _partition_affinity_order(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
     ]
 
 
-def _initial_asset_task_groups(
-    tasks: Sequence[UpdateTask],
-) -> list[list[UpdateTask]]:
-    """Group a clean asset build at retry/forward and bucket boundaries."""
-
-    groups: list[list[UpdateTask]] = []
-    current: list[UpdateTask] = []
-    current_key: tuple[bool, int] | None = None
-    for task in tasks:
-        work, request = task
-        key = (
-            request.request_kind != "retry",
-            stable_bucket(
-                str(request.params["id"]), work.spec.asset_bucket_count
-            ),
-        )
-        if current and key != current_key:
-            groups.append(current)
-            current = []
-        current_key = key
-        current.append(task)
-    if current:
-        groups.append(current)
-    return groups
-
-
 def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:
     work, request = task
     spec = work.spec
@@ -1244,13 +1088,6 @@ def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:
             return (0, "", "")
         day = _date_value(value)
         return (0, f"{day.year:04d}-{day.month:02d}", day.isoformat())
-    if spec.update_type == "by_asset":
-        asset_id = str(request.params["id"])
-        return (
-            1,
-            f"{stable_bucket(asset_id, spec.asset_bucket_count):08d}",
-            asset_id,
-        )
     return (2, "", "")
 
 
@@ -1268,6 +1105,7 @@ def _fetch_and_prepare_request(
     """Fetch, combine, and validate one logical request in its fetch worker."""
 
     request = ledger_request.params
+    request_options = {**spec.request_options, **request_options}
     if ledger_request.request_kind == "initial_range_backfill":
         request_options = _daily_range_request_options(request_options)
     pages = _fetch_request_pages(
@@ -1331,8 +1169,7 @@ def _fetch_request_pages(
             cancel_requested=cancel_requested,
         )
     if pagination != "offset":
-        return [
-            _fetch_one(
+        page = _fetch_one(
                 spec,
                 source_adapter,
                 request,
@@ -1341,13 +1178,44 @@ def _fetch_request_pages(
                 retry_backoff_seconds,
                 cancel_requested,
             )
-        ]
+        limit = request_options.get("row_limit")
+        if limit is not None and page.row_count >= int(limit):
+            return [page, _invalid_pagination_page(
+                request_index, request, "response reached row_limit without complete pagination"
+            )]
+        return [page]
+    return _fetch_offset_pages(
+        spec=spec,
+        source_adapter=source_adapter,
+        request=request,
+        request_index=str(request_index),
+        request_options=request_options,
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        cancel_requested=cancel_requested,
+    )
+
+
+def _fetch_offset_pages(
+    *,
+    spec: DatasetSpec,
+    source_adapter: object,
+    request: dict[str, Any],
+    request_index: str,
+    request_options: dict[str, Any],
+    max_retries: int,
+    retry_backoff_seconds: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> list[FetchPage]:
+    """Fetch one complete offset-paginated request."""
+
     page_size = int(request_options.get("page_size", 5000))
     limit_param = str(request_options.get("limit_param", "limit"))
     offset_param = str(request_options.get("offset_param", "offset"))
     offset = int(request_options.get("offset_start", 0))
     max_pages = int(request_options.get("max_pages", 10_000))
     pages = []
+    seen_pages: set[str] = set()
     for page_index in range(max_pages):
         paged = {**request, limit_param: page_size, offset_param: offset}
         page = _fetch_one(
@@ -1360,6 +1228,18 @@ def _fetch_request_pages(
             cancel_requested,
         )
         pages.append(page)
+        if page.frame is not None and page.row_count:
+            from bagelquant_data.core.hashing import frame_content_hash
+
+            digest = frame_content_hash(page.frame)
+            if digest in seen_pages:
+                pages.append(
+                    _invalid_pagination_page(
+                        request_index, request, "pagination repeated a prior page"
+                    )
+                )
+                return pages
+            seen_pages.add(digest)
         if page.status != "success" or page.row_count < page_size:
             return pages
         offset += page_size
@@ -1469,23 +1349,28 @@ def _fetch_adaptive_date_range(
             continue
         span_days = (upper - lower).days
         if span_days <= minimum_window_days:
-            pages.append(
-                _invalid_pagination_page(
-                    f"{request_key}:saturated",
-                    ranged,
-                    (
-                        f"adaptive date range {lower.isoformat()} to "
-                        f"{upper.isoformat()} still returned {page.row_count} rows "
-                        f"at configured limit {row_limit}"
-                    ),
+            pages[-1] = replace(page, frame=None)
+            pages.extend(
+                _fetch_offset_pages(
+                    spec=spec,
+                    source_adapter=source_adapter,
+                    request=ranged,
+                    request_index=f"{request_key}:leaf",
+                    request_options={
+                        **request_options,
+                        "page_size": row_limit,
+                    },
+                    max_retries=max_retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    cancel_requested=cancel_requested,
                 )
             )
-            return pages
+            if any(candidate.status != "success" for candidate in pages):
+                return pages
+            continue
         midpoint = lower + timedelta(days=span_days // 2)
         pages[-1] = replace(page, frame=None)
-        pending.appendleft(
-            (midpoint + timedelta(days=1), upper, f"{request_key}:1")
-        )
+        pending.appendleft((midpoint + timedelta(days=1), upper, f"{request_key}:1"))
         pending.appendleft((lower, midpoint, f"{request_key}:0"))
     return pages
 

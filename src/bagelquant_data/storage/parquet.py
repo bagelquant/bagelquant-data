@@ -140,9 +140,7 @@ class ParquetStore:
         existed_before = _is_file(path)
         backup_path = None
         if retain_backup and existed_before:
-            backup_path = path.with_name(
-                f".{path.name}.{uuid4().hex}.rollback"
-            )
+            backup_path = path.with_name(f".{path.name}.{uuid4().hex}.rollback")
             os.link(_filesystem_path(path), _filesystem_path(backup_path))
         try:
             atomic_write_parquet(
@@ -157,9 +155,7 @@ class ParquetStore:
         if spec.update_type == "general":
             # Hash the durable representation.  Parquet normalizes foreign
             # Arrow buffers, so this is the value a later deep scan will see.
-            content_hash = frame_content_hash(
-                pl.read_parquet(_filesystem_path(path))
-            )
+            content_hash = frame_content_hash(pl.read_parquet(_filesystem_path(path)))
         file_size = os.stat(_filesystem_path(path)).st_size
         manifest = {
             "source": spec.source,
@@ -212,6 +208,7 @@ class ParquetStore:
         *,
         replace_manifests: bool = False,
         write_context: PartitionWriteContext | None = None,
+        version_commit: dict[str, Any] | None = None,
     ) -> None:
         """Publish manifest and schema metadata in one SQLite transaction."""
 
@@ -223,20 +220,17 @@ class ParquetStore:
             schema_ipc=context.schema_ipc,
             schema_hash=context.schema_hash,
             replace_manifests=replace_manifests,
+            version_commit=version_commit,
         )
 
-    def _update_canonical_schema(
-        self, spec: DatasetSpec, frame: pl.DataFrame
-    ) -> None:
+    def _update_canonical_schema(self, spec: DatasetSpec, frame: pl.DataFrame) -> None:
         incoming = pl.Schema(frame.schema)
         if spec.update_type == "general":
             schema = incoming
         else:
             existing = self.canonical_schema(spec.source, spec.name)
             schema = compatible_schema(
-                candidate
-                for candidate in (existing, incoming)
-                if candidate is not None
+                candidate for candidate in (existing, incoming) if candidate is not None
             )
         self.set_canonical_schema(spec.source, spec.name, schema)
 

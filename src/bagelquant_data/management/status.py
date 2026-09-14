@@ -8,7 +8,7 @@ import os
 import uuid
 from collections import Counter
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec, incremental_key
 from bagelquant_data.core.exceptions import DestructiveOperationError
-from bagelquant_data.core.hashing import frame_content_hash, stable_bucket
+from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.paths import LakePaths
@@ -153,11 +153,24 @@ class StatusManager:
                 for scope in scopes
                 if scope["last_success_at"] is not None
             ]
-            revision_due = sum(
-                _revision_due(
-                    scope, provider_checks.get(int(scope["id"])),
-                    refresh_days=spec.revision_refresh_days,
-                )
+            cutoff = max(
+                (
+                    str(scope["scope_key"])
+                    for scope in scopes
+                    if scope["scope_kind"] == "date"
+                ),
+                default=None,
+            )
+            recent_start = (
+                date.fromisoformat(cutoff) - timedelta(days=spec.recent_recheck_days)
+                if cutoff
+                else None
+            )
+            recent_rechecks = sum(
+                scope["scope_kind"] == "date"
+                and scope["status"] in {"success", "empty"}
+                and recent_start is not None
+                and date.fromisoformat(str(scope["scope_key"])) > recent_start
                 for scope in scopes
             )
             future_rechecks = [
@@ -166,7 +179,8 @@ class StatusManager:
                 if scope["status"] in {"success", "empty"}
                 and (check := provider_checks.get(int(scope["id"]))) is not None
                 and check["recheck_after"] is not None
-                and date.fromisoformat(str(check["recheck_after"])) > datetime.now(UTC).date()
+                and date.fromisoformat(str(check["recheck_after"]))
+                > datetime.now(UTC).date()
             ]
             summaries.append(
                 {
@@ -179,8 +193,7 @@ class StatusManager:
                     "empty": counts["empty"],
                     "failed": counts["failed"],
                     "invalid": counts["invalid"],
-                    "actionable_pending_failed": counts["pending"]
-                    + counts["failed"],
+                    "actionable_pending_failed": counts["pending"] + counts["failed"],
                     "deferred_recheck": len(future_rechecks),
                     "next_provider_recheck": min(future_rechecks, default=None),
                     "earliest_pending_scope": min(pending_keys, default=None),
@@ -189,7 +202,7 @@ class StatusManager:
                     "provider_checked_through_min": min(checked, default=None),
                     "provider_checked_through_max": max(checked, default=None),
                     "last_success_at": max(successes, default=None),
-                    "revision_due_assets": revision_due,
+                    "recent_recheck_dates": recent_rechecks,
                 }
             )
         return summaries
@@ -262,10 +275,11 @@ class StatusManager:
         missing = [row["partition_path"] for row in files if not row["exists"]]
         root = self.paths.dataset_root(source, dataset)
         manifested = {str(row["partition_path"]) for row in files}
-        physical = {
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*.parquet")
-        } if root.exists() else set()
+        physical = (
+            {path.relative_to(root).as_posix() for path in root.rglob("*.parquet")}
+            if root.exists()
+            else set()
+        )
         orphaned = sorted(physical - manifested)
         issues: list[dict[str, Any]] = [
             {"kind": "missing", "path": path, "detail": "manifest file is missing"}
@@ -298,8 +312,12 @@ class StatusManager:
                     actual = {
                         "row_count": frame.height,
                         "file_size_bytes": path.stat().st_size,
-                        "min_time": None if time_values[0] is None else str(time_values[0]),
-                        "max_time": None if time_values[1] is None else str(time_values[1]),
+                        "min_time": None
+                        if time_values[0] is None
+                        else str(time_values[0]),
+                        "max_time": None
+                        if time_values[1] is None
+                        else str(time_values[1]),
                         "content_hash": frame_content_hash(frame),
                         "schema_hash": _schema_hash(frame),
                     }
@@ -341,9 +359,7 @@ class StatusManager:
     ) -> dict[str, Any]:
         """Validate physical files against the registered dataset contract."""
 
-        manifest = self.validate_manifest(
-            spec.name, source=spec.source, deep=False
-        )
+        manifest = self.validate_manifest(spec.name, source=spec.source, deep=False)
         issues = [
             _health_issue(
                 _manifest_issue_code(issue),
@@ -377,9 +393,7 @@ class StatusManager:
                     frame = pl.read_parquet(path)
                 except Exception as error:  # noqa: BLE001 - report corrupt files.
                     issues.append(
-                        _health_issue(
-                            "unreadable_file", str(error), path=relative
-                        )
+                        _health_issue("unreadable_file", str(error), path=relative)
                     )
                     continue
                 files_scanned += 1
@@ -398,17 +412,59 @@ class StatusManager:
                             )
                         )
                 actual_schema_hash = _schema_hash(frame)
-                if canonical_hash is not None and actual_schema_hash != canonical_hash:
+                if actual_schema_hash != row["schema_hash"]:
                     issues.append(
                         _health_issue(
                             "canonical_schema_mismatch",
                             "file schema does not match canonical dataset schema",
                             path=relative,
-                            expected=canonical_hash,
+                            expected=row["schema_hash"],
                             actual=actual_schema_hash,
                         )
                     )
                 issues.extend(_contract_issues(frame, spec, relative))
+        from bagelquant_data.storage.recovery import inspect_partition
+        from bagelquant_data.storage.parquet import ParquetStore
+        parquet = ParquetStore(self.paths, self.metadata)
+        recovery = []
+        for row in rows:
+            values = row.get("partition_values", {})
+            if isinstance(values, str):
+                values = json.loads(values)
+            if not values.get("versioned"):
+                continue
+            evidence = inspect_partition(parquet, spec.source, spec.name, row["partition_path"], deep=deep)
+            recovery.append(evidence)
+            if evidence["recovery_state"] != "ready":
+                damaged_partition = any(
+                    issue.get("path") == row["partition_path"]
+                    and issue.get("code")
+                    in {
+                        "missing_file",
+                        "unreadable_file",
+                        "manifest_mismatch",
+                        "canonical_schema_mismatch",
+                        "missing_key_column",
+                        "null_key",
+                        "duplicate_key",
+                        "partition_path",
+                        "partition_value_mismatch",
+                    }
+                    for issue in issues
+                )
+                recovery_issue = _health_issue(
+                    "recovery_evidence",
+                    (
+                        "Both recovery evidence and the committed Parquet partition "
+                        "are insufficient; historical recovery is blocked"
+                        if damaged_partition
+                        else str(evidence["error"])
+                    ),
+                    path=row["partition_path"],
+                )
+                recovery_issue["repairable"] = not damaged_partition
+                recovery_issue["recovery_state"] = evidence["recovery_state"]
+                issues.append(recovery_issue)
         repairable = sum(bool(issue["repairable"]) for issue in issues)
         return {
             "source": spec.source,
@@ -420,6 +476,7 @@ class StatusManager:
             "issues": issues,
             "issue_counts": dict(Counter(str(issue["code"]) for issue in issues)),
             "repairable_issue_count": repairable,
+            "recovery": recovery,
             "deep": deep,
             "valid": not issues,
         }
@@ -499,9 +556,7 @@ class StatusManager:
         reports = []
         for spec in selected_specs:
             manifest_rows = grouped[spec.name]
-            manifested = {
-                str(row["partition_path"]) for row in manifest_rows
-            }
+            manifested = {str(row["partition_path"]) for row in manifest_rows}
             actual = physical[spec.name]
             issues = [
                 _health_issue(
@@ -568,9 +623,7 @@ class StatusManager:
             parts = path.relative_to(source_root).parts
             for root_parts, dataset in roots:
                 if parts[: len(root_parts)] == root_parts:
-                    inventory[dataset].add(
-                        Path(*parts[len(root_parts) :]).as_posix()
-                    )
+                    inventory[dataset].add(Path(*parts[len(root_parts) :]).as_posix())
                     break
         return inventory
 
@@ -622,9 +675,7 @@ class StatusManager:
                     f"Partition path escapes dataset root: {relative}"
                 )
             if source_path.is_file():
-                moves.append(
-                    (source_path, quarantine_root / Path(relative), relative)
-                )
+                moves.append((source_path, quarantine_root / Path(relative), relative))
         _atomic_json(
             journal,
             {
@@ -644,9 +695,7 @@ class StatusManager:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source_path, target)
                 moved.append((source_path, target, relative))
-            removed = self.metadata.remove_manifests(
-                spec.source, spec.name, selected
-            )
+            removed = self.metadata.remove_manifests(spec.source, spec.name, selected)
             _atomic_json(
                 journal,
                 {
@@ -657,9 +706,7 @@ class StatusManager:
                     "reason": reason,
                     "state": "committed",
                     "partitions": list(selected),
-                    "manifest_rows": [
-                        str(row["partition_path"]) for row in removed
-                    ],
+                    "manifest_rows": [str(row["partition_path"]) for row in removed],
                 },
             )
         except Exception:
@@ -677,9 +724,7 @@ class StatusManager:
             "journal": str(journal),
             "quarantine_root": str(quarantine_root),
             "quarantined": [relative for _, _, relative in moved],
-            "removed_manifests": [
-                str(row["partition_path"]) for row in removed
-            ],
+            "removed_manifests": [str(row["partition_path"]) for row in removed],
         }
 
 
@@ -738,6 +783,8 @@ def _contract_issues(
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     key = incremental_key(spec)
+    if "_record_id" in frame.columns:
+        key = ("_record_id", "_commit_seq", "source_time", "asset_id", "time")
     if key is not None:
         missing = [column for column in key if column not in frame.columns]
         if missing:
@@ -776,23 +823,7 @@ def _contract_issues(
                     )
                 )
     values = _partition_values(Path(relative))
-    expected_parts = (
-        {"year", "month"}
-        if spec.update_type == "by_daily"
-        else {"year", "bucket"}
-        if spec.update_type == "by_asset"
-        else set()
-    )
-    if spec.update_type == "general":
-        if relative != "data.parquet":
-            issues.append(
-                _health_issue(
-                    "partition_path",
-                    "general dataset must use data.parquet",
-                    path=relative,
-                )
-            )
-        return issues
+    expected_parts = {"year", "month"}
     if set(values) != expected_parts or Path(relative).name != "data.parquet":
         issues.append(
             _health_issue(
@@ -802,24 +833,17 @@ def _contract_issues(
             )
         )
         return issues
-    if frame.is_empty() or "time" not in frame.columns:
+    if frame.is_empty():
         return issues
-    if spec.update_type == "by_daily":
-        mismatches = frame.filter(
-            (pl.col("time").dt.year() != int(values["year"]))
-            | (pl.col("time").dt.month() != int(values["month"]))
+    date_column = "snapshot_date" if spec.update_type == "general" else "time"
+    mismatches = (
+        frame.filter(
+            (pl.col(date_column).dt.year() != int(values["year"]))
+            | (pl.col(date_column).dt.month() != int(values["month"]))
         ).height
-    elif "asset_id" in frame.columns:
-        expected_bucket = int(values["bucket"])
-        mismatches = sum(
-            1
-            for asset_id, row_time in frame.select("asset_id", "time").iter_rows()
-            if row_time.year != int(values["year"])
-            or stable_bucket(str(asset_id), spec.asset_bucket_count)
-            != expected_bucket
-        )
-    else:
-        mismatches = 0
+        if date_column in frame.columns
+        else 0
+    )
     if mismatches:
         issues.append(
             _health_issue(
@@ -897,22 +921,3 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _revision_due(
-    scope: dict[str, Any], provider_check: dict[str, Any] | None,
-    *, refresh_days: int,
-) -> bool:
-    if scope["scope_kind"] != "asset" or scope["status"] == "running":
-        return False
-    if provider_check is None or provider_check["last_checked_at"] is None:
-        return True
-    recheck = provider_check["recheck_after"]
-    last_checked = datetime.fromisoformat(str(provider_check["last_checked_at"]))
-    if last_checked.tzinfo is None:
-        last_checked = last_checked.replace(tzinfo=UTC)
-    # Empty responses are terminal checks too. A missing explicit schedule uses
-    # the same refresh interval as the request planner, not an immediate retry.
-    return bool(
-        recheck is not None and date.fromisoformat(str(recheck)) <= datetime.now(UTC).date()
-    ) or (datetime.now(UTC) - last_checked).days >= refresh_days

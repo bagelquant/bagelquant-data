@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -18,13 +16,11 @@ def manifest_rows(
     *,
     start: DateLike | None = None,
     end: DateLike | None = None,
-    buckets: Iterable[int] | None = None,
 ) -> list[dict[str, object]]:
     """Return manifest rows overlapping the requested physical partitions."""
 
     lower = None if start is None else _date_value(start).isoformat()
     upper = None if end is None else _date_value(end).isoformat()
-    selected_buckets = None if buckets is None else set(buckets)
     rows = []
     for row in metadata.manifest(source, dataset):
         if (
@@ -37,16 +33,6 @@ def manifest_rows(
             upper is not None
             and row.get("min_time") is not None
             and str(row["min_time"]) > upper
-        ):
-            continue
-        partition_values = row.get("partition_values")
-        if isinstance(partition_values, str):
-            partition_values = json.loads(partition_values)
-        if (
-            selected_buckets is not None
-            and isinstance(partition_values, dict)
-            and "bucket" in partition_values
-            and int(partition_values["bucket"]) not in selected_buckets
         ):
             continue
         rows.append(row)

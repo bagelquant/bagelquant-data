@@ -22,13 +22,41 @@ class MetadataStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "3"
+    SCHEMA_VERSION = "4"
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.check_compatibility(self.path)
         self._thread_state = local()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @classmethod
+    def check_compatibility(cls, path: Path) -> None:
+        """Reject an existing incompatible lake before opening any write handle."""
+        if not path.is_file() or path.stat().st_size == 0:
+            return
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = {
+                row[0]
+                for row in db.execute(
+                    "select name from sqlite_master where type='table'"
+                )
+            }
+            row = (
+                db.execute(
+                    "select value from metadata_state where key='schema_version'"
+                ).fetchone()
+                if "metadata_state" in tables
+                else None
+            )
+            if tables and (row is None or str(row[0]) != cls.SCHEMA_VERSION):
+                raise ConfigurationError(
+                    "Incompatible data-lake metadata schema; back up and rebuild the lake explicitly. Automatic migration is disabled."
+                )
+        finally:
+            db.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -203,6 +231,23 @@ class MetadataStore:
                 (source, dataset),
             )
             db.execute(
+                "delete from version_batches where commit_seq in "
+                "(select seq from version_commits where source=? and dataset=?)",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from version_checks where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from version_commits where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
+                "delete from dataset_initializations where source=? and dataset=?",
+                (source, dataset),
+            )
+            db.execute(
                 "delete from update_scopes where source=? and dataset=?",
                 (source, dataset),
             )
@@ -327,6 +372,7 @@ class MetadataStore:
         schema_ipc: bytes,
         schema_hash: str,
         replace_manifests: bool = False,
+        version_commit: dict[str, Any] | None = None,
     ) -> None:
         """Commit changed manifests and the canonical schema atomically."""
 
@@ -334,6 +380,24 @@ class MetadataStore:
         now = _now()
         with self.connect() as db:
             db.execute("begin immediate")
+            if version_commit is not None:
+                seq = int(version_commit["seq"])
+                cursor = db.execute(
+                    "update version_commits set status='committed' where seq=? and source=? and dataset=? and status='prepared'",
+                    (seq, source, dataset),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "Version commit is not prepared for this dataset"
+                    )
+                db.executemany(
+                    "insert into version_batches(commit_seq,partition_path,content_hash,row_count,schema_ipc,min_available,max_available,min_observation,max_observation) values(?,?,?,?,?,?,?,?,?)",
+                    [
+                        (seq, b["partition_path"], b["content_hash"], b["row_count"], b["schema_ipc"],
+                         b["min_available"], b["max_available"], b["min_observation"], b["max_observation"])
+                        for b in version_commit["batches"]
+                    ],
+                )
             if replace_manifests:
                 db.execute(
                     "delete from partition_manifest where source=? and dataset=?",
@@ -931,22 +995,21 @@ class MetadataStore:
         with self.connect() as db:
             for row in rows:
                 status = str(row["status"])
-                if status not in {"success", "failed", "invalid"}:
+                if status not in {"success", "empty", "failed", "invalid"}:
                     raise ValueError(f"Unsupported scope transition: {status}")
                 cursor = db.execute(
                     """
                     update update_scopes set
                         status=?, checked_through=case
-                            when ?='success' then coalesce(?,data_max_time,checked_through)
+                            when ? in ('success','empty') then coalesce(?,data_max_time,checked_through)
                             else checked_through
                         end,
-                        data_max_time=case when ?='success' then coalesce(?,data_max_time)
+                        data_max_time=case when ? in ('success','empty') then coalesce(?,data_max_time)
                             else data_max_time end,
-                        row_count=case when ?='success' then ? else row_count end,
-                        last_success_at=case when ?='success' then ? else last_success_at end,
-                        last_revision_check_at=null,
+                        row_count=case when ? in ('success','empty') then ? else row_count end,
+                        last_success_at=case when ? in ('success','empty') then ? else last_success_at end,
                         recheck_after=null, last_error=?, active_run_id=null,
-                        commit_run_id=case when ?='success' then ? else commit_run_id end,
+                        commit_run_id=case when ? in ('success','empty') then ? else commit_run_id end,
                         updated_at=?
                     where id=? and active_run_id=?
                     """,
@@ -972,13 +1035,15 @@ class MetadataStore:
                     raise RuntimeError(
                         f"Scope {row['scope_id']} is not claimed by ingestion run {run_id}"
                     )
-                if status == "success" and row.get("provider_checked_through"):
+                if status in {"success", "empty"} and row.get(
+                    "provider_checked_through"
+                ):
                     self._upsert_provider_scope_check(
                         db,
                         scope_id=int(row["scope_id"]),
                         checked_through=str(row["provider_checked_through"]),
                         recheck_after=row.get("provider_recheck_after"),
-                        result="nonempty",
+                        result="empty" if status == "empty" else "nonempty",
                         checked_at=now,
                     )
             success_count = sum(row["status"] == "success" for row in rows)
@@ -1392,6 +1457,33 @@ class MetadataStore:
                     )
             db.executescript(
                 """
+                create table if not exists version_commits (
+                    seq integer primary key autoincrement,
+                    source text not null, dataset text not null, run_id text not null,
+                    ingested_at text not null, pit_date text not null,
+                    mode text not null, status text not null, spec_hash text not null,
+                    request_json text not null default '[]'
+                );
+                create index if not exists version_commits_dataset on version_commits(source,dataset,status,seq);
+                create table if not exists version_batches (
+                    commit_seq integer not null, partition_path text not null,
+                    content_hash text not null, row_count integer not null,
+                    schema_ipc blob not null,
+                    min_available text, max_available text,
+                    min_observation text, max_observation text,
+                    primary key(commit_seq,partition_path)
+                );
+                create table if not exists version_checks (
+                    id integer primary key autoincrement,
+                    source text not null, dataset text not null, run_id text not null,
+                    checked_at text not null, visible_commit integer,
+                    request_json text not null, row_count integer not null
+                );
+                create table if not exists dataset_initializations (
+                    source text not null, dataset text not null, spec_hash text not null,
+                    initial_start text not null, initial_end text not null,
+                    status text not null, primary key(source,dataset)
+                );
                 create table if not exists sources (
                     name text primary key,
                     adapter text not null,
@@ -1464,7 +1556,6 @@ class MetadataStore:
                     attempt_count integer not null default 0,
                     last_attempt_at text,
                     last_success_at text,
-                    last_revision_check_at text,
                     recheck_after text,
                     last_error text,
                     spec_hash text not null,

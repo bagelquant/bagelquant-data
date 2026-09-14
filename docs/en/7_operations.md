@@ -79,4 +79,7 @@ UpdateProgress includes planning and discovery callbacks before scope counts are
 
 For dated General updates, completion counts belong to the requested snapshot; an unfinished older checkpoint remains attempt history and does not make a successful later full refresh partial.
 
-Asset-level empty provider responses retain their revision recheck schedule. Status uses the same UTC refresh interval as request planning when a prior check has no explicit recheck date; a completed empty response is not immediately revision-due.
+Incremental updates recheck every date in the most recent three natural days.
+Older terminal `success` and `empty` scopes remain complete unless an explicit
+refresh is requested. Provider-check scheduling stays separate from local
+coverage truth.

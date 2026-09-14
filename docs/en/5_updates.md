@@ -1,221 +1,47 @@
-# Updates
+# Updates, versions, and recovery
 
-Run one dataset or an explicit ordered list of datasets. The update facade does
-not discover and run every dataset for a provider; the application owns that
-selection.
+Use `lake.update.dataset()` or `lake.update.datasets()` with an explicit source.
+The modes are `initialize`, `incremental` (default), and `refresh`.
+Initialization requires a frozen start/end and a new dataset, or the same unfinished
+initialization range and definition. A completed initialization cannot be repeated.
+Refresh rechecks the explicit range and appends new versions when content changes.
 
-```python
-lake.update.dataset("daily", source="tushare", end="2026-07-10")
-lake.update.datasets(
-    ["daily", "income"], source="tushare",
-    start="1999-12-31", end="2026-07-10", workers=4,
-)
-```
+A successful initialization uses source dates for the historical baseline. Later
+versions use `max(source_time, local ingestion date + availability_day_offset)`.
+Workbench declares Asia/Shanghai with offset −1. `ingested_at` is always UTC.
+Same-day versions are ordered by ingestion timestamp and commit sequence. Empty
+responses do not delete records. Identical responses record a check referencing the
+visible commit; they do not change manifests or downstream content generations.
 
-## Authoritative update scopes
+Coverage is one date × parameter variant. Natural dates include weekends; trading
+sources use the declared calendar. Every update fills unfinished scopes and rechecks
+the latest three natural days through its target. All pages must pass key/date/asset,
+truncation, and repeated-page checks before a scope becomes `success` or `empty`.
+Cancellation preserves completed scopes and leaves unfinished scopes resumable.
+Four provider workers are the default. Admission, retry, and pagination share the
+provider limiter; Tushare's global ceiling is 500 requests/minute with lower endpoint
+limits applied as well. Applications never launch an upstream update from a query.
 
-The metadata database owns a shared `update_scopes` ledger. An update first
-synchronizes the selected dataset's expected scopes, then claims and executes
-eligible rows. It never infers completeness from the maximum date in Parquet.
-
-- `by_daily` creates one scope per open calendar date and parameter variant.
-- `by_asset` creates one scope per asset and parameter variant.
-- `data_max_time` and scope success are local, commit-backed facts.
-- `provider_scope_checks.checked_through` records the end of a validated
-  provider check independently from the latest returned observation.
-- `general` datasets without an explicit `end` remain replacement refreshes.
-  A dated update instead owns one immutable snapshot scope per parameter
-  variant. Repeating the same target date trusts successful/empty scope rows
-  and makes no Provider call; advancing the target date creates only the new
-  snapshot scopes. An existing general manifest is adopted into this ledger
-  once, without rereading Parquet or calling the Provider.
-
-For a dataset with `request_discovery`, discovery runs before scopes are
-synchronized when the requested target does not already have complete ledger
-state. Its normalized values participate in the same variant identity as
-static parameters, so daily, asset, and dated general ledgers retain
-independent recoverable scopes for every discovered value. The discovery call
-is recorded in the target dataset's API audit with `request_kind = 'discovery'`.
-If discovery fails, produces no values, or a general fan-out request fails, the
-existing general dataset is not replaced.
-
-Scope statuses are `pending`, `running`, `success`, `empty`, `failed`, and
-`invalid`. Every validated empty response finishes the scope as `empty`, even
-when no local rows exist. The separate provider check controls when that scope
-is eligible again, while `data_max_time`, `last_success_at`, `row_count`, and
-`commit_run_id` continue to describe only committed local data. Successful
-current-day daily scopes are checked once more after the date becomes
-historical. Invalid responses normally require an explicit operator reset.
-
-Sparse-event endpoints whose complete primary key is meaningful even when all
-non-key fields are null may opt into
-`source_options.allow_all_null_payload = true`. The default remains `false`.
-This option relaxes only the all-null payload check: null primary keys,
-out-of-range dates, wrong asset identities, and every other response contract
-remain invalid. For `by_daily`, enabling the option also selects existing
-`invalid` scopes whose exact error is `response payload is entirely null` for
-an ordinary one-day retry. Those retries never participate in historical range
-backfill, and invalid scopes with any other error remain terminal until an
-explicit reset or definition change.
-
-For `by_asset`, normal work starts after the provider-check watermark. Once every
-`revision_refresh_days`, the request also includes the preceding
-`revision_lookback_days`, allowing later provider revisions to upsert canonical
-records without repeatedly downloading the full history. Applications may set
-`source_options.asset_recent_recheck_days` to a non-negative integer. When the
-target advances, the ordinary forward request then overlaps that many recent
-calendar days, catching rows that were published after an earlier provider
-check without changing Dataset identity or resetting committed scopes.
-
-## Commit and failure semantics
-
-Selected datasets run sequentially. Each dataset owns one bounded provider
-thread pool, so `workers` controls concurrency inside that dataset and never
-multiplies across datasets. Results are committed on the scheduler thread. A
-single SQLite writer connection is reused on that thread, while every durable
-outcome retains its own transaction boundary. A nonempty scope becomes successful only after the
-corresponding Parquet batch commits. If the write fails, the scope becomes
-failed and its local watermark does not advance. A validated empty response
-writes the API audit (`result_kind = 'empty'`), provider check, `empty` scope
-transition, and durable run `empty_count` in one SQLite transaction. It does not
-increment `success_count`, update `last_success_at`, or move `data_max_time`.
-An all-empty valid run has status `no_data` and no local data change.
-
-Before publishing a partition, the lake hashes its sorted, rechunked Arrow IPC
-logical content. If the existing manifest has the same hash, the Parquet file
-and manifest row are left untouched while the scope, provider check, and run
-still complete normally. `partitions_rewritten` therefore counts physical
-writes, while `partitions_skipped` counts no-op partitions.
-
-For every `by_daily` dataset, an update first rechecks existing `empty` scopes
-that fall within the latest 20 requested trading sessions. These calls are
-audited as `empty_recheck`. A repeated empty stays `empty`; a nonempty response
-commits canonically and changes the scope to `success`. Failed scopes and these
-recent empty scopes form a repair phase that finishes and commits before any
-new forward work starts. Older daily empties and empty `by_asset` scopes remain
-terminal until reset or a definition change. Empties first observed during a
-run are considered for repair on the next run, not twice in the same run.
-
-## Initial daily range backfill
-
-A provider endpoint that supports complete date-range queries can compact its
-untouched historical `by_daily` backlog with
-`source_options.daily_range_backfill`:
+Each availability month contains `data.parquet` and `recovery.sqlite`. The journal
+holds immutable compressed Arrow batches with schema, hashes, and commit identity.
+The publication order is journal, Parquet, then the `lake.db` commit and coverage.
+Unregistered prepared batches are never visible. Neither journal nor Parquet history
+is automatically pruned. General partitions use snapshot month and a unique snapshot
+ID, independently of business dates inside the snapshot.
 
 ```python
-lake.update.dataset(
-    "sparse_daily",
-    source="custom",
-    end="2026-07-10",
-    source_options={
-        "daily_range_backfill": {
-            "start_param": "start_date",
-            "end_param": "end_date",
-            "row_limit": 1000,
-            "max_scopes": 1024,
-            "max_pages": 4096,
-        }
-    },
-)
+lake.admin.recovery_status("income", source="tushare", deep=True)
+lake.admin.repair_partitions("income", source="tushare", partitions=[
+    "year=2026/month=09/data.parquet",
+])
 ```
 
-Only never-checked historical `pending` scopes are compacted. A range that was
-interrupted by cancellation, forced worker termination, or lease expiry may be
-formed again when it has no durable provider result. Ordinary forward daily
-work, real provider or validation failures, `allow_all_null_payload` recovery
-retries, and recent-empty rechecks retain the one-day request path. Variants
-are grouped independently and only adjacent trading-calendar scopes are
-combined, up to `max_scopes`.
+Local repair replays only registered batches and preserves PIT dates, ingestion
+identities, content hashes, and coverage. A broken journal can be rebuilt only when
+the verified complete Parquet reproduces every original batch hash and schema.
+Insufficient evidence on both sides blocks recovery. A provider's newest data is
+never substituted for a lost historical version. Missing date scopes may be fetched
+by an explicit normal update; later historical refreshes are new PIT observations.
 
-Every range response must contain canonical dates only from its requested
-daily scopes and valid primary keys. The lake splits the validated response by
-canonical `time`: nonempty dates become `success` only after their Parquet
-commit, while missing dates become durable `empty` provider checks. Missing
-date fields, invalid keys, or unrequested dates invalidate every scope in the
-physical range without advancing coverage.
-
-`row_limit` activates the same adaptive date bisection used by explicit asset
-ranges. Saturated parent rows are audited and discarded. Only complete,
-unsaturated leaves are combined; saturation at one day invalidates the whole
-logical range, so truncated data is never published.
-
-`api_calls` continues to represent physical provider calls and records these
-calls with `request_kind = 'initial_range_backfill'`, including actual leaf
-bounds and saturated parents. `ingestion_runs.request_count` is therefore a
-physical-call count, while `success_count`, `empty_count`, and `failure_count`
-count daily scope outcomes. Progress `total` and `completed` also count daily
-scopes, so one completed range can advance progress by many steps.
-
-Each selected dataset has a writer lease tied to a workflow owner. A second
-process cannot update that dataset until the first process finishes or its
-lease expires. Scopes are claimed only when entering the bounded in-flight
-queue. Cooperative cancellation stops new claims, settles completed provider
-calls, commits completed nonempty buffers, preserves completed empties, and
-releases leases. Owner cleanup after forced termination changes only genuinely
-unfinished `running` scopes to retryable `failed`; committed `success` and
-durable `empty` scopes remain unchanged.
-
-Failed physical calls are attempted three times within one invocation with a
-fixed, cancellable 60-second wait. A persistent failure is stored in the scope
-ledger and retried before forward or revision work in a later update; it does
-not block unrelated scopes.
-
-Omit `batch_size` to commit when the dataset completes or its buffer reaches
-`max_buffer_mb` (512 MiB by default). Setting `batch_size` explicitly keeps a
-request-count commit boundary. Within retry and incremental work, requests are
-ordered by physical partition affinity: daily scopes by month and asset scopes
-by stable asset bucket. When a `by_asset` dataset has an empty manifest, the
-initial build also commits at retry/forward and bucket boundaries. A bucket
-smaller than the configured buffer is therefore written once; explicit
-`batch_size` and `max_buffer_mb` limits can still split an oversized bucket.
-Up to four internal workers hash, write, validate, and publish independent
-Parquet partitions in parallel. One writer pool is reused across every commit
-and sequential dataset in the update invocation. Incoming rows are
-deduplicated once per commit, new partitions avoid unnecessary reads, and
-coverage is aggregated once from the touched canonical partitions. Provider
-workers also combine and validate each request before returning it to the
-scheduler. Schema reconciliation, manifest publication, API audit writes, and
-scope transitions remain serialized, and any writer failure settles the
-remaining in-flight work before the whole batch is rolled back.
-`max_in_flight` bounds queued calls:
-
-```python
-report = lake.update.datasets(
-    ["trade_cal", "stock_basic", "daily", "income"],
-    source="tushare",
-    workers=4,
-    max_in_flight=8,
-    max_buffer_mb=512,
-)
-```
-
-Applications can observe `sync`, `claim`, `fetch`, `commit`, and `complete`
-progress through `progress_callback`. Reports include changed partition hashes
-for downstream invalidation, `planning_seconds`, and separate rewritten and
-skipped partition counts. `bytes_written` is the cumulative size of physically
-rewritten Parquet files and is zero for a fully no-op update.
-
-Pass provider-specific values with `params`. The normalized parameter variant
-is part of the scope identity; ledger-owned date, asset, and range values still
-take precedence.
-
-Provider endpoints that silently cap a date-range response can opt into
-`source_options.pagination = "adaptive_date_range"`. Configure `row_limit`,
-`start_param`, `end_param`, `minimum_window_days`, and `max_pages`. When a
-response reaches `row_limit`, the lake keeps its API audit record but discards
-its rows, bisects the requested date range, and fetches both children. Only
-validated, unsaturated leaves are eligible for the scope's atomic commit. A
-leaf that still reaches the limit at the minimum window is marked `invalid`,
-so a truncated response can never advance local coverage or appear as a
-successful complete scope.
-
-Inspect and reset state through the status facade:
-
-```python
-lake.admin.status.update_summary(source="tushare")
-lake.admin.status.provider_scope_checks(source="tushare", dataset="income")
-lake.admin.status.update_scopes(
-    source="tushare", dataset="income", status="failed"
-)
-lake.admin.status.reset_update_scopes([123, 124])
-```
+Old metadata schemas are rejected before database writes. Back up and explicitly
+rebuild an incompatible lake; there are no automatic migrations or compatibility readers.

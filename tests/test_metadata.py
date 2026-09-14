@@ -313,6 +313,10 @@ def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) ->
     assert row["last_error"] == "writer lease expired"
 
 
+
+
+
+
 def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) -> None:
     metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
     metadata.synchronize_update_scopes(
@@ -333,7 +337,7 @@ def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) 
         run_id="run-empty",
         source="tushare",
         dataset="income",
-        mode="by_asset",
+        mode="by_daily",
     )
     metadata.claim_update_scopes([scope_id], run_id="run-empty")
 
@@ -391,7 +395,7 @@ def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(
         run_id="run-owner",
         source="tushare",
         dataset="income",
-        mode="by_asset",
+        mode="by_daily",
         owner_id=owner_id,
     )
     metadata.acquire_update_leases(

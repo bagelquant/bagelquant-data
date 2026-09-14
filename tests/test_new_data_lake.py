@@ -11,35 +11,10 @@ from bagelquant_data.core import DatasetSpecError, ValidationError, incremental_
 
 
 def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
-    spec = DatasetSpec(
-        "balancesheet",
-        "by_asset",
-        asset_list="stock_basic",
-        primary_key_extra=("period",),
-        field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-    )
-
-    assert [field.name for field in fields(DatasetSpec)] == [
-        "name",
-        "update_type",
-        "source",
-        "description",
-        "calendar",
-        "asset_list",
-        "primary_key_extra",
-        "source_api_params",
-        "source_api_param_sets",
-        "date_param",
-        "request_date_field",
-        "field_mappings",
-        "asset_bucket_count",
-        "revision_lookback_days",
-        "revision_refresh_days",
-        "source_api",
-        "request_discovery",
-    ]
+    spec = DatasetSpec("balancesheet", "by_daily", date_kind="calendar", date_params=("f_ann_date",),
+                       primary_key_extra=("period",), field_mappings={"f_ann_date": "time", "ts_code": "asset_id"})
     assert incremental_key(spec) == ("time", "asset_id", "period")
-    assert not hasattr(spec, "primary_key")
+    assert not {"asset_list", "asset_bucket_count", "revision_refresh_days"} & {field.name for field in fields(DatasetSpec)}
     assert not hasattr(DatasetSpec, "from_mapping")
 
 
@@ -77,7 +52,7 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     with pytest.raises(DatasetSpecError, match="calendar"):
         lake.admin.datasets.register(DatasetSpec("daily", "by_daily"))
-    with pytest.raises(DatasetSpecError, match="asset_list"):
+    with pytest.raises(DatasetSpecError, match="unsupported update_type"):
         lake.admin.datasets.register(DatasetSpec("income", "by_asset"))
 
     path = tmp_path / "daily.toml"
@@ -93,7 +68,7 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
 
     financial_path = tmp_path / "income.toml"
     financial_path.write_text(
-        'name = "income"\nupdate_type = "by_asset"\nasset_list = "stock_basic"\n'
+        'name = "income"\nupdate_type = "by_daily"\ndate_kind = "calendar"\n'
         'request_date_field = "ann_date"\n[field_mappings]\n'
         'f_ann_date = "time"\nts_code = "asset_id"\n'
     )
@@ -138,6 +113,48 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
     )
     with pytest.raises(DatasetSpecError, match="source_api_param_sets"):
         lake.admin.datasets.register_toml(path)
+
+
+def test_manager_validates_nullable_primary_key_extras(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    common = {
+        "name": "financial",
+        "update_type": "by_daily",
+        "date_kind": "calendar",
+        "field_mappings": {"announcement_date": "time", "code": "asset_id"},
+    }
+
+    with pytest.raises(DatasetSpecError, match="subset of primary_key_extra"):
+        lake.admin.datasets.register(
+            DatasetSpec(
+                **common,
+                primary_key_extra=("report_type",),
+                nullable_primary_key_extra=("company_type",),
+            )
+        )
+
+    with pytest.raises(DatasetSpecError, match="duplicate fields"):
+        lake.admin.datasets.register(
+            DatasetSpec(
+                **common,
+                primary_key_extra=("company_type",),
+                nullable_primary_key_extra=("company_type", "company_type"),
+            )
+        )
+
+    registered = lake.admin.datasets.register(
+        DatasetSpec(
+            **common,
+            primary_key_extra=("report_type", "company_type"),
+            nullable_primary_key_extra=("company_type",),
+        )
+    )
+    reopened = DataLake.open(tmp_path).admin.datasets.get(
+        "financial", source="custom"
+    )
+    assert reopened.nullable_primary_key_extra == (
+        "company_type",
+    ) == registered.nullable_primary_key_extra
 
 
 def test_manager_loads_stored_specs_without_source_api_params(tmp_path) -> None:
@@ -256,6 +273,32 @@ def test_incremental_ingestion_rejects_null_primary_key_values(tmp_path) -> None
         lake.ingest(spec, frame)
 
 
+def test_incremental_ingestion_accepts_declared_nullable_extra_key(tmp_path) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = DatasetSpec(
+        "financial",
+        "by_daily",
+        date_kind="calendar",
+        primary_key_extra=("company_type",),
+        nullable_primary_key_extra=("company_type",),
+        field_mappings={"announcement_date": "time", "code": "asset_id"},
+    )
+    frame = pl.DataFrame(
+        {
+            "announcement_date": ["20250102", "20250102"],
+            "code": ["A", "A"],
+            "company_type": pl.Series([None, "1"], dtype=pl.String),
+            "value": [1.0, 2.0],
+        }
+    )
+
+    lake.ingest(spec, frame)
+
+    result = lake.query.query("financial", source="custom").collect()
+    assert result.height == 2
+    assert result["company_type"].null_count() == 1
+
+
 def test_field_mappings_reject_missing_sources_and_unmapped_collisions(
     tmp_path,
 ) -> None:
@@ -315,4 +358,4 @@ def test_field_mappings_allow_arbitrary_renames(tmp_path) -> None:
 
     frame = lake.query.query("daily", source="custom").collect()
     assert frame["close"].to_list() == [11.25]
-    assert "vendor_close" not in frame.columns
+    assert "vendor_close" in frame.columns

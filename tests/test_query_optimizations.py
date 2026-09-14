@@ -5,7 +5,6 @@ import pytest
 
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core import DatasetNotFoundError
-from bagelquant_data.core.hashing import stable_bucket
 
 
 def _record_scan_paths(
@@ -46,57 +45,13 @@ def test_daily_query_prunes_to_intersecting_month(tmp_path, monkeypatch) -> None
     calls = _record_scan_paths(monkeypatch)
 
     frame = lake.query.query(
-        "daily", source="custom", start="2025-02-01", end="2025-02-28"
+        "daily", source="custom", observation_start="2025-02-01", observation_end="2025-02-28"
     ).collect()
 
     assert frame["close"].to_list() == [2.0]
     assert sum(len(paths) for paths in calls) == 1
 
 
-def test_asset_query_prunes_to_one_bucket_per_intersecting_year(
-    tmp_path, monkeypatch
-) -> None:
-    target = "000001.SZ"
-    other = next(
-        f"{value:06d}.SZ"
-        for value in range(2, 10_000)
-        if stable_bucket(f"{value:06d}.SZ", 32) != stable_bucket(target, 32)
-    )
-    lake = DataLake.open(tmp_path)
-    spec = DatasetSpec(
-        "income",
-        "by_asset",
-        asset_list="stock_basic",
-        field_mappings={"ann_date": "time", "ts_code": "asset_id"},
-    )
-    lake.ingest(
-        spec,
-        pl.DataFrame(
-            {
-                "ann_date": ["20240630", "20250630", "20240630", "20250630"],
-                "ts_code": [target, target, other, other],
-                "value": [1.0, 2.0, 3.0, 4.0],
-            }
-        ),
-    )
-    lake.admin.status.rebuild_manifest("income", source="custom")
-    calls = _record_scan_paths(monkeypatch)
-
-    frame = lake.query.query(
-        "income",
-        source="custom",
-        start="2024-01-01",
-        end="2025-12-31",
-        assets=[target],
-    ).collect()
-
-    assert frame.height == 2
-    assert sum(len(paths) for paths in calls) == 2
-    assert all(
-        f"bucket={stable_bucket(target, 32):02d}" in path
-        for paths in calls
-        for path in paths
-    )
 
 
 def test_out_of_range_query_returns_typed_empty_lazy_frame(tmp_path) -> None:
@@ -140,5 +95,5 @@ def test_query_fails_when_manifested_file_is_missing(tmp_path) -> None:
     path = lake.paths.dataset_root("custom", "daily") / str(manifest["partition_path"])
     path.unlink()
 
-    with pytest.raises(DatasetNotFoundError, match="references missing files"):
+    with pytest.raises(DatasetNotFoundError, match="references missing partition"):
         lake.query.query("daily", source="custom").collect()

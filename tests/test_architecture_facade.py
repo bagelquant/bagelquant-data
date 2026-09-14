@@ -27,5 +27,5 @@ def test_standard_normalizer_renames_to_canonical_fields(tmp_path) -> None:
         {"time": __import__("datetime").date(2025, 1, 2), "asset_id": "000001.SZ"}
     ]
     columns = lake.query.query("daily", source="custom").collect().columns
-    assert "trade_date" not in columns
-    assert "ts_code" not in columns
+    assert "trade_date" in columns
+    assert "ts_code" in columns

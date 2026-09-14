@@ -1,40 +1,33 @@
-# Queries
-
-Both query methods return a Polars `LazyFrame`; call `.collect()` only when an
-eager DataFrame is required.
-
-Use `query_general()` for every kind of dataset, especially `general` datasets
-without canonical time and asset fields:
+# PIT queries
 
 ```python
-stocks = lake.query.query_general("stock_basic", source="tushare", fields=["ts_code", "name"])
+# Latest complete observation versions, restricted to numerical source dates.
+latest = lake.query.query("daily", source="tushare",
+    observation_start="2026-01-01", observation_end="2026-01-31")
+# What was known at the calculation cutoff, including later-month revisions.
+known = lake.query.query("daily", source="tushare", as_of_date="2026-09-09",
+    observation_start="2026-01-01", observation_end="2026-01-31")
+versions = lake.query.query("daily", source="tushare", view="versions")
+# Observation-axis values for a numerical consumer.
+observations = lake.query.observations("daily", source="tushare", start="2026-01-01")
 ```
 
-Use `query()` only for `by_daily` and `by_asset` datasets. It can filter the
-canonical `(time, asset_id)` key and select output fields:
+`source_time` is the observation/announcement date; `time` is availability.
+`start` and `end` filter availability after version resolution. `observation_start`
+and `observation_end` filter the independent source axis and prune manifests using
+source-date bounds. `as_of_date` filters visibility before selecting the latest
+business-key version. `ingested_before` accepts a timezone-aware timestamp.
+Fields and numerical filters must be applied after version selection.
 
-```python
-close = lake.query.query(
-    "daily",
-    source="tushare",
-    start="2026-01-01",
-    end="2026-01-31",
-    assets=["000001.SZ"],
-    fields=["time", "asset_id", "close"],
-)
-```
+`view="history"` selects each observation's version known on its own source date.
+`observations()` also restores the ordinary numerical `time` axis; an explicit
+`as_of_date` instead resolves its whole input window at that cutoff.
+`lake.query.frozen()` pins a visible commit ceiling for one computation.
+`version_evidence()` supplies immutable visible batch identities without numerical
+reads. Check timestamps do not participate in these identities.
 
-Omit `fields` to return all stored fields. Calling `query()` on a `general`
-dataset raises an error; use `query_general()` instead.
-
-The lake prunes manifest entries before creating Polars scans. Date filters
-exclude non-overlapping monthly or yearly partitions; asset filters on
-`by_asset` datasets additionally select only the stable asset buckets. Polars
-still receives the exact predicates and projection for pushdown.
-
-Partitions with older compatible schemas are grouped by manifest
-`schema_hash`. Each group is projected, missing columns are filled with typed
-nulls, and compatible numeric columns are cast to the canonical dataset schema
-before the lazy groups are concatenated. A query outside stored coverage
-returns a typed empty `LazyFrame`. A manifest that references a missing file
-fails explicitly and never falls back to a directory glob.
+General uses `query_general()`: latest complete snapshot by default, or an explicit
+`as_of_date`, `snapshot_id`, or `ingested_before`. `view="versions"` audits all
+eligible snapshots. `snapshots()` lists complete snapshot metadata including empty
+snapshots. Historical initialization is a baseline available for historical reads;
+subsequent snapshots never backdate changes or merge rows from different snapshots.

@@ -67,14 +67,14 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
         ).fetchall()
     assert sorted(rows) == [
         ("discovery", 3),
-        ("refresh", 1),
-        ("refresh", 1),
-        ("refresh", 1),
-        ("refresh", 1),
+        ("forward", 1),
+        ("forward", 1),
+        ("forward", 1),
+        ("forward", 1),
     ]
 
 
-def test_dated_general_discovery_is_skipped_for_completed_snapshot(tmp_path) -> None:
+def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(tmp_path) -> None:
     source = DiscoverySource()
     lake = DataLake.open(tmp_path)
     lake.admin.sources.register(source)
@@ -96,11 +96,11 @@ def test_dated_general_discovery_is_skipped_for_completed_snapshot(tmp_path) -> 
         "logical_membership", source="custom", end="2025-01-03"
     )
 
-    assert report.request_count == 0
-    assert len(source.calls) == call_count
+    assert report.request_count == 2
+    assert len(source.calls) == call_count + 3
 
 
-def test_discovery_values_expand_daily_and_asset_ledger_variants(tmp_path) -> None:
+def test_discovery_values_expand_trading_and_calendar_day_variants(tmp_path) -> None:
     lake = DataLake.open(tmp_path)
     lake.ingest(
         DatasetSpec("trade_cal", "general"),
@@ -122,7 +122,7 @@ def test_discovery_values_expand_daily_and_asset_ledger_variants(tmp_path) -> No
         "daily", "by_daily", calendar="trade_cal", field_mappings={"trade_date": "time", "ts_code": "asset_id"}
     )
     asset = DatasetSpec(
-        "asset", "by_asset", asset_list="stock_basic", field_mappings={"ann_date": "time", "ts_code": "asset_id"}
+        "asset", "by_daily", date_kind="calendar", field_mappings={"ann_date": "time", "ts_code": "asset_id"}
     )
     lake.admin.datasets.register(daily)
     lake.admin.datasets.register(asset)
