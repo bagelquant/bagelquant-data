@@ -460,6 +460,53 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
     ).collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 120.0
 
 
+def test_baseline_repair_restores_missing_observation_to_its_source_date(
+    tmp_path,
+) -> None:
+    lake = DataLake.open(tmp_path)
+    spec = daily_spec()
+    lake.ingest(
+        spec,
+        pl.DataFrame(
+            {"trade_date": ["20260824"], "ts_code": ["A"], "close": [90.0]}
+        ),
+        mode="initialize",
+        ingested_at=instant("08-25"),
+    )
+    missing = pl.DataFrame(
+        {"trade_date": ["20260825"], "ts_code": ["A"], "close": [100.0]}
+    )
+    lake.ingest(spec, missing, ingested_at=instant("09-10"))
+
+    committed = lake._pipeline.commit_frame(
+        spec,
+        missing,
+        run_id="baseline-repair",
+        mode="incremental",
+        ingested_at=instant("09-11"),
+        baseline_repair=True,
+    )
+
+    assert committed.rows_committed == 1
+    repaired = lake.query.query(
+        "prices",
+        source="custom",
+        as_of_date="2026-08-25",
+    ).collect()
+    assert repaired.filter(pl.col("source_time") == date(2026, 8, 25))[
+        "close"
+    ].item() == 100.0
+    versions = lake.query.query(
+        "prices",
+        source="custom",
+        observation_start="2026-08-25",
+        observation_end="2026-08-25",
+        view="versions",
+    ).collect()
+    assert versions.height == 2
+    assert versions.filter(pl.col("_baseline"))["time"].item() == date(2026, 8, 25)
+
+
 def test_repeating_pagination_never_claims_complete(tmp_path):
     lake = DataLake.open(tmp_path)
     source = DailySource()

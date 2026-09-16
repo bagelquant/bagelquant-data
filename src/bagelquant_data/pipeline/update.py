@@ -609,7 +609,44 @@ def _harvest_request(
         return
     if state.work.spec.update_type == "by_daily" and request.daily_scopes:
         nonempty, empty = _split_daily_scope_results(state.work.spec, request, frame)
-        if empty:
+        required_empty, allowed_empty = _classify_empty_daily_scopes(
+            state.work, empty
+        )
+        if required_empty:
+            pipeline.metadata.record_api_calls(calls)
+            message = (
+                "provider response omitted a required dense trading-date scope"
+            )
+            for scope in required_empty:
+                _transition(
+                    pipeline,
+                    state,
+                    replace(
+                        request,
+                        scope_id=scope.scope_id,
+                        target_end=scope.scope_key,
+                        recheck_after=scope.recheck_after,
+                        daily_scopes=(scope,),
+                        range_backfill_eligible=False,
+                    ),
+                    "invalid",
+                    message,
+                )
+            if allowed_empty:
+                pipeline.metadata.record_empty_scope_results(
+                    calls=(),
+                    scope_results=(
+                        {
+                            "scope_id": scope.scope_id,
+                            "checked_through": scope.scope_key,
+                            "recheck_after": None,
+                        }
+                        for scope in allowed_empty
+                    ),
+                    run_id=state.work.run_id,
+                )
+                state.empty_count += len(allowed_empty)
+        elif allowed_empty:
             pipeline.metadata.record_empty_scope_results(
                 calls=calls,
                 scope_results=(
@@ -618,11 +655,11 @@ def _harvest_request(
                         "checked_through": scope.scope_key,
                         "recheck_after": None,
                     }
-                    for scope in empty
+                    for scope in allowed_empty
                 ),
                 run_id=state.work.run_id,
             )
-            state.empty_count += len(empty)
+            state.empty_count += len(allowed_empty)
         else:
             state.pending_api_calls.extend(calls)
         state.request_count += request_count
@@ -677,6 +714,37 @@ def _split_daily_scope_results(
             )
         )
     return nonempty, empty
+
+
+def _classify_empty_daily_scopes(
+    work: DatasetUpdateWork,
+    scopes: Sequence[DailyScope],
+) -> tuple[list[DailyScope], list[DailyScope]]:
+    """Apply the caller's explicit dense-series completeness contract."""
+
+    options = {**work.spec.request_options, **_request_options(work.context)}
+    value = options.get("require_nonempty_scopes", False)
+    if not isinstance(value, bool):
+        raise ValueError("source_options.require_nonempty_scopes must be boolean")
+    if not value:
+        return [], list(scopes)
+    start_value = options.get("required_nonempty_start")
+    try:
+        required_start = (
+            None if start_value in {None, ""} else _date_value(start_value)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "source_options.required_nonempty_start must be an ISO date"
+        ) from error
+    required: list[DailyScope] = []
+    allowed: list[DailyScope] = []
+    for scope in scopes:
+        target = required if (
+            required_start is None or _date_value(scope.scope_key) >= required_start
+        ) else allowed
+        target.append(scope)
+    return required, allowed
 
 
 def _api_call_rows(
@@ -762,6 +830,9 @@ def _commit_state(
             requests=[
                 {"scope_id": r.scope_id, "params": r.params} for _, r in buffered
             ],
+            baseline_repair=bool(
+                state.work.context.options.get("baseline_repair", False)
+            ),
         )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed
@@ -1276,6 +1347,18 @@ def _fetch_adaptive_date_range(
     end_param = str(request_options.get("end_param", "end"))
     minimum_window_days = int(request_options.get("minimum_window_days", 0))
     max_pages = int(request_options.get("max_pages", 10_000))
+    empty_range_policy = str(
+        request_options.get("empty_range_policy", "accept")
+    )
+    if empty_range_policy not in {"accept", "bisect"}:
+        return [
+            _invalid_pagination_page(
+                request_index,
+                request,
+                "adaptive date pagination empty_range_policy must be "
+                "'accept' or 'bisect'",
+            )
+        ]
     if row_limit <= 0 or minimum_window_days < 0 or max_pages <= 0:
         return [
             _invalid_pagination_page(
@@ -1345,9 +1428,19 @@ def _fetch_adaptive_date_range(
         pages.append(page)
         if page.status != "success":
             return pages
+        span_days = (upper - lower).days
+        if page.row_count == 0 and empty_range_policy == "bisect":
+            if span_days <= minimum_window_days:
+                continue
+            midpoint = lower + timedelta(days=span_days // 2)
+            pages[-1] = replace(page, frame=None)
+            pending.appendleft(
+                (midpoint + timedelta(days=1), upper, f"{request_key}:1")
+            )
+            pending.appendleft((lower, midpoint, f"{request_key}:0"))
+            continue
         if page.row_count < row_limit:
             continue
-        span_days = (upper - lower).days
         if span_days <= minimum_window_days:
             pages[-1] = replace(page, frame=None)
             pages.extend(

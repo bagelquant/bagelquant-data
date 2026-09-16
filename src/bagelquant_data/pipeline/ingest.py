@@ -127,6 +127,7 @@ class IngestionPipeline:
         mode: str = "incremental",
         ingested_at: datetime | None = None,
         requests: list[dict] | None = None,
+        baseline_repair: bool = False,
     ) -> CommitResult:
         """Commit a frame as part of an existing logical run."""
 
@@ -163,4 +164,5 @@ class IngestionPipeline:
             mode=mode,
             ingested_at=ingested_at,
             requests=requests,
+            baseline_repair=baseline_repair,
         )

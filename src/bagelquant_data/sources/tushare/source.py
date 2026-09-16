@@ -149,6 +149,8 @@ def _to_tushare_params(request: Mapping[str, Any]) -> dict[str, Any]:
             "date": "trade_date",
             "id": "ts_code",
         }.get(key, key)
+        if mapped == "fields" and isinstance(value, (list, tuple)):
+            value = ",".join(str(field) for field in value)
         params[mapped] = _format_date(value) if mapped.endswith("date") else value
     return params
 

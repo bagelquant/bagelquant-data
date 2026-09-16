@@ -49,11 +49,14 @@ def commit_versions(
     mode: str = "incremental",
     ingested_at: datetime | None = None,
     requests: list[dict] | None = None,
+    baseline_repair: bool = False,
 ):
     from bagelquant_data.pipeline.commit import CommitResult
 
     if mode not in {"initialize", "incremental", "refresh"}:
         raise ValueError("mode must be initialize, incremental, or refresh")
+    if baseline_repair and mode != "incremental":
+        raise ValueError("baseline repair requires incremental mode")
     now = ingested_at or datetime.now(UTC)
     if now.tzinfo is None:
         raise ValueError("ingested_at must be timezone-aware")
@@ -139,10 +142,15 @@ def commit_versions(
                     source=spec.source,
                     observation_start=observation_start,
                     observation_end=observation_end,
-                    fields=["_record_id", "_payload_hash"],
+                    fields=["_record_id", "_payload_hash", "_baseline"],
                 )
                 .collect()
             )
+            if baseline_repair and "_baseline" in old.columns:
+                # A previous ordinary repair learned the record only on its
+                # ingestion date.  It must not suppress the missing baseline
+                # version that restores the same row to its source date.
+                old = old.filter(pl.col("_baseline").fill_null(False))
             if old.height:
                 frame = frame.join(old, on=["_record_id", "_payload_hash"], how="anti")
         if frame.is_empty():
@@ -157,7 +165,7 @@ def commit_versions(
         frame = frame.with_columns(
             (
                 pl.col("source_time")
-                if mode == "initialize"
+                if mode == "initialize" or baseline_repair
                 else pl.max_horizontal(pl.col("source_time"), pl.lit(available))
             ).alias("time")
         )
@@ -234,7 +242,7 @@ def commit_versions(
     frame = frame.with_columns(
         pl.lit(now, dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
         pl.lit(seq, dtype=pl.Int64).alias("_commit_seq"),
-        pl.lit(mode == "initialize").alias("_baseline"),
+        pl.lit(mode == "initialize" or baseline_repair).alias("_baseline"),
     )
     if spec.update_type == "general":
         frame = frame.with_columns(pl.lit(str(seq)).alias("_snapshot_id"))

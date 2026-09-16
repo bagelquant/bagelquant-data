@@ -385,7 +385,8 @@ class LakeUpdater:
         run_ids = {run.run_id for run in report.runs}
         bounds = {}
         for row in self.lake.metadata._rows(
-            "select c.dataset,c.run_id,b.partition_path,b.min_available,b.max_available,c.pit_date "
+            "select c.dataset,c.run_id,b.partition_path,"
+            "b.min_available,b.max_available,b.min_observation,b.max_observation,c.pit_date "
             "from version_batches b join version_commits c on c.seq=b.commit_seq "
             "where c.source=? and c.status='committed'", (source,),
         ):
@@ -393,8 +394,8 @@ class LakeUpdater:
                 bounds.setdefault((row["dataset"], row["partition_path"]), []).append(row)
         return replace(report, changed_partitions=tuple(
             replace(change,
-                    min_time=min(str(row["min_available"] or row["pit_date"]) for row in bounds[key]),
-                    max_time=max(str(row["max_available"] or row["pit_date"]) for row in bounds[key]))
+                    min_time=_version_batch_change_bounds(bounds[key])[0],
+                    max_time=_version_batch_change_bounds(bounds[key])[1])
             if (key := (change.dataset, change.partition_path)) in bounds else change
             for change in changes
         ))
@@ -433,6 +434,7 @@ def _request_context(
     params = kwargs.pop("params", None)
     owner_id = kwargs.pop("owner_id", None)
     cancel_requested = kwargs.pop("cancel_requested", None)
+    baseline_repair = kwargs.pop("baseline_repair", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -469,6 +471,8 @@ def _request_context(
         if not callable(cancel_requested):
             raise ConfigurationError("cancel_requested must be callable")
         options["cancel_requested"] = cancel_requested
+    if baseline_repair is not None:
+        options["baseline_repair"] = bool(baseline_repair)
     return RequestContext(source=source, dataset=dataset, options=options, **known)
 
 
@@ -482,6 +486,36 @@ def _manifest_map(
         for dataset in dict.fromkeys(datasets)
         for row in metadata.manifest(source, dataset)
     }
+
+
+def _version_batch_change_bounds(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, str]:
+    """Return the observation range affected by committed version batches.
+
+    Raw versions are physically partitioned by availability date.  A repair
+    committed today may nevertheless replace observations from years ago, so
+    downstream invalidation must prefer observation bounds over availability
+    bounds.
+    """
+    return (
+        min(
+            str(
+                row.get("min_observation")
+                or row.get("min_available")
+                or row["pit_date"]
+            )
+            for row in rows
+        ),
+        max(
+            str(
+                row.get("max_observation")
+                or row.get("max_available")
+                or row["pit_date"]
+            )
+            for row in rows
+        ),
+    )
 
 
 def _partition_changes(

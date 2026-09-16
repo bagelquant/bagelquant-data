@@ -12,6 +12,12 @@ def test_tushare_maps_default_daily_date_to_trade_date() -> None:
     assert _to_tushare_params({"date": "2025-01-02"}) == {"trade_date": "20250102"}
 
 
+def test_tushare_serializes_fields_using_the_provider_contract() -> None:
+    assert _to_tushare_params({"fields": ["ts_code", "trade_date", "close"]}) == {
+        "fields": "ts_code,trade_date,close"
+    }
+
+
 def test_provider_quota_coordinates_cooldown_and_pacing(monkeypatch) -> None:
     clock = [100.0]
     monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])

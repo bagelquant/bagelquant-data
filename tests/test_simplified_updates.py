@@ -7,7 +7,11 @@ from typing import Any, cast
 import polars as pl
 
 from bagelquant_data import DataLake, DatasetSpec
-from bagelquant_data.management.lake import _manifest_map, _partition_changes
+from bagelquant_data.management.lake import (
+    _manifest_map,
+    _partition_changes,
+    _version_batch_change_bounds,
+)
 
 
 def test_partition_change_coordinates_cover_deleted_boundary_rows() -> None:
@@ -31,6 +35,21 @@ def test_partition_change_coordinates_cover_deleted_boundary_rows() -> None:
 
     assert change.min_time == "2025-01-02"
     assert change.max_time == "2025-01-31"
+
+
+def test_partition_change_coordinates_use_historical_observation_bounds(
+) -> None:
+    assert _version_batch_change_bounds(
+        [
+            {
+                "min_available": "2026-09-15",
+                "max_available": "2026-09-15",
+                "min_observation": "2019-03-29",
+                "max_observation": "2022-08-31",
+                "pit_date": "2026-09-15",
+            }
+        ]
+    ) == ("2019-03-29", "2022-08-31")
 
 
 def test_update_manifest_snapshot_reads_only_selected_datasets() -> None:
@@ -208,6 +227,18 @@ class DailyRangeSource:
             },
             schema={"trade_date": pl.String, "ts_code": pl.String},
         )
+
+
+class EmptyMultiDayRangeSource(DailyRangeSource):
+    """Model a provider that silently returns zero rows for range requests."""
+
+    def fetch(self, dataset: str, request: dict[str, object]) -> pl.DataFrame:
+        if "start_date" in request and request["start_date"] != request["end_date"]:
+            self.requests.append(dict(request))
+            return pl.DataFrame(
+                schema={"trade_date": pl.String, "ts_code": pl.String}
+            )
+        return super().fetch(dataset, request)
 
 
 def _daily_range_lake(
@@ -1057,6 +1088,69 @@ def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> N
         "2025-01-24",
         "2025-01-25",
     ]
+
+
+def test_daily_dense_range_bisects_silent_empty_parent(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(3)]
+    rows = {
+        value.isoformat(): (f"{index:06d}.SZ",)
+        for index, value in enumerate(sessions)
+    }
+    source = EmptyMultiDayRangeSource(rows)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+    options = _daily_range_options()
+    options["empty_range_policy"] = "bisect"
+    options["require_nonempty_scopes"] = True
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=options,
+    )
+
+    assert report.status == "success"
+    assert report.request_count == 5
+    assert report.success_count == 3
+    assert report.empty_count == 0
+    assert all(
+        row["status"] == "success"
+        for row in lake.admin.status.update_scopes(
+            dataset="daily", source="custom"
+        )
+    )
+
+
+def test_daily_dense_response_rejects_missing_scope(tmp_path) -> None:
+    sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(3)]
+    rows = {
+        sessions[0].isoformat(): (),
+        sessions[1].isoformat(): (),
+        sessions[2].isoformat(): ("000001.SZ",),
+    }
+    source = DailyRangeSource(rows)
+    lake = _daily_range_lake(tmp_path, source, sessions)
+    options = _daily_range_options()
+    options["require_nonempty_scopes"] = True
+
+    report = lake.update.dataset(
+        "daily",
+        source="custom",
+        start=sessions[0],
+        end=sessions[-1],
+        source_options=options,
+    )
+
+    assert report.status == "partial"
+    assert report.failure_count == 2
+    assert report.success_count == 1
+    assert [
+        row["status"]
+        for row in lake.admin.status.update_scopes(
+            dataset="daily", source="custom"
+        )
+    ] == ["invalid", "invalid", "success"]
 
 
 def test_daily_initial_range_requests_only_new_pending_tail(tmp_path) -> None:
