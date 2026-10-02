@@ -16,6 +16,7 @@ income = DatasetSpec(
     nullable_primary_key_extra=("ann_date", "comp_type", "end_type"),
     field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
     availability_timezone="Asia/Shanghai", availability_day_offset=-1,
+    availability_cutoff_time="09:30:00",
     request_options={"pagination": "offset", "page_size": 1000, "max_pages": 10000},
 )
 ```

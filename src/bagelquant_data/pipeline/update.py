@@ -830,9 +830,6 @@ def _commit_state(
             requests=[
                 {"scope_id": r.scope_id, "params": r.params} for _, r in buffered
             ],
-            baseline_repair=bool(
-                state.work.context.options.get("baseline_repair", False)
-            ),
         )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed

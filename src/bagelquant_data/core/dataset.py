@@ -43,6 +43,7 @@ class DatasetSpec:
     request_options: dict[str, object] = field(default_factory=dict)
     availability_timezone: str = "UTC"
     availability_day_offset: int = 0
+    availability_cutoff_time: str | None = None
 
 
 def dataset_key(spec: DatasetSpec) -> tuple[str, str]:

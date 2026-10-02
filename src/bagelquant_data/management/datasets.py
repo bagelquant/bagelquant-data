@@ -134,6 +134,17 @@ class DatasetManager:
         from zoneinfo import ZoneInfo
 
         ZoneInfo(spec.availability_timezone)
+        if spec.availability_day_offset < 0 and spec.availability_cutoff_time is None:
+            raise DatasetSpecError("negative availability_day_offset requires an explicit cutoff time")
+        if spec.availability_cutoff_time is not None:
+            from datetime import time
+
+            try:
+                cutoff = time.fromisoformat(spec.availability_cutoff_time)
+            except (TypeError, ValueError) as error:
+                raise DatasetSpecError("availability_cutoff_time must be local HH:MM:SS") from error
+            if cutoff.tzinfo is not None or cutoff.isoformat() != spec.availability_cutoff_time:
+                raise DatasetSpecError("availability_cutoff_time must be local HH:MM:SS")
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
@@ -246,6 +257,7 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         "request_options",
         "availability_timezone",
         "availability_day_offset",
+        "availability_cutoff_time",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -351,4 +363,5 @@ def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> Datase
         request_options=dict(value.get("request_options", {})),
         availability_timezone=str(value.get("availability_timezone", "UTC")),
         availability_day_offset=int(value.get("availability_day_offset", 0)),
+        availability_cutoff_time=value.get("availability_cutoff_time"),
     )

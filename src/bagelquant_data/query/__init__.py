@@ -65,22 +65,31 @@ class LakeQuery:
         from .raw import _date_value
 
         spec = self._datasets.get(dataset, source=source)
+        upper = str(_date_value(as_of_date)) if as_of_date is not None else None
+        first = str(_date_value(observation_start)) if observation_start is not None else None
+        last = str(_date_value(observation_end)) if observation_end is not None else None
+        conditions = ["c.source=?", "c.dataset=?", "c.status='committed'"]
+        parameters = [source, dataset]
+        if self._max_commit is not None:
+            conditions.append("b.commit_seq<=?")
+            parameters.append(self._max_commit)
+        if upper is not None:
+            conditions.append("(c.mode='initialize' OR coalesce(b.min_available,c.pit_date)<=?)" if spec.update_type == "general" else "coalesce(b.min_available,c.pit_date)<=?")
+            parameters.append(upper)
+        if first is not None:
+            conditions.append("(b.max_observation IS NULL OR b.max_observation>=?)")
+            parameters.append(first)
+        if last is not None:
+            conditions.append("(b.min_observation IS NULL OR b.min_observation<=?)")
+            parameters.append(last)
         rows = self._raw.metadata._rows(
             "select b.commit_seq,b.partition_path,b.content_hash,b.row_count,"
             "b.min_available,b.max_available,b.min_observation,b.max_observation,c.mode,c.pit_date "
             "from version_batches b join version_commits c on c.seq=b.commit_seq "
-            "where c.source=? and c.dataset=? and c.status='committed' order by b.commit_seq,b.partition_path",
-            (source, dataset),
+            "where " + " and ".join(conditions) + " order by b.commit_seq,b.partition_path",
+            tuple(parameters),
         )
-        upper = str(_date_value(as_of_date)) if as_of_date is not None else None
-        first = str(_date_value(observation_start)) if observation_start is not None else None
-        last = str(_date_value(observation_end)) if observation_end is not None else None
-        selected = [row for row in rows
-                    if (self._max_commit is None or row["commit_seq"] <= self._max_commit)
-                    and (upper is None or (row["mode"] == "initialize" if spec.update_type == "general" else False)
-                         or str(row["min_available"] or row["pit_date"]) <= upper)
-                    and (first is None or row["max_observation"] is None or row["max_observation"] >= first)
-                    and (last is None or row["min_observation"] is None or row["min_observation"] <= last)]
+        selected = rows
         if spec.update_type == "general" and selected:
             latest = max(row["commit_seq"] for row in selected)
             selected = [row for row in selected if row["commit_seq"] == latest]

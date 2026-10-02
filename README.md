@@ -34,8 +34,11 @@ recovery journals. `lake.db` alone determines committed data and coverage.
 Raw preserves provider columns, `source_time` (observation/announcement date),
 `time` (version availability), and UTC `ingested_at`. Explicit `initialize`
 creates a historical baseline; subsequent updates use the later of the source
-date and the configured collection-day boundary. Workbench uses Shanghai date
-minus one day. Unchanged checks do not create content versions. Updates recheck
+date and the configured collection cutoff. `availability_cutoff_time` is an
+exclusive local `HH:MM:SS` boundary: at/after it, advance the effective date by
+one calendar day before applying `availability_day_offset`. A negative offset
+requires an explicit cutoff. Workbench uses the next-open convention with
+Shanghai 09:30 and offset −1. Unchanged checks do not create content versions. Updates recheck
 the most recent three natural days; older refreshes require `mode="refresh"`.
 
 Use `as_of_date` for a PIT snapshot, `view="versions"` for all versions, and

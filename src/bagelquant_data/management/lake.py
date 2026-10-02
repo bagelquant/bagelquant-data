@@ -434,7 +434,6 @@ def _request_context(
     params = kwargs.pop("params", None)
     owner_id = kwargs.pop("owner_id", None)
     cancel_requested = kwargs.pop("cancel_requested", None)
-    baseline_repair = kwargs.pop("baseline_repair", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -471,8 +470,6 @@ def _request_context(
         if not callable(cancel_requested):
             raise ConfigurationError("cancel_requested must be callable")
         options["cancel_requested"] = cancel_requested
-    if baseline_repair is not None:
-        options["baseline_repair"] = bool(baseline_repair)
     return RequestContext(source=source, dataset=dataset, options=options, **known)
 
 

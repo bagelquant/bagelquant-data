@@ -7,8 +7,14 @@ initialization range and definition. A completed initialization cannot be repeat
 Refresh rechecks the explicit range and appends new versions when content changes.
 
 A successful initialization uses source dates for the historical baseline. Later
-versions use `max(source_time, local ingestion date + availability_day_offset)`.
-Workbench declares Asia/Shanghai with offset −1. `ingested_at` is always UTC.
+versions use `max(source_time, local ingestion date + availability_day_offset + rollover)`.
+With an explicit local `availability_cutoff_time` (`HH:MM:SS`), rollover is one
+at/after the cutoff and zero before it. Negative offsets require a cutoff.
+Workbench uses the next-open convention: offset −1 and an Asia/Shanghai 09:30
+cutoff prevent revisions received at or after the open from entering the
+previous signal date. Calendar dates
+are not exchange sessions; consumers align them forward to open sessions.
+`ingested_at` is always UTC.
 Same-day versions are ordered by ingestion timestamp and commit sequence. Empty
 responses do not delete records. Identical responses record a check referencing the
 visible commit; they do not change manifests or downstream content generations.
@@ -42,6 +48,8 @@ the verified complete Parquet reproduces every original batch hash and schema.
 Insufficient evidence on both sides blocks recovery. A provider's newest data is
 never substituted for a lost historical version. Missing date scopes may be fetched
 by an explicit normal update; later historical refreshes are new PIT observations.
+There is no provider-backed `baseline_repair` option. Missing coverage cannot
+authorize backdating a newly fetched value or replacing an existing baseline.
 
 Old metadata schemas are rejected before database writes. Back up and explicitly
 rebuild an incompatible lake; there are no automatic migrations or compatibility readers.

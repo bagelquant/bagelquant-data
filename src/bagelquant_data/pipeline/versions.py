@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -49,20 +49,26 @@ def commit_versions(
     mode: str = "incremental",
     ingested_at: datetime | None = None,
     requests: list[dict] | None = None,
-    baseline_repair: bool = False,
 ):
     from bagelquant_data.pipeline.commit import CommitResult
 
     if mode not in {"initialize", "incremental", "refresh"}:
         raise ValueError("mode must be initialize, incremental, or refresh")
-    if baseline_repair and mode != "incremental":
-        raise ValueError("baseline repair requires incremental mode")
     now = ingested_at or datetime.now(UTC)
     if now.tzinfo is None:
         raise ValueError("ingested_at must be timezone-aware")
     now = now.astimezone(UTC)
-    available = now.astimezone(ZoneInfo(spec.availability_timezone)).date() + timedelta(
-        days=spec.availability_day_offset
+    local = now.astimezone(ZoneInfo(spec.availability_timezone))
+    # The boundary is exclusive: receipt at/after the decision cutoff belongs
+    # to the next date. A negative offset without a cutoff has no causal meaning.
+    if spec.availability_day_offset < 0 and spec.availability_cutoff_time is None:
+        raise ValueError("negative availability_day_offset requires an explicit cutoff time")
+    rollover = (
+        spec.availability_cutoff_time is not None
+        and local.time() >= time.fromisoformat(spec.availability_cutoff_time)
+    )
+    available = local.date() + timedelta(
+        days=spec.availability_day_offset + int(rollover)
     )
     root = parquet.paths.dataset_root(spec.source, spec.name)
     manifests = parquet.metadata.manifest(spec.source, spec.name)
@@ -146,11 +152,6 @@ def commit_versions(
                 )
                 .collect()
             )
-            if baseline_repair and "_baseline" in old.columns:
-                # A previous ordinary repair learned the record only on its
-                # ingestion date.  It must not suppress the missing baseline
-                # version that restores the same row to its source date.
-                old = old.filter(pl.col("_baseline").fill_null(False))
             if old.height:
                 frame = frame.join(old, on=["_record_id", "_payload_hash"], how="anti")
         if frame.is_empty():
@@ -165,7 +166,7 @@ def commit_versions(
         frame = frame.with_columns(
             (
                 pl.col("source_time")
-                if mode == "initialize" or baseline_repair
+                if mode == "initialize"
                 else pl.max_horizontal(pl.col("source_time"), pl.lit(available))
             ).alias("time")
         )
@@ -242,7 +243,7 @@ def commit_versions(
     frame = frame.with_columns(
         pl.lit(now, dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
         pl.lit(seq, dtype=pl.Int64).alias("_commit_seq"),
-        pl.lit(mode == "initialize" or baseline_repair).alias("_baseline"),
+        pl.lit(mode == "initialize").alias("_baseline"),
     )
     if spec.update_type == "general":
         frame = frame.with_columns(pl.lit(str(seq)).alias("_snapshot_id"))

@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from dataclasses import replace
 import sqlite3
 
 import polars as pl
@@ -22,14 +23,68 @@ def daily_spec(**extra):
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
         **extra,
     )
+
+
+def test_version_evidence_uses_exact_observation_cutoff_and_frozen_commit(tmp_path):
+    lake = DataLake.open(tmp_path)
+    spec = daily_spec()
+    lake.ingest(spec,price(),mode="initialize",ingested_at=instant("08-26"))
+    frozen = lake.query.frozen()
+    original = frozen.version_evidence("prices",source="custom",observation_start="2026-08-25",observation_end="2026-08-25")
+    assert original and lake.query.version_evidence("prices",source="custom",observation_start="2026-08-26",observation_end="2026-08-31") == []
+    lake.ingest(spec,price(120.),ingested_at=instant("09-10"))
+    assert frozen.version_evidence("prices",source="custom",observation_start="2026-08-25",observation_end="2026-08-25") == original
+    assert lake.query.version_evidence("prices",source="custom",as_of_date="2026-09-08",observation_start="2026-08-25",observation_end="2026-08-25") == original
+    assert len(lake.query.version_evidence("prices",source="custom",as_of_date="2026-09-09",observation_start="2026-08-25",observation_end="2026-08-25")) == 2
 
 
 def price(value=100.0):
     return pl.DataFrame(
         {"trade_date": ["20260825"], "ts_code": ["A"], "close": [value]}
     )
+
+
+@pytest.mark.parametrize("clock,expected", [
+    ("03:00:00", "2026-09-15"),
+    ("09:29:59", "2026-09-15"),
+    ("09:30:00", "2026-09-16"),
+    ("15:00:00", "2026-09-16"),
+    ("18:48:00", "2026-09-16"),
+])
+def test_next_open_cutoff_never_backdates_a_late_revision(tmp_path, clock, expected):
+    lake = DataLake.open(tmp_path)
+    spec = daily_spec()
+    lake.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(f"2026-09-16T{clock}+08:00"))
+    versions = lake.query.query("prices", source="custom", view="versions").collect()
+    assert versions.filter(~pl.col("_baseline"))["time"].item() == date.fromisoformat(expected)
+    previous = date.fromordinal(date.fromisoformat(expected).toordinal() - 1)
+    assert lake.query.query("prices", source="custom", as_of_date=previous).collect()["close"].item() == 100.
+    assert lake.query.observations("prices", source="custom").collect()["close"].item() == 100.
+
+
+@pytest.mark.parametrize("instant_text,expected", [
+    ("2026-09-18T14:59:59+08:00", "2026-09-18"),
+    ("2026-09-18T15:00:00+08:00", "2026-09-19"),
+    ("2026-09-19T03:00:00+08:00", "2026-09-19"),
+    ("2026-10-01T18:48:00+08:00", "2026-10-02"),
+])
+def test_close_cutoff_uses_local_timezone_and_conservative_calendar_date(tmp_path, instant_text, expected):
+    lake = DataLake.open(tmp_path)
+    spec = replace(daily_spec(), availability_day_offset=0, availability_cutoff_time="15:00:00")
+    lake.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(instant_text))
+    versions = lake.query.query("prices", source="custom", view="versions").collect()
+    assert versions.filter(~pl.col("_baseline"))["time"].item() == date.fromisoformat(expected)
+
+
+def test_negative_offset_without_cutoff_is_rejected(tmp_path):
+    lake = DataLake.open(tmp_path)
+    with pytest.raises(ConfigurationError, match="cutoff"):
+        lake.admin.datasets.register(replace(daily_spec(), availability_cutoff_time=None))
 
 
 def test_cross_month_versions_cutoffs_and_idempotence(tmp_path):
@@ -84,6 +139,7 @@ def test_general_keeps_distinct_complete_snapshots(tmp_path):
         "general",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     lake.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
     lake.ingest(spec, pl.DataFrame({"code": ["B"]}), ingested_at=instant("09-10"))
@@ -104,6 +160,7 @@ def test_general_empty_update_is_a_complete_snapshot(tmp_path):
         "general",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     lake.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
     lake.ingest(
@@ -128,6 +185,7 @@ def test_unchanged_general_snapshot_records_only_a_check(tmp_path, frame):
         "general",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     lake.ingest(spec, frame, ingested_at=instant("09-09"))
     before_manifest = lake.metadata.manifest("custom", "reference")
@@ -156,6 +214,7 @@ def test_unchanged_general_snapshot_commits_new_definition_identity(tmp_path):
         description="original definition",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     revised = DatasetSpec(
         "reference",
@@ -163,6 +222,7 @@ def test_unchanged_general_snapshot_commits_new_definition_identity(tmp_path):
         description="revised definition",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     frame = pl.DataFrame({"code": ["A"]})
     lake.ingest(original, frame, ingested_at=instant("09-09"))
@@ -195,6 +255,7 @@ def test_general_initial_snapshot_is_not_visible_before_its_pit_date(tmp_path):
         "general",
         availability_timezone="Asia/Shanghai",
         availability_day_offset=-1,
+        availability_cutoff_time="09:30:00",
     )
     lake.ingest(
         spec,
@@ -460,7 +521,7 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
     ).collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 120.0
 
 
-def test_baseline_repair_restores_missing_observation_to_its_source_date(
+def test_provider_gap_repair_cannot_backdate_new_or_revised_observations(
     tmp_path,
 ) -> None:
     lake = DataLake.open(tmp_path)
@@ -484,18 +545,21 @@ def test_baseline_repair_restores_missing_observation_to_its_source_date(
         run_id="baseline-repair",
         mode="incremental",
         ingested_at=instant("09-11"),
-        baseline_repair=True,
     )
 
-    assert committed.rows_committed == 1
+    assert committed.rows_committed == 0
     repaired = lake.query.query(
         "prices",
         source="custom",
         as_of_date="2026-08-25",
     ).collect()
-    assert repaired.filter(pl.col("source_time") == date(2026, 8, 25))[
-        "close"
-    ].item() == 100.0
+    assert repaired.filter(pl.col("source_time") == date(2026, 8, 25)).is_empty()
+    lake._pipeline.commit_frame(
+        spec,
+        pl.DataFrame({"trade_date": ["20260824"], "ts_code": ["A"], "close": [999.0]}),
+        run_id="provider-revision", ingested_at=instant("09-11"),
+    )
+    assert lake.query.observations("prices", source="custom").collect()["close"].to_list() == [90.0]
     versions = lake.query.query(
         "prices",
         source="custom",
@@ -503,8 +567,11 @@ def test_baseline_repair_restores_missing_observation_to_its_source_date(
         observation_end="2026-08-25",
         view="versions",
     ).collect()
-    assert versions.height == 2
-    assert versions.filter(pl.col("_baseline"))["time"].item() == date(2026, 8, 25)
+    assert versions.height == 1
+    assert versions.filter(pl.col("_baseline")).is_empty()
+    lake.admin.sources.register(DailySource())
+    with pytest.raises(ConfigurationError, match="Unsupported update option"):
+        lake.update.dataset("prices", source="custom", baseline_repair=True)
 
 
 def test_repeating_pagination_never_claims_complete(tmp_path):

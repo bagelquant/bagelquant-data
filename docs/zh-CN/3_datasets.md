@@ -7,3 +7,5 @@
 `source_api_param_sets` 对列表值做笛卡尔展开；`parameter_dataset`、`parameter_field` 和 `parameter_name` 可以从已登记的 General 目录生成未来请求参数，但不会创建资产级水位。TOML 和表单生成的定义进入同一个校验器。
 
 旧的按资产更新类型、年/桶分区与修订水位参数均不受支持。
+
+`availability_cutoff_time` 显式规定本地信息截止时刻（`HH:MM:SS`）。达到或超过该时刻的采集先顺延一个自然日，再应用 `availability_day_offset`。负偏移必须声明截止时刻；例如偏移 −1、截止 09:30:00 对应次日开盘前采集口径，不能用于声称前一日收盘前已知的信息集。

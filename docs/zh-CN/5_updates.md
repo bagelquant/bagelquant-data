@@ -2,7 +2,9 @@
 
 `lake.update.dataset()` 与 `lake.update.datasets()` 支持 `initialize`、`incremental` 和 `refresh`。初始化必须指定冻结的起止范围，只能用于新数据集或同一未完成初始化；完成后不能再次回填历史可用时间。普通更新和刷新仅在内容变化时追加版本。
 
-初始化以源日期建立历史基线。其后版本使用 `max(source_time, 本地入库日期 + availability_day_offset)`；Workbench 配置为 Asia/Shanghai 与 −1 天。`ingested_at` 始终使用 UTC，同一 PIT 日期按实际入库时间和提交序号排序。空响应不会删除旧记录，无变化检查不会创建版本。
+初始化以源日期建立历史基线。其后版本使用 `max(source_time, 本地入库日期 + availability_day_offset + 截止后顺延)`。可显式声明本地 `availability_cutoff_time`（`HH:MM:SS`）；入库时刻达到或超过截止时刻便顺延一个自然日。负偏移必须同时声明截止时刻。Workbench 采用次日开盘口径：上海时间 09:30 截止、偏移 −1；达到或晚于开盘收到的修订不会进入前一信号日。自然日由下游向后对齐交易日。`ingested_at` 始终使用 UTC，同一 PIT 日期按实际入库时间和提交序号排序。空响应不会删除旧记录，无变化检查不会创建版本。
+
+不存在供应商回填的 `baseline_repair` 选项。缺少覆盖不能授权将新下载值追溯为旧基线。原样恢复只能重放已有且校验一致的恢复日志；重新访问供应商得到的修订按新版本保存。
 
 覆盖单位是日期 × 参数 variant。自然日包含周末，交易日使用声明日历。普通更新补齐未完成范围，并重查目标日期之前最近三个自然日；更早历史需要显式 `refresh`。所有分页必须通过主键、日期、重复页与截断校验，scope 才能成为 `success` 或 `empty`。取消会保留已完成 scope。
 
