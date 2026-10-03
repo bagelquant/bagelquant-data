@@ -52,6 +52,33 @@ def test_daily_query_prunes_to_intersecting_month(tmp_path, monkeypatch) -> None
     assert sum(len(paths) for paths in calls) == 1
 
 
+def test_query_reads_manifested_partition_beyond_windows_path_limit(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+    import shutil
+    import sqlite3
+    from bagelquant_data.storage.atomic import _filesystem_path
+
+    lake = DataLake.open(tmp_path)
+    spec = DatasetSpec("daily", "by_daily", calendar="trade_cal",
+        field_mappings={"trade_date":"time","ts_code":"asset_id"})
+    lake.ingest(spec,pl.DataFrame({"trade_date":["20250102"],"ts_code":["A"],"close":[11.]}))
+    manifest = lake.metadata.manifest("custom","daily")[0]
+    relative = Path(manifest["partition_path"])
+    dataset_root = lake.paths.dataset_root("custom","daily")
+    nested = Path("retained")
+    while len(str(dataset_root/nested/relative)) <= 280:
+        nested /= "immutable-input-projection"
+    retained = dataset_root/nested/relative
+    Path(_filesystem_path(retained.parent)).mkdir(parents=True)
+    shutil.move(_filesystem_path(dataset_root/relative),_filesystem_path(retained))
+    with sqlite3.connect(lake.paths.database) as metadata:
+        metadata.execute("UPDATE partition_manifest SET partition_path=? WHERE source=? AND dataset=? AND partition_path=?",
+            ((nested/relative).as_posix(),"custom","daily",relative.as_posix()))
+    scans = _record_scan_paths(monkeypatch)
+    assert lake.query.query("daily",source="custom").collect()["close"].to_list() == [11.]
+    assert scans == [(_filesystem_path(retained),)]
+
+
 
 
 def test_out_of_range_query_returns_typed_empty_lazy_frame(tmp_path) -> None:

@@ -8,6 +8,7 @@ import pytest
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.storage.recovery import repair_partition, reconstruct
+from bagelquant_data.query import frozen_raw_reads
 
 
 def instant(day):
@@ -45,6 +46,30 @@ def price(value=100.0):
     return pl.DataFrame(
         {"trade_date": ["20260825"], "ts_code": ["A"], "close": [value]}
     )
+
+
+def test_frozen_scope_pins_new_readers_and_survives_worker_handoff(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    lake = DataLake.open(tmp_path)
+    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    boundary = lake.query.freeze()
+    lake.ingest(daily_spec(), price(120.), ingested_at=instant("09-10"))
+    with frozen_raw_reads(tmp_path, boundary):
+        pinned = DataLake.open(tmp_path).query
+        assert pinned.freeze() == boundary
+        with pytest.raises(ValueError, match="frozen"):
+            pinned.query("prices", source="custom", max_commit=boundary + 1)
+        with pytest.raises(ValueError, match="nested"):
+            with frozen_raw_reads(tmp_path, boundary + 1):
+                pass
+        with frozen_raw_reads(tmp_path, boundary):
+            assert DataLake.open(tmp_path).query.freeze() == boundary
+    def read():
+        return pinned.query("prices", source="custom").collect()["close"].item()
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        assert workers.submit(read).result() == 100.
+    assert DataLake.open(tmp_path).query.query("prices", source="custom").collect()["close"].item() == 120.
+    assert lake.query.frozen(max_commit=boundary).query("prices", source="custom").collect()["close"].item() == 100.
 
 
 @pytest.mark.parametrize("clock,expected", [

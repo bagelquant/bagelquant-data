@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from datetime import date, datetime
 import polars as pl
@@ -11,6 +12,7 @@ from bagelquant_data.core.exceptions import DatasetNotFoundError
 from bagelquant_data.core.schema import align_lazy_frame, compatible_schema
 from bagelquant_data.storage.metadata import MetadataStore
 from bagelquant_data.storage.parquet import ParquetStore
+from bagelquant_data.storage.atomic import _filesystem_path
 
 
 class RawQueryService:
@@ -178,11 +180,12 @@ class RawQueryService:
         grouped = {}
         for row in rows:
             path = root / row["partition_path"]
-            if not path.is_file():
+            filesystem_path = _filesystem_path(path)
+            if not os.path.isfile(filesystem_path):
                 raise DatasetNotFoundError(
                     f"Canonical manifest references missing partition: {path}"
                 )
-            grouped.setdefault(row["schema_hash"], []).append(str(path))
+            grouped.setdefault(row["schema_hash"], []).append(filesystem_path)
         frames = [
             pl.scan_parquet(paths, hive_partitioning=False)
             for paths in grouped.values()

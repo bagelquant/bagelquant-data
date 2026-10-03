@@ -19,4 +19,8 @@ observations = lake.query.observations(
 
 `view="history"` 返回每个观测日在当时已知的版本；`observations()` 在版本选择后把普通数值 `time` 轴恢复为源观测日期。`lake.query.frozen()` 冻结一次计算能看到的最高提交序号，`version_evidence()` 返回不可变批次身份，无变化检查时间不参与依赖指纹。
 
+显式 `max_commit` 不能超过读取器的当前边界。`bagelquant_data.query` 中的
+`frozen_raw_reads(root, max_commit)` 会约束该目录内新建的读取器；嵌套上下文
+只能收窄边界。已捕获的读取器传给 worker 后仍保留边界，且不会修改数据湖。
+
 General 使用 `query_general()`，默认读取最新完整快照，也支持 `as_of_date`、`snapshot_id`、`ingested_before` 和 `view="versions"`。`snapshots()` 会列出包括空快照在内的完整提交。

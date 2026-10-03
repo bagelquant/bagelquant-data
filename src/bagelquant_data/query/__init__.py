@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Iterator
 
 import polars as pl
 
@@ -13,13 +17,46 @@ from bagelquant_data.management.datasets import DatasetManager
 from bagelquant_data.query.raw import RawQueryService
 
 
+_READ_BOUNDARIES: ContextVar[dict[str, int]] = ContextVar("lake_read_boundaries", default={})
+
+
+@contextmanager
+def frozen_raw_reads(root: str | Path, max_commit: int) -> Iterator[None]:
+    """Bind newly opened query facades to one explicit committed source view.
+
+    Query objects capture this boundary and retain it when passed to workers.
+    The scope never changes a lake or an existing reader. Nested scopes may
+    narrow the boundary, but cannot escape their parent's frozen view.
+    """
+    if isinstance(max_commit, bool) or not isinstance(max_commit, int) or max_commit < 0:
+        raise ValueError("max_commit must be a nonnegative integer")
+    key = str(Path(root).resolve())
+    boundaries = _READ_BOUNDARIES.get()
+    if key in boundaries and max_commit > boundaries[key]:
+        raise ValueError("a nested source view cannot exceed its frozen read boundary")
+    token = _READ_BOUNDARIES.set({**boundaries, key: max_commit})
+    try:
+        yield
+    finally:
+        _READ_BOUNDARIES.reset(token)
+
+
 class LakeQuery:
     """Read general and canonical-keyed datasets as Polars LazyFrames."""
 
     def __init__(self, raw_service: RawQueryService, datasets: DatasetManager) -> None:
         self._raw = raw_service
         self._datasets = datasets
-        self._max_commit = None
+        root = raw_service.metadata.path.resolve().parent.parent
+        self._max_commit = _READ_BOUNDARIES.get().get(str(root))
+
+    def _version_options(self, options: dict) -> dict:
+        if self._max_commit is not None:
+            selected = options.get("max_commit", self._max_commit)
+            if selected is None or int(selected) > self._max_commit:
+                raise ValueError("query cannot exceed its frozen committed source view")
+            options["max_commit"] = selected
+        return options
 
     def query_general(
         self,
@@ -31,20 +68,27 @@ class LakeQuery:
     ) -> pl.LazyFrame:
         """Read any dataset without `time` or `asset_id` filters."""
 
-        if self._max_commit is not None:
-            version_options.setdefault("max_commit", self._max_commit)
+        version_options = self._version_options(version_options)
         return self._raw.query_general(
             dataset, source=source, fields=fields, **version_options
         )
 
     def freeze(self) -> int:
         """Freeze the committed input boundary for one computation."""
+        if self._max_commit is not None:
+            return self._max_commit
         rows = self._raw.metadata._rows("select coalesce(max(seq),0) as seq from version_commits where status='committed'")
         return int(rows[0]["seq"])
 
-    def frozen(self) -> "LakeQuery":
+    def frozen(self, *, max_commit: int | None = None) -> "LakeQuery":
+        """Return an independent reader at an explicit or current boundary."""
+        selected = self.freeze() if max_commit is None else max_commit
+        if isinstance(selected, bool) or not isinstance(selected, int) or selected < 0:
+            raise ValueError("max_commit must be a nonnegative integer")
+        if selected > self.freeze():
+            raise ValueError("requested source boundary is not available in this reader")
         query = LakeQuery(self._raw, self._datasets)
-        query._max_commit = self.freeze()
+        query._max_commit = selected
         return query
 
     def snapshots(self, dataset: str, *, source: str) -> list[dict]:
@@ -69,7 +113,7 @@ class LakeQuery:
         first = str(_date_value(observation_start)) if observation_start is not None else None
         last = str(_date_value(observation_end)) if observation_end is not None else None
         conditions = ["c.source=?", "c.dataset=?", "c.status='committed'"]
-        parameters = [source, dataset]
+        parameters: list[str | int] = [source, dataset]
         if self._max_commit is not None:
             conditions.append("b.commit_seq<=?")
             parameters.append(self._max_commit)
@@ -113,8 +157,7 @@ class LakeQuery:
             raise ConfigurationError(
                 f"{source}/{dataset} is general; use query_general()"
             )
-        if self._max_commit is not None:
-            version_options.setdefault("max_commit", self._max_commit)
+        version_options = self._version_options(version_options)
         return self._raw.query(
             dataset,
             source=source,

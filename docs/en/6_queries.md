@@ -23,6 +23,10 @@ Fields and numerical filters must be applied after version selection.
 `observations()` also restores the ordinary numerical `time` axis; an explicit
 `as_of_date` instead resolves its whole input window at that cutoff.
 `lake.query.frozen()` pins a visible commit ceiling for one computation.
+An explicit `max_commit` cannot exceed the reader's current ceiling. The
+`frozen_raw_reads(root, max_commit)` context in `bagelquant_data.query` bounds
+new readers opened for that root. Nested contexts may narrow the ceiling;
+captured readers retain it across worker handoffs, without changing the lake.
 `version_evidence()` supplies immutable visible batch identities without numerical
 reads. Check timestamps do not participate in these identities.
 

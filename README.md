@@ -47,6 +47,12 @@ Use `as_of_date` for a PIT snapshot, `view="versions"` for all versions, and
 selection. Historical initialization cannot recover provider history overwritten
 before collection began.
 
+`lake.query.frozen()` returns an independent reader at one committed version
+boundary. `frozen_raw_reads(root, max_commit)` from `bagelquant_data.query`
+also bounds readers opened inside a computation; captured readers retain the
+boundary when passed to workers. Later computations can open a fresh reader.
+Neither operation changes stored data or invokes a provider.
+
 Schema v4 and package v0.6 are a hard cut. Old databases are rejected before
 writes; no migration, data deletion, or automatic provider recovery occurs.
 [Versioning and recovery](docs/en/5_updates.md) describe the full contract.
