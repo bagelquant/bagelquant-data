@@ -29,7 +29,7 @@ calls. Fetch time is cumulative across parallel jobs and may exceed elapsed
 wall-clock time.
 
 Complete provider request parameters remain available through the admin
-facade. Metadata schema v3 stores their JSON as zlib-compressed SQLite blobs
+facade. Metadata schema v4 stores their JSON as zlib-compressed SQLite blobs
 and decodes them transparently when read.
 
 Use `validate_manifest` for a fast metadata/file comparison. For a complete
@@ -62,7 +62,7 @@ adopts the files it finds and therefore is not part of automatic health repair.
 
 ## Fresh-lake schema contract
 
-Fresh lakes create metadata schema v3 directly, including canonical dataset
+Fresh lakes create metadata schema v4 directly, including canonical dataset
 schemas and compressed API audit payloads. Opening an unversioned or older
 database fails with a clear incompatibility error; the library never migrates,
 repairs, backs up, or rewrites an old lake automatically. Stop all workers,

@@ -57,6 +57,11 @@ Schema v4 and package v0.6 are a hard cut. Old databases are rejected before
 writes; no migration, data deletion, or automatic provider recovery occurs.
 [Versioning and recovery](docs/en/5_updates.md) describe the full contract.
 
+AI contributors start with [AGENTS.md](AGENTS.md) and the
+[local workflow and topic routes](.ai/README.md). Integrated checkouts use the
+verified workspace's bilingual AI workflow guide and ignored task records;
+standalone checkouts use the local rules and conversation handoff.
+
 ```bash
 uv run pytest
 uv run pyright
