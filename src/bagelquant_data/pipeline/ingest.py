@@ -45,6 +45,8 @@ class IngestionReport:
     partitions_skipped: int = 0
     planning_seconds: float = 0.0
     bytes_written: int = 0
+    bytes_read: int = 0
+    peak_partition_in_flight: int = 0
 
 
 class IngestionPipeline:
@@ -114,6 +116,8 @@ class IngestionPipeline:
             partitions_rewritten=commit.partitions_rewritten,
             partitions_skipped=commit.partitions_skipped,
             bytes_written=commit.bytes_written,
+            bytes_read=commit.bytes_read,
+            peak_partition_in_flight=commit.peak_partition_in_flight,
             error_message=error_message,
         )
 
@@ -163,4 +167,5 @@ class IngestionPipeline:
             mode=mode,
             ingested_at=ingested_at,
             requests=requests,
+            writer_executor=writer_executor,
         )

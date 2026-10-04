@@ -206,6 +206,9 @@ def _update_benchmark(
         "planning_seconds": report.planning_seconds,
         "requests": requests,
         "workers": workers,
+        "bytes_read": report.bytes_read,
+        "bytes_written": report.bytes_written,
+        "peak_partition_in_flight": report.peak_partition_in_flight,
     }
 
 
@@ -242,6 +245,8 @@ def _bulk_daily_benchmark(
     files = lake.metadata.manifest("bulk_daily", "bulk_daily")
     return {
         "bytes_written": report.bytes_written,
+        "bytes_read": report.bytes_read,
+        "peak_partition_in_flight": report.peak_partition_in_flight,
         "columns": 22,
         "commit_seconds": report.commit_seconds,
         "elapsed_seconds": report.elapsed_seconds,
@@ -286,6 +291,8 @@ def _parameterized_daily_benchmark(
     return {
         "assets": asset_count,
         "bytes_written": report.bytes_written,
+        "bytes_read": report.bytes_read,
+        "peak_partition_in_flight": report.peak_partition_in_flight,
         "commit_count": report.commit_count,
         "commit_seconds": report.commit_seconds,
         "days": day_count,

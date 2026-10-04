@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import cast
@@ -49,8 +50,9 @@ def commit_versions(
     mode: str = "incremental",
     ingested_at: datetime | None = None,
     requests: list[dict] | None = None,
+    writer_executor: ThreadPoolExecutor | None = None,
 ):
-    from bagelquant_data.pipeline.commit import CommitResult
+    from bagelquant_data.pipeline.commit import CommitResult, MAX_PARQUET_WRITE_WORKERS
 
     if mode not in {"initialize", "incremental", "refresh"}:
         raise ValueError("mode must be initialize, incremental, or refresh")
@@ -266,56 +268,51 @@ def commit_versions(
         groups = frame.with_columns(pl.col(partition_field).dt.strftime("%Y-%m").alias("_partition")).partition_by(
             "_partition", as_dict=True, maintain_order=True
         )
+    manifest_by_partition = {m["partition_path"]: m for m in manifests}
+    pending = iter(groups.items())
+    bytes_read = 0
+    peak_partition_in_flight = 0
     try:
-        for (month,), group in groups.items():
-            delta = group.drop("_partition")
-            partition = f"year={month[:4]}/month={month[5:]}/data.parquet"
-            path = root / partition
-            manifest = next(
-                (m for m in manifests if m["partition_path"] == partition), None
-            )
-            if manifest is not None and not path.is_file():
-                raise RuntimeError(
-                    "Committed partition is missing; restore ingestion evidence before updating"
-                )
-            if manifest is not None:
-                old = pl.read_parquet(path, hive_partitioning=False)
-                from bagelquant_data.core.hashing import frame_content_hash
-
-                if frame_content_hash(old) != manifest["content_hash"]:
-                    raise RuntimeError(
-                        "Committed partition is damaged; repair it before updating"
+        while True:
+            # Bound both queued tasks and concurrent old+delta partition frames.
+            tasks = []
+            failure = None
+            try:
+                for _ in range(MAX_PARQUET_WRITE_WORKERS if writer_executor else 1):
+                    item = next(pending, None)
+                    if item is None:
+                        break
+                    (month,), group = item
+                    partition = f"year={month[:4]}/month={month[5:]}/data.parquet"
+                    args = (spec, group.drop("_partition"), parquet, root, partition,
+                            int(seq), manifest_by_partition.get(partition))
+                    tasks.append(
+                        writer_executor.submit(_write_version_partition, *args)
+                        if writer_executor else _write_version_partition(*args)
                     )
-                merged = concat_compatible_frames([old, delta])
-            else:
-                merged = delta
-            merged = sort_versions(merged)
-            if spec.update_type != "general":
-                delta = align_frame(delta, merged.schema)
-            batches.append(append_batch(root, partition, int(seq), delta))
-            values = {
-                "year": int(month[:4]),
-                "month": int(month[5:]),
-                "versioned": True,
-            }
-            if "source_time" in merged.columns and merged.height:
-                values.update(
-                    min_source_time=str(merged["source_time"].min()),
-                    max_source_time=str(merged["source_time"].max()),
-                )
-            context = partition_write_context(merged.schema)
-            writes.append(
-                parquet.write_partition_file_result(
-                    spec,
-                    merged,
-                    Path(partition),
-                    values,
-                    existing_manifest=manifest,
-                    retain_backup=True,
-                    write_context=context,
-                )
-            )
-            schemas.append(merged.schema)
+            except BaseException as error:
+                failure = error
+            if not tasks:
+                if failure is not None:
+                    raise failure
+                break
+            peak_partition_in_flight = max(peak_partition_in_flight, len(tasks))
+            # Settle every submitted writer before rollback; later completion
+            # must never republish a partition after its rollback.
+            for task in tasks:
+                try:
+                    write, batch, schema, read_bytes = (
+                        task.result() if writer_executor else task
+                    )
+                    writes.append(write)
+                    batches.append(batch)
+                    schemas.append(schema)
+                    bytes_read += read_bytes
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            if failure is not None:
+                raise failure
         canonical = compatible_schema(schemas)
         parquet.commit_metadata(
             spec,
@@ -333,4 +330,42 @@ def commit_versions(
         0,
         sum(w.bytes_written for w in writes),
         present_times=source_times,
+        bytes_read=bytes_read,
+        peak_partition_in_flight=peak_partition_in_flight,
     )
+
+
+def _write_version_partition(spec, delta, parquet, root, partition, seq, manifest):
+    """Prepare one independent partition without touching lake.db metadata."""
+    from bagelquant_data.core.hashing import frame_content_hash
+
+    path = root / partition
+    if manifest is not None and not path.is_file():
+        raise RuntimeError(
+            "Committed partition is missing; restore ingestion evidence before updating"
+        )
+    bytes_read = 0
+    if manifest is not None:
+        bytes_read = path.stat().st_size
+        old = pl.read_parquet(path, hive_partitioning=False)
+        if frame_content_hash(old) != manifest["content_hash"]:
+            raise RuntimeError("Committed partition is damaged; repair it before updating")
+        merged = concat_compatible_frames([old, delta])
+    else:
+        merged = delta
+    merged = sort_versions(merged)
+    if spec.update_type != "general":
+        delta = align_frame(delta, merged.schema)
+    batch = append_batch(root, partition, seq, delta)
+    month = partition.split("/")
+    values = {"year": int(month[0][5:]), "month": int(month[1][6:]), "versioned": True}
+    if "source_time" in merged.columns and merged.height:
+        values.update(
+            min_source_time=str(merged["source_time"].min()),
+            max_source_time=str(merged["source_time"].max()),
+        )
+    write = parquet.write_partition_file_result(
+        spec, merged, Path(partition), values, existing_manifest=manifest,
+        retain_backup=True, write_context=partition_write_context(merged.schema),
+    )
+    return write, batch, merged.schema, bytes_read

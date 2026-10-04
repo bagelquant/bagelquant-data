@@ -10,6 +10,10 @@
 
 每个可用月份包含 `data.parquet` 与 `recovery.sqlite`。提交顺序是先写不可变 Arrow 恢复批次，再发布 Parquet，最后提交 `lake.db` 中的 manifest、版本和覆盖。只有权威数据库已登记的提交可见。
 
+供应商抓取、响应校验与分区写入共用一个由 `workers` 限制的线程池（默认四个线程），不另外创建写线程池。独立月份最多同时提交四个分区任务；`lake.db` 与覆盖发布仍由调度线程统一执行。失败时先等待所有已提交写任务结束，再集中回滚，避免迟到的写入重新覆盖旧结果。报告中的 `bytes_read` 统计旧规范分区读取量，`bytes_written` 统计写入量，`peak_partition_in_flight` 统计排队及执行中的分区任务峰值；这些操作计数不参与内容身份。
+
+可运行 `uv run python scripts/benchmark_updates.py --workers 1`，再以 `2`、`4`、`8` 重复，比较固定数据规模及原生线程配置下的总耗时、提交耗时、分区任务数与读写字节。基准只使用临时数据湖和模拟供应商。
+
 ```python
 lake.admin.recovery_status("income", source="tushare", deep=True)
 lake.admin.repair_partitions(

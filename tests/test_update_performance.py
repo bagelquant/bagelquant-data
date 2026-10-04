@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import polars as pl
@@ -122,6 +124,122 @@ def test_one_batch_rewrites_one_shared_partition(tmp_path) -> None:
     assert report.commit_count == 1
     assert report.partitions_rewritten == 1
     assert lake.query.query("daily", source="custom").collect().height == 4
+
+
+def test_provider_fetches_overlap_in_the_shared_bounded_executor(tmp_path):
+    lake = _daily_lake(tmp_path, [f"202701{day:02}" for day in range(1, 7)])
+    barrier = threading.Barrier(2, timeout=10)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    class ConcurrentSource(DailySource):
+        def fetch(self, dataset, request):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                return super().fetch(dataset, request)
+            finally:
+                with lock:
+                    active -= 1
+
+    lake.admin.sources.register(ConcurrentSource())
+    report = lake.update.dataset(
+        "daily", source="custom", end="2027-01-06", workers=2, max_in_flight=2,
+    )
+    assert peak == 2
+    assert report.peak_in_flight == 2
+    assert report.rows_committed == 6
+
+
+def test_partition_writes_overlap_but_metadata_publishes_on_scheduler(
+    tmp_path, monkeypatch,
+) -> None:
+    from bagelquant_data.pipeline import versions
+
+    dates = [f"2027{month:02}02" for month in range(1, 7)]
+    lake = _daily_lake(tmp_path, dates)
+    main_thread = threading.get_ident()
+    barrier = threading.Barrier(2, timeout=10)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    threads = []
+    original = versions._write_version_partition
+
+    def tracked(*args):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            barrier.wait()
+            return original(*args)
+        finally:
+            with lock:
+                active -= 1
+
+    publish = lake.parquet.commit_metadata
+
+    def tracked_publish(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(versions, "_write_version_partition", tracked)
+    monkeypatch.setattr(lake.parquet, "commit_metadata", tracked_publish)
+    report = lake.update.dataset("daily", source="custom", end="2027-06-02")
+    assert 2 <= peak <= 4
+    assert threads == [main_thread]
+    assert report.partitions_rewritten == 6
+    assert report.peak_partition_in_flight == 4
+    assert lake.query.query("daily", source="custom").collect().height == 6
+
+
+@pytest.mark.parametrize("fail_publication", [False, True])
+def test_parallel_partition_failure_settles_writers_before_atomic_rollback(
+    tmp_path, monkeypatch, fail_publication,
+) -> None:
+    from bagelquant_data.pipeline import versions
+
+    dates = [f"2027{month:02}02" for month in range(1, 5)]
+    lake = _daily_lake(tmp_path, dates)
+    frame = pl.DataFrame({"trade_date": dates, "ts_code": ["a"] * 4,
+                          "value": [1.0] * 4})
+    lake.ingest(_daily_spec(), frame)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("data.parquet")}
+    manifests = lake.metadata.manifest("custom", "daily")
+    original = versions._write_version_partition
+    barrier = threading.Barrier(4, timeout=10)
+    finished = []
+
+    def tracked(*args):
+        barrier.wait()
+        if not fail_publication and "month=01" in args[4]:
+            raise RuntimeError("injected partition failure")
+        result = original(*args)
+        finished.append(args[4])
+        return result
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected publication failure")
+
+    monkeypatch.setattr(versions, "_write_version_partition", tracked)
+    if fail_publication:
+        monkeypatch.setattr(lake.parquet, "commit_metadata", fail)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        with pytest.raises(RuntimeError, match="injected"):
+            lake._pipeline.commit_frame(
+                _daily_spec(), frame.with_columns(pl.lit(2.0).alias("value")),
+                run_id="failure-test", writer_executor=executor,
+                ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        assert len(finished) == (4 if fail_publication else 3)
+        assert {p: p.read_bytes() for p in before} == before
+        assert lake.metadata.manifest("custom", "daily") == manifests
+        assert not list(tmp_path.rglob("*.rollback"))
 
 
 def test_single_page_response_avoids_request_level_concat(

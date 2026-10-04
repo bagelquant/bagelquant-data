@@ -24,9 +24,22 @@ sources use the declared calendar. Every update fills unfinished scopes and rech
 the latest three natural days through its target. All pages must pass key/date/asset,
 truncation, and repeated-page checks before a scope becomes `success` or `empty`.
 Cancellation preserves completed scopes and leaves unfinished scopes resumable.
-Four provider workers are the default. Admission, retry, and pagination share the
+Four workers are the default. Provider fetch/validation and partition writes share
+one executor bounded by `workers`; there is no additional writer thread pool.
+Changed independent monthly partitions are prepared and written in batches of
+at most four tasks. Only the scheduler publishes `lake.db` metadata and coverage.
+All admitted writers finish before any failed batch is rolled back, so a late
+writer cannot undo rollback. Reports expose `bytes_read` for old canonical
+partitions, `bytes_written`, and `peak_partition_in_flight` (queued plus running
+partition tasks) alongside commit time. These are operational counters, not
+content identity. Admission, retry, and pagination share the
 provider limiter; Tushare's global ceiling is 500 requests/minute with lower endpoint
 limits applied as well. Applications never launch an upstream update from a query.
+
+Use `uv run python scripts/benchmark_updates.py --workers 1` and repeat with
+`--workers 2`, `4`, and `8` for a synthetic throughput comparison. The benchmark
+uses temporary lakes and fake providers; compare elapsed/commit time, partition
+task counts and bytes, keeping all dataset sizes and native thread settings fixed.
 
 Each availability month contains `data.parquet` and `recovery.sqlite`. The journal
 holds immutable compressed Arrow batches with schema, hashes, and commit identity.

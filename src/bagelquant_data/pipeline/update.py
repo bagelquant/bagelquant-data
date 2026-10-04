@@ -6,6 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, cast
@@ -17,7 +18,6 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.pipeline.commit import (
-    MAX_PARQUET_WRITE_WORKERS,
     CommitResult,
 )
 from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
@@ -60,6 +60,8 @@ class UpdateReport:
     partitions_skipped: int = 0
     planning_seconds: float = 0.0
     bytes_written: int = 0
+    bytes_read: int = 0
+    peak_partition_in_flight: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +151,8 @@ class _RunState:
     partitions_rewritten: int = 0
     partitions_skipped: int = 0
     bytes_written: int = 0
+    bytes_read: int = 0
+    peak_partition_in_flight: int = 0
     peak_in_flight: int = 0
     fatal_error: str | None = None
     cancelled: bool = False
@@ -221,8 +225,9 @@ def update_datasets(
     with (
         pipeline.metadata.writer_session(),
         ThreadPoolExecutor(
-            max_workers=MAX_PARQUET_WRITE_WORKERS,
-            thread_name_prefix="bagelquant-parquet",
+            max_workers=max(1, int(works[0].context.options.get("workers", 4)))
+            if works else 4,
+            thread_name_prefix="bagelquant-data",
         ) as writer_executor,
     ):
         return _update_datasets(
@@ -293,7 +298,7 @@ def _update_datasets(
             )
             tasks.extend((work, request) for request in work.requests)
         ordered_tasks = _partition_affinity_order(_fair_tasks(tasks))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with nullcontext(writer_executor) as executor:
             repair_tasks = [
                 task
                 for task in ordered_tasks
@@ -837,6 +842,10 @@ def _commit_state(
         state.partitions_rewritten += commit.partitions_rewritten
         state.partitions_skipped += commit.partitions_skipped
         state.bytes_written += commit.bytes_written
+        state.bytes_read += commit.bytes_read
+        state.peak_partition_in_flight = max(
+            state.peak_partition_in_flight, commit.peak_partition_in_flight
+        )
         canonical_maxima = _canonical_data_maxima(commit, state.work.spec, buffered)
         transitions = [
             _success_transition(
@@ -1076,6 +1085,8 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         partitions_rewritten=state.partitions_rewritten,
         partitions_skipped=state.partitions_skipped,
         bytes_written=state.bytes_written,
+        bytes_read=state.bytes_read,
+        peak_partition_in_flight=state.peak_partition_in_flight,
         peak_in_flight=state.peak_in_flight,
         error_message=error,
     )
@@ -1098,6 +1109,10 @@ def _combine(
         partitions_rewritten=sum(report.partitions_rewritten for report in reports),
         partitions_skipped=sum(report.partitions_skipped for report in reports),
         bytes_written=sum(report.bytes_written for report in reports),
+        bytes_read=sum(report.bytes_read for report in reports),
+        peak_partition_in_flight=max(
+            (report.peak_partition_in_flight for report in reports), default=0
+        ),
         peak_in_flight=max((report.peak_in_flight for report in reports), default=0),
     )
 
