@@ -2,7 +2,9 @@
 
 ## Public contract and availability
 
-- Preserve `lake.admin`, `lake.update`, `lake.query`; Data is library-only.
+- Current facades are `lake.admin`, `lake.update`, `lake.query`; the stage-2
+  refactor may replace them with one public path, without compatibility layers.
+  Data remains library-only.
   Do not restore a CLI, `[project.scripts]`, interactive prompts, terminal
   progress or `tqdm`. Callers explicitly select datasets; progress is optional
   callbacks. Queries never launch an update or provider request.

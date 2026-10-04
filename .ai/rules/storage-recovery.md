@@ -1,5 +1,20 @@
 # Storage, PIT queries and recovery
 
+## Target ownership and current implementation
+
+- Data's target owns Raw and neutral generic derived datasets, storage/query/
+  versions/PIT and frozen input evidence. Current lake mechanics below govern
+  Raw; expanded APIs, schemas and generic input mechanisms still in Workbench
+  are pending stage 2 and are not implemented by this instruction change.
+- Keep dataset storage neutral: no Core Panel/Domain dependency and no second
+  canonical store for Core numerical or BT account/evaluation artifacts.
+  Workbench selects China/research semantics and references Data receipts through
+  public APIs; generic input storage, validation and recovery belong here.
+- A Data input freeze identifies selected data versions and their evidence.
+  Workbench's submitted research closure freezes definitions, semantic choices
+  and backend references. It is application metadata, not another data snapshot
+  authority or an implementation of Data's generic integrity mechanisms.
+
 ## Storage authority
 
 - Use temporary output, validation and atomic publication. Keep canonical
@@ -25,6 +40,9 @@
 - `lake.query.frozen()` / `frozen_raw_reads(root, max_commit)` enforce an explicit
   committed-read boundary, including captured readers passed to workers.
   Passive reads never use current bytes in place of frozen inputs or call providers.
+- A frozen commit boundary does not replace PIT selection at the required
+  information cutoff. Future frozen-input APIs must preserve both facts and
+  expose evidence sufficient for independent consumers without importing Core.
 - Current freshness and historical integrity are separate facts. An unchanged
   check does not create a content version; empty replies never delete records.
   Same-day ordering uses ingestion timestamp and commit sequence.

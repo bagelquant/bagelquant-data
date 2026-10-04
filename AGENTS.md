@@ -1,9 +1,12 @@
 # Data agent entry
 
-This repository owns the provider-neutral Parquet/SQLite lake, dataset
-declarations, coverage ledgers, PIT queries, explicit updates and provider adapters.
-It has no BagelQuant package dependency; never import Core, BT or Workbench.
-Preserve the library-only `lake.admin`, `lake.update` and `lake.query` facades.
+This repository owns the provider-neutral Raw lake, dataset declarations,
+coverage, PIT queries, explicit updates and provider adapters. The refactor target
+also assigns neutral generic derived datasets, versions and frozen input evidence
+to Data; that expansion is pending stage 2, not an implemented API.
+Data has no BagelQuant package dependency; never import Core, BT or Workbench.
+The current library-only facades are `lake.admin`, `lake.update` and `lake.query`;
+stage 2 may replace their contracts without compatibility layers.
 
 Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
 affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
@@ -19,6 +22,10 @@ Keep this entry short; detailed owner contracts live under `.ai/rules/`.
 - Coverage is commit-backed truth; queries never submit updates or call providers.
 - Schema v4 is a fresh-lake hard cut; do not add migration/compatibility readers,
   adopt orphan files or substitute current provider bytes for historical evidence.
+- Expose neutral data and evidence; Core owns Domain/Panel conversion and numerical
+  artifacts, BT owns account/evaluation artifacts. Do not duplicate their storage.
+- Workbench supplies China semantics and research intent through public APIs;
+  it owns app metadata/governance/orchestration, not generic data mechanisms.
 
 For formal work in an integrated workspace, create/resume a root `.ai/tasks/`
 record using the workspace CLI. Discover the workspace with

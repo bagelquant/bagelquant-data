@@ -12,6 +12,23 @@
   integration edge; storage/query/ledger are provider-neutral. Declare any
   necessary dependency in the owning manifest.
 
+## Package target and staged refactor
+
+- Target ownership: Raw and neutral generic derived datasets, their storage,
+  queries, versions, PIT selection and frozen input evidence belong to Data.
+  Current Raw APIs exist; the expanded derived/frozen-input contracts and
+  generic mechanisms still in Workbench are pending the Data refactor, stage 2.
+- Return neutral frames plus schema, availability and immutable identity evidence;
+  never expose Core types or import Core. Core owns generic Domain/Panel
+  conversion and numerical artifacts; BT owns account/evaluation artifacts.
+  Do not add a second canonical store for either package's results.
+- Data freezes selected input versions/evidence. Workbench freezes submitted
+  research definitions, China semantics and backend receipt references; it owns
+  app metadata/governance/task orchestration, not input bytes or generic proofs.
+- Follow rules -> Data -> Core -> BT -> Workbench -> new database/service restart.
+  Stage 1 changes instructions only; concrete APIs and storage schemas are deferred
+  to their owner stages. Breaking refactors remove old paths without compatibility.
+
 ## Implementation
 
 - Prefer the smallest complete system and existing lower-level primitives. Keep
@@ -46,6 +63,11 @@
 - State cross-repo public contract changes. Keep edits independently coherent,
   update bounds/versions only when required, test Data first then all affected
   consumers, and report each repository separately.
+- For a package refactor, name one owner per capability/artifact and prove the
+  public API works without Workbench using temporary roots and fake providers.
+  Check dependency direction, remove superseded paths when authority moves,
+  and verify frozen input integrity separately from research submission metadata.
+  A missing backend API is work for its owner, not a generic Workbench workaround.
 - Major architecture changes update applicable AGENTS and owner rules in the
   same change; update root instructions if cross-repository boundaries change.
 - Do not commit caches, credentials, databases, provider data, environments,
