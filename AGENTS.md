@@ -33,7 +33,7 @@ For formal work in an integrated workspace, create/resume a root `.ai/tasks/`
 record using the workspace CLI. Discover the workspace with
 `git rev-parse --show-superproject-working-tree`. If empty, inspect checkout
 ancestors as candidates. Accept only a candidate that is its own Git root,
-declares the six component paths in `.gitmodules` and has their index gitlinks
+declares the four component paths in `.gitmodules` and has their index gitlinks
 (mode `160000`); this checkout must match its exact declared relative owner path.
 For every candidate, also verify
 root `AGENTS.md`, `.ai/README.md`, `.ai/workflow.md`, `.ai/rules/workspace.md`
