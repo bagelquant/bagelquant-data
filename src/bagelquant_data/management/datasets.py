@@ -3,38 +3,31 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import tomllib
-import uuid
 from pathlib import Path
 from typing import Any
 
 from bagelquant_data.core.dataset import (
     DatasetSpec,
     RequestDiscoverySpec,
-    dataset_key,
 )
 from bagelquant_data.core.exceptions import (
     DatasetNotFoundError,
     DatasetSpecError,
-    DestructiveOperationError,
 )
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.paths import LakePaths
 
 
 class DatasetManager:
     """Register and inspect plain TOML-backed dataset specifications."""
 
-    def __init__(self, metadata: MetadataStore, paths: LakePaths) -> None:
+    def __init__(self, metadata: DataMetaStore, paths: LakePaths) -> None:
         self.metadata = metadata
         self.paths = paths
-        self._specs: dict[tuple[str, str], DatasetSpec] = {}
 
     def register(self, spec: DatasetSpec) -> DatasetSpec:
         self.validate_spec(spec)
-        self._specs[dataset_key(spec)] = spec
         self.metadata.upsert_dataset(spec)
         return spec
 
@@ -47,18 +40,32 @@ class DatasetManager:
 
         return self.register(_spec_from_mapping(tomllib.loads(text)))
 
-    def get(self, dataset: str, *, source: str) -> DatasetSpec:
-        key = (source, dataset)
-        if key in self._specs:
-            return self._specs[key]
-        row = self.metadata.get_dataset(source, dataset)
+    def get(
+        self, dataset: str, *, source: str, include_inactive: bool = False
+    ) -> DatasetSpec:
+        if include_inactive:
+            rows = self.metadata._rows(
+                "select * from datasets where source=? and name=?", (source, dataset)
+            )
+            row = rows[0] if rows else None
+        else:
+            row = self.metadata.get_dataset(source, dataset)
         if row is None:
             raise DatasetNotFoundError(f"Dataset is not registered: {source}/{dataset}")
         spec = _spec_from_mapping(json.loads(row["spec_json"]), stored=True)
-        self._specs[key] = spec
         return spec
 
-    def list(self, source: str | None = None) -> list[dict[str, Any]]:
+    def list(
+        self, source: str | None = None, *, include_inactive: bool = False
+    ) -> list[dict[str, Any]]:
+        if include_inactive:
+            return (
+                self.metadata._rows("select * from datasets order by source,name")
+                if source is None
+                else self.metadata._rows(
+                    "select * from datasets where source=? order by name", (source,)
+                )
+            )
         return self.metadata.list_datasets(source)
 
     def enable(self, dataset: str, *, source: str) -> None:
@@ -69,7 +76,16 @@ class DatasetManager:
 
     @staticmethod
     def validate_spec(spec: DatasetSpec) -> None:
-        if spec.update_type not in {"general", "by_daily"}:
+        for identity in (spec.source, spec.name):
+            if (
+                not identity
+                or identity in {".", ".."}
+                or any(c in identity for c in "/\\:")
+            ):
+                raise DatasetSpecError(
+                    "Dataset identities must be nonempty safe path components"
+                )
+        if spec.update_type not in {"general", "by_date"}:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} has unsupported update_type: {spec.update_type}"
             )
@@ -102,19 +118,23 @@ class DatasetManager:
                     "request_discovery.target_param conflicts with target request parameters"
                 )
         if (
-            spec.update_type == "by_daily"
+            spec.update_type == "by_date"
             and spec.date_kind == "trading"
             and not spec.calendar
         ):
             raise DatasetSpecError(
-                f"{spec.source}/{spec.name} by_daily requires calendar"
+                f"{spec.source}/{spec.name} by_date requires calendar"
             )
-        if spec.date_param is not None and spec.update_type != "by_daily":
+        if spec.date_param is not None and spec.update_type != "by_date":
             raise DatasetSpecError(
-                f"{spec.source}/{spec.name} date_param is only valid for by_daily"
+                f"{spec.source}/{spec.name} date_param is only valid for by_date"
             )
-        if spec.update_type == "general" and (spec.date_params or spec.request_date_field):
-            raise DatasetSpecError("date_params and request_date_field are only valid for by_daily")
+        if spec.update_type == "general" and (
+            spec.date_params or spec.request_date_field
+        ):
+            raise DatasetSpecError(
+                "date_params and request_date_field are only valid for by_date"
+            )
         if spec.date_param is not None and not spec.date_param:
             raise DatasetSpecError(
                 f"{spec.source}/{spec.name} date_param cannot be empty"
@@ -135,16 +155,25 @@ class DatasetManager:
 
         ZoneInfo(spec.availability_timezone)
         if spec.availability_day_offset < 0 and spec.availability_cutoff_time is None:
-            raise DatasetSpecError("negative availability_day_offset requires an explicit cutoff time")
+            raise DatasetSpecError(
+                "negative availability_day_offset requires an explicit cutoff time"
+            )
         if spec.availability_cutoff_time is not None:
             from datetime import time
 
             try:
                 cutoff = time.fromisoformat(spec.availability_cutoff_time)
             except (TypeError, ValueError) as error:
-                raise DatasetSpecError("availability_cutoff_time must be local HH:MM:SS") from error
-            if cutoff.tzinfo is not None or cutoff.isoformat() != spec.availability_cutoff_time:
-                raise DatasetSpecError("availability_cutoff_time must be local HH:MM:SS")
+                raise DatasetSpecError(
+                    "availability_cutoff_time must be local HH:MM:SS"
+                ) from error
+            if (
+                cutoff.tzinfo is not None
+                or cutoff.isoformat() != spec.availability_cutoff_time
+            ):
+                raise DatasetSpecError(
+                    "availability_cutoff_time must be local HH:MM:SS"
+                )
         mappings = spec.field_mappings
         if not isinstance(mappings, dict) or not all(
             isinstance(source, str) and source and isinstance(target, str) and target
@@ -175,60 +204,10 @@ class DatasetManager:
                     f"{spec.source}/{spec.name} field_mappings must map to: {', '.join(missing_targets)}"
                 )
 
-    def remove(
-        self,
-        dataset: str,
-        *,
-        source: str,
-        delete_data: bool = False,
-        confirm: bool = False,
-    ) -> None:
-        if delete_data and not confirm:
-            raise DestructiveOperationError(
-                "Pass confirm=True to delete canonical data"
-            )
+    def remove(self, dataset: str, *, source: str) -> None:
+        """Unregister the active declaration while retaining committed evidence."""
+        self.metadata.ensure_writable()
         self.metadata.remove_dataset(source, dataset)
-        self._specs.pop((source, dataset), None)
-        if delete_data:
-            shutil.rmtree(self.paths.dataset_root(source, dataset), ignore_errors=True)
-
-    def clear_dataset_data(
-        self, dataset: str, *, source: str, confirm: bool = False
-    ) -> dict[str, int]:
-        """Delete stored data and current state, retaining the dataset declaration."""
-
-        if not confirm:
-            raise DestructiveOperationError("Pass confirm=True to clear dataset data")
-        self.get(dataset, source=source)
-        roots = [
-            (self.paths.lake / source, self.paths.dataset_root(source, dataset)),
-            (self.paths.staging / source, self.paths.staging / source / dataset),
-            (self.paths.rejected / source, self.paths.rejected / source / dataset),
-        ]
-        trash = self.paths.tmp / "deletions" / uuid.uuid4().hex
-        staged: list[tuple[Path, Path]] = []
-        try:
-            for index, (base, path) in enumerate(roots):
-                if not path.resolve().is_relative_to(base.resolve()):
-                    raise DestructiveOperationError(
-                        f"Dataset path escapes lake root: {source}/{dataset}"
-                    )
-                if not path.exists():
-                    continue
-                target = trash / str(index)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(path, target)
-                staged.append((path, target))
-            result = self.metadata.clear_dataset_data(source, dataset)
-        except Exception:
-            for path, target in reversed(staged):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists():
-                    os.replace(target, path)
-            raise
-        result["directories"] = len(staged)
-        shutil.rmtree(trash, ignore_errors=True)
-        return result
 
 
 def _spec_from_mapping(value: dict[str, Any], *, stored: bool = False) -> DatasetSpec:

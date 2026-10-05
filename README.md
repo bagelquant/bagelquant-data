@@ -1,66 +1,61 @@
 # BagelQuant Data
 
-`bagelquant-data` is a local Parquet and SQLite data lake for quantitative
-research. Its public API has three facades: `lake.admin`, `lake.update`, and
-`lake.query`.
-
-Read the guides in order: [overview](docs/en/1_overview.md),
-[quickstart](docs/en/2_quickstart.md), [datasets](docs/en/3_datasets.md),
-[sources](docs/en/4_sources.md), [updates](docs/en/5_updates.md),
-[queries](docs/en/6_queries.md), and [operations](docs/en/7_operations.md).
-Chinese PIT guides are available under [docs/zh-CN](docs/zh-CN/1_overview.md).
+An independent Python package for Raw datasets, typed daily DataItems, categories,
+versions, coverage, point-in-time reads, frozen inputs and local recovery.
+Data returns Polars frames and imports no other BagelQuant package. Workbench
+supplies paths, market declarations and global runtime policy.
 
 ```python
+from pathlib import Path
+from datetime import date
 import polars as pl
-from bagelquant_data import DataLake, DatasetSpec
+from bagelquant_data import DataLake, DatasetSpec, DataItemSpec, RawInput
 
-lake = DataLake.open("data")
-spec = DatasetSpec(
-    "daily",
-    "by_daily",
-    calendar="trade_cal",
-    field_mappings={"trade_date": "time", "ts_code": "asset_id"},
+lake = DataLake.open(
+    data_meta_path=Path("research/data_meta.sqlite"),
+    lake_path=Path("research/lake"),
 )
-lake.ingest(spec, pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"], "close": [11.25]}))
-print(lake.query.query("daily", source="custom", fields=["time", "asset_id", "close"]).collect())
+lake.raw.ingest(
+    DatasetSpec("prices", "by_date", date_kind="calendar",
+                field_mappings={"time": "time", "asset_id": "asset_id"}),
+    pl.DataFrame({"time": [date(2020, 1, 2)], "asset_id": ["A"], "close": [11.25]}),
+    mode="initialize",
+)
+lake.items.register(DataItemSpec(
+    "close", (RawInput("custom", "prices"),),
+    time_column="source_time", value_column="close",
+))
+lake.items.initialize("close", start="2020-01-02", end="2020-01-02")
+print(lake.items.read("close").collect())
 ```
 
-`general` stores each changed complete snapshot from an explicit update. An unchanged
-refresh records a check without creating another content version. `by_daily`
-tracks each declared trading or calendar date and parameter variant. Both use
-monthly Parquet files backed by immutable Arrow batches in monthly SQLite
-recovery journals. `lake.db` alone determines committed data and coverage.
+| API | Responsibility |
+| --- | --- |
+| `lake.catalog` | Sources and independent Raw/DataItem category trees |
+| `lake.raw` | Declarations, initialize/update/refresh/ingest, reads and coverage |
+| `lake.items` | Typed long tables, transformations, external producers and builds |
+| `lake.integrity` | Passive scans, plans and evidence-based local repairs |
+| `lake.inputs` | Durable frozen input receipts, reads and verification |
+| `bagelquant_data.exploration` | Pure statistics and Polars result tables |
 
-Raw preserves provider columns, `source_time` (observation/announcement date),
-`time` (version availability), and UTC `ingested_at`. Explicit `initialize`
-creates a historical baseline; subsequent updates use the later of the source
-date and the configured collection cutoff. `availability_cutoff_time` is an
-exclusive local `HH:MM:SS` boundary: at/after it, advance the effective date by
-one calendar day before applying `availability_day_offset`. A negative offset
-requires an explicit cutoff. Workbench uses the next-open convention with
-Shanghai 09:30 and offset −1. Unchanged checks do not create content versions. Updates recheck
-the most recent three natural days; older refreshes require `mode="refresh"`.
+Both paths are required. `data_meta_path` identifies the single Data SQLite file,
+including task state and compressed Arrow recovery evidence. Immutable Parquet
+generations retain year/month partitions. Read-only opens create nothing.
+Package 0.7 and metadata schema 5 are an incompatible fresh-database cut; old
+databases are rejected. No aliases, migrations or automatic history cleanup exist.
 
-Use `as_of_date` for a PIT snapshot, `view="versions"` for all versions, and
-`observation_start`/`observation_end` independently of availability `start`/`end`.
-`lake.query.observations()` returns the normal numerical date axis after version
-selection. Historical initialization cannot recover provider history overwritten
-before collection began.
+Historical daily reads are causal by default. Explicit `as_of` selects a fixed
+information cutoff; `view="versions"` exposes revisions. Initialization labels
+unverifiable original publication history as a baseline; `strict=True` excludes it.
+Later unchanged observations preserve new availability evidence without creating
+duplicate content versions. Frozen receipts pin both commit and check boundaries.
 
-`lake.query.frozen()` returns an independent reader at one committed version
-boundary. `frozen_raw_reads(root, max_commit)` from `bagelquant_data.query`
-also bounds readers opened inside a computation; captured readers retain the
-boundary when passed to workers. Later computations can open a fresh reader.
-Neither operation changes stored data or invokes a provider.
-
-Schema v4 and package v0.6 are a hard cut. Old databases are rejected before
-writes; no migration, data deletion, or automatic provider recovery occurs.
-[Versioning and recovery](docs/en/5_updates.md) describe the full contract.
-
-AI contributors start with [AGENTS.md](AGENTS.md) and the
-[local workflow and topic routes](.ai/README.md). Integrated checkouts use the
-verified workspace's bilingual AI workflow guide and ignored task records;
-standalone checkouts use the local rules and conversation handoff.
+Read [overview](docs/en/1_overview.md), [quickstart](docs/en/2_quickstart.md),
+[datasets](docs/en/3_datasets.md), [sources](docs/en/4_sources.md),
+[updates](docs/en/5_updates.md), [queries](docs/en/6_queries.md),
+[operations](docs/en/7_operations.md), [DataItems](docs/en/8_items.md) and
+[exploration](docs/en/9_exploration.md). [中文文档](docs/zh-CN/1_overview.md).
+AI contributors start with [AGENTS.md](AGENTS.md) and [.ai/README.md](.ai/README.md).
 
 ```bash
 uv run pytest

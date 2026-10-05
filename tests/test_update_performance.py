@@ -77,27 +77,27 @@ class RevisionAssetSource:
 def _daily_spec() -> DatasetSpec:
     return DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
     )
 
 
 def _daily_lake(tmp_path, dates: list[str]) -> DataLake:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(DailySource())
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(DailySource())
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": dates, "is_open": [1] * len(dates)}),
     )
-    lake.admin.datasets.register(_daily_spec())
+    lake.raw.register(_daily_spec())
     return lake
 
 
 def test_scheduler_bounds_in_flight_and_reports_timings(tmp_path) -> None:
     lake = _daily_lake(tmp_path, [f"202501{day:02d}" for day in range(1, 11)])
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-10",
@@ -114,7 +114,7 @@ def test_scheduler_bounds_in_flight_and_reports_timings(tmp_path) -> None:
 def test_one_batch_rewrites_one_shared_partition(tmp_path) -> None:
     lake = _daily_lake(tmp_path, [f"202501{day:02d}" for day in range(1, 5)])
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-04",
@@ -123,7 +123,7 @@ def test_one_batch_rewrites_one_shared_partition(tmp_path) -> None:
 
     assert report.commit_count == 1
     assert report.partitions_rewritten == 1
-    assert lake.query.query("daily", source="custom").collect().height == 4
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 4
 
 
 def test_provider_fetches_overlap_in_the_shared_bounded_executor(tmp_path):
@@ -146,8 +146,8 @@ def test_provider_fetches_overlap_in_the_shared_bounded_executor(tmp_path):
                 with lock:
                     active -= 1
 
-    lake.admin.sources.register(ConcurrentSource())
-    report = lake.update.dataset(
+    lake.catalog.sources.register(ConcurrentSource())
+    report = lake.raw.update(
         "daily", source="custom", end="2027-01-06", workers=2, max_in_flight=2,
     )
     assert peak == 2
@@ -182,20 +182,20 @@ def test_partition_writes_overlap_but_metadata_publishes_on_scheduler(
             with lock:
                 active -= 1
 
-    publish = lake.parquet.commit_metadata
+    publish = lake._parquet.commit_metadata
 
     def tracked_publish(*args, **kwargs):
         threads.append(threading.get_ident())
         return publish(*args, **kwargs)
 
     monkeypatch.setattr(versions, "_write_version_partition", tracked)
-    monkeypatch.setattr(lake.parquet, "commit_metadata", tracked_publish)
-    report = lake.update.dataset("daily", source="custom", end="2027-06-02")
+    monkeypatch.setattr(lake._parquet, "commit_metadata", tracked_publish)
+    report = lake.raw.update("daily", source="custom", end="2027-06-02", workers=4)
     assert 2 <= peak <= 4
     assert threads == [main_thread]
     assert report.partitions_rewritten == 6
     assert report.peak_partition_in_flight == 4
-    assert lake.query.query("daily", source="custom").collect().height == 6
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 6
 
 
 @pytest.mark.parametrize("fail_publication", [False, True])
@@ -208,9 +208,9 @@ def test_parallel_partition_failure_settles_writers_before_atomic_rollback(
     lake = _daily_lake(tmp_path, dates)
     frame = pl.DataFrame({"trade_date": dates, "ts_code": ["a"] * 4,
                           "value": [1.0] * 4})
-    lake.ingest(_daily_spec(), frame)
-    before = {p: p.read_bytes() for p in tmp_path.rglob("data.parquet")}
-    manifests = lake.metadata.manifest("custom", "daily")
+    lake.raw.ingest(_daily_spec(), frame)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("data-*.parquet")}
+    manifests = lake._data_meta.manifest("custom", "daily")
     original = versions._write_version_partition
     barrier = threading.Barrier(4, timeout=10)
     finished = []
@@ -228,17 +228,17 @@ def test_parallel_partition_failure_settles_writers_before_atomic_rollback(
 
     monkeypatch.setattr(versions, "_write_version_partition", tracked)
     if fail_publication:
-        monkeypatch.setattr(lake.parquet, "commit_metadata", fail)
+        monkeypatch.setattr(lake._parquet, "commit_metadata", fail)
     with ThreadPoolExecutor(max_workers=4) as executor:
         with pytest.raises(RuntimeError, match="injected"):
             lake._pipeline.commit_frame(
                 _daily_spec(), frame.with_columns(pl.lit(2.0).alias("value")),
-                run_id="failure-test", writer_executor=executor,
+                run_id="failure-test", writer_executor=executor, partition_workers=4,
                 ingested_at=datetime(2026, 1, 1, tzinfo=UTC),
             )
         assert len(finished) == (4 if fail_publication else 3)
         assert {p: p.read_bytes() for p in before} == before
-        assert lake.metadata.manifest("custom", "daily") == manifests
+        assert lake._data_meta.manifest("custom", "daily") == manifests
         assert not list(tmp_path.rglob("*.rollback"))
 
 
@@ -258,7 +258,7 @@ def test_single_page_response_avoids_request_level_concat(
 
     monkeypatch.setattr(update_module, "concat_compatible_frames", tracked_concat)
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",
@@ -333,7 +333,7 @@ def test_daily_response_validation_uses_equivalent_vector_checks(
 def test_daily_response_validation_can_allow_all_null_optional_payload() -> None:
     spec = DatasetSpec(
         "suspend_d",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         primary_key_extra=("suspend_type",),
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
@@ -379,7 +379,7 @@ def test_daily_response_validation_can_allow_all_null_optional_payload() -> None
 def test_daily_response_validation_allows_declared_nullable_extra_keys() -> None:
     spec = DatasetSpec(
         "financial",
-        "by_daily",
+        "by_date",
         date_kind="calendar",
         primary_key_extra=("period", "company_type"),
         nullable_primary_key_extra=("company_type",),
@@ -416,7 +416,7 @@ def test_default_buffer_does_not_commit_every_hundred_requests(tmp_path) -> None
     )
     lake = _daily_lake(tmp_path, dates)
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         end="2025-05-30",
@@ -443,7 +443,7 @@ def test_response_validation_runs_in_fetch_worker_but_sqlite_stays_on_scheduler(
     validation_threads: list[int] = []
     transition_threads: list[int] = []
     original_validation = update_module._validate_response
-    original_transition = lake.metadata.transition_update_scopes
+    original_transition = lake._data_meta.commit_dataset_metadata
 
     def tracked_validation(spec, request, frame, **kwargs):
         validation_threads.append(threading.get_ident())
@@ -459,12 +459,12 @@ def test_response_validation_runs_in_fetch_worker_but_sqlite_stays_on_scheduler(
         tracked_validation,
     )
     monkeypatch.setattr(
-        lake.metadata,
-        "transition_update_scopes",
+        lake._data_meta,
+        "commit_dataset_metadata",
         tracked_transition,
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
@@ -504,7 +504,7 @@ def test_response_processing_failure_settles_fetches_without_committing(
     )
 
     with pytest.raises(RuntimeError, match="response processing fault"):
-        lake.update.dataset(
+        lake.raw.update(
             "daily",
             source="custom",
             start="2025-01-02",
@@ -513,23 +513,23 @@ def test_response_processing_failure_settles_fetches_without_committing(
             max_in_flight=4,
         )
 
-    scopes = lake.admin.status.update_scopes(
+    scopes = lake.integrity.update_scopes(
         dataset="daily", source="custom"
     )
     assert 2 <= calls <= 4
     assert {str(row["status"]) for row in scopes} <= {"failed", "pending"}
-    assert lake.admin.status.files("daily", source="custom") == []
+    assert lake.raw.manifest("daily", source="custom") == []
 
 
 
 
 def test_coverage_inspection_does_not_read_numerical_rows(tmp_path, monkeypatch) -> None:
     lake = _daily_lake(tmp_path, ["20250102"])
-    lake.update.dataset("daily", source="custom", start="2025-01-02", end="2025-01-02")
+    lake.raw.update("daily", source="custom", start="2025-01-02", end="2025-01-02")
     def forbidden_query(*args, **kwargs):
         raise AssertionError("coverage must not read daily Parquet")
     monkeypatch.setattr("bagelquant_data.query.raw.RawQueryService.query", forbidden_query)
-    assert lake.admin.coverage("daily", source="custom", start="2025-01-02", end="2025-01-02")["complete"]
+    assert lake.integrity.coverage("daily", source="custom", start="2025-01-02", end="2025-01-02")["complete"]
 
 
 def test_atomic_validation_does_not_replace_existing_file(

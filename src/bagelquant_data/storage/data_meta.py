@@ -16,27 +16,82 @@ from typing import Any
 
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
+from bagelquant_data.storage.paths import validate_generation
 
 
-class MetadataStore:
+class DataMetaStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "4"
+    SCHEMA_VERSION = "5"
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        self.check_compatibility(self.path)
+    def __init__(self, data_meta_path: str | Path, *, read_only: bool = False) -> None:
+        self.data_meta_path = Path(data_meta_path)
+        self.read_only = read_only
+        if read_only and not self.data_meta_path.is_file():
+            raise FileNotFoundError("Read-only Data metadata must already exist")
+        if read_only and self.data_meta_path.stat().st_size == 0:
+            raise ConfigurationError(
+                "Read-only Data metadata has no initialized schema"
+            )
+        self.check_compatibility(self.data_meta_path)
         self._thread_state = local()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        if not read_only:
+            self.data_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize()
+
+    def ensure_writable(self) -> None:
+        """Reject mutations before any file or metadata write starts."""
+        if self.read_only:
+            raise PermissionError("Data lake is read-only")
+
+    def bind_lake(self, lake_path: Path) -> None:
+        """Validate that this metadata authority belongs to the selected lake."""
+        import os
+        from uuid import uuid4
+
+        rows = self._rows("select value from data_meta_state where key='lake_location'")
+        if rows:
+            recorded = (self.data_meta_path.resolve().parent / str(rows[0]["value"])).resolve()
+            if recorded != lake_path.resolve():
+                raise ConfigurationError(
+                    "Data metadata and lake paths refer to different lakes"
+                )
+            return
+        self.ensure_writable()
+        try:
+            location = Path(
+                os.path.relpath(lake_path.resolve(), self.data_meta_path.resolve().parent)
+            ).as_posix()
+        except ValueError:  # Separate Windows volumes cannot have a relative link.
+            location = lake_path.resolve().as_posix()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            current = db.execute(
+                "select value from data_meta_state where key='lake_location'"
+            ).fetchone()
+            if current is not None:
+                if (
+                    self.data_meta_path.resolve().parent / str(current[0])
+                ).resolve() != lake_path.resolve():
+                    raise ConfigurationError(
+                        "Data metadata and lake paths refer to different lakes"
+                    )
+            else:
+                db.executemany(
+                    "insert into data_meta_state(key,value,updated_at) values(?,?,?)",
+                    [
+                        ("lake_id", uuid4().hex, _now()),
+                        ("lake_location", location, _now()),
+                    ],
+                )
 
     @classmethod
-    def check_compatibility(cls, path: Path) -> None:
+    def check_compatibility(cls, data_meta_path: Path) -> None:
         """Reject an existing incompatible lake before opening any write handle."""
-        if not path.is_file() or path.stat().st_size == 0:
+        if not data_meta_path.is_file() or data_meta_path.stat().st_size == 0:
             return
-        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        db = sqlite3.connect(data_meta_path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             tables = {
                 row[0]
@@ -46,9 +101,9 @@ class MetadataStore:
             }
             row = (
                 db.execute(
-                    "select value from metadata_state where key='schema_version'"
+                    "select value from data_meta_state where key='schema_version'"
                 ).fetchone()
-                if "metadata_state" in tables
+                if "data_meta_state" in tables
                 else None
             )
             if tables and (row is None or str(row[0]) != cls.SCHEMA_VERSION):
@@ -75,17 +130,23 @@ class MetadataStore:
             connection.close()
 
     def _new_connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = (
+            sqlite3.connect(self.data_meta_path.resolve().as_uri() + "?mode=ro", uri=True)
+            if self.read_only
+            else sqlite3.connect(self.data_meta_path)
+        )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        if not self.read_only:
+            connection.execute("PRAGMA synchronous=FULL")
         return connection
 
     @contextmanager
     def writer_session(self) -> Iterator[sqlite3.Connection]:
         """Reuse one scheduler-thread connection while preserving transactions."""
 
+        self.ensure_writable()
         active = getattr(self._thread_state, "writer_connection", None)
         if isinstance(active, sqlite3.Connection):
             yield active
@@ -106,6 +167,7 @@ class MetadataStore:
         enabled: bool = True,
         options: dict[str, Any] | None = None,
     ) -> None:
+        self.ensure_writable()
         now = _now()
         options_json = (
             None
@@ -122,6 +184,7 @@ class MetadataStore:
                     configured=excluded.configured,
                     enabled=excluded.enabled,
                     options_json=coalesce(excluded.options_json, sources.options_json),
+                    active=1,
                     updated_at=excluded.updated_at
                 """,
                 (name, adapter, int(configured), int(enabled), options_json, now, now),
@@ -134,10 +197,15 @@ class MetadataStore:
         return json.loads(str(rows[0]["options_json"]))
 
     def remove_source(self, name: str) -> None:
+        self.ensure_writable()
         with self.connect() as db:
-            db.execute("delete from sources where name = ?", (name,))
+            db.execute(
+                "update sources set active=0, enabled=0, updated_at=? where name=?",
+                (_now(), name),
+            )
 
     def set_source_enabled(self, name: str, enabled: bool) -> None:
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 "update sources set enabled = ?, updated_at = ? where name = ?",
@@ -145,7 +213,7 @@ class MetadataStore:
             )
 
     def list_sources(self) -> list[dict[str, Any]]:
-        rows = self._rows("select * from sources order by name")
+        rows = self._rows("select * from sources where active=1 order by name")
         for row in rows:
             if row.get("options_json"):
                 options = json.loads(str(row["options_json"]))
@@ -154,33 +222,39 @@ class MetadataStore:
         return rows
 
     def upsert_dataset(self, spec: DatasetSpec) -> None:
+        self.ensure_writable()
+        with self.connect() as db:
+            self._write_dataset(db, spec)
+
+    def _write_dataset(self, db: sqlite3.Connection, spec: DatasetSpec) -> None:
         now = _now()
         payload = json.dumps(_spec_payload(spec), sort_keys=True, default=str)
         spec_hash = hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
-        with self.connect() as db:
-            db.execute(
-                """
-                insert into datasets(
-                    name, source, enabled, spec_hash, spec_json, created_at, updated_at
-                )
-                values (?, ?, ?, ?, ?, ?, ?)
-                on conflict(source, name) do update set
-                    spec_hash=excluded.spec_hash,
-                    spec_json=excluded.spec_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    spec.name,
-                    spec.source,
-                    1,
-                    spec_hash,
-                    payload,
-                    now,
-                    now,
-                ),
+        db.execute(
+            """
+            insert into datasets(
+                name, source, enabled, spec_hash, spec_json, created_at, updated_at
             )
+            values (?, ?, ?, ?, ?, ?, ?)
+            on conflict(source, name) do update set
+                spec_hash=excluded.spec_hash,
+                spec_json=excluded.spec_json,
+                active=1,
+                updated_at=excluded.updated_at
+            """,
+            (
+                spec.name,
+                spec.source,
+                1,
+                spec_hash,
+                payload,
+                now,
+                now,
+            ),
+        )
 
     def set_dataset_enabled(self, source: str, dataset: str, enabled: bool) -> None:
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 "update datasets set enabled = ?, updated_at = ? where source = ? and name = ?",
@@ -188,90 +262,27 @@ class MetadataStore:
             )
 
     def remove_dataset(self, source: str, dataset: str) -> None:
+        """Archive a definition without deleting immutable historical evidence."""
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
-                "delete from dataset_schemas where source = ? and dataset = ?",
-                (source, dataset),
+                "update datasets set active=0,enabled=0,updated_at=? where source=? and name=?",
+                (_now(), source, dataset),
             )
-            db.execute(
-                "delete from datasets where source = ? and name = ?", (source, dataset)
-            )
-
-    def clear_dataset_data(self, source: str, dataset: str) -> dict[str, int]:
-        """Clear current dataset state while preserving its registration and audit."""
-
-        with self.connect() as db:
-            db.execute("begin immediate")
-            lease = db.execute(
-                "select 1 from update_leases where source=? and dataset=?",
-                (source, dataset),
-            ).fetchone()
-            if lease is not None:
-                raise RuntimeError(f"Dataset update is active: {source}/{dataset}")
-            manifest = db.execute(
-                "select count(*), coalesce(sum(row_count), 0) from partition_manifest "
-                "where source=? and dataset=?",
-                (source, dataset),
-            ).fetchone()
-            scopes = db.execute(
-                "select count(*) from update_scopes where source=? and dataset=?",
-                (source, dataset),
-            ).fetchone()
-            db.execute(
-                "delete from partition_manifest where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from dataset_schemas where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from provider_scope_checks where scope_id in "
-                "(select id from update_scopes where source=? and dataset=?)",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from version_batches where commit_seq in "
-                "(select seq from version_commits where source=? and dataset=?)",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from version_checks where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from version_commits where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from dataset_initializations where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from update_scopes where source=? and dataset=?",
-                (source, dataset),
-            )
-            db.execute(
-                "delete from update_leases where source=? and dataset=?",
-                (source, dataset),
-            )
-        return {
-            "partitions": int(manifest[0]),
-            "rows": int(manifest[1]),
-            "scopes": int(scopes[0]),
-        }
 
     def list_datasets(self, source: str | None = None) -> list[dict[str, Any]]:
         if source is None:
-            return self._rows("select * from datasets order by source, name")
+            return self._rows(
+                "select * from datasets where active=1 order by source, name"
+            )
         return self._rows(
-            "select * from datasets where source = ? order by name",
+            "select * from datasets where source = ? and active=1 order by name",
             (source,),
         )
 
     def get_dataset(self, source: str, dataset: str) -> dict[str, Any] | None:
         rows = self._rows(
-            "select * from datasets where source = ? and name = ?",
+            "select * from datasets where source = ? and name = ? and active=1",
             (source, dataset),
         )
         return rows[0] if rows else None
@@ -304,11 +315,12 @@ class MetadataStore:
         *,
         source: str | None = None,
         datasets: Iterable[str] | None = None,
+        include_inactive: bool = False,
     ) -> list[dict[str, Any]]:
         """Aggregate exact manifest-backed status in one SQLite query."""
 
         selected = None if datasets is None else tuple(dict.fromkeys(datasets))
-        clauses: list[str] = []
+        clauses: list[str] = [] if include_inactive else ["d.active=1"]
         parameters: list[Any] = []
         if source is not None:
             clauses.append("d.source = ?")
@@ -349,6 +361,7 @@ class MetadataStore:
     ) -> None:
         """Persist the current canonical schema after canonical files commit."""
 
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 """
@@ -373,15 +386,35 @@ class MetadataStore:
         schema_hash: str,
         replace_manifests: bool = False,
         version_commit: dict[str, Any] | None = None,
+        scope_transitions: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        committed_rows: int = 0,
     ) -> None:
-        """Commit changed manifests and the canonical schema atomically."""
-
+        """Atomically publish files, schema, durable batch evidence and visibility."""
+        self.ensure_writable()
         rows = list(manifests)
         now = _now()
         with self.connect() as db:
             db.execute("begin immediate")
             if version_commit is not None:
+                self.assert_dataset_parent(
+                    db,
+                    source,
+                    dataset,
+                    version_commit["parent"],
+                    version_commit["definition_hash"],
+                    run_id,
+                )
                 seq = int(version_commit["seq"])
+                for batch in version_commit["batches"]:
+                    registered = db.execute(
+                        "select content_hash from version_batches where commit_seq=? and partition_path=?",
+                        (seq, batch["partition_path"]),
+                    ).fetchone()
+                    if registered is None or registered[0] != batch["content_hash"]:
+                        raise RuntimeError(
+                            "Prepared recovery batch is missing or inconsistent"
+                        )
                 cursor = db.execute(
                     "update version_commits set status='committed' where seq=? and source=? and dataset=? and status='prepared'",
                     (seq, source, dataset),
@@ -390,217 +423,215 @@ class MetadataStore:
                     raise RuntimeError(
                         "Version commit is not prepared for this dataset"
                     )
-                db.executemany(
-                    "insert into version_batches(commit_seq,partition_path,content_hash,row_count,schema_ipc,min_available,max_available,min_observation,max_observation) values(?,?,?,?,?,?,?,?,?)",
-                    [
-                        (seq, b["partition_path"], b["content_hash"], b["row_count"], b["schema_ipc"],
-                         b["min_available"], b["max_available"], b["min_observation"], b["max_observation"])
-                        for b in version_commit["batches"]
-                    ],
-                )
+                if version_commit.get("check"):
+                    _insert_version_check(db, **version_commit["check"])
             if replace_manifests:
                 db.execute(
                     "delete from partition_manifest where source=? and dataset=?",
                     (source, dataset),
                 )
-            if rows:
-                db.executemany(
-                    """
-                    insert into partition_manifest(
-                        source,dataset,partition_path,partition_values,row_count,
-                        file_size_bytes,min_time,max_time,content_hash,schema_hash,
-                        updated_at
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    on conflict(source,dataset,partition_path) do update set
-                        partition_values=excluded.partition_values,
-                        row_count=excluded.row_count,
-                        file_size_bytes=excluded.file_size_bytes,
-                        min_time=excluded.min_time,
-                        max_time=excluded.max_time,
-                        content_hash=excluded.content_hash,
-                        schema_hash=excluded.schema_hash,
-                        updated_at=excluded.updated_at
-                    """,
-                    [
-                        (
-                            row["source"],
-                            row["dataset"],
-                            str(row["partition_path"]),
-                            json.dumps(
-                                row["partition_values"],
-                                sort_keys=True,
-                                default=str,
-                            ),
-                            int(row["row_count"]),
-                            int(row["file_size_bytes"]),
-                            row.get("min_time"),
-                            row.get("max_time"),
-                            row["content_hash"],
-                            row["schema_hash"],
-                            now,
-                        )
-                        for row in rows
-                    ],
-                )
+            self._write_manifests(db, rows, now)
             db.execute(
-                """
-                insert into dataset_schemas(
-                    source,dataset,schema_ipc,schema_hash,updated_at
-                ) values (?, ?, ?, ?, ?)
-                on conflict(source,dataset) do update set
-                    schema_ipc=excluded.schema_ipc,
-                    schema_hash=excluded.schema_hash,
-                    updated_at=excluded.updated_at
-                """,
+                "insert into dataset_schemas(source,dataset,schema_ipc,schema_hash,updated_at) values(?,?,?,?,?) "
+                "on conflict(source,dataset) do update set schema_ipc=excluded.schema_ipc,"
+                "schema_hash=excluded.schema_hash,updated_at=excluded.updated_at",
                 (source, dataset, schema_ipc, schema_hash, now),
             )
+            if scope_transitions:
+                if run_id is None:
+                    raise ValueError(
+                        "Coverage publication requires an ingestion run ID"
+                    )
+                self._transition_scopes(
+                    db, scope_transitions, run_id=run_id, committed_rows=committed_rows
+                )
 
-    def upsert_manifest(
-        self,
-        *,
+    def _write_manifests(
+        self, db: sqlite3.Connection, rows: list[dict[str, Any]], now: str
+    ) -> None:
+        for row in rows:
+            generation = str(row["generation_path"])
+            validate_generation(str(row["partition_path"]), generation)
+            values = (
+                row["source"],
+                row["dataset"],
+                str(row["partition_path"]),
+                generation,
+                json.dumps(row["partition_values"], sort_keys=True, default=str),
+                int(row["row_count"]),
+                int(row["file_size_bytes"]),
+                row.get("min_time"),
+                row.get("max_time"),
+                row["content_hash"],
+                row["schema_hash"],
+                now,
+            )
+            db.execute(
+                "insert into partition_manifest(source,dataset,partition_path,generation_path,partition_values,"
+                "row_count,file_size_bytes,min_time,max_time,content_hash,schema_hash,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?) on conflict(source,dataset,partition_path) do update set "
+                "generation_path=excluded.generation_path,partition_values=excluded.partition_values,"
+                "row_count=excluded.row_count,file_size_bytes=excluded.file_size_bytes,min_time=excluded.min_time,"
+                "max_time=excluded.max_time,content_hash=excluded.content_hash,schema_hash=excluded.schema_hash,"
+                "updated_at=excluded.updated_at",
+                values,
+            )
+            db.execute(
+                "insert or ignore into partition_generations(source,dataset,partition_path,generation_path,content_hash,schema_hash) values(?,?,?,?,?,?)",
+                (
+                    row["source"],
+                    row["dataset"],
+                    row["partition_path"],
+                    generation,
+                    row["content_hash"],
+                    row["schema_hash"],
+                ),
+            )
+
+    @staticmethod
+    def assert_dataset_parent(
+        db: sqlite3.Connection,
         source: str,
         dataset: str,
-        partition_path: str,
-        partition_values: dict[str, Any],
-        row_count: int,
-        file_size_bytes: int,
-        min_time: str | None,
-        max_time: str | None,
-        content_hash: str,
-        schema_hash: str,
+        parent: dict[str, str],
+        definition_hash: str,
+        run_id: str | None,
     ) -> None:
-        self.upsert_manifests(
-            [
-                {
-                    "source": source,
-                    "dataset": dataset,
-                    "partition_path": partition_path,
-                    "partition_values": partition_values,
-                    "row_count": row_count,
-                    "file_size_bytes": file_size_bytes,
-                    "min_time": min_time,
-                    "max_time": max_time,
-                    "content_hash": content_hash,
-                    "schema_hash": schema_hash,
-                }
-            ]
-        )
+        current = {
+            row[0]: row[1]
+            for row in db.execute(
+                "select partition_path,generation_path from partition_manifest where source=? and dataset=?",
+                (source, dataset),
+            )
+        }
+        definition = db.execute(
+            "select spec_hash from datasets where source=? and name=? and active=1",
+            (source, dataset),
+        ).fetchone()
+        if current != parent or definition is None or definition[0] != definition_hash:
+            raise RuntimeError("Dataset changed while preparing the publication")
+        lease = db.execute(
+            "select run_id from update_leases where source=? and dataset=?",
+            (source, dataset),
+        ).fetchone()
+        if lease is None or lease[0] != run_id:
+            raise RuntimeError("Dataset writer no longer owns publication permission")
+
+    @contextmanager
+    def dataset_writer(self, source: str, dataset: str, run_id: str) -> Iterator[None]:
+        """Exclude foreign publishers while preserving an enclosing update lease."""
+        self.ensure_writable()
+        with self.connect() as db:
+            db.execute("begin immediate")
+            now = datetime.now(UTC)
+            existing = db.execute(
+                "select run_id from update_leases where source=? and dataset=?",
+                (source, dataset),
+            ).fetchone()
+            if existing is not None and existing[0] != run_id:
+                raise RuntimeError(f"Dataset update already active: {source}/{dataset}")
+            owns = existing is None
+            if owns:
+                db.execute(
+                    "insert into update_leases(source,dataset,run_id,owner_id,heartbeat_at,lease_expires_at) values(?,?,?,?,?,?) on conflict(source,dataset) do update set run_id=excluded.run_id,owner_id=excluded.owner_id,heartbeat_at=excluded.heartbeat_at,lease_expires_at=excluded.lease_expires_at",
+                    (
+                        source,
+                        dataset,
+                        run_id,
+                        run_id,
+                        now.isoformat(),
+                        (now + timedelta(seconds=300)).isoformat(),
+                    ),
+                )
+        try:
+            yield
+        finally:
+            if owns:
+                self.release_update_leases([run_id])
+
+    def upsert_manifest(self, **manifest: Any) -> None:
+        self.upsert_manifests([manifest])
 
     def upsert_manifests(self, manifests: Iterable[dict[str, Any]]) -> None:
-        rows = list(manifests)
-        if not rows:
-            return
+        self.ensure_writable()
         with self.connect() as db:
-            db.executemany(
-                """
-                insert into partition_manifest(
-                    source, dataset, partition_path, partition_values, row_count,
-                    file_size_bytes, min_time, max_time, content_hash, schema_hash, updated_at
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(source, dataset, partition_path) do update set
-                    partition_values=excluded.partition_values,
-                    row_count=excluded.row_count,
-                    file_size_bytes=excluded.file_size_bytes,
-                    min_time=excluded.min_time,
-                    max_time=excluded.max_time,
-                    content_hash=excluded.content_hash,
-                    schema_hash=excluded.schema_hash,
-                    updated_at=excluded.updated_at
-                """,
-                [
-                    (
-                        row["source"],
-                        row["dataset"],
-                        str(row["partition_path"]),
-                        json.dumps(
-                            row["partition_values"], sort_keys=True, default=str
-                        ),
-                        int(row["row_count"]),
-                        int(row["file_size_bytes"]),
-                        row.get("min_time"),
-                        row.get("max_time"),
-                        row["content_hash"],
-                        row["schema_hash"],
-                        _now(),
-                    )
-                    for row in rows
-                ],
-            )
+            self._write_manifests(db, list(manifests), _now())
 
     def replace_manifests(
         self, source: str, dataset: str, manifests: Iterable[dict[str, Any]]
     ) -> None:
-        rows = list(manifests)
-        now = _now()
-        with self.connect() as db:
-            db.execute(
-                "delete from partition_manifest where source = ? and dataset = ?",
-                (source, dataset),
-            )
-            if rows:
-                db.executemany(
-                    """
-                    insert into partition_manifest(
-                        source, dataset, partition_path, partition_values, row_count,
-                        file_size_bytes, min_time, max_time, content_hash, schema_hash, updated_at
-                    )
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            row["source"],
-                            row["dataset"],
-                            str(row["partition_path"]),
-                            json.dumps(
-                                row["partition_values"], sort_keys=True, default=str
-                            ),
-                            int(row["row_count"]),
-                            int(row["file_size_bytes"]),
-                            row.get("min_time"),
-                            row.get("max_time"),
-                            row["content_hash"],
-                            row["schema_hash"],
-                            now,
-                        )
-                        for row in rows
-                    ],
-                )
-
-    def remove_manifests(
-        self, source: str, dataset: str, partition_paths: Iterable[str]
-    ) -> list[dict[str, Any]]:
-        """Remove selected manifest rows while no dataset writer is active."""
-
-        paths = tuple(dict.fromkeys(str(path) for path in partition_paths))
-        if not paths:
-            return []
-        placeholders = ",".join("?" for _ in paths)
+        self.ensure_writable()
         with self.connect() as db:
             db.execute("begin immediate")
-            lease = db.execute(
-                "select 1 from update_leases where source=? and dataset=?",
+            db.execute(
+                "delete from partition_manifest where source=? and dataset=?",
+                (source, dataset),
+            )
+            self._write_manifests(db, list(manifests), _now())
+
+    def dataset_snapshot(self, source: str, dataset: str) -> dict[str, Any]:
+        """Pin schema, manifests and commit visibility in one SQLite read snapshot."""
+        with self.connect() as db:
+            db.execute("begin")
+            manifests = [
+                dict(row)
+                for row in db.execute(
+                    "select * from partition_manifest where source=? and dataset=? order by partition_path",
+                    (source, dataset),
+                )
+            ]
+            schema = db.execute(
+                "select schema_ipc from dataset_schemas where source=? and dataset=?",
                 (source, dataset),
             ).fetchone()
-            if lease is not None:
-                raise RuntimeError(f"Dataset update is active: {source}/{dataset}")
-            rows = db.execute(
-                "select * from partition_manifest where source=? and dataset=? "
-                f"and partition_path in ({placeholders}) order by partition_path",
-                (source, dataset, *paths),
-            ).fetchall()
-            db.execute(
-                "delete from partition_manifest where source=? and dataset=? "
-                f"and partition_path in ({placeholders})",
-                (source, dataset, *paths),
-            )
-        return [
-            {
-                **dict(row),
-                "partition_values": json.loads(str(row["partition_values"])),
+            commits = [
+                dict(row)
+                for row in db.execute(
+                    "select c.*,coalesce((select sum(b.row_count) from version_batches b where b.commit_seq=c.seq),0) as row_count "
+                    "from version_commits c where source=? and dataset=? and status='committed' order by seq",
+                    (source, dataset),
+                )
+            ]
+            batch_schemas = {
+                int(row["commit_seq"]): bytes(row["schema_ipc"])
+                for row in db.execute(
+                    "select b.commit_seq,b.schema_ipc from version_batches b join version_commits c on c.seq=b.commit_seq "
+                    "where c.source=? and c.dataset=? and c.status='committed' order by b.commit_seq,b.partition_path",
+                    (source, dataset),
+                )
             }
-            for row in rows
-        ]
+            checks = [
+                dict(row)
+                for row in db.execute(
+                    "select * from version_checks where source=? and dataset=? order by id",
+                    (source, dataset),
+                )
+            ]
+            record_checks = [
+                dict(row)
+                for row in db.execute(
+                    "select r.* from version_check_records r join version_checks c on c.id=r.check_id "
+                    "where c.source=? and c.dataset=? order by r.check_id,r.record_id",
+                    (source, dataset),
+                )
+            ]
+        return {
+            "manifests": manifests,
+            "schema_ipc": None if schema is None else bytes(schema[0]),
+            "commits": commits,
+            "batch_schemas": batch_schemas,
+            "checks": checks,
+            "record_checks": record_checks,
+        }
+
+    def known_generations(self, source: str, dataset: str) -> set[str]:
+        return {
+            str(row["generation_path"])
+            for row in self._rows(
+                "select generation_path from partition_generations where source=? and dataset=?",
+                (source, dataset),
+            )
+        }
 
     def manifest(
         self, source: str | None = None, dataset: str | None = None
@@ -635,6 +666,7 @@ class MetadataStore:
         rows_committed: int = 0,
         error_message: str | None = None,
     ) -> None:
+        self.ensure_writable()
         now = _now()
         with self.connect() as db:
             db.execute(
@@ -675,6 +707,7 @@ class MetadataStore:
     ) -> None:
         """Create an ingestion run before any scope is claimed."""
 
+        self.ensure_writable()
         now = _now()
         with self.connect() as db:
             db.execute(
@@ -701,6 +734,7 @@ class MetadataStore:
     ) -> None:
         """Finalize a run even when the update scheduler raises."""
 
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 """
@@ -733,6 +767,7 @@ class MetadataStore:
         reason: str,
         row_count: int,
     ) -> None:
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 """
@@ -760,6 +795,7 @@ class MetadataStore:
         )
 
     def record_api_calls(self, calls: Iterable[dict[str, Any]]) -> None:
+        self.ensure_writable()
         rows = list(calls)
         if not rows:
             return
@@ -831,6 +867,7 @@ class MetadataStore:
     def synchronize_update_scopes(self, scopes: Iterable[dict[str, Any]]) -> None:
         """Insert ledger identities and invalidate rows whose spec changed."""
 
+        self.ensure_writable()
         rows = list(scopes)
         if not rows:
             return
@@ -937,6 +974,7 @@ class MetadataStore:
     ) -> int:
         """Remove identities that can no longer be reconstructed from the spec."""
 
+        self.ensure_writable()
         with self.connect() as db:
             db.execute(
                 "delete from provider_scope_checks where scope_id in ("
@@ -954,6 +992,7 @@ class MetadataStore:
     def claim_update_scopes(
         self, scope_ids: Iterable[int], *, run_id: str
     ) -> list[int]:
+        self.ensure_writable()
         ids = list(dict.fromkeys(int(scope_id) for scope_id in scope_ids))
         if not ids:
             return []
@@ -987,75 +1026,86 @@ class MetadataStore:
         committed_rows: int = 0,
     ) -> None:
         """Commit scope outcomes in one metadata transaction."""
-
+        self.ensure_writable()
         rows = list(transitions)
         if not rows:
             return
-        now = _now()
         with self.connect() as db:
-            for row in rows:
-                status = str(row["status"])
-                if status not in {"success", "empty", "failed", "invalid"}:
-                    raise ValueError(f"Unsupported scope transition: {status}")
-                cursor = db.execute(
-                    """
-                    update update_scopes set
-                        status=?, checked_through=case
-                            when ? in ('success','empty') then coalesce(?,data_max_time,checked_through)
-                            else checked_through
-                        end,
-                        data_max_time=case when ? in ('success','empty') then coalesce(?,data_max_time)
-                            else data_max_time end,
-                        row_count=case when ? in ('success','empty') then ? else row_count end,
-                        last_success_at=case when ? in ('success','empty') then ? else last_success_at end,
-                        recheck_after=null, last_error=?, active_run_id=null,
-                        commit_run_id=case when ? in ('success','empty') then ? else commit_run_id end,
-                        updated_at=?
-                    where id=? and active_run_id=?
-                    """,
-                    (
-                        status,
-                        status,
-                        row.get("data_max_time"),
-                        status,
-                        row.get("data_max_time"),
-                        status,
-                        int(row.get("row_count", 0)),
-                        status,
-                        now,
-                        row.get("last_error"),
-                        status,
-                        run_id,
-                        now,
-                        int(row["scope_id"]),
-                        run_id,
-                    ),
+            self._transition_scopes(
+                db, rows, run_id=run_id, committed_rows=committed_rows
+            )
+
+    def _transition_scopes(
+        self,
+        db: sqlite3.Connection,
+        rows: list[dict[str, Any]],
+        *,
+        run_id: str,
+        committed_rows: int = 0,
+    ) -> None:
+        """Publish coverage using the caller's existing metadata transaction."""
+        now = _now()
+        for row in rows:
+            status = str(row["status"])
+            if status not in {"success", "empty", "failed", "invalid"}:
+                raise ValueError(f"Unsupported scope transition: {status}")
+            cursor = db.execute(
+                """
+                update update_scopes set
+                    status=?, checked_through=case
+                        when ? in ('success','empty') then coalesce(?,data_max_time,checked_through)
+                        else checked_through
+                    end,
+                    data_max_time=case when ? in ('success','empty') then coalesce(?,data_max_time)
+                        else data_max_time end,
+                    row_count=case when ? in ('success','empty') then ? else row_count end,
+                    last_success_at=case when ? in ('success','empty') then ? else last_success_at end,
+                    recheck_after=null, last_error=?, active_run_id=null,
+                    commit_run_id=case when ? in ('success','empty') then ? else commit_run_id end,
+                    updated_at=?
+                where id=? and active_run_id=?
+                """,
+                (
+                    status,
+                    status,
+                    row.get("data_max_time"),
+                    status,
+                    row.get("data_max_time"),
+                    status,
+                    int(row.get("row_count", 0)),
+                    status,
+                    now,
+                    row.get("last_error"),
+                    status,
+                    run_id,
+                    now,
+                    int(row["scope_id"]),
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Scope {row['scope_id']} is not claimed by ingestion run {run_id}"
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError(
-                        f"Scope {row['scope_id']} is not claimed by ingestion run {run_id}"
-                    )
-                if status in {"success", "empty"} and row.get(
-                    "provider_checked_through"
-                ):
-                    self._upsert_provider_scope_check(
-                        db,
-                        scope_id=int(row["scope_id"]),
-                        checked_through=str(row["provider_checked_through"]),
-                        recheck_after=row.get("provider_recheck_after"),
-                        result="empty" if status == "empty" else "nonempty",
-                        checked_at=now,
-                    )
-            success_count = sum(row["status"] == "success" for row in rows)
-            if success_count:
-                db.execute(
-                    """
-                    update ingestion_runs set success_count=success_count+?,
-                        rows_committed=rows_committed+?
-                    where run_id=? and status='running'
-                    """,
-                    (success_count, int(committed_rows), run_id),
+            if status in {"success", "empty"} and row.get("provider_checked_through"):
+                self._upsert_provider_scope_check(
+                    db,
+                    scope_id=int(row["scope_id"]),
+                    checked_through=str(row["provider_checked_through"]),
+                    recheck_after=row.get("provider_recheck_after"),
+                    result="empty" if status == "empty" else "nonempty",
+                    checked_at=now,
                 )
+        success_count = sum(row["status"] == "success" for row in rows)
+        if success_count:
+            db.execute(
+                """
+                update ingestion_runs set success_count=success_count+?,
+                    rows_committed=rows_committed+?
+                where run_id=? and status='running'
+                """,
+                (success_count, int(committed_rows), run_id),
+            )
 
     def record_empty_scope_result(
         self,
@@ -1072,6 +1122,7 @@ class MetadataStore:
         therefore expose either the complete empty outcome or none of it.
         """
 
+        self.ensure_writable()
         scope_results = (
             []
             if scope_id is None
@@ -1100,6 +1151,7 @@ class MetadataStore:
     ) -> None:
         """Atomically audit one physical call and persist its empty daily scopes."""
 
+        self.ensure_writable()
         rows = list(calls)
         if not rows:
             raise ValueError("An empty result must include at least one API audit row")
@@ -1230,6 +1282,7 @@ class MetadataStore:
     def reset_update_scopes(
         self, scope_ids: Iterable[int], *, clear_watermark: bool = False
     ) -> int:
+        self.ensure_writable()
         ids = list(dict.fromkeys(int(scope_id) for scope_id in scope_ids))
         if not ids:
             return 0
@@ -1258,6 +1311,7 @@ class MetadataStore:
         ttl_seconds: int = 300,
         owner_id: str | None = None,
     ) -> None:
+        self.ensure_writable()
         rows = list(leases)
         if not rows:
             return
@@ -1265,10 +1319,6 @@ class MetadataStore:
         expires = (now + timedelta(seconds=ttl_seconds)).isoformat()
         with self.connect() as db:
             db.execute("begin immediate")
-            db.execute(
-                "delete from update_leases where lease_expires_at <= ?",
-                (now.isoformat(),),
-            )
             for source, dataset, run_id in rows:
                 conflict = db.execute(
                     "select run_id from update_leases where source=? and dataset=?",
@@ -1290,7 +1340,14 @@ class MetadataStore:
                     lease_expires_at=excluded.lease_expires_at
                 """,
                 [
-                    (source, dataset, run_id, owner_id, now.isoformat(), expires)
+                    (
+                        source,
+                        dataset,
+                        run_id,
+                        owner_id or run_id,
+                        now.isoformat(),
+                        expires,
+                    )
                     for source, dataset, run_id in rows
                 ],
             )
@@ -1298,6 +1355,7 @@ class MetadataStore:
     def abandon_update_owner(self, owner_id: str, *, reason: str) -> dict[str, int]:
         """Release one workflow owner's unfinished writes after forced termination."""
 
+        self.ensure_writable()
         now = _now()
         with self.connect() as db:
             db.execute("begin immediate")
@@ -1339,6 +1397,7 @@ class MetadataStore:
             }
 
     def refresh_update_lease(self, *, run_id: str, ttl_seconds: int = 300) -> None:
+        self.ensure_writable()
         now = datetime.now(UTC)
         with self.connect() as db:
             db.execute(
@@ -1351,6 +1410,7 @@ class MetadataStore:
             )
 
     def release_update_leases(self, run_ids: Iterable[str]) -> None:
+        self.ensure_writable()
         ids = list(run_ids)
         if not ids:
             return
@@ -1362,51 +1422,9 @@ class MetadataStore:
 
     def active_update_leases(self) -> list[dict[str, Any]]:
         return self._rows(
-            "select * from update_leases where lease_expires_at > ? order by source,dataset",
+            "select *,lease_expires_at<=? as heartbeat_expired from update_leases order by source,dataset",
             (_now(),),
         )
-
-    def recover_stale_running_scopes(self) -> int:
-        now = _now()
-        with self.connect() as db:
-            db.execute("begin immediate")
-            stale_runs = [
-                str(row["active_run_id"])
-                for row in db.execute(
-                    """
-                    select distinct active_run_id from update_scopes
-                    where status='running' and not exists (
-                        select 1 from update_leases
-                        where update_leases.run_id=update_scopes.active_run_id
-                          and update_leases.lease_expires_at > ?
-                    )
-                    """,
-                    (now,),
-                ).fetchall()
-                if row["active_run_id"] is not None
-            ]
-            cursor = db.execute(
-                """
-                update update_scopes set status='failed',active_run_id=null,
-                    last_error='writer lease expired',updated_at=?
-                where status='running' and not exists (
-                    select 1 from update_leases
-                    where update_leases.run_id=update_scopes.active_run_id
-                      and update_leases.lease_expires_at > ?
-                )
-                """,
-                (now, now),
-            )
-            db.execute("delete from update_leases where lease_expires_at <= ?", (now,))
-            if stale_runs:
-                placeholders = ",".join("?" for _ in stale_runs)
-                db.execute(
-                    f"update ingestion_runs set status='cancelled',finished_at=?,"
-                    f"error_message='writer lease expired' where status='running' "
-                    f"and run_id in ({placeholders})",
-                    (now, *stale_runs),
-                )
-            return int(cursor.rowcount)
 
     def dataset_spec_hash(self, source: str, dataset: str) -> str:
         rows = self._rows(
@@ -1416,6 +1434,14 @@ class MetadataStore:
         if not rows:
             raise KeyError(f"Unknown dataset: {source}/{dataset}")
         return str(rows[0]["spec_hash"])
+
+    def assert_definition(self, spec: DatasetSpec) -> None:
+        row = self.get_dataset(spec.source, spec.name)
+        expected = json.dumps(_spec_payload(spec), sort_keys=True, default=str)
+        if row is None or row["spec_json"] != expected:
+            raise RuntimeError(
+                "Dataset definition changed before preparing the publication"
+            )
 
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._rows(
@@ -1443,16 +1469,16 @@ class MetadataStore:
             }
             if existing_tables:
                 schema_version = None
-                if "metadata_state" in existing_tables:
+                if "data_meta_state" in existing_tables:
                     row = db.execute(
-                        "select value from metadata_state where key='schema_version'"
+                        "select value from data_meta_state where key='schema_version'"
                     ).fetchone()
                     schema_version = None if row is None else str(row["value"])
                 if schema_version != self.SCHEMA_VERSION:
                     raise ConfigurationError(
                         "Incompatible data-lake metadata schema "
-                        f"({schema_version or 'unversioned'}). Stop all workers, delete "
-                        "the old lake, and create a fresh lake; automatic migration is "
+                        f"({schema_version or 'unversioned'}). Preserve the existing "
+                        "lake and open a fresh path; automatic migration is "
                         "intentionally disabled."
                     )
             db.executescript(
@@ -1462,13 +1488,14 @@ class MetadataStore:
                     source text not null, dataset text not null, run_id text not null,
                     ingested_at text not null, pit_date text not null,
                     mode text not null, status text not null, spec_hash text not null,
-                    request_json text not null default '[]'
+                    request_json text not null default '[]', input_receipt_id text,
+                    baseline integer not null default 0
                 );
                 create index if not exists version_commits_dataset on version_commits(source,dataset,status,seq);
                 create table if not exists version_batches (
                     commit_seq integer not null, partition_path text not null,
                     content_hash text not null, row_count integer not null,
-                    schema_ipc blob not null,
+                    schema_ipc blob not null, payload blob not null,
                     min_available text, max_available text,
                     min_observation text, max_observation text,
                     primary key(commit_seq,partition_path)
@@ -1476,8 +1503,14 @@ class MetadataStore:
                 create table if not exists version_checks (
                     id integer primary key autoincrement,
                     source text not null, dataset text not null, run_id text not null,
-                    checked_at text not null, visible_commit integer,
-                    request_json text not null, row_count integer not null
+                    checked_at text not null, pit_date text not null, baseline integer not null,
+                    visible_commit integer,
+                    request_json text not null, row_count integer not null, input_receipt_id text
+                );
+                create table if not exists version_check_records (
+                    check_id integer not null, record_id text not null, payload_hash text not null,
+                    version_commit integer not null, available_date text not null,
+                    primary key(check_id,record_id)
                 );
                 create table if not exists dataset_initializations (
                     source text not null, dataset text not null, spec_hash text not null,
@@ -1489,6 +1522,7 @@ class MetadataStore:
                     adapter text not null,
                     configured integer not null default 0,
                     enabled integer not null default 1,
+                    active integer not null default 1,
                     options_json text,
                     created_at text not null,
                     updated_at text not null
@@ -1497,6 +1531,7 @@ class MetadataStore:
                     name text not null,
                     source text not null,
                     enabled integer not null default 1,
+                    active integer not null default 1,
                     spec_hash text not null,
                     spec_json text not null,
                     created_at text not null,
@@ -1585,7 +1620,7 @@ class MetadataStore:
                     lease_expires_at text not null,
                     primary key(source, dataset)
                 );
-                create table if not exists metadata_state (
+                create table if not exists data_meta_state (
                     key text primary key,
                     value text not null,
                     updated_at text not null
@@ -1594,6 +1629,7 @@ class MetadataStore:
                     source text not null,
                     dataset text not null,
                     partition_path text not null,
+                    generation_path text not null,
                     partition_values text not null,
                     row_count integer not null,
                     file_size_bytes integer not null,
@@ -1603,6 +1639,11 @@ class MetadataStore:
                     schema_hash text not null,
                     updated_at text not null,
                     primary key(source, dataset, partition_path)
+                );
+                create table if not exists partition_generations (
+                    source text not null, dataset text not null, partition_path text not null,
+                    generation_path text not null, content_hash text not null, schema_hash text not null,
+                    primary key(source,dataset,generation_path)
                 );
                 create table if not exists dataset_schemas (
                     source text not null,
@@ -1626,7 +1667,7 @@ class MetadataStore:
                 now = _now()
                 db.execute(
                     """
-                    insert into metadata_state(key,value,updated_at) values
+                    insert or ignore into data_meta_state(key,value,updated_at) values
                         ('schema_version',?,?)
                     """,
                     (
@@ -1638,6 +1679,55 @@ class MetadataStore:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _insert_version_check(
+    db: sqlite3.Connection,
+    *,
+    source: str,
+    dataset: str,
+    run_id: str,
+    checked_at: str,
+    pit_date: str,
+    baseline: bool,
+    request_json: str,
+    row_count: int,
+    records: list[dict[str, Any]],
+    input_receipt_id: str | None = None,
+) -> None:
+    """Record immutable unchanged-content witnesses in the publication transaction."""
+    check_id = db.execute(
+        "insert into version_checks(source,dataset,run_id,checked_at,pit_date,baseline,visible_commit,request_json,row_count,input_receipt_id) "
+        "values(?,?,?,?,?,?,(select max(seq) from version_commits where source=? and dataset=? and status='committed'),?,?,?)",
+        (
+            source,
+            dataset,
+            run_id,
+            checked_at,
+            pit_date,
+            int(baseline),
+            source,
+            dataset,
+            request_json,
+            row_count,
+            input_receipt_id,
+        ),
+    ).lastrowid
+    if check_id is None:
+        raise RuntimeError("Failed to allocate an unchanged-content witness")
+    db.executemany(
+        "insert into version_check_records(check_id,record_id,payload_hash,version_commit,available_date) values(?,?,?,?,?)",
+        [
+            (
+                check_id,
+                row["_record_id"],
+                row["_payload_hash"],
+                int(row["_commit_seq"]),
+                str(row["time"]),
+            )
+            for row in records
+        ],
+    )
 
 
 def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:

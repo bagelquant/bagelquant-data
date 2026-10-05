@@ -1,11 +1,32 @@
-# 运维
+# 完整性与恢复
 
-通过 `lake.admin` 查看数据集、manifest、日期 × 参数 scope、ingestion run、版本批次与恢复状态。浅扫描核对元数据和文件清单；深扫描读取 canonical Parquet，验证内容哈希、schema、业务键、月分区和恢复日志。扫描不会接管孤立文件，也不会调用 Provider。
+```python
+facts = lake.integrity.scan("daily", source="tushare", deep=True)
+plan = lake.integrity.repair_plan("daily", source="tushare")
+results = lake.integrity.repair(plan)
+```
 
-General 的显式更新在完整快照内容变化时生成新快照；内容未变时只记录检查。同一日期可以有多个不同内容的快照 ID；部分参数或分页失败时，上一份完整快照继续可见。`by_daily` 的覆盖必须包含请求范围内每个声明日期和参数 variant 的终态 `success` 或 `empty`，不以物理行密度或最后一条观测日期推断覆盖。
+扫描只报告 manifest/schema/键/哈希/分区/恢复事实，不修改状态，不接管孤立文件，不调用
+Provider。浅扫描比较登记文件，深扫描校验内容及 Arrow 恢复证据。修复计划固定 lake 身份
+和 manifest；过期或不同 lake 的计划失败，执行期间持有数据集更新 lease。
 
-每个月分区旁保存 `recovery.sqlite`，其中是已提交的不可变压缩 Arrow 批次。Parquet 损坏而恢复证据完整时，`lake.admin.repair_partitions()` 只重放已登记批次，保留原 PIT 日期、入库时间、提交序号和内容身份，也不触发 Provider。恢复日志损坏时，只有完整且已验证的 Parquet 能按原批次 schema 和哈希重建它；两侧证据都不足时，深扫描将该问题标为不可自动修复，并阻止伪造历史。
+唯一 Data SQLite 决定提交可见性。先准备其中的压缩 Arrow 批次及不可变 Parquet 文件，
+再通过 SQLite 事务一起发布 manifest、schema、commit 和 coverage。未登记文件不可见，
+旧的已登记 generation 作为历史证据保留。
 
-尚未完成的日期 scope 可通过普通显式更新补取。供应商返回的新值或历史刷新发现的变化都形成新版本，不会替代既有版本。无变化检查只记录检查结果，不改变 manifest 或下游内容 generation。
+本地修复必须重现原始哈希、schema、可用日期和身份。完整恢复批次可以恢复损坏 Parquet；
+完整已校验 Parquet 只有能重现每个原始批次时才可恢复其 payload。证据不足明确失败。
+全部元数据库丢失必须恢复备份，不能从散落文件或当前 Provider 响应推造历史。
+没有自动历史清理、quarantine、孤立 manifest 接管或旧 schema 迁移。
 
-旧数据库 schema 会在任何写入之前被拒绝。请先备份并重建数据根；本包不提供迁移或兼容读取。
+`integrity` 提供运行、失败、scope、coverage、lease 状态；`raw.status/status_many` 与
+`items.status` 提供对象概况。重置 scope、放弃失效 owner 都是显式操作，与扫描分开。
+所有验收使用临时根和假 Provider，不访问真实工作区数据。
+心跳过期只报告事实，不自动释放写入所有权。调用者确认 owner 已终止后才应显式调用
+`abandon_update_owner`。发布事务同时校验 run 所有权、父 generation 和当前定义。
+
+`integrity.backup(data_meta_path=..., lake_path=...)` 将一致的 SQLite 快照和已提交文件
+导出到新的调用者路径，并返回校验后的文件哈希。`integrity.verify_backup()` 校验备份。
+`DataLake.restore(backup_data_meta_path=..., backup_lake_path=...,
+data_meta_path=..., lake_path=...)` 将同 schema 备份恢复到新路径；已有目标会被拒绝。
+完整历史和冻结输入保留在单个元数据库中，旧物理文件可按登记 Arrow 批次重现。

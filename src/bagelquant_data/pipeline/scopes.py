@@ -15,7 +15,7 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError, DataSourceError
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.query.raw import RawQueryService
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 
 
 ALL_NULL_PAYLOAD_ERROR = "response payload is entirely null"
@@ -106,7 +106,7 @@ def synchronize_requests(
     *,
     spec: DatasetSpec,
     raw: RawQueryService,
-    metadata: MetadataStore,
+    metadata: DataMetaStore,
     start: DateLike | None,
     end: DateLike | None,
     today: DateLike | None = None,
@@ -130,7 +130,7 @@ def synchronize_requests(
         assert requests is not None
         return requests
     spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
-    if spec.update_type == "by_daily":
+    if spec.update_type == "by_date":
         return _daily_requests(
             spec, raw=raw, metadata=metadata, variants=variants, start=start,
             final_day=final_day, execution_day=execution_day, spec_hash=spec_hash,
@@ -273,7 +273,7 @@ def compact_daily_range_backfill(
 ) -> tuple[LedgerRequest, ...]:
     """Compact untouched daily backlog into bounded physical range requests."""
 
-    if spec.update_type != "by_daily" or not source_options:
+    if spec.update_type != "by_date" or not source_options:
         return tuple(requests)
     raw_policy = source_options.get("daily_range_backfill")
     if raw_policy is None:
@@ -343,7 +343,7 @@ def _daily_requests(
     spec: DatasetSpec,
     *,
     raw: RawQueryService,
-    metadata: MetadataStore,
+    metadata: DataMetaStore,
     variants: list[tuple[str, dict[str, object]]],
     start: DateLike | None,
     final_day: date,

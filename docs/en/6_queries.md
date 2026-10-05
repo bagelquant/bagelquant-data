@@ -1,37 +1,48 @@
-# PIT queries
+# PIT reads and frozen inputs
 
 ```python
-# Latest complete observation versions, restricted to numerical source dates.
-latest = lake.query.query("daily", source="tushare",
-    observation_start="2026-01-01", observation_end="2026-01-31")
-# What was known at the calculation cutoff, including later-month revisions.
-known = lake.query.query("daily", source="tushare", as_of_date="2026-09-09",
-    observation_start="2026-01-01", observation_end="2026-01-31")
-versions = lake.query.query("daily", source="tushare", view="versions")
-# Observation-axis values for a numerical consumer.
-observations = lake.query.observations("daily", source="tushare", start="2026-01-01")
+history = lake.raw.read("daily", source="tushare")
+snapshot = lake.raw.read("daily", source="tushare", as_of="2020-01-10",
+                         observation_start="2020-01-01", observation_end="2020-01-05")
+current = lake.raw.read("daily", source="tushare", view="latest")
+versions = lake.raw.read_versions("daily", source="tushare")
+observations = lake.raw.observations("daily", source="tushare")
+item = lake.items.read("close")
+fixed_item = lake.items.read("close", view="snapshot", as_of="2020-01-10")
 ```
 
-`source_time` is the observation/announcement date; `time` is availability.
-`start` and `end` filter availability after version resolution. `observation_start`
-and `observation_end` filter the independent source axis and prune manifests using
-source-date bounds. `as_of_date` filters visibility before selecting the latest
-business-key version. `ingested_before` accepts a timezone-aware timestamp.
-Fields and numerical filters must be applied after version selection.
+Daily Raw and DataItem historical reads select each observation's version visible
+on its own date. Fixed `as_of` is an independent information cutoff. Reading a
+short observation window does not substitute its endpoint for the cutoff. Raw
+`start/end` filter the availability axis; `observation_start/end` filter the
+observation axis. `observations()` restores the observation `time` axis after PIT
+selection. `general` reads return a complete selected snapshot, with optional
+`as_of`; they have no implicit daily coordinate grid.
 
-`view="history"` selects each observation's version known on its own source date.
-`observations()` also restores the ordinary numerical `time` axis; an explicit
-`as_of_date` instead resolves its whole input window at that cutoff.
-`lake.query.frozen()` pins a visible commit ceiling for one computation.
-An explicit `max_commit` cannot exceed the reader's current ceiling. The
-`frozen_raw_reads(root, max_commit)` context in `bagelquant_data.query` bounds
-new readers opened for that root. Nested contexts may narrow the ceiling;
-captured readers retain it across worker handoffs, without changing the lake.
-`version_evidence()` supplies immutable visible batch identities without numerical
-reads. Check timestamps do not participate in these identities.
+`strict=True` excludes historical baselines whose original timing is unverified.
+Same-value later collection can provide a later verified availability witness;
+it cannot invent an earlier publication date. `view="versions"` exposes all
+eligible revisions. Ordinary LazyFrames pin committed generations at creation,
+so delayed `collect()` does not switch to a newly published generation.
 
-General uses `query_general()`: latest complete snapshot by default, or an explicit
-`as_of_date`, `snapshot_id`, or `ingested_before`. `view="versions"` audits all
-eligible snapshots. `snapshots()` lists complete snapshot metadata including empty
-snapshots. Historical initialization is a baseline available for historical reads;
-subsequent snapshots never backdate changes or merge rows from different snapshots.
+```python
+from bagelquant_data import RawInput, ItemInput, input_read_boundary
+
+receipt = lake.inputs.freeze({
+    "raw": RawInput("tushare", "daily", view="history"),
+    "close": ItemInput("close"),
+}, information_cutoff="2020-01-10")
+frozen = lake.inputs.read(receipt, "close")
+verification = lake.inputs.verify(receipt)
+with input_read_boundary(lake.data_meta_path, receipt.max_commit,
+                         receipt.information_cutoff, max_check_id=receipt.max_check_id):
+    # Readers opened here capture the same boundaries, including across workers.
+    reader = DataLake.open(data_meta_path=lake.data_meta_path,
+                           lake_path=lake.lake_path, read_only=True)
+```
+
+Receipts atomically record dependencies, definitions, schema, compressed batch
+identities, information cutoff and commit/check upper bounds. They read verified
+local evidence, surviving later revisions, unregistering and current-file damage.
+Nested boundaries may tighten but cannot explicitly expand. Reopening receipt
+IDs uses `lake.inputs.get(id)`; reading never fetches providers.

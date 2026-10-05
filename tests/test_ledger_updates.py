@@ -41,16 +41,16 @@ class LedgerSource:
 
 
 def _daily_lake(tmp_path, source: LedgerSource) -> DataLake:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
@@ -62,33 +62,33 @@ def test_daily_ledger_synchronizes_and_commits_before_success(tmp_path) -> None:
     source = LedgerSource()
     lake = _daily_lake(tmp_path, source)
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
 
     assert report.status == "success"
-    rows = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    rows = lake.integrity.update_scopes(dataset="daily", source="custom")
     assert [(row["scope_key"], row["status"]) for row in rows] == [
         ("2025-01-02", "success"),
         ("2025-01-03", "success"),
     ]
     assert all(row["commit_run_id"] == report.run_id for row in rows)
-    assert lake.admin.status.dataset("daily", source="custom")["row_count"] == 2
+    assert lake.raw.status("daily", source="custom")["row_count"] == 2
 
 
 def test_wrong_daily_date_is_invalid_and_requires_reset(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource(wrong_date=True))
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
 
     assert report.status == "failed"
-    row = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    row = lake.integrity.update_scopes(dataset="daily", source="custom")[0]
     assert row["status"] == "invalid"
-    assert lake.admin.status.reset_update_scopes([int(row["id"])]) == 1
+    assert lake.integrity.reset_update_scopes([int(row["id"])]) == 1
     assert (
-        lake.admin.status.update_scopes(dataset="daily", source="custom")[0]["status"]
+        lake.integrity.update_scopes(dataset="daily", source="custom")[0]["status"]
         == "pending"
     )
 
@@ -103,22 +103,22 @@ def test_wrong_daily_date_is_invalid_and_requires_reset(tmp_path) -> None:
 
 def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> None:
     source = LedgerSource(empty=True)
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
@@ -127,13 +127,13 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
         retry_backoff_seconds=0,
     )
 
-    scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    scope = lake.integrity.update_scopes(dataset="daily", source="custom")[0]
     assert report.status == "no_data"
     assert scope["status"] == "empty"
     assert scope["data_max_time"] is None
     assert scope["last_success_at"] is None
     assert (
-        lake.admin.status.provider_scope_checks(
+        lake.integrity.provider_scope_checks(
             dataset="daily", source="custom"
         )[0]["recheck_after"]
         is None
@@ -141,17 +141,17 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
     assert len(source.requests) == 1
 
     source.requests.clear()
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
         end="2025-01-02",
     )
     assert [request[1]["date"] for request in source.requests] == ["2025-01-02"]
-    assert lake.admin.status.update_scopes(
+    assert lake.integrity.update_scopes(
         dataset="daily", source="custom"
     )[0]["status"] == "empty"
-    api_call = lake.metadata._rows(
+    api_call = lake._data_meta._rows(
         "select request_kind,result_kind from api_calls order by rowid desc limit 1"
     )[0]
     assert api_call == {"request_kind": "empty_recheck", "result_kind": "empty"}
@@ -160,22 +160,22 @@ def test_recent_historical_empty_is_rechecked_and_remains_empty(tmp_path) -> Non
 def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
     today = date.today()
     source = LedgerSource(empty=True)
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": [today.isoformat()], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=today,
@@ -185,9 +185,9 @@ def test_dense_current_day_empty_is_terminal_provider_check(tmp_path) -> None:
     assert report.status == "no_data"
     assert report.success_count == 0
     assert report.empty_count == 1
-    scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    scope = lake.integrity.update_scopes(dataset="daily", source="custom")[0]
     assert scope["status"] == "empty"
-    check = lake.admin.status.provider_scope_checks(
+    check = lake.integrity.provider_scope_checks(
         dataset="daily", source="custom"
     )[0]
     assert check["checked_through"] == today.isoformat()
@@ -210,23 +210,23 @@ def test_daily_update_rechecks_all_scopes_in_last_three_calendar_days(
             return super().fetch(dataset, request)
 
     source = SelectiveSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
     sessions = [date(2025, 1, 1) + timedelta(days=index) for index in range(25)]
-    lake.ingest(
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": sessions, "is_open": [1] * len(sessions)}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
     source.empty_dates = {value.isoformat() for value in sessions}
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -236,7 +236,7 @@ def test_daily_update_rechecks_all_scopes_in_last_three_calendar_days(
 
     source.empty_dates.clear()
     source.requests.clear()
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -247,7 +247,7 @@ def test_daily_update_rechecks_all_scopes_in_last_three_calendar_days(
     requested = {str(request["date"]) for _, request in source.requests}
     assert requested == {value.isoformat() for value in sessions[-3:]}
     assert report.success_count == 3
-    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    scopes = lake.integrity.update_scopes(dataset="daily", source="custom")
     assert [row["status"] for row in scopes[:-3]] == ["empty"] * 22
     assert [row["status"] for row in scopes[-3:]] == ["success"] * 3
 
@@ -262,7 +262,7 @@ def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> No
             request_date = str(request["date"])
             if request_date == "2025-01-03":
                 assert self.lake is not None
-                repaired = self.lake.admin.status.update_scopes(
+                repaired = self.lake.integrity.update_scopes(
                     dataset="daily", source="custom"
                 )
                 assert next(
@@ -271,32 +271,32 @@ def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> No
             return super().fetch(dataset, request)
 
     source = PhaseSource()
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source.lake = lake
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
-    lake.ingest(
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
     )
     source.empty = False
     source.requests.clear()
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
@@ -311,99 +311,42 @@ def test_empty_rechecks_commit_before_incremental_requests_start(tmp_path) -> No
 
 
 def test_incompatible_old_schema_is_rejected_without_migration(tmp_path) -> None:
-    path = tmp_path / "metadata" / "lake.db"
-    path.parent.mkdir(parents=True)
+    path = tmp_path / "data_meta.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
-        db.execute("create table metadata_state (key text primary key, value text)")
+        db.execute("create table data_meta_state (key text primary key, value text)")
         db.execute(
-            "insert into metadata_state(key,value) values ('schema_version','1')"
+            "insert into data_meta_state(key,value) values ('schema_version','1')"
         )
 
     with pytest.raises(ConfigurationError, match="Automatic migration is disabled"):
-        DataLake.open(tmp_path)
+        DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
 
 
 
 
-def test_clear_dataset_data_preserves_registration_and_audit(tmp_path) -> None:
-    source = LedgerSource()
-    lake = _daily_lake(tmp_path, source)
-    lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03"
-    )
-    before_runs = lake.admin.status.runs(20)
-
-    result = lake.admin.datasets.clear_dataset_data(
-        "daily", source="custom", confirm=True
-    )
-
-    assert result["partitions"] > 0
-    assert result["rows"] == 2
-    assert lake.admin.datasets.get("daily", source="custom").name == "daily"
-    assert lake.admin.status.files("daily", source="custom") == []
-    assert lake.admin.status.update_scopes(dataset="daily", source="custom") == []
-    assert lake.admin.status.runs(20) == before_runs
-    assert not lake.paths.dataset_root("custom", "daily").exists()
-    assert lake.metadata._rows(
-        "select * from version_commits where source=? and dataset=?",
-        ("custom", "daily"),
-    ) == []
-    assert lake.metadata._rows(
-        "select * from version_checks where source=? and dataset=?",
-        ("custom", "daily"),
-    ) == []
 
 
-def test_clear_dataset_data_requires_confirmation_and_rejects_escape(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.admin.datasets.register(DatasetSpec("../escape", "general"))
-
-    with pytest.raises(Exception, match="confirm=True"):
-        lake.admin.datasets.clear_dataset_data("../escape", source="custom")
-    with pytest.raises(Exception, match="escapes lake root"):
-        lake.admin.datasets.clear_dataset_data(
-            "../escape", source="custom", confirm=True
-        )
 
 
-def test_clear_dataset_data_restores_files_on_metadata_failure(
-    tmp_path, monkeypatch
-) -> None:
-    lake = _daily_lake(tmp_path, LedgerSource())
-    lake.update.dataset(
-        "daily", source="custom", start="2025-01-02", end="2025-01-03"
-    )
-    root = lake.paths.dataset_root("custom", "daily")
-    files = sorted(path.relative_to(root) for path in root.rglob("*.parquet"))
-
-    def fail(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-        raise sqlite3.OperationalError("metadata unavailable")
-
-    monkeypatch.setattr(lake.metadata, "clear_dataset_data", fail)
-    with pytest.raises(sqlite3.OperationalError, match="metadata unavailable"):
-        lake.admin.datasets.clear_dataset_data(
-            "daily", source="custom", confirm=True
-        )
-
-    assert sorted(path.relative_to(root) for path in root.rglob("*.parquet")) == files
 
 
 def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-03"
     )
-    healthy = lake.admin.status.validate_manifest(
+    healthy = lake.integrity.validate_manifest(
         "daily", source="custom", deep=True
     )
     assert healthy["valid"]
     assert healthy["files_scanned"] == healthy["manifest_files"]
 
-    root = lake.paths.dataset_root("custom", "daily")
+    root = lake._paths.dataset_root("custom", "daily")
     orphan = root / "year=1999" / "orphan.parquet"
     orphan.parent.mkdir(parents=True)
     pl.DataFrame({"time": ["1999-01-01"], "asset_id": ["X"]}).write_parquet(orphan)
-    with_orphan = lake.admin.status.validate_manifest(
+    with_orphan = lake.integrity.validate_manifest(
         "daily", source="custom", deep=True
     )
     assert with_orphan["orphaned_files"] == ["year=1999/orphan.parquet"]
@@ -414,7 +357,7 @@ def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> No
     pl.DataFrame(
         {"time": ["2025-01-02"], "asset_id": ["000001.SZ"], "close": [99.0]}
     ).write_parquet(manifested)
-    mismatched = lake.admin.status.validate_manifest(
+    mismatched = lake.integrity.validate_manifest(
         "daily", source="custom", deep=True
     )
     assert any(issue["kind"] == "mismatch" for issue in mismatched["issues"])
@@ -422,7 +365,7 @@ def test_deep_manifest_validation_detects_orphans_and_mismatches(tmp_path) -> No
 
 def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
 
@@ -430,7 +373,7 @@ def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -
         raise AssertionError("fast health must not read parquet")
 
     monkeypatch.setattr(pl, "read_parquet", fail)
-    result = lake.admin.status.validate_manifest(
+    result = lake.integrity.validate_manifest(
         "daily", source="custom", deep=False
     )
 
@@ -440,13 +383,13 @@ def test_fast_manifest_validation_does_not_read_parquet(tmp_path, monkeypatch) -
 
 def test_deep_manifest_validation_isolates_unreadable_file(tmp_path) -> None:
     lake = _daily_lake(tmp_path, LedgerSource())
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="2025-01-02", end="2025-01-02"
     )
-    path = next(lake.paths.dataset_root("custom", "daily").rglob("*.parquet"))
+    path = next(lake._paths.dataset_root("custom", "daily").rglob("*.parquet"))
     path.write_bytes(b"not parquet")
 
-    result = lake.admin.status.validate_manifest(
+    result = lake.integrity.validate_manifest(
         "daily", source="custom", deep=True
     )
 
@@ -464,26 +407,26 @@ def test_commit_failure_cannot_publish_buffered_daily_success(
 
     monkeypatch.setattr(lake._pipeline, "commit_frame", fail_commit)
     with pytest.raises(PermissionError, match="locked partition"):
-        lake.update.dataset(
+        lake.raw.update(
             "daily",
             source="custom",
             start="2025-01-02",
             end="2025-01-03",
         )
 
-    rows = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    rows = lake.integrity.update_scopes(dataset="daily", source="custom")
     assert {row["status"] for row in rows} == {"failed"}
     assert not any(row["commit_run_id"] for row in rows)
-    assert lake.admin.status.runs(1)[0]["status"] == "failed"
+    assert lake.integrity.runs(1)[0]["status"] == "failed"
 
 
 def test_removed_audit_public_surface(tmp_path) -> None:
     assert not hasattr(bagelquant_data, "UpdatePlan")
     assert not hasattr(bagelquant_data, "CoverageSummary")
-    lake = DataLake.open(tmp_path)
-    assert not hasattr(lake.update, "plan")
-    assert not hasattr(lake.update, "execute")
-    assert not hasattr(lake.update, "state_fingerprint")
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    assert not hasattr(lake.raw, "plan")
+    assert not hasattr(lake.raw, "execute")
+    assert not hasattr(lake.raw, "state_fingerprint")
 
 
 def test_atomic_parquet_replace_retries_transient_permission_errors(

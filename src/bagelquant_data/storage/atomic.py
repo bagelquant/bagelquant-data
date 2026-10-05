@@ -22,7 +22,7 @@ def atomic_write_parquet(
 ) -> None:
     """Write a parquet file then atomically replace the destination."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    Path(_filesystem_path(path.parent)).mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     filesystem_tmp = _filesystem_path(tmp)
     try:
@@ -40,12 +40,17 @@ def atomic_write_parquet(
                 if expected_schema is not None
                 else frame.head(0).to_arrow().schema
             )
-            schema_matches = parquet_file.schema_arrow.equals(physical_schema)
+            # Parquet dictionary pages normalize large_string dictionary values
+            # to string. Compare their Polars logical types so categorical and
+            # enum values retain their declared scalar type across the roundtrip.
+            schema_matches = pl.Schema(parquet_file.schema_arrow) == pl.Schema(
+                physical_schema
+            )
         finally:
             parquet_file.close()
         if (
             metadata.num_rows != frame.height
-            or metadata.num_columns != frame.width
+            or len(physical_schema) != frame.width
             or not schema_matches
         ):
             raise ValidationError(

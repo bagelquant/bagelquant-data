@@ -1,23 +1,26 @@
 # Quickstart
 
 ```python
+from pathlib import Path
+from datetime import date
 import polars as pl
-from bagelquant_data import DataLake, DatasetSpec
+from bagelquant_data import DataLake, DatasetSpec, RawInput
 
-lake = DataLake.open("data")
-daily = DatasetSpec(
-    "daily",
-    "by_daily",
-    calendar="trade_cal",
-    field_mappings={"trade_date": "time", "ts_code": "asset_id"},
-)
-lake.ingest(
-    daily,
-    pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"], "close": [11.25]}),
-)
-
-close = lake.query.query("daily", source="custom", fields=["time", "asset_id", "close"])
-print(close.collect())
+lake = DataLake.open(data_meta_path=Path("example/data_meta.sqlite"),
+                     lake_path=Path("example/lake"))
+spec = DatasetSpec("prices", "by_date", date_kind="calendar",
+                   field_mappings={"time": "time", "asset_id": "asset_id"})
+lake.raw.ingest(spec, pl.DataFrame({
+    "time": [date(2020, 1, 2)], "asset_id": ["A"], "close": [11.25],
+}), mode="initialize")
+print(lake.raw.observations("prices", source="custom").collect())
+receipt = lake.inputs.freeze({"prices": RawInput("custom", "prices")},
+                             information_cutoff="2020-01-02")
+print(lake.inputs.read(receipt, "prices").collect())
+print(lake.inputs.verify(receipt))
 ```
 
-Use `uv sync` to install the project and `uv run pytest` to run its tests.
+This example uses local supplied frames, without provider calls. Initialization
+records a historical baseline; strict reads can exclude unverified timing.
+To open existing data pass the same explicit paths and `read_only=True`. Mutating
+APIs then raise `PermissionError`, and missing files/databases fail without creation.

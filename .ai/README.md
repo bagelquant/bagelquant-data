@@ -6,14 +6,15 @@ topic rules; rules are authoritative instructions and linked docs explain use.
 | Task topic | Owner rules | Relevant docs |
 | --- | --- | --- |
 | Dataset/provider mapping, availability cutoff, ingestion, scopes, retries, pagination/resources | [Ingestion and updates](rules/ingestion-updates.md) | [Datasets](../docs/en/3_datasets.md), [Sources](../docs/en/4_sources.md), [Updates](../docs/en/5_updates.md) |
-| Raw/derived datasets, Parquet/SQLite commit, frozen/PIT input evidence, schema, recovery, integrity/quarantine | [Storage and recovery](rules/storage-recovery.md) | [Queries](../docs/en/6_queries.md), [Operations](../docs/en/7_operations.md), [Chinese PIT overview](../docs/zh-CN/1_overview.md) |
+| Raw/DataItems, classification, Parquet/SQLite commit, frozen/PIT inputs, schema, recovery and integrity | [Storage and recovery](rules/storage-recovery.md) | [Queries](../docs/en/6_queries.md), [Operations](../docs/en/7_operations.md), [DataItems](../docs/en/8_items.md), [Exploration](../docs/en/9_exploration.md) |
 | Public facade or data-boundary change | Both owner rules and [development](rules/development.md) | [Overview](../docs/en/1_overview.md), [Quickstart](../docs/en/2_quickstart.md) |
 
 Data is independently versioned and imports no BagelQuant package. Its target
-owns Raw and neutral generic derived datasets, storage/query/versions/PIT and
-frozen input evidence. The derived-data expansion and relocation of generic
-input mechanisms from Workbench are pending stage 2; current guides describe
-the existing Raw lake, not those future APIs or schemas.
+owns Raw and neutral DataItems, categories, storage/query/versions/PIT, frozen
+input receipts and recovery. Version 0.7 implements the stage-2 public facades
+with explicit data_meta_path/lake_path and one Data SQLite (schema 5). Data's
+guides describe this implemented contract; real database/service cutover remains
+separate. Exploration returns pure statistics and Polars tables.
 
 Workbench remains the downstream composition root for China semantics, app
 metadata, research governance and task orchestration through public package APIs.

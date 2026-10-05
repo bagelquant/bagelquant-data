@@ -126,7 +126,7 @@ def test_provider_admission_is_cancelable_without_calling_provider(monkeypatch) 
         return checks[0] > 2
 
     result = _fetch_one(
-        DatasetSpec(name="balancesheet", source="tushare", update_type="by_daily"),
+        DatasetSpec(name="balancesheet", source="tushare", update_type="by_date"),
         source, {"id": "A"}, "request", 3, 60.0, canceled,
     )
     assert result.status == "cancelled"

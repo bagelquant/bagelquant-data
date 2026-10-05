@@ -6,11 +6,11 @@ from datetime import date, datetime
 from pathlib import Path
 
 from bagelquant_data.core.types import DateLike
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 
 
 def manifest_rows(
-    metadata: MetadataStore,
+    metadata: DataMetaStore,
     source: str,
     dataset: str,
     *,
@@ -39,7 +39,7 @@ def manifest_rows(
     return rows
 
 
-def manifest_paths(metadata: MetadataStore, source: str, dataset: str) -> list[Path]:
+def manifest_paths(metadata: DataMetaStore, source: str, dataset: str) -> list[Path]:
     """Return all known manifest paths for compatibility."""
 
     return [

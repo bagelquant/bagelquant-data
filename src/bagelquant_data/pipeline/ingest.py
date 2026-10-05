@@ -13,10 +13,9 @@ from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.normalization import NormalizeContext, StandardNormalizer
 from bagelquant_data.core.registry import FrameworkRegistries
 from bagelquant_data.pipeline.commit import CommitResult
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.parquet import ParquetStore
 from bagelquant_data.storage.rejected import RejectedStore
-from bagelquant_data.storage.staging import StagingStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,14 +56,12 @@ class IngestionPipeline:
         *,
         registries: FrameworkRegistries,
         parquet: ParquetStore,
-        metadata: MetadataStore,
-        staging: StagingStore,
+        metadata: DataMetaStore,
         rejected: RejectedStore,
     ) -> None:
         self.registries = registries
         self.parquet = parquet
         self.metadata = metadata
-        self.staging = staging
         self.rejected = rejected
 
     def ingest_frame(
@@ -131,6 +128,8 @@ class IngestionPipeline:
         mode: str = "incremental",
         ingested_at: datetime | None = None,
         requests: list[dict] | None = None,
+        scope_transitions: list[dict] | None = None,
+        partition_workers: int = 1,
     ) -> CommitResult:
         """Commit a frame as part of an existing logical run."""
 
@@ -167,5 +166,7 @@ class IngestionPipeline:
             mode=mode,
             ingested_at=ingested_at,
             requests=requests,
+            scope_transitions=scope_transitions,
             writer_executor=writer_executor,
+            partition_workers=partition_workers,
         )

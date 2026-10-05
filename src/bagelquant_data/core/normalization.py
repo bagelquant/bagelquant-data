@@ -69,7 +69,7 @@ class StandardNormalizer:
         if "period" in renamed_names:
             expressions.append(_date_expr("period").alias("period"))
         accepted = lf.with_columns(expressions)
-        if spec.update_type == "by_daily":
+        if spec.update_type == "by_date":
             source_dates = spec.source_time_fields or ("time",)
             accepted = accepted.with_columns(
                 pl.coalesce([_date_expr(field) for field in source_dates]).alias(

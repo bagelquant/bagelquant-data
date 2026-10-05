@@ -59,7 +59,7 @@ def test_update_manifest_snapshot_reads_only_selected_datasets() -> None:
         def manifest(self, source: str, dataset: str):  # noqa: ANN201
             calls.append((source, dataset))
             return [
-                {
+                {"generation_path": f"{dataset}.parquet",
                     "dataset": dataset,
                     "partition_path": f"{dataset}.parquet",
                     "content_hash": dataset,
@@ -244,9 +244,9 @@ class EmptyMultiDayRangeSource(DailyRangeSource):
 def _daily_range_lake(
     tmp_path, source: DailyRangeSource, sessions: list[date]
 ) -> DataLake:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {
@@ -255,10 +255,10 @@ def _daily_range_lake(
             }
         ),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
@@ -280,9 +280,9 @@ def _daily_range_options() -> dict[str, Any]:
 
 def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "stock_basic",
             "general",
@@ -291,16 +291,16 @@ def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "stock_basic",
         source="custom",
         params={"exchange": "SZSE", "list_status": "P"},
     )
     source.responses["stock_basic"] = pl.DataFrame({"code": ["B"]})
-    lake.update.dataset("stock_basic", source="custom")
+    lake.raw.update("stock_basic", source="custom")
 
     frame = cast(
-        pl.DataFrame, lake.query.query_general("stock_basic", source="custom").collect()
+        pl.DataFrame, lake.raw.read("stock_basic", source="custom", view="latest").collect()
     )
     assert frame["code"].to_list() == ["B"]
     assert source.requests[0] == {"exchange": "SZSE", "list_status": "P"}
@@ -310,17 +310,17 @@ def test_each_explicit_general_update_commits_a_new_snapshot(
     tmp_path,
 ) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(DatasetSpec("stock_basic", "general"))
 
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-03"
     )
-    repeated = lake.update.dataset(
+    repeated = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-03"
     )
-    advanced = lake.update.dataset(
+    advanced = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-04"
     )
 
@@ -328,7 +328,7 @@ def test_each_explicit_general_update_commits_a_new_snapshot(
     assert repeated.request_count == 1
     assert advanced.request_count == 1
     assert len(source.requests) == 3
-    scopes = lake.admin.status.update_scopes(
+    scopes = lake.integrity.update_scopes(
         source="custom", dataset="stock_basic"
     )
     assert [(row["scope_key"], row["status"]) for row in scopes] == [
@@ -341,63 +341,48 @@ def test_dated_general_update_requires_a_real_snapshot_checkpoint(
     tmp_path,
 ) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["new"]})})
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
     spec = DatasetSpec("stock_basic", "general")
-    lake.ingest(spec, pl.DataFrame({"code": ["stored"]}))
+    lake.raw.ingest(spec, pl.DataFrame({"code": ["stored"]}))
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-03"
     )
 
     assert report.request_count == 1
     assert source.requests == [{}]
-    assert lake.query.query_general(
+    assert lake.raw.read(
         "stock_basic", source="custom"
-    ).collect()["code"].to_list() == ["new"]
+    , view="latest").collect()["code"].to_list() == ["new"]
 
 
-def test_dated_general_update_refetches_after_quarantine(tmp_path) -> None:
-    source = FanoutSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(DatasetSpec(
-        "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D", "P"]},),
-    ))
-    first = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
-    assert first.request_count == 3
-    lake.admin.quarantine_partitions("stock_basic", source="custom",
-        partition_paths=["data.parquet"], reason="fixture damage", repair_id="test", confirm=True)
-    repaired = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
-    assert repaired.request_count == 3
-    assert repaired.status == "success"
-    assert lake.admin.validate_dataset("stock_basic", source="custom", deep=True)["valid"]
 
 
 def test_new_general_snapshot_supersedes_an_unfinished_older_attempt(tmp_path) -> None:
     source = FanoutSource(failed_status="D")
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(DatasetSpec(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(DatasetSpec(
         "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D", "P"]},),
     ))
-    failed = lake.update.dataset("stock_basic", source="custom", end="2025-01-02", max_retries=1)
+    failed = lake.raw.update("stock_basic", source="custom", end="2025-01-02", max_retries=1)
     assert failed.status == "failed"
     source.failed_status = None
-    repaired = lake.update.dataset("stock_basic", source="custom", end="2025-01-03")
+    repaired = lake.raw.update("stock_basic", source="custom", end="2025-01-03")
     assert repaired.request_count == 3
     assert repaired.status == "success"
     assert repaired.remaining_scope_count == 0
-    assert lake.admin.validate_dataset("stock_basic", source="custom", deep=True)["valid"]
+    assert lake.integrity.scan("stock_basic", source="custom", deep=True)["valid"]
 
 
 def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(
     tmp_path,
 ) -> None:
     source = FanoutSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "stock_basic",
             "general",
@@ -409,23 +394,23 @@ def test_general_update_expands_parameter_sets_and_keeps_literal_default_lists(
         )
     )
 
-    lake.update.dataset("stock_basic", source="custom")
+    lake.raw.update("stock_basic", source="custom")
 
     assert sorted(source.requests, key=lambda request: str(request["list_status"])) == sorted([
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "L"},
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "D"},
         {"exchange": "SSE", "ts_code": ["000001.SZ", "000002.SZ"], "list_status": "P"},
     ], key=lambda request: str(request["list_status"]))
-    assert lake.query.query_general("stock_basic", source="custom").collect()[
+    assert lake.raw.read("stock_basic", source="custom", view="latest").collect()[
         "status"
     ].sort().to_list() == ["D", "L", "P"]
 
 
 def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
     source = FanoutSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "stock_basic",
             "general",
@@ -436,15 +421,15 @@ def test_parameter_set_cartesian_product_and_runtime_override(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset("stock_basic", source="custom", workers=1)
+    lake.raw.update("stock_basic", source="custom", workers=1)
 
-    assert sorted(source.requests, key=str) == sorted([
+    assert sorted(source.requests, key=lambda row: sorted(row.items())) == sorted([
         {"list_status": "L", "exchange": "SSE"},
         {"list_status": "L", "exchange": "SZSE"},
         {"list_status": "D", "exchange": "SSE"},
         {"list_status": "D", "exchange": "SZSE"},
         {"list_status": "P"},
-    ], key=str)
+    ], key=lambda row: sorted(row.items()))
 
 
 
@@ -452,14 +437,14 @@ def test_general_update_retains_existing_data_when_parameter_set_call_fails(
     tmp_path,
 ) -> None:
     source = FanoutSource(failed_status="D")
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
     spec = DatasetSpec(
         "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D"]},)
     )
-    lake.ingest(spec, pl.DataFrame({"status": ["old"]}))
+    lake.raw.ingest(spec, pl.DataFrame({"status": ["old"]}))
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "stock_basic",
         source="custom",
         max_retries=1,
@@ -467,7 +452,7 @@ def test_general_update_retains_existing_data_when_parameter_set_call_fails(
     )
 
     assert report.status == "failed"
-    assert lake.query.query_general("stock_basic", source="custom").collect()[
+    assert lake.raw.read("stock_basic", source="custom", view="latest").collect()[
         "status"
     ].to_list() == ["old"]
 
@@ -476,13 +461,13 @@ def test_dated_general_failure_leaves_every_snapshot_scope_retryable(
     tmp_path,
 ) -> None:
     source = FanoutSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
     spec = DatasetSpec(
         "stock_basic", "general", source_api_param_sets=({"list_status": ["L", "D"]},)
     )
-    lake.admin.datasets.register(spec)
-    initial = lake.update.dataset(
+    lake.raw.register(spec)
+    initial = lake.raw.update(
         "stock_basic",
         source="custom",
         end="2025-01-02",
@@ -491,7 +476,7 @@ def test_dated_general_failure_leaves_every_snapshot_scope_retryable(
     )
     source.failed_status = "D"
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "stock_basic",
         source="custom",
         end="2025-01-03",
@@ -499,34 +484,34 @@ def test_dated_general_failure_leaves_every_snapshot_scope_retryable(
         retry_backoff_seconds=0,
     )
 
-    scopes = lake.admin.status.update_scopes(
+    scopes = lake.integrity.update_scopes(
         dataset="stock_basic", source="custom"
     )
     assert initial.status == "success"
     assert report.status == "failed"
     assert {str(scope["status"]) for scope in scopes} == {"failed", "success"}
     assert not any(scope["status"] == "running" for scope in scopes)
-    assert lake.query.query_general("stock_basic", source="custom").collect()[
+    assert lake.raw.read("stock_basic", source="custom", view="latest").collect()[
         "status"
     ].sort().to_list() == ["D", "L"]
 
 
-def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(
+def test_by_date_fetches_missing_calendar_dates_and_writes_year_month(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = StaticSource({})
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 0]}
         ),
     )
-    lake.ingest(
+    lake.raw.ingest(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             source_api_params={"date": "wrong", "exchange": "SSE"},
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
@@ -536,7 +521,7 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(
         ),
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         today="2025-01-04",
@@ -548,25 +533,25 @@ def test_by_daily_fetches_missing_calendar_dates_and_writes_year_month(
         {"date": "2025-01-03", "exchange": "SZSE"},
     ]
     assert (
-        lake.admin.status.partitions("daily", source="custom")[0]["partition_path"]
+        lake.raw.manifest("daily", source="custom")[0]["partition_path"]
         == "year=2025/month=01/data.parquet"
     )
 
 
-def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+def test_by_date_uses_configured_date_parameter(tmp_path) -> None:
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = StaticSource(
         {"st": pl.DataFrame({"trade_date": ["20250102"], "ts_code": ["000001.SZ"]})}
     )
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "st",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             date_param="pub_date",
             source_api_params={"pub_date": "wrong"},
@@ -574,29 +559,29 @@ def test_by_daily_uses_configured_date_parameter(tmp_path) -> None:
         )
     )
 
-    lake.update.dataset("st", source="custom", today="2025-01-02")
+    lake.raw.update("st", source="custom", today="2025-01-02")
 
     assert source.requests == [{"pub_date": "2025-01-02"}]
 
 
 
 
-def test_by_daily_ledger_checks_every_untracked_date(
+def test_by_date_ledger_checks_every_untracked_date(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = StaticSource({})
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 1]}
         ),
     )
-    lake.ingest(
+    lake.raw.ingest(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         ),
@@ -609,7 +594,7 @@ def test_by_daily_ledger_checks_every_untracked_date(
         ),
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="20250101", end="20250104"
     )
 
@@ -621,23 +606,23 @@ def test_by_daily_ledger_checks_every_untracked_date(
 
 
 def test_empty_incremental_dataset_accepts_compact_fallback_dates(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = StaticSource({})
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["19991231", "20000101"], "is_open": [1, 1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start="19991231", end="19991231"
     )
 
@@ -645,24 +630,24 @@ def test_empty_incremental_dataset_accepts_compact_fallback_dates(tmp_path) -> N
 
 
 def test_explicit_dataset_list_includes_general_refresh(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
-    lake.admin.datasets.register(
+    lake.raw.register(DatasetSpec("stock_basic", "general"))
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    report = lake.update.datasets(
+    report = lake.raw.update_many(
         ["stock_basic", "daily"],
         source="custom",
         end="20250102",
@@ -674,9 +659,9 @@ def test_explicit_dataset_list_includes_general_refresh(tmp_path) -> None:
 
 def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -> None:
     source = FanoutSource(failed_status="L")
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "stock_basic", "general", source_api_param_sets=({"list_status": "L"},)
         )
@@ -684,7 +669,7 @@ def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -
     waits: list[float] = []
     monkeypatch.setattr("bagelquant_data.pipeline.update.time.sleep", waits.append)
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "stock_basic",
         source="custom",
         retry_backoff_seconds=60,
@@ -696,10 +681,10 @@ def test_retry_wait_is_fixed_and_attempt_count_is_three(tmp_path, monkeypatch) -
 
 
 def test_datasets_run_sequentially_with_workers_inside_each_dataset(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = ConcurrentDailySource(release_at=4)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {
@@ -709,16 +694,16 @@ def test_datasets_run_sequentially_with_workers_inside_each_dataset(tmp_path) ->
         ),
     )
     for name in ("daily", "daily_basic"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 name,
-                "by_daily",
+                "by_date",
                 calendar="trade_cal",
                 field_mappings={"trade_date": "time", "ts_code": "asset_id"},
             )
         )
 
-    lake.update.datasets(
+    lake.raw.update_many(
         ["daily", "daily_basic"],
         source="custom",
         end="2025-01-05",
@@ -734,24 +719,24 @@ def test_datasets_run_sequentially_with_workers_inside_each_dataset(tmp_path) ->
 
 
 def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = ConcurrentDailySource(failures={"2025-01-02"})
-    lake.admin.sources.register(source)
+    lake.catalog.sources.register(source)
     calendar = DatasetSpec("trade_cal", "general")
-    lake.ingest(
+    lake.raw.ingest(
         calendar,
         pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-03",
@@ -760,19 +745,19 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
     )
     assert first.status == "partial"
     assert first.remaining_scope_count == 1
-    assert lake.admin.status.update_scopes(
+    assert lake.integrity.update_scopes(
         dataset="daily", source="custom", status="failed"
     )
 
     source.failures.clear()
     source.requests.clear()
-    lake.ingest(
+    lake.raw.ingest(
         calendar,
         pl.DataFrame(
             {"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 1]}
         ),
     )
-    second = lake.update.dataset(
+    second = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-04",
@@ -787,7 +772,7 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
         "2025-01-04",
     ]
     assert (
-        lake.admin.status.update_scopes(
+        lake.integrity.update_scopes(
             dataset="daily", source="custom", status="failed"
         )
         == []
@@ -813,23 +798,23 @@ def test_all_null_payload_policy_retries_only_matching_invalid_scope(tmp_path) -
             )
 
     source = SparseEventSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "suspend_d",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             primary_key_extra=("suspend_type",),
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "suspend_d",
         source="custom",
         end="2025-01-02",
@@ -837,7 +822,7 @@ def test_all_null_payload_policy_retries_only_matching_invalid_scope(tmp_path) -
     )
 
     assert first.status == "failed"
-    invalid = lake.admin.status.update_scopes(
+    invalid = lake.integrity.update_scopes(
         dataset="suspend_d",
         source="custom",
         status="invalid",
@@ -845,7 +830,7 @@ def test_all_null_payload_policy_retries_only_matching_invalid_scope(tmp_path) -
     assert len(invalid) == 1
     assert invalid[0]["last_error"] == "response payload is entirely null"
 
-    second = lake.update.dataset(
+    second = lake.raw.update(
         "suspend_d",
         source="custom",
         end="2025-01-02",
@@ -856,12 +841,12 @@ def test_all_null_payload_policy_retries_only_matching_invalid_scope(tmp_path) -
     assert second.status == "success"
     assert len(source.requests) == 2
     assert source.requests[-1] == {"date": "2025-01-02"}
-    scopes = lake.admin.status.update_scopes(
+    scopes = lake.integrity.update_scopes(
         dataset="suspend_d",
         source="custom",
     )
     assert [row["status"] for row in scopes] == ["success"]
-    frame = lake.query.query("suspend_d", source="custom").collect()
+    frame = lake.raw.read("suspend_d", source="custom", view="latest").collect()
     assert frame.select("suspend_type", "suspend_timing").to_dicts() == [
         {"suspend_type": "S", "suspend_timing": None}
     ]
@@ -885,21 +870,21 @@ def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -
             )
 
     source = NullKeySource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",
@@ -909,7 +894,7 @@ def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -
     assert first.status == "failed"
     assert source.requests == 1
 
-    second = lake.update.dataset(
+    second = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",
@@ -920,7 +905,7 @@ def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -
     assert second.status == "failed"
     assert second.request_count == 1
     assert source.requests == 2
-    assert lake.admin.status.update_scopes(
+    assert lake.integrity.update_scopes(
         dataset="daily",
         source="custom",
         status="invalid",
@@ -928,29 +913,29 @@ def test_all_null_payload_policy_does_not_retry_other_invalid_reason(tmp_path) -
 
 
 def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = ConcurrentDailySource(failures={"2025-01-02"})
-    lake.admin.sources.register(source)
+    lake.catalog.sources.register(source)
     calendar = DatasetSpec("trade_cal", "general")
-    lake.ingest(
+    lake.raw.ingest(
         calendar,
         pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-03",
         max_retries=1,
     )
-    lake.ingest(
+    lake.raw.ingest(
         calendar,
         pl.DataFrame(
             {"time": ["20250102", "20250103", "20250104"], "is_open": [1, 1, 1]}
@@ -958,7 +943,7 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
     )
     source.requests.clear()
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-04",
@@ -972,23 +957,23 @@ def test_persistent_failed_job_does_not_block_new_daily_work(tmp_path) -> None:
         "2025-01-04",
     ]
     assert report.remaining_scope_count == 1
-    assert lake.query.query("daily", source="custom").collect()[
+    assert lake.raw.read("daily", source="custom", view="latest").collect()[
         "time"
     ].max() == __import__("datetime").date(2025, 1, 4)
 
 
 def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = PaginatedDailySource()
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
@@ -1000,23 +985,23 @@ def test_paginated_failure_retries_the_whole_logical_job(tmp_path) -> None:
         "max_retries": 1,
     }
 
-    first = lake.update.dataset("daily", **options)
+    first = lake.raw.update("daily", **options)
     assert first.status == "failed"
-    assert lake.admin.status.files("daily", source="custom") == []
-    failed = lake.admin.status.update_scopes(
+    assert lake.raw.manifest("daily", source="custom") == []
+    failed = lake.integrity.update_scopes(
         dataset="daily", source="custom", status="failed"
     )
     assert failed[0]["scope_key"] == "2025-01-02"
 
     source.fail_second_page = False
     source.requests.clear()
-    second = lake.update.dataset("daily", **options)
+    second = lake.raw.update("daily", **options)
 
     assert second.status == "success"
     assert [request["offset"] for request in source.requests] == [0, 2]
-    assert lake.query.query("daily", source="custom").collect().height == 3
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 3
     assert (
-        lake.admin.status.update_scopes(
+        lake.integrity.update_scopes(
             dataset="daily", source="custom", status="failed"
         )
         == []
@@ -1036,7 +1021,7 @@ def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> N
     source = DailyRangeSource(rows)
     lake = _daily_range_lake(tmp_path, source, sessions)
 
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1054,18 +1039,18 @@ def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> N
             "end_date": sessions[-1].isoformat(),
         }
     ]
-    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    scopes = lake.integrity.update_scopes(dataset="daily", source="custom")
     assert [row["status"] for row in scopes[:2]] == ["empty", "empty"]
     assert all(row["status"] == "success" for row in scopes[2:])
     assert all(row["commit_run_id"] == first.run_id for row in scopes[2:])
-    checks = lake.admin.status.provider_scope_checks(
+    checks = lake.integrity.provider_scope_checks(
         dataset="daily", source="custom"
     )
     assert [row["checked_through"] for row in checks[:2]] == [
         sessions[0].isoformat(),
         sessions[1].isoformat(),
     ]
-    calls = lake.metadata._rows(
+    calls = lake._data_meta._rows(
         "select request_kind,scope_id,request_params from api_calls "
         "where dataset='daily' order by rowid"
     )
@@ -1074,7 +1059,7 @@ def test_daily_initial_range_maps_mixed_results_to_durable_scopes(tmp_path) -> N
     assert calls[0]["scope_id"] is None
 
     source.requests.clear()
-    second = lake.update.dataset(
+    second = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1102,7 +1087,7 @@ def test_daily_dense_range_bisects_silent_empty_parent(tmp_path) -> None:
     options["empty_range_policy"] = "bisect"
     options["require_nonempty_scopes"] = True
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1116,7 +1101,7 @@ def test_daily_dense_range_bisects_silent_empty_parent(tmp_path) -> None:
     assert report.empty_count == 0
     assert all(
         row["status"] == "success"
-        for row in lake.admin.status.update_scopes(
+        for row in lake.integrity.update_scopes(
             dataset="daily", source="custom"
         )
     )
@@ -1134,7 +1119,7 @@ def test_daily_dense_response_rejects_missing_scope(tmp_path) -> None:
     options = _daily_range_options()
     options["require_nonempty_scopes"] = True
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1147,7 +1132,7 @@ def test_daily_dense_response_rejects_missing_scope(tmp_path) -> None:
     assert report.success_count == 1
     assert [
         row["status"]
-        for row in lake.admin.status.update_scopes(
+        for row in lake.integrity.update_scopes(
             dataset="daily", source="custom"
         )
     ] == ["invalid", "invalid", "success"]
@@ -1158,12 +1143,12 @@ def test_daily_initial_range_requests_only_new_pending_tail(tmp_path) -> None:
     rows = {value.isoformat(): (f"{index:06d}.SZ",) for index, value in enumerate(sessions)}
     source = DailyRangeSource(rows)
     lake = _daily_range_lake(tmp_path, source, sessions)
-    lake.update.dataset(
+    lake.raw.update(
         "daily", source="custom", start=sessions[0], end=sessions[2]
     )
     source.requests.clear()
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1185,9 +1170,9 @@ def test_daily_initial_range_groups_each_variant_independently(tmp_path) -> None
     sessions = [date(2025, 1, 3), date(2025, 1, 6), date(2025, 1, 7)]
     rows = {value.isoformat(): ("ignored",) for value in sessions}
     source = DailyRangeSource(rows)
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {
@@ -1196,17 +1181,17 @@ def test_daily_initial_range_groups_each_variant_independently(tmp_path) -> None
             }
         ),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             source_api_param_sets=({"index_code": ["IDX-A", "IDX-B"]},),
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1233,7 +1218,7 @@ def test_daily_initial_range_discards_saturated_parents(tmp_path) -> None:
     options = _daily_range_options()
     options["daily_range_backfill"]["row_limit"] = 2
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1244,8 +1229,8 @@ def test_daily_initial_range_discards_saturated_parents(tmp_path) -> None:
     assert report.status == "success"
     assert report.request_count == 7
     assert report.success_count == 4
-    assert lake.query.query("daily", source="custom").collect().height == 4
-    calls = lake.metadata._rows(
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 4
+    calls = lake._data_meta._rows(
         "select row_count,status,request_kind from api_calls "
         "where dataset='daily' order by rowid"
     )
@@ -1265,7 +1250,7 @@ def test_daily_initial_range_saturated_leaf_uses_offset_pagination(tmp_path) -> 
     options = _daily_range_options()
     options["daily_range_backfill"]["row_limit"] = 2
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1275,8 +1260,8 @@ def test_daily_initial_range_saturated_leaf_uses_offset_pagination(tmp_path) -> 
 
     assert report.status == "success"
     assert report.request_count == 5
-    assert lake.query.query("daily", source="custom").collect().height == 2
-    scopes = lake.admin.status.update_scopes(dataset="daily", source="custom")
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 2
+    scopes = lake.integrity.update_scopes(dataset="daily", source="custom")
     assert [row["status"] for row in scopes] == ["success", "empty"]
 
 
@@ -1286,7 +1271,7 @@ def test_daily_initial_range_resumes_after_cooperative_cancel(tmp_path) -> None:
     source = DailyRangeSource(rows)
     lake = _daily_range_lake(tmp_path, source, sessions)
 
-    canceled = lake.update.dataset(
+    canceled = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1299,12 +1284,12 @@ def test_daily_initial_range_resumes_after_cooperative_cancel(tmp_path) -> None:
     assert source.requests == []
     assert all(
         row["status"] == "pending"
-        for row in lake.admin.status.update_scopes(
+        for row in lake.integrity.update_scopes(
             dataset="daily", source="custom"
         )
     )
 
-    resumed = lake.update.dataset(
+    resumed = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1329,7 +1314,7 @@ def test_daily_range_transport_failure_retries_as_individual_days(tmp_path) -> N
     source.fail = True
     lake = _daily_range_lake(tmp_path, source, sessions)
 
-    failed = lake.update.dataset(
+    failed = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],
@@ -1343,7 +1328,7 @@ def test_daily_range_transport_failure_retries_as_individual_days(tmp_path) -> N
     source.fail = False
     source.requests.clear()
 
-    retried = lake.update.dataset(
+    retried = lake.raw.update(
         "daily",
         source="custom",
         start=sessions[0],

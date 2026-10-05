@@ -17,6 +17,8 @@ class RejectedStore:
         self.paths = paths
 
     def write(self, source: str, dataset: str, run_id: str, reason: str, frame: pl.DataFrame) -> Path:
+        if self.paths.read_only:
+            raise PermissionError("Data lake is read-only")
         path = self.paths.rejected / source / dataset / run_id / f"{reason}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = frame.with_columns(

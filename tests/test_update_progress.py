@@ -54,17 +54,17 @@ class RangeProgressSource:
 
 
 def _lake(tmp_path, source: ProgressSource, *datasets: str) -> DataLake:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
     for dataset in datasets:
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 dataset,
-                "by_daily",
+                "by_date",
                 calendar="trade_cal",
                 field_mappings={"trade_date": "time", "ts_code": "asset_id"},
             )
@@ -76,7 +76,7 @@ def test_progress_callback_reports_ledger_phases_and_completion(tmp_path) -> Non
     lake = _lake(tmp_path, ProgressSource(), "daily")
     events: list[UpdateProgress] = []
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",
@@ -98,7 +98,7 @@ def test_progress_callback_counts_paginated_request_as_one_scope(tmp_path) -> No
     lake = _lake(tmp_path, ProgressSource(paginated=True), "daily")
     events: list[UpdateProgress] = []
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",
@@ -113,9 +113,9 @@ def test_progress_callback_counts_paginated_request_as_one_scope(tmp_path) -> No
 
 def test_range_backfill_progress_counts_logical_daily_scopes(tmp_path) -> None:
     source = RangeProgressSource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame(
             {
@@ -124,17 +124,17 @@ def test_range_backfill_progress_counts_logical_daily_scopes(tmp_path) -> None:
             }
         ),
     )
-    lake.admin.datasets.register(
+    lake.raw.register(
         DatasetSpec(
             "daily",
-            "by_daily",
+            "by_date",
             calendar="trade_cal",
             field_mappings={"trade_date": "time", "ts_code": "asset_id"},
         )
     )
     events: list[UpdateProgress] = []
 
-    lake.update.dataset(
+    lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-04",
@@ -161,7 +161,7 @@ def test_progress_callback_reports_multiple_datasets_and_failure(tmp_path) -> No
     lake = _lake(tmp_path, source, "daily", "daily_basic")
     events: list[UpdateProgress] = []
 
-    report = lake.update.datasets(
+    report = lake.raw.update_many(
         ["daily", "daily_basic"],
         source="custom",
         end="2025-01-02",
@@ -174,7 +174,7 @@ def test_progress_callback_reports_multiple_datasets_and_failure(tmp_path) -> No
 
     failed_lake = _lake(tmp_path / "failed", ProgressSource(fail=True), "daily")
     failed_events: list[UpdateProgress] = []
-    failed = failed_lake.update.dataset(
+    failed = failed_lake.raw.update(
         "daily",
         source="custom",
         end="2025-01-02",

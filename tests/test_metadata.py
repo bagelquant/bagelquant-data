@@ -7,20 +7,22 @@ import sys
 import pytest
 
 from bagelquant_data.core import ConfigurationError
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 
 
 def test_metadata_store_initializes_wal_mode(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
 
     with metadata.connect() as db:
         journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0]
 
     assert journal_mode == "wal"
+    assert metadata.data_meta_path == tmp_path / "data_meta.sqlite"
+    assert not hasattr(metadata, "path")
 
 
 def test_metadata_connection_is_closed_after_context_exit(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
 
     with metadata.connect() as connection:
         connection.execute("SELECT 1").fetchone()
@@ -41,9 +43,9 @@ from bagelquant_data import DataLake
 _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
 root = Path(tempfile.mkdtemp())
-lake = DataLake.open(root / "lake")
+lake = DataLake.open(data_meta_path=root / "data_meta.sqlite", lake_path=root / "lake")
 for _ in range(200):
-    lake.metadata.manifest("custom", "missing")
+    lake._data_meta.manifest("custom", "missing")
 with sqlite3.connect(root / "probe.sqlite") as connection:
     connection.execute("CREATE TABLE probe (value INTEGER)")
 """
@@ -59,34 +61,34 @@ with sqlite3.connect(root / "probe.sqlite") as connection:
 
 
 def test_metadata_store_rejects_incompatible_unversioned_schema(tmp_path) -> None:
-    path = tmp_path / "metadata" / "lake.db"
-    path.parent.mkdir()
-    with sqlite3.connect(path) as db:
+    data_meta_path = tmp_path / "data_meta.sqlite"
+    data_meta_path.parent.mkdir(exist_ok=True)
+    with sqlite3.connect(data_meta_path) as db:
         db.execute("create table datasets (category text not null)")
 
     with pytest.raises(
         ConfigurationError, match="Incompatible data-lake metadata schema"
     ):
-        MetadataStore(path)
+        DataMetaStore(data_meta_path=data_meta_path)
 
 
 def test_metadata_store_rejects_schema_v2_without_migration(tmp_path) -> None:
-    path = tmp_path / "metadata" / "lake.db"
-    path.parent.mkdir()
-    with sqlite3.connect(path) as db:
-        db.execute("create table metadata_state (key text primary key, value text)")
+    data_meta_path = tmp_path / "data_meta.sqlite"
+    data_meta_path.parent.mkdir(exist_ok=True)
+    with sqlite3.connect(data_meta_path) as db:
+        db.execute("create table data_meta_state (key text primary key, value text)")
         db.execute(
-            "insert into metadata_state(key,value) values ('schema_version','2')"
+            "insert into data_meta_state(key,value) values ('schema_version','2')"
         )
 
     with pytest.raises(
         ConfigurationError, match="Incompatible data-lake metadata schema"
     ):
-        MetadataStore(path)
+        DataMetaStore(data_meta_path=data_meta_path)
 
 
 def test_record_api_calls_inserts_batch(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
 
     metadata.record_api_calls(
         [
@@ -149,15 +151,16 @@ def test_record_api_calls_inserts_batch(tmp_path) -> None:
 
 
 def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
 
     metadata.upsert_manifests(
         [
             {
+                "generation_path": "year=2024/month=01/data-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.parquet",
                 "source": "tushare",
                 "dataset": "income",
-                "partition_path": "year=2024/bucket=0/data.parquet",
-                "partition_values": {"year": 2024, "bucket": 0},
+                "partition_path": "year=2024/month=01/data.parquet",
+                "partition_values": {"year": 2024, "month": 1},
                 "row_count": 10,
                 "file_size_bytes": 100,
                 "min_time": "2024-01-01",
@@ -166,10 +169,11 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
                 "schema_hash": "schema-1",
             },
             {
+                "generation_path": "year=2024/month=02/data-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.parquet",
                 "source": "tushare",
                 "dataset": "income",
-                "partition_path": "year=2024/bucket=1/data.parquet",
-                "partition_values": {"year": 2024, "bucket": 1},
+                "partition_path": "year=2024/month=02/data.parquet",
+                "partition_values": {"year": 2024, "month": 2},
                 "row_count": 20,
                 "file_size_bytes": 200,
                 "min_time": "2024-01-01",
@@ -182,8 +186,9 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
     metadata.upsert_manifest(
         source="tushare",
         dataset="income",
-        partition_path="year=2024/bucket=0/data.parquet",
-        partition_values={"year": 2024, "bucket": 0},
+        partition_path="year=2024/month=01/data.parquet",
+        generation_path="year=2024/month=01/data-cccccccccccccccccccccccccccccccc.parquet",
+        partition_values={"year": 2024, "month": 1},
         row_count=11,
         file_size_bytes=110,
         min_time="2024-01-01",
@@ -197,13 +202,13 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
     assert [
         (row["partition_path"], row["row_count"], row["content_hash"]) for row in rows
     ] == [
-        ("year=2024/bucket=0/data.parquet", 11, "hash-1b"),
-        ("year=2024/bucket=1/data.parquet", 20, "hash-2"),
+        ("year=2024/month=01/data.parquet", 11, "hash-1b"),
+        ("year=2024/month=02/data.parquet", 20, "hash-2"),
     ]
 
 
 def test_update_scopes_claim_transition_and_reset(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     metadata.synchronize_update_scopes(
         [
             {
@@ -231,7 +236,7 @@ def test_update_scopes_claim_transition_and_reset(tmp_path) -> None:
 
 
 def test_scope_resynchronization_does_not_touch_unchanged_rows(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     scope = {
         "source": "tushare",
         "dataset": "daily",
@@ -250,10 +255,8 @@ def test_scope_resynchronization_does_not_touch_unchanged_rows(tmp_path) -> None
     assert after["updated_at"] == before["updated_at"]
 
 
-def test_writer_session_reuses_one_physical_connection(
-    tmp_path, monkeypatch
-) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+def test_writer_session_reuses_one_physical_connection(tmp_path, monkeypatch) -> None:
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     opened = 0
     original = metadata._new_connection
 
@@ -282,8 +285,10 @@ def test_writer_session_reuses_one_physical_connection(
     assert opened == 1
 
 
-def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+def test_dataset_leases_require_explicit_owner_abandon_after_expired_heartbeat(
+    tmp_path,
+) -> None:
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     metadata.synchronize_update_scopes(
         [
             {
@@ -307,18 +312,21 @@ def test_dataset_leases_are_atomic_and_stale_running_scopes_recover(tmp_path) ->
             "update update_leases set lease_expires_at='2000-01-01T00:00:00+00:00'"
         )
 
-    assert metadata.recover_stale_running_scopes() == 1
+    with pytest.raises(RuntimeError, match="already active"):
+        metadata.acquire_update_leases([("tushare", "daily", "run-2")])
+    assert metadata.update_scopes()[0]["status"] == "running"
+    assert metadata.active_update_leases()[0]["heartbeat_expired"]
+    assert (
+        metadata.abandon_update_owner("run-1", reason="verified dead writer")["scopes"]
+        == 1
+    )
     row = metadata.update_scopes()[0]
     assert row["status"] == "failed"
-    assert row["last_error"] == "writer lease expired"
-
-
-
-
+    assert row["last_error"] == "verified dead writer"
 
 
 def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     metadata.synchronize_update_scopes(
         [
             {
@@ -337,7 +345,7 @@ def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) 
         run_id="run-empty",
         source="tushare",
         dataset="income",
-        mode="by_daily",
+        mode="by_date",
     )
     metadata.claim_update_scopes([scope_id], run_id="run-empty")
 
@@ -376,7 +384,7 @@ def test_empty_result_transaction_rolls_back_as_one_unit(tmp_path, monkeypatch) 
 def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(
     tmp_path,
 ) -> None:
-    metadata = MetadataStore(tmp_path / "metadata" / "lake.db")
+    metadata = DataMetaStore(data_meta_path=tmp_path / "data_meta.sqlite")
     metadata.synchronize_update_scopes(
         {
             "source": "tushare",
@@ -395,7 +403,7 @@ def test_forced_owner_cleanup_preserves_empty_and_retries_only_inflight(
         run_id="run-owner",
         source="tushare",
         dataset="income",
-        mode="by_daily",
+        mode="by_date",
         owner_id=owner_id,
     )
     metadata.acquire_update_leases(

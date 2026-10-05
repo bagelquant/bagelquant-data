@@ -1,85 +1,44 @@
-# Operations
-
-Inspect a lake through `lake.admin`:
+# Integrity and recovery
 
 ```python
-print(lake.admin.summary())
-print(lake.admin.status.dataset("daily", source="tushare"))
-print(lake.admin.status.datasets(source="tushare"))
-print(lake.admin.runs())
-print(lake.admin.status.update_summary(source="tushare"))
+facts = lake.integrity.scan("daily", source="tushare", deep=True)
+catalog_facts = lake.integrity.scan_many(source="tushare", deep=False)
+plan = lake.integrity.repair_plan("daily", source="tushare")
+restored = lake.integrity.repair(plan)
 ```
 
-The update ledger is commit-backed local state. `provider_scope_checks` is the
-separate scheduling watermark, while `api_calls` and ingestion runs are the
-attempt history. Failed scopes retain their error and attempt count. Invalid
-scopes identify provider responses whose keys, date range, asset identity, or
-payload did not satisfy the dataset contract.
+Scans report manifest/schema/key/hash/partition/recovery facts without mutation.
+They do not adopt orphan files or call providers. Shallow scans compare registered
+file inventories; deep scans verify content and registered Arrow evidence.
+Plans bind lake identity and committed manifest. Execution rejects stale or
+foreign plans and holds the dataset's update lease during repair.
 
-Use `reset_update_scopes` to retry selected terminal state deliberately. A
-dataset declaration or parameter-variant change automatically invalidates its
-old scope identities and creates pending work. The narrow exception is a
-`by_daily` update with `source_options.allow_all_null_payload = true`: it
-automatically retries only scopes invalidated by the exact all-null-payload
-error, while all other invalid reasons remain terminal.
+`data_meta_path` alone determines committed visibility. Publication prepares
+compressed Arrow evidence in that SQLite and immutable Parquet files, then
+atomically publishes manifest, schema, commit and coverage. Prepared/unregistered
+files are invisible; retained older registered generations are historical evidence.
 
-Update reports include elapsed, fetch, commit, and metadata timings, commit and
-partition counts, planning time, skipped no-op partitions, and peak in-flight
-calls. Fetch time is cumulative across parallel jobs and may exceed elapsed
-wall-clock time.
+Local repair reproduces registered original hashes and identities. Verified
+recovery batches restore damaged Parquet. Verified committed Parquet can restore
+recovery payloads only when every original batch hash/schema is reproduced.
+If evidence is insufficient, repair fails explicitly. A completely lost metadata
+database requires backup restoration; loose files or current provider bytes
+cannot reconstruct authoritative history. No automatic cleanup/quarantine/
+manifest adoption or metadata migration exists.
 
-Complete provider request parameters remain available through the admin
-facade. Metadata schema v4 stores their JSON as zlib-compressed SQLite blobs
-and decodes them transparently when read.
+Run history, failures, scopes, coverage and active leases are available through
+`lake.integrity`; object summaries through `lake.raw.status/status_many` and
+`lake.items.status`. Scope resets and abandoned-owner recovery are explicit
+mutations, distinct from passive scans. Tests never use the real workspace data root.
+Expired heartbeat is reported without releasing ownership. Only a caller that
+has verified owner termination should call `abandon_update_owner`; publishing
+also checks the still-owned run id, parent generation and current definition.
 
-Use `validate_manifest` for a fast metadata/file comparison. For a complete
-contract check, call
-`lake.admin.validate_dataset("daily", source="tushare", deep=True)`. The deep
-validator also reads every canonical Parquet partition and checks its hash,
-schema, primary-key columns, null and duplicate keys, and physical partition
-ownership. Orphan Parquet files are reported but are never adopted implicitly.
-
-Catalogs should use `lake.admin.status.datasets(...)`: it loads the manifest
-once and returns exact row counts, partition counts, byte sizes, and observed
-minimum/maximum dates for every selected registered dataset. Use
-`lake.admin.validate_datasets(..., deep=False)` for a bulk shallow health scan;
-it loads manifests once and inventories the source's physical Parquet files in
-one traversal. Deep bulk validation intentionally retains the full per-file
-contract checks.
-
-Confirmed corrupt partitions can be moved out of the canonical lake with
-`lake.admin.quarantine_partitions(...)`. Pass `confirm=True`, a reason, and an
-optional repair ID. The operation uses atomic same-lake moves, updates the
-manifest in one transaction, rolls both changes back on failure, and writes a
-recovery journal under
-`.health-repair-quarantine/<repair-id>/<source>/<dataset>/journal.json`.
-Quarantined files are retained until an operator removes them. These integrity
-APIs deliberately do not guess which provider scopes to retry; the application
-layer must reset the affected scopes before its normal update workflow.
-
-Use `rebuild_manifest` only after an intentional external storage repair. It
-adopts the files it finds and therefore is not part of automatic health repair.
-
-## Fresh-lake schema contract
-
-Fresh lakes create metadata schema v4 directly, including canonical dataset
-schemas and compressed API audit payloads. Opening an unversioned or older
-database fails with a clear incompatibility error; the library never migrates,
-repairs, backs up, or rewrites an old lake automatically. Stop all workers,
-delete or archive the old lake, and create a fresh lake root before downloading
-again.
-
-## Snapshot repair and activity
-
-A General snapshot is current only when its canonical manifest and files exist and all current parameter variants have terminal provider scopes. Missing snapshots or unfinished variants cause an explicit update to refetch the entire fanout before replacing the snapshot. Legacy manifest-only scopes are never adopted as provider coverage.
-
-The arrow-ipc-v1 logical hash normalizes unused trailing validity bits before serialization, so identical nullable data has the same checksum across worker counts. Actual values, schema and null positions remain covered.
-
-UpdateProgress includes planning and discovery callbacks before scope counts are known. Fetch activity includes current_scope, in_flight, request_count, wait_reason and wait_seconds. Optional source request_status reports quota waiting without contacting the provider. Completed counts represent logical processed scopes; rows_committed separately tracks publication. Heartbeat pulses never advance either count.
-
-For dated General updates, completion counts belong to the requested snapshot; an unfinished older checkpoint remains attempt history and does not make a successful later full refresh partial.
-
-Incremental updates recheck every date in the most recent three natural days.
-Older terminal `success` and `empty` scopes remain complete unless an explicit
-refresh is requested. Provider-check scheduling stays separate from local
-coverage truth.
+`integrity.backup(data_meta_path=..., lake_path=...)` exports a consistent SQLite
+snapshot and its committed immutable files into new caller paths; it returns
+verified owned file hashes. `integrity.verify_backup()` validates the bundle.
+`DataLake.restore(backup_data_meta_path=..., backup_lake_path=...,
+data_meta_path=..., lake_path=...)` restores a verified same-schema bundle into
+new paths. Backup and restore reject existing destinations. Complete history
+and frozen inputs remain in the single metadata file; older physical files are
+reconstructed from registered Arrow batches when needed.

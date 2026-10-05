@@ -40,9 +40,9 @@ def _discovery() -> RequestDiscoverySpec:
 
 def test_general_discovery_fans_out_declared_provider_api_and_records_provenance(tmp_path) -> None:
     source = DiscoverySource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "logical_membership",
             "general",
@@ -52,7 +52,7 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
         )
     )
 
-    lake.update.dataset("logical_membership", source="custom")
+    lake.raw.update("logical_membership", source="custom")
 
     assert source.calls[0] == ("discover_codes", {"level": "L1"})
     assert sorted(source.calls[1:], key=lambda item: (str(item[1]["code"]), str(item[1]["region"]))) == [
@@ -61,7 +61,7 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
         ("provider_target", {"region": "north", "code": "B"}),
         ("provider_target", {"region": "south", "code": "B"}),
     ]
-    with sqlite3.connect(lake.paths.database) as connection:
+    with sqlite3.connect(lake._paths.data_meta_path) as connection:
         rows = connection.execute(
             "select request_kind, row_count from api_calls"
         ).fetchall()
@@ -76,9 +76,9 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
 
 def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(tmp_path) -> None:
     source = DiscoverySource()
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "logical_membership",
             "general",
@@ -88,11 +88,11 @@ def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(
         )
     )
 
-    lake.update.dataset(
+    lake.raw.update(
         "logical_membership", source="custom", end="2025-01-03"
     )
     call_count = len(source.calls)
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "logical_membership", source="custom", end="2025-01-03"
     )
 
@@ -101,12 +101,12 @@ def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(
 
 
 def test_discovery_values_expand_trading_and_calendar_day_variants(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102", "20250103"], "is_open": [1, 1]}),
     )
-    lake.ingest(
+    lake.raw.ingest(
         DatasetSpec("stock_basic", "general", field_mappings={"ts_code": "asset_id"}),
         pl.DataFrame(
             {
@@ -116,22 +116,22 @@ def test_discovery_values_expand_trading_and_calendar_day_variants(tmp_path) -> 
             }
         ),
     )
-    raw = RawQueryService(lake.parquet, lake.metadata)
+    raw = RawQueryService(lake._parquet, lake._data_meta)
     variants = ({"code": "A"}, {"code": "B"})
     daily = DatasetSpec(
-        "daily", "by_daily", calendar="trade_cal", field_mappings={"trade_date": "time", "ts_code": "asset_id"}
+        "daily", "by_date", calendar="trade_cal", field_mappings={"trade_date": "time", "ts_code": "asset_id"}
     )
     asset = DatasetSpec(
-        "asset", "by_daily", date_kind="calendar", field_mappings={"ann_date": "time", "ts_code": "asset_id"}
+        "asset", "by_date", date_kind="calendar", field_mappings={"ann_date": "time", "ts_code": "asset_id"}
     )
-    lake.admin.datasets.register(daily)
-    lake.admin.datasets.register(asset)
+    lake.raw.register(daily)
+    lake.raw.register(asset)
 
     daily_requests = synchronize_requests(
-        spec=daily, raw=raw, metadata=lake.metadata, start="2025-01-02", end="2025-01-03", discovered_param_sets=variants
+        spec=daily, raw=raw, metadata=lake._data_meta, start="2025-01-02", end="2025-01-03", discovered_param_sets=variants
     )
     asset_requests = synchronize_requests(
-        spec=asset, raw=raw, metadata=lake.metadata, start="2025-01-02", end="2025-01-03", discovered_param_sets=variants
+        spec=asset, raw=raw, metadata=lake._data_meta, start="2025-01-02", end="2025-01-03", discovered_param_sets=variants
     )
 
     assert len(daily_requests) == 4
@@ -142,16 +142,16 @@ def test_discovery_values_expand_trading_and_calendar_day_variants(tmp_path) -> 
 
 def test_discovery_empty_result_and_parameter_conflict_are_rejected(tmp_path) -> None:
     source = DiscoverySource(values=[])
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec("logical", "general", request_discovery=_discovery())
     )
 
     with pytest.raises(DataSourceError, match="no usable"):
-        lake.update.dataset("logical", source="custom")
+        lake.raw.update("logical", source="custom")
     with pytest.raises(DatasetSpecError, match="conflicts"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 "conflict",
                 "general",
@@ -178,10 +178,10 @@ target_param = "code"
 """.strip(),
         encoding="utf-8",
     )
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
 
-    registered = lake.admin.datasets.register_toml(path)
-    restored = DataLake.open(tmp_path).admin.datasets.get(
+    registered = lake.raw.register_toml(path)
+    restored = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake").raw.get(
         "logical_membership", source="custom"
     )
 

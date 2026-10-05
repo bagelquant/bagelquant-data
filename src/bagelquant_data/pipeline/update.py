@@ -225,8 +225,9 @@ def update_datasets(
     with (
         pipeline.metadata.writer_session(),
         ThreadPoolExecutor(
-            max_workers=max(1, int(works[0].context.options.get("workers", 4)))
-            if works else 4,
+            max_workers=max(1, int(works[0].context.options.get("workers", 1)))
+            if works
+            else 1,
             thread_name_prefix="bagelquant-data",
         ) as writer_executor,
     ):
@@ -264,10 +265,8 @@ def _update_datasets(
             time.perf_counter() - started_at,
         )
     started_at = time.perf_counter()
-    workers = max(1, int(works[0].context.options.get("workers", 4)))
-    max_in_flight = max(
-        workers, int(works[0].context.options.get("max_in_flight", workers * 2))
-    )
+    workers = max(1, int(works[0].context.options.get("workers", 1)))
+    max_in_flight = max(1, int(works[0].context.options.get("max_in_flight", workers)))
     states = {work.spec.name: _RunState(work) for work in works}
     callbacks = {work.spec.name: _progress_callback(work.context) for work in works}
     tasks: list[UpdateTask] = []
@@ -471,7 +470,12 @@ def _run_fetches(
             source_adapter=source_adapter,
             ledger_request=request,
             request_index=index,
-            request_options=_request_options(work.context),
+            request_options={
+                **_request_options(work.context),
+                "_buffer_limit_bytes": max(
+                    1, _buffer_limit(work.context) // (2 * max_in_flight)
+                ),
+            },
             max_retries=max(1, int(work.context.options.get("max_retries", 3))),
             retry_backoff_seconds=float(
                 work.context.options.get("retry_backoff_seconds", 60.0)
@@ -533,6 +537,25 @@ def _run_fetches(
             state.wait_seconds = 0.0
             prepared = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
+            incoming_bytes = (
+                int(prepared.frame.estimated_size())
+                if prepared.frame is not None
+                else 0
+            )
+            buffer_limit = max(1, _buffer_limit(work.context) // 2)
+            if state.buffered_bytes + incoming_bytes > buffer_limit:
+                if work.spec.update_type == "general":
+                    raise ValueError(
+                        "Complete general snapshot exceeds max_buffer_bytes; increase the explicit buffer limit"
+                    )
+                _commit_state(
+                    pipeline,
+                    state,
+                    callbacks[work.spec.name],
+                    completed[work.spec.name],
+                    totals[work.spec.name],
+                    writer_executor,
+                )
             started = time.perf_counter()
             _harvest_request(pipeline, state, request, prepared)
             state.metadata_seconds += time.perf_counter() - started
@@ -545,11 +568,7 @@ def _run_fetches(
                 total=totals[work.spec.name],
             )
             configured_batch_size = work.context.options.get("batch_size")
-            max_bytes = (
-                max(1, int(work.context.options.get("max_buffer_mb", 512)))
-                * 1024
-                * 1024
-            )
+            max_bytes = buffer_limit
             if work.spec.update_type != "general" and (
                 (
                     configured_batch_size is not None
@@ -612,16 +631,12 @@ def _harvest_request(
             prepared.validation_error,
         )
         return
-    if state.work.spec.update_type == "by_daily" and request.daily_scopes:
+    if state.work.spec.update_type == "by_date" and request.daily_scopes:
         nonempty, empty = _split_daily_scope_results(state.work.spec, request, frame)
-        required_empty, allowed_empty = _classify_empty_daily_scopes(
-            state.work, empty
-        )
+        required_empty, allowed_empty = _classify_empty_daily_scopes(state.work, empty)
         if required_empty:
             pipeline.metadata.record_api_calls(calls)
-            message = (
-                "provider response omitted a required dense trading-date scope"
-            )
+            message = "provider response omitted a required dense trading-date scope"
             for scope in required_empty:
                 _transition(
                     pipeline,
@@ -735,9 +750,7 @@ def _classify_empty_daily_scopes(
         return [], list(scopes)
     start_value = options.get("required_nonempty_start")
     try:
-        required_start = (
-            None if start_value in {None, ""} else _date_value(start_value)
-        )
+        required_start = None if start_value in {None, ""} else _date_value(start_value)
     except (TypeError, ValueError) as error:
         raise ValueError(
             "source_options.required_nonempty_start must be an ISO date"
@@ -745,9 +758,13 @@ def _classify_empty_daily_scopes(
     required: list[DailyScope] = []
     allowed: list[DailyScope] = []
     for scope in scopes:
-        target = required if (
-            required_start is None or _date_value(scope.scope_key) >= required_start
-        ) else allowed
+        target = (
+            required
+            if (
+                required_start is None or _date_value(scope.scope_key) >= required_start
+            )
+            else allowed
+        )
         target.append(scope)
     return required, allowed
 
@@ -825,6 +842,18 @@ def _commit_state(
     try:
         _flush_api_calls(pipeline, state)
         started = time.perf_counter()
+        transitions = [
+            _success_transition(
+                state.work.spec,
+                request,
+                scope_frame,
+                data_max_time=str(request.target_end)
+                if request.target_end is not None
+                else None,
+            )
+            for scope_frame, request in buffered
+            if request.scope_id is not None
+        ]
         commit = pipeline.commit_frame(
             state.work.spec,
             frame,
@@ -835,6 +864,8 @@ def _commit_state(
             requests=[
                 {"scope_id": r.scope_id, "params": r.params} for _, r in buffered
             ],
+            scope_transitions=transitions,
+            partition_workers=int(state.work.context.options.get("workers", 1)),
         )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed
@@ -846,24 +877,6 @@ def _commit_state(
         state.peak_partition_in_flight = max(
             state.peak_partition_in_flight, commit.peak_partition_in_flight
         )
-        canonical_maxima = _canonical_data_maxima(commit, state.work.spec, buffered)
-        transitions = [
-            _success_transition(
-                state.work.spec,
-                request,
-                scope_frame,
-                data_max_time=canonical_maxima.get(request.scope_id),
-            )
-            for scope_frame, request in buffered
-            if request.scope_id is not None
-        ]
-        started = time.perf_counter()
-        pipeline.metadata.transition_update_scopes(
-            transitions,
-            run_id=state.work.run_id,
-            committed_rows=commit.rows_committed,
-        )
-        state.metadata_seconds += time.perf_counter() - started
         state.success_count += sum(not f.is_empty() for f, _ in buffered)
         state.empty_count += sum(f.is_empty() for f, _ in buffered)
     except Exception as exc:
@@ -1165,13 +1178,45 @@ def _partition_affinity_order(tasks: Sequence[UpdateTask]) -> list[UpdateTask]:
 def _partition_affinity(task: UpdateTask) -> tuple[int, str, str]:
     work, request = task
     spec = work.spec
-    if spec.update_type == "by_daily":
+    if spec.update_type == "by_date":
         value = request.target_end or request.params.get(spec.date_param or "date")
         if value is None:
             return (0, "", "")
         day = _date_value(value)
         return (0, f"{day.year:04d}-{day.month:02d}", day.isoformat())
     return (2, "", "")
+
+
+def _buffer_limit(context: RequestContext) -> int:
+    return int(
+        context.options.get(
+            "max_buffer_bytes",
+            int(context.options.get("max_buffer_mb", 64)) * 1024 * 1024,
+        )
+    )
+
+
+def _bound_pages(
+    pages: list[FetchPage],
+    options: dict[str, Any],
+    request_key: str | int,
+    request: dict[str, Any],
+) -> bool:
+    limit = int(options.get("_buffer_limit_bytes", 64 * 1024 * 1024))
+    retained = sum(
+        int(page.frame.estimated_size()) for page in pages if page.frame is not None
+    )
+    if retained <= limit:
+        return True
+    pages[:] = [replace(page, frame=None) for page in pages]
+    pages.append(
+        _invalid_pagination_page(
+            request_key,
+            request,
+            "Provider response exceeds the configured max_buffer_bytes allocation",
+        )
+    )
+    return False
 
 
 def _fetch_and_prepare_request(
@@ -1201,7 +1246,9 @@ def _fetch_and_prepare_request(
         retry_backoff_seconds=retry_backoff_seconds,
         cancel_requested=cancel_requested,
     )
-    if any(page.status != "success" for page in pages):
+    if not _bound_pages(pages, request_options, request_index, request) or any(
+        page.status != "success" for page in pages
+    ):
         return PreparedFetch(tuple(pages), None)
     frames = [
         page.frame for page in pages if page.frame is not None and page.frame.height
@@ -1217,7 +1264,7 @@ def _fetch_and_prepare_request(
     if not isinstance(allow_all_null_payload, bool):
         raise ValueError("source_options.allow_all_null_payload must be boolean")
     return PreparedFetch(
-        tuple(pages),
+        tuple(replace(page, frame=None) for page in pages),
         frame,
         _validate_response(
             spec,
@@ -1253,19 +1300,24 @@ def _fetch_request_pages(
         )
     if pagination != "offset":
         page = _fetch_one(
-                spec,
-                source_adapter,
-                request,
-                str(request_index),
-                max_retries,
-                retry_backoff_seconds,
-                cancel_requested,
-            )
+            spec,
+            source_adapter,
+            request,
+            str(request_index),
+            max_retries,
+            retry_backoff_seconds,
+            cancel_requested,
+        )
         limit = request_options.get("row_limit")
         if limit is not None and page.row_count >= int(limit):
-            return [page, _invalid_pagination_page(
-                request_index, request, "response reached row_limit without complete pagination"
-            )]
+            return [
+                page,
+                _invalid_pagination_page(
+                    request_index,
+                    request,
+                    "response reached row_limit without complete pagination",
+                ),
+            ]
         return [page]
     return _fetch_offset_pages(
         spec=spec,
@@ -1311,6 +1363,8 @@ def _fetch_offset_pages(
             cancel_requested,
         )
         pages.append(page)
+        if not _bound_pages(pages, request_options, request_index, request):
+            return pages
         if page.frame is not None and page.row_count:
             from bagelquant_data.core.hashing import frame_content_hash
 
@@ -1359,9 +1413,7 @@ def _fetch_adaptive_date_range(
     end_param = str(request_options.get("end_param", "end"))
     minimum_window_days = int(request_options.get("minimum_window_days", 0))
     max_pages = int(request_options.get("max_pages", 10_000))
-    empty_range_policy = str(
-        request_options.get("empty_range_policy", "accept")
-    )
+    empty_range_policy = str(request_options.get("empty_range_policy", "accept"))
     if empty_range_policy not in {"accept", "bisect"}:
         return [
             _invalid_pagination_page(
@@ -1438,6 +1490,8 @@ def _fetch_adaptive_date_range(
             cancel_requested,
         )
         pages.append(page)
+        if not _bound_pages(pages, request_options, request_index, request):
+            return pages
         if page.status != "success":
             return pages
         span_days = (upper - lower).days
@@ -1470,6 +1524,8 @@ def _fetch_adaptive_date_range(
                     cancel_requested=cancel_requested,
                 )
             )
+            if not _bound_pages(pages, request_options, request_index, request):
+                return pages
             if any(candidate.status != "success" for candidate in pages):
                 return pages
             continue

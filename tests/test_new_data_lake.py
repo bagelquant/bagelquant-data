@@ -11,7 +11,7 @@ from bagelquant_data.core import DatasetSpecError, ValidationError, incremental_
 
 
 def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
-    spec = DatasetSpec("balancesheet", "by_daily", date_kind="calendar", date_params=("f_ann_date",),
+    spec = DatasetSpec("balancesheet", "by_date", date_kind="calendar", date_params=("f_ann_date",),
                        primary_key_extra=("period",), field_mappings={"f_ann_date": "time", "ts_code": "asset_id"})
     assert incremental_key(spec) == ("time", "asset_id", "period")
     assert not {"asset_list", "asset_bucket_count", "revision_refresh_days"} & {field.name for field in fields(DatasetSpec)}
@@ -19,28 +19,28 @@ def test_dataset_spec_is_a_plain_minimal_dataclass() -> None:
 
 
 def test_removed_historical_empty_policy_is_rejected(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     path = tmp_path / "daily.toml"
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n'
+        'name = "daily"\nupdate_type = "by_date"\ncalendar = "trade_cal"\n'
         "historical_empty_is_error = true\n[field_mappings]\n"
         'trade_date = "time"\nts_code = "asset_id"\n'
     )
 
     with pytest.raises(DatasetSpecError, match="Unsupported dataset fields"):
-        lake.admin.datasets.register_toml(path)
+        lake.raw.register_toml(path)
 
 
 def test_dataset_description_round_trips_from_toml_and_metadata(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     path = tmp_path / "general.toml"
     path.write_text(
         'name = "stock_basic"\nupdate_type = "general"\n'
         'description = "Listed equity reference data."\n'
     )
 
-    registered = lake.admin.datasets.register_toml(path)
-    reopened = DataLake.open(tmp_path).admin.datasets.get(
+    registered = lake.raw.register_toml(path)
+    reopened = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake").raw.get(
         "stock_basic", source="custom"
     )
 
@@ -49,17 +49,17 @@ def test_dataset_description_round_trips_from_toml_and_metadata(tmp_path) -> Non
 
 
 def test_manager_validates_references_and_toml(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     with pytest.raises(DatasetSpecError, match="calendar"):
-        lake.admin.datasets.register(DatasetSpec("daily", "by_daily"))
+        lake.raw.register(DatasetSpec("daily", "by_date"))
     with pytest.raises(DatasetSpecError, match="unsupported update_type"):
-        lake.admin.datasets.register(DatasetSpec("income", "by_asset"))
+        lake.raw.register(DatasetSpec("income", "by_asset"))
 
     path = tmp_path / "daily.toml"
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\ndate_param = "pub_date"\n[field_mappings]\ntrade_date = "time"\nts_code = "asset_id"\n[source_api_params]\nexchange = "SSE"\n[[source_api_param_sets]]\nlist_status = ["L", "D"]\n'
+        'name = "daily"\nupdate_type = "by_date"\ncalendar = "trade_cal"\ndate_param = "pub_date"\n[field_mappings]\ntrade_date = "time"\nts_code = "asset_id"\n[source_api_params]\nexchange = "SSE"\n[[source_api_param_sets]]\nlist_status = ["L", "D"]\n'
     )
-    spec = lake.admin.datasets.register_toml(path)
+    spec = lake.raw.register_toml(path)
     assert spec.calendar == "trade_cal"
     assert spec.date_param == "pub_date"
     assert spec.source_api_params == {"exchange": "SSE"}
@@ -68,37 +68,37 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
 
     financial_path = tmp_path / "income.toml"
     financial_path.write_text(
-        'name = "income"\nupdate_type = "by_daily"\ndate_kind = "calendar"\n'
+        'name = "income"\nupdate_type = "by_date"\ndate_kind = "calendar"\n'
         'request_date_field = "ann_date"\n[field_mappings]\n'
         'f_ann_date = "time"\nts_code = "asset_id"\n'
     )
-    financial = lake.admin.datasets.register_toml(financial_path)
+    financial = lake.raw.register_toml(financial_path)
     assert financial.request_date_field == "ann_date"
     assert (
-        DataLake.open(tmp_path)
-        .admin.datasets.get("income", source="custom")
+        DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+        .raw.get("income", source="custom")
         .request_date_field
         == "ann_date"
     )
-    reopened = DataLake.open(tmp_path)
-    assert reopened.admin.datasets.get("daily", source="custom").source_api_params == {
+    reopened = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    assert reopened.raw.get("daily", source="custom").source_api_params == {
         "exchange": "SSE"
     }
     assert (
-        reopened.admin.datasets.get("daily", source="custom").date_param == "pub_date"
+        reopened.raw.get("daily", source="custom").date_param == "pub_date"
     )
-    assert reopened.admin.datasets.get(
+    assert reopened.raw.get(
         "daily", source="custom"
     ).source_api_param_sets == ({"list_status": ["L", "D"]},)
-    assert reopened.admin.datasets.get("daily", source="custom").field_mappings == {
+    assert reopened.raw.get("daily", source="custom").field_mappings == {
         "trade_date": "time",
         "ts_code": "asset_id",
     }
 
-    lake.admin.datasets.register(DatasetSpec("general", "general"))
-    reopened = DataLake.open(tmp_path)
+    lake.raw.register(DatasetSpec("general", "general"))
+    reopened = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     assert (
-        reopened.admin.datasets.get("general", source="custom").source_api_param_sets
+        reopened.raw.get("general", source="custom").source_api_param_sets
         == ()
     )
 
@@ -106,26 +106,26 @@ def test_manager_validates_references_and_toml(tmp_path) -> None:
         'name = "invalid"\nupdate_type = "general"\nsource_api_params = "SSE"\n'
     )
     with pytest.raises(DatasetSpecError, match="source_api_params"):
-        lake.admin.datasets.register_toml(path)
+        lake.raw.register_toml(path)
 
     path.write_text(
         'name = "invalid"\nupdate_type = "general"\nsource_api_param_sets = []\n'
     )
     with pytest.raises(DatasetSpecError, match="source_api_param_sets"):
-        lake.admin.datasets.register_toml(path)
+        lake.raw.register_toml(path)
 
 
 def test_manager_validates_nullable_primary_key_extras(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     common = {
         "name": "financial",
-        "update_type": "by_daily",
+        "update_type": "by_date",
         "date_kind": "calendar",
         "field_mappings": {"announcement_date": "time", "code": "asset_id"},
     }
 
     with pytest.raises(DatasetSpecError, match="subset of primary_key_extra"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 **common,
                 primary_key_extra=("report_type",),
@@ -134,7 +134,7 @@ def test_manager_validates_nullable_primary_key_extras(tmp_path) -> None:
         )
 
     with pytest.raises(DatasetSpecError, match="duplicate fields"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 **common,
                 primary_key_extra=("company_type",),
@@ -142,14 +142,14 @@ def test_manager_validates_nullable_primary_key_extras(tmp_path) -> None:
             )
         )
 
-    registered = lake.admin.datasets.register(
+    registered = lake.raw.register(
         DatasetSpec(
             **common,
             primary_key_extra=("report_type", "company_type"),
             nullable_primary_key_extra=("company_type",),
         )
     )
-    reopened = DataLake.open(tmp_path).admin.datasets.get(
+    reopened = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake").raw.get(
         "financial", source="custom"
     )
     assert reopened.nullable_primary_key_extra == (
@@ -158,50 +158,50 @@ def test_manager_validates_nullable_primary_key_extras(tmp_path) -> None:
 
 
 def test_manager_loads_stored_specs_without_source_api_params(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.admin.datasets.register(DatasetSpec("stock_basic", "general"))
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.register(DatasetSpec("stock_basic", "general"))
     payload = json.dumps(
         {"name": "stock_basic", "update_type": "general", "source": "custom"}
     )
-    with lake.metadata.connect() as db:
+    with lake._data_meta.connect() as db:
         db.execute(
             "update datasets set spec_json = ? where source = ? and name = ?",
             (payload, "custom", "stock_basic"),
         )
 
-    reopened = DataLake.open(tmp_path)
+    reopened = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     assert (
-        reopened.admin.datasets.get("stock_basic", source="custom").source_api_params
+        reopened.raw.get("stock_basic", source="custom").source_api_params
         == {}
     )
 
 
 def test_manager_rejects_date_param_for_non_daily_datasets(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
 
     with pytest.raises(DatasetSpecError, match="date_param"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec("stock_basic", "general", date_param="pub_date")
         )
 
     with pytest.raises(DatasetSpecError, match="request_date_field"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec("stock_basic", "general", request_date_field="ann_date")
         )
 
 
 def test_manager_requires_complete_incremental_field_mappings(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
 
     with pytest.raises(DatasetSpecError, match="field_mappings"):
-        lake.admin.datasets.register(
-            DatasetSpec("daily", "by_daily", calendar="trade_cal")
+        lake.raw.register(
+            DatasetSpec("daily", "by_date", calendar="trade_cal")
         )
     with pytest.raises(DatasetSpecError, match="asset_id"):
-        lake.admin.datasets.register(
+        lake.raw.register(
             DatasetSpec(
                 "daily",
-                "by_daily",
+                "by_date",
                 calendar="trade_cal",
                 field_mappings={"trade_date": "time"},
             )
@@ -209,42 +209,42 @@ def test_manager_requires_complete_incremental_field_mappings(tmp_path) -> None:
 
     path = tmp_path / "invalid-mappings.toml"
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\nfield_mappings = []\n'
+        'name = "daily"\nupdate_type = "by_date"\ncalendar = "trade_cal"\nfield_mappings = []\n'
     )
     with pytest.raises(DatasetSpecError, match="field_mappings"):
-        lake.admin.datasets.register_toml(path)
+        lake.raw.register_toml(path)
 
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n'
+        'name = "daily"\nupdate_type = "by_date"\ncalendar = "trade_cal"\n'
         '[field_mappings]\ntrade_date = "time"\nts_code = "asset_id"\n'
     )
-    assert lake.admin.datasets.register_toml(path).field_mappings == {
+    assert lake.raw.register_toml(path).field_mappings == {
         "trade_date": "time",
         "ts_code": "asset_id",
     }
 
     path.write_text(
-        'name = "daily"\nupdate_type = "by_daily"\ncalendar = "trade_cal"\n'
+        'name = "daily"\nupdate_type = "by_date"\ncalendar = "trade_cal"\n'
         '[[field_mappings]]\ntrade_date = "time"\nts_code = "asset_id"\n'
     )
     with pytest.raises(DatasetSpecError, match="TOML table"):
-        lake.admin.datasets.register_toml(path)
+        lake.raw.register_toml(path)
 
 
 def test_general_and_incremental_ingestion(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(
         DatasetSpec("stock_basic", "general"), pl.DataFrame({"code": ["A", "A", "B"]})
     )
-    assert lake.query.query_general(
+    assert lake.raw.read(
         "stock_basic", source="custom", fields=["code"]
-    ).collect()["code"].to_list() == ["A", "B"]
+    , view="latest").collect()["code"].to_list() == ["A", "B"]
 
     with pytest.raises(ValidationError, match="asset_id"):
-        lake.ingest(
+        lake.raw.ingest(
             DatasetSpec(
                 "daily",
-                "by_daily",
+                "by_date",
                 calendar="trade_cal",
                 field_mappings={"time": "time", "asset_id": "asset_id"},
             ),
@@ -253,10 +253,10 @@ def test_general_and_incremental_ingestion(tmp_path) -> None:
 
 
 def test_incremental_ingestion_rejects_null_primary_key_values(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
     )
@@ -270,14 +270,14 @@ def test_incremental_ingestion_rejects_null_primary_key_values(tmp_path) -> None
     )
 
     with pytest.raises(ValidationError, match="null primary key values"):
-        lake.ingest(spec, frame)
+        lake.raw.ingest(spec, frame)
 
 
 def test_incremental_ingestion_accepts_declared_nullable_extra_key(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "financial",
-        "by_daily",
+        "by_date",
         date_kind="calendar",
         primary_key_extra=("company_type",),
         nullable_primary_key_extra=("company_type",),
@@ -292,9 +292,9 @@ def test_incremental_ingestion_accepts_declared_nullable_extra_key(tmp_path) -> 
         }
     )
 
-    lake.ingest(spec, frame)
+    lake.raw.ingest(spec, frame)
 
-    result = lake.query.query("financial", source="custom").collect()
+    result = lake.raw.read("financial", source="custom", view="latest").collect()
     assert result.height == 2
     assert result["company_type"].null_count() == 1
 
@@ -302,24 +302,24 @@ def test_incremental_ingestion_accepts_declared_nullable_extra_key(tmp_path) -> 
 def test_field_mappings_reject_missing_sources_and_unmapped_collisions(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     missing_source = DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
     )
     with pytest.raises(ValidationError, match="mapped source"):
-        lake.ingest(missing_source, pl.DataFrame({"trade_date": ["20250102"]}))
+        lake.raw.ingest(missing_source, pl.DataFrame({"trade_date": ["20250102"]}))
 
     collision = DatasetSpec(
         "daily_collision",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id", "open": "close"},
     )
     with pytest.raises(ValidationError, match="collide"):
-        lake.ingest(
+        lake.raw.ingest(
             collision,
             pl.DataFrame(
                 {
@@ -333,10 +333,10 @@ def test_field_mappings_reject_missing_sources_and_unmapped_collisions(
 
 
 def test_field_mappings_allow_arbitrary_renames(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={
             "trade_date": "time",
@@ -345,7 +345,7 @@ def test_field_mappings_allow_arbitrary_renames(tmp_path) -> None:
         },
     )
 
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -356,6 +356,6 @@ def test_field_mappings_allow_arbitrary_renames(tmp_path) -> None:
         ),
     )
 
-    frame = lake.query.query("daily", source="custom").collect()
+    frame = lake.raw.read("daily", source="custom", view="latest").collect()
     assert frame["close"].to_list() == [11.25]
     assert "vendor_close" in frame.columns

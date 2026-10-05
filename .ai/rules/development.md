@@ -16,8 +16,10 @@
 
 - Target ownership: Raw and neutral generic derived datasets, their storage,
   queries, versions, PIT selection and frozen input evidence belong to Data.
-  Current Raw APIs exist; the expanded derived/frozen-input contracts and
-  generic mechanisms still in Workbench are pending the Data refactor, stage 2.
+  Version 0.7 implements catalog/raw/items/integrity/inputs and pure exploration.
+  DataMetaStore owns the sole caller-configured data_meta_path SQLite; lake_path
+  is also explicit. Old facades, aliases, schemas and monthly SQLite journals
+  are removed. Live database/service cutover remains a later authorized stage.
 - Return neutral frames plus schema, availability and immutable identity evidence;
   never expose Core types or import Core. Core owns generic Domain/Panel
   conversion and numerical artifacts; BT owns account/evaluation artifacts.
@@ -25,6 +27,9 @@
 - Data freezes selected input versions/evidence. Workbench freezes submitted
   research definitions, China semantics and backend receipt references; it owns
   app metadata/governance/task orchestration, not input bytes or generic proofs.
+- Workbench owns global scheduler/runtime/resource policy. Data defaults to
+  serial execution and enforces explicit local worker/in-flight/buffer ceilings
+  through one pool and serial publication; it never probes RAM/CPU for admission.
 - Follow rules -> Data -> Core -> BT -> Workbench -> new database/service restart.
   Stage 1 changes instructions only; concrete APIs and storage schemas are deferred
   to their owner stages. Breaking refactors remove old paths without compatibility.

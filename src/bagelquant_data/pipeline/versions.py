@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
+from typing import Callable, ParamSpec, TypeVar
+from functools import wraps
 from zoneinfo import ZoneInfo
 
 import polars as pl
+from polars.datatypes import DataTypeClass
 
 from bagelquant_data.core.dataset import DatasetSpec, record_key
 from bagelquant_data.core.types import DateLike
@@ -21,11 +25,11 @@ from bagelquant_data.core.schema import (
 )
 from bagelquant_data.storage.parquet import (
     ParquetStore,
-    finalize_partition_writes,
     rollback_partition_writes,
     partition_write_context,
 )
 from bagelquant_data.storage.recovery import append_batch, sort_versions
+from bagelquant_data.storage.data_meta import _insert_version_check
 
 
 VERSION_FIELDS = frozenset(
@@ -37,10 +41,88 @@ VERSION_FIELDS = frozenset(
         "_snapshot_id",
         "snapshot_date",
         "_baseline",
+        "_attestation_id",
     }
 )
 
+def _payload_value(value: object) -> object:
+    """Encode logical scalars without JSON's null/nonfinite conflation."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return {"float": value.hex()}
+    if isinstance(value, Decimal):
+        return {"decimal": str(value)}
+    if isinstance(value, datetime):
+        return {"datetime": value.isoformat()}
+    if isinstance(value, date):
+        return {"date": value.isoformat()}
+    if isinstance(value, time):
+        return {"time": value.isoformat()}
+    if isinstance(value, timedelta):
+        return {"duration_us": (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds}
+    if isinstance(value, bytes):
+        return {"binary": value.hex()}
+    if isinstance(value, (list, tuple)):
+        return [_payload_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _payload_value(item) for key, item in sorted(value.items())}
+    raise TypeError(f"Unsupported persisted payload scalar: {type(value).__name__}")
 
+
+def _payload_expression(expression: pl.Expr, dtype: pl.DataType | DataTypeClass) -> pl.Expr:
+    """Preserve native temporal precision before crossing into Python rows."""
+    if dtype.is_temporal():
+        return expression.cast(pl.Int64)
+    if isinstance(dtype, pl.List):
+        return expression.list.eval(_payload_expression(pl.element(), dtype.inner))
+    if isinstance(dtype, pl.Array):
+        return expression.arr.to_list().list.eval(_payload_expression(pl.element(), dtype.inner))
+    if isinstance(dtype, pl.Struct):
+        fields = [_payload_expression(expression.struct.field(field.name), field.dtype).alias(field.name)
+                  for field in dtype.fields]
+        return pl.when(expression.is_null()).then(None).otherwise(pl.struct(fields))
+    return expression
+
+
+def _payload_hashes(frame: pl.DataFrame, fields: list[str]) -> pl.Series:
+    """Hash typed rows without retaining Python copies of the whole payload.
+
+    Schema makes type revisions content revisions. Floating hex retains signed
+    zero, infinities and ordinary precision; NaN stays distinct from null.
+    Nested values use the same recursive representation. Iteration is bounded
+    to Polars' row buffer and the required resulting digest column.
+    """
+    selected = frame.select(fields)
+    header = json.dumps([(name, str(dtype)) for name, dtype in selected.schema.items()],
+                        separators=(",", ":")).encode()
+    selected = selected.select(_payload_expression(pl.col(name), dtype).alias(name)
+                               for name, dtype in selected.schema.items())
+    base = hashlib.sha256(b"typed-row-v1\0" + header + b"\0")
+    hashes = []
+    for row in selected.iter_rows():
+        digest = base.copy()
+        digest.update(json.dumps([_payload_value(value) for value in row],
+                                 sort_keys=True, separators=(",", ":")).encode())
+        hashes.append(digest.hexdigest())
+    return pl.Series("_payload_hash", hashes, dtype=pl.String)
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _leased(function: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(function)
+    def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        spec = cast(DatasetSpec, args[0])
+        parquet = cast(ParquetStore, args[2])
+        with parquet.metadata.dataset_writer(spec.source, spec.name, str(kwargs["run_id"])):
+            return function(*args, **kwargs)
+    return guarded
+
+
+@_leased
 def commit_versions(
     spec: DatasetSpec,
     frame: pl.DataFrame,
@@ -51,9 +133,19 @@ def commit_versions(
     ingested_at: datetime | None = None,
     requests: list[dict] | None = None,
     writer_executor: ThreadPoolExecutor | None = None,
+    available_date: DateLike | None = None,
+    preserve_available: bool = False,
+    historical_baseline: bool | None = None,
+    scope_transitions: list[dict] | None = None,
+    partition_workers: int = 1,
+    input_receipt_id: str | None = None,
 ):
-    from bagelquant_data.pipeline.commit import CommitResult, MAX_PARQUET_WRITE_WORKERS
+    from bagelquant_data.pipeline.commit import CommitResult
 
+    parquet.metadata.ensure_writable()
+    parquet.metadata.assert_definition(spec)
+    if isinstance(partition_workers, bool) or not isinstance(partition_workers, int) or partition_workers < 1:
+        raise ValueError("partition_workers must be a positive integer")
     if mode not in {"initialize", "incremental", "refresh"}:
         raise ValueError("mode must be initialize, incremental, or refresh")
     now = ingested_at or datetime.now(UTC)
@@ -72,8 +164,14 @@ def commit_versions(
     available = local.date() + timedelta(
         days=spec.availability_day_offset + int(rollover)
     )
+    if available_date is not None:
+        from bagelquant_data.query.raw import _date_value
+        available = _date_value(available_date)
+    baseline = mode == "initialize" if historical_baseline is None else historical_baseline
     root = parquet.paths.dataset_root(spec.source, spec.name)
     manifests = parquet.metadata.manifest(spec.source, spec.name)
+    parent = {str(row["partition_path"]): str(row["generation_path"]) for row in manifests}
+    definition_hash = parquet.metadata.dataset_spec_hash(spec.source, spec.name)
     if mode == "initialize":
         initialization = parquet.metadata._rows(
             "select status from dataset_initializations where source=? and dataset=?",
@@ -101,22 +199,13 @@ def commit_versions(
         if "source_time" in frame.columns
         else frozenset()
     )
-    if spec.update_type == "by_daily":
-        checked_rows = frame.height
+    attestations = pl.DataFrame()
+    checked_rows = frame.height
+    if spec.update_type == "by_date":
         keys = list(record_key(spec))
-        frame = frame.with_columns(
-            pl.struct(keys).struct.json_encode().alias("_record_id")
-        )
+        frame = frame.with_columns(_payload_hashes(frame, keys).rename("_record_id"))
         payload = sorted(set(frame.columns) - {"time", "year", "month", "_record_id"})
-        frame = frame.with_columns(
-            pl.struct(payload)
-            .struct.json_encode()
-            .map_elements(
-                lambda text: hashlib.sha256(text.encode()).hexdigest(),
-                return_dtype=pl.String,
-            )
-            .alias("_payload_hash")
-        )
+        frame = frame.with_columns(_payload_hashes(frame, payload))
         conflicts = (
             frame.group_by("_record_id")
             .agg(pl.col("_payload_hash").n_unique())
@@ -138,6 +227,14 @@ def commit_versions(
                 f"differing_fields={differing_fields}"
             )
         frame = frame.unique("_record_id", maintain_order=True)
+        frame = frame.with_columns(
+            (
+                pl.max_horizontal(pl.col("source_time"), pl.col("time"))
+                if preserve_available
+                else pl.col("source_time") if mode == "initialize"
+                else pl.max_horizontal(pl.col("source_time"), pl.lit(available))
+            ).alias("time")
+        )
         if manifests and frame.height:
             from bagelquant_data.query.raw import RawQueryService
 
@@ -150,28 +247,25 @@ def commit_versions(
                     source=spec.source,
                     observation_start=observation_start,
                     observation_end=observation_end,
-                    fields=["_record_id", "_payload_hash", "_baseline"],
+                    fields=["_record_id", "_payload_hash", "_commit_seq"],
                 )
                 .collect()
             )
             if old.height:
-                frame = frame.join(old, on=["_record_id", "_payload_hash"], how="anti")
+                # Unchanged values retain their content version. An immutable
+                # check witnesses that exact version at this collection date.
+                attestations = frame.join(old, on=["_record_id", "_payload_hash"], how="inner").select(
+                    "_record_id", "_payload_hash", "_commit_seq", "time"
+                )
+                frame = frame.join(old.select("_record_id", "_payload_hash"), on=["_record_id", "_payload_hash"], how="anti")
         if frame.is_empty():
             with parquet.metadata.connect() as db:
-                db.execute(
-                    "insert into version_checks(source,dataset,run_id,checked_at,visible_commit,request_json,row_count) "
-                    "values(?,?,?,?,(select max(seq) from version_commits where source=? and dataset=? and status='committed'),?,?)",
-                    (spec.source, spec.name, run_id, now.isoformat(), spec.source, spec.name,
-                     json.dumps(requests or [], sort_keys=True, default=str), checked_rows),
-                )
+                db.execute("begin immediate")
+                parquet.metadata.assert_dataset_parent(db, spec.source, spec.name, parent, definition_hash, run_id)
+                _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id)
+                if scope_transitions:
+                    parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
             return CommitResult(0, 0, len({value[:7] for value in source_times}), 0, present_times=source_times)
-        frame = frame.with_columns(
-            (
-                pl.col("source_time")
-                if mode == "initialize"
-                else pl.max_horizontal(pl.col("source_time"), pl.lit(available))
-            ).alias("time")
-        )
     else:
         frame = frame.unique(maintain_order=True)
         if manifests:
@@ -210,25 +304,16 @@ def commit_versions(
                 == frame_content_hash(frame)
             ):
                 with parquet.metadata.connect() as db:
-                    db.execute(
-                        "insert into version_checks(source,dataset,run_id,checked_at,visible_commit,request_json,row_count) "
-                        "values(?,?,?,?,(select max(seq) from version_commits where source=? and dataset=? and status='committed'),?,?)",
-                        (
-                            spec.source,
-                            spec.name,
-                            run_id,
-                            now.isoformat(),
-                            spec.source,
-                            spec.name,
-                            json.dumps(requests or [], sort_keys=True, default=str),
-                            frame.height,
-                        ),
-                    )
+                    db.execute("begin immediate")
+                    parquet.metadata.assert_dataset_parent(db, spec.source, spec.name, parent, definition_hash, run_id)
+                    _record_check(db, spec, run_id, now, available, baseline, requests, frame.height, input_receipt_id=input_receipt_id)
+                    if scope_transitions:
+                        parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
                 return CommitResult(0, 0, 1, 0)
         frame = frame.with_columns(pl.lit(available).alias("snapshot_date"))
     with parquet.metadata.connect() as db:
         seq = db.execute(
-            "insert into version_commits(source,dataset,run_id,ingested_at,pit_date,mode,status,spec_hash,request_json) values(?,?,?,?,?,?,'prepared',?,?)",
+            "insert into version_commits(source,dataset,run_id,ingested_at,pit_date,mode,status,spec_hash,request_json,input_receipt_id,baseline) values(?,?,?,?,?,?,'prepared',?,?,?,?)",
             (
                 spec.source,
                 spec.name,
@@ -238,6 +323,8 @@ def commit_versions(
                 mode,
                 parquet.metadata.dataset_spec_hash(spec.source, spec.name),
                 json.dumps(requests or [], sort_keys=True, default=str),
+                input_receipt_id,
+                int(baseline),
             ),
         ).lastrowid
     if seq is None:
@@ -245,7 +332,7 @@ def commit_versions(
     frame = frame.with_columns(
         pl.lit(now, dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
         pl.lit(seq, dtype=pl.Int64).alias("_commit_seq"),
-        pl.lit(mode == "initialize").alias("_baseline"),
+        pl.lit(baseline).alias("_baseline"),
     )
     if spec.update_type == "general":
         frame = frame.with_columns(pl.lit(str(seq)).alias("_snapshot_id"))
@@ -263,7 +350,7 @@ def commit_versions(
     batches = []
     stored_schema = parquet.canonical_schema(spec.source, spec.name)
     schemas = [frame.schema, *([stored_schema] if stored_schema is not None else [])]
-    if spec.update_type == "by_daily":
+    if spec.update_type == "by_date":
         frame = align_frame(frame, compatible_schema(schemas))
         groups = frame.with_columns(pl.col(partition_field).dt.strftime("%Y-%m").alias("_partition")).partition_by(
             "_partition", as_dict=True, maintain_order=True
@@ -278,7 +365,7 @@ def commit_versions(
             tasks = []
             failure = None
             try:
-                for _ in range(MAX_PARQUET_WRITE_WORKERS if writer_executor else 1):
+                for _ in range(partition_workers if writer_executor else 1):
                     item = next(pending, None)
                     if item is None:
                         break
@@ -318,12 +405,19 @@ def commit_versions(
             spec,
             canonical,
             [w.manifest for w in writes],
-            version_commit={"seq": seq, "batches": batches},
+            version_commit={
+                "seq": seq, "batches": batches,
+                "parent": parent, "definition_hash": definition_hash,
+                "check": _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id)
+                if attestations.height else None,
+            },
+            scope_transitions=scope_transitions,
+            run_id=run_id,
+            committed_rows=frame.height,
         )
     except BaseException:
         rollback_partition_writes(writes)
         raise
-    finalize_partition_writes(writes)
     return CommitResult(
         frame.height,
         len(writes),
@@ -335,11 +429,30 @@ def commit_versions(
     )
 
 
-def _write_version_partition(spec, delta, parquet, root, partition, seq, manifest):
-    """Prepare one independent partition without touching lake.db metadata."""
-    from bagelquant_data.core.hashing import frame_content_hash
+def _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, records, *, input_receipt_id=None):
+    return {
+        "source": spec.source, "dataset": spec.name, "run_id": run_id,
+        "checked_at": now.isoformat(), "pit_date": available.isoformat(), "baseline": baseline,
+        "request_json": json.dumps(requests or [], sort_keys=True, default=str),
+        "row_count": checked_rows, "records": records.to_dicts(),
+        "input_receipt_id": input_receipt_id,
+    }
 
-    path = root / partition
+
+def _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, records=None, *, input_receipt_id=None):
+    _insert_version_check(db, **_check_evidence(
+        spec, run_id, now, available, baseline, requests, checked_rows,
+        pl.DataFrame() if records is None else records,
+        input_receipt_id=input_receipt_id,
+    ))
+
+
+def _write_version_partition(spec, delta, parquet, root, partition, seq, manifest):
+    """Prepare one independent partition without publishing committed visibility."""
+    from bagelquant_data.core.hashing import frame_content_hash
+    from bagelquant_data.storage.atomic import _filesystem_path
+
+    path = Path(_filesystem_path(parquet.paths.generation_path(spec.source, spec.name, partition, manifest["generation_path"]) if manifest is not None else root / partition))
     if manifest is not None and not path.is_file():
         raise RuntimeError(
             "Committed partition is missing; restore ingestion evidence before updating"
@@ -356,7 +469,7 @@ def _write_version_partition(spec, delta, parquet, root, partition, seq, manifes
     merged = sort_versions(merged)
     if spec.update_type != "general":
         delta = align_frame(delta, merged.schema)
-    batch = append_batch(root, partition, seq, delta)
+    batch = append_batch(parquet.metadata, partition, seq, delta)
     month = partition.split("/")
     values = {"year": int(month[0][5:]), "month": int(month[1][6:]), "versioned": True}
     if "source_time" in merged.columns and merged.height:
@@ -366,6 +479,6 @@ def _write_version_partition(spec, delta, parquet, root, partition, seq, manifes
         )
     write = parquet.write_partition_file_result(
         spec, merged, Path(partition), values, existing_manifest=manifest,
-        retain_backup=True, write_context=partition_write_context(merged.schema),
+        write_context=partition_write_context(merged.schema),
     )
     return write, batch, merged.schema, bytes_read

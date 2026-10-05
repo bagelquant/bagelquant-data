@@ -33,7 +33,3 @@ class ValidationError(BagelQuantDataError):
 
 class DuplicateResolutionError(BagelQuantDataError):
     """A single-value panel cannot be produced without resolving duplicates."""
-
-
-class DestructiveOperationError(BagelQuantDataError):
-    """A destructive operation was requested without explicit confirmation."""

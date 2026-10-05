@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import uuid
 from collections import Counter
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
@@ -15,17 +13,16 @@ from typing import Any
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec, incremental_key
-from bagelquant_data.core.exceptions import DestructiveOperationError
 from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.management.datasets import DatasetManager
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.paths import LakePaths
 
 
 class StatusManager:
     """Manifest-driven status queries."""
 
-    def __init__(self, metadata: MetadataStore, paths: LakePaths) -> None:
+    def __init__(self, metadata: DataMetaStore, paths: LakePaths) -> None:
         self.metadata = metadata
         self.paths = paths
 
@@ -220,53 +217,17 @@ class StatusManager:
         return self.metadata.rejected(source, dataset)
 
     def files(self, dataset: str, *, source: str) -> list[dict[str, Any]]:
-        root = self.paths.dataset_root(source, dataset)
         rows = self.partitions(dataset, source=source)
         for row in rows:
-            path = root / row["partition_path"]
-            row["path"] = str(path)
-            row["exists"] = path.exists()
+            try:
+                path = self.paths.generation_path(
+                    source, dataset, row["partition_path"], row["generation_path"]
+                )
+                row["path"] = str(path)
+                row["exists"] = path.exists()
+            except ValueError as error:
+                row.update(path=None, exists=False, reference_error=str(error))
         return rows
-
-    def rebuild_manifest(self, dataset: str, *, source: str) -> dict[str, Any]:
-        root = self.paths.dataset_root(source, dataset)
-        manifests: list[dict[str, Any]] = []
-        for path in sorted(root.glob("**/*.parquet")):
-            relative_path = path.relative_to(root)
-            frame = pl.read_parquet(path)
-            time_values = (
-                frame.select(
-                    pl.min("time").alias("min_time"), pl.max("time").alias("max_time")
-                ).row(0)
-                if "time" in frame.columns and frame.height
-                else (None, None)
-            )
-            manifests.append(
-                {
-                    "source": source,
-                    "dataset": dataset,
-                    "partition_path": relative_path.as_posix(),
-                    "partition_values": _partition_values(relative_path),
-                    "row_count": frame.height,
-                    "file_size_bytes": path.stat().st_size,
-                    "min_time": str(time_values[0])
-                    if time_values[0] is not None
-                    else None,
-                    "max_time": str(time_values[1])
-                    if time_values[1] is not None
-                    else None,
-                    "content_hash": frame_content_hash(frame),
-                    "schema_hash": _schema_hash(frame),
-                }
-            )
-        self.metadata.replace_manifests(source, dataset, manifests)
-        return {
-            "source": source,
-            "dataset": dataset,
-            "files_scanned": len(manifests),
-            "rows": sum(int(row["row_count"]) for row in manifests),
-            "bytes": sum(int(row["file_size_bytes"]) for row in manifests),
-        }
 
     def validate_manifest(
         self, dataset: str, *, source: str, deep: bool = False
@@ -274,7 +235,7 @@ class StatusManager:
         files = self.files(dataset, source=source)
         missing = [row["partition_path"] for row in files if not row["exists"]]
         root = self.paths.dataset_root(source, dataset)
-        manifested = {str(row["partition_path"]) for row in files}
+        manifested = self.metadata.known_generations(source, dataset)
         physical = (
             {path.relative_to(root).as_posix() for path in root.rglob("*.parquet")}
             if root.exists()
@@ -286,6 +247,15 @@ class StatusManager:
             for path in missing
         ]
         issues.extend(
+            {
+                "kind": "invalid_reference",
+                "path": row["partition_path"],
+                "detail": row["reference_error"],
+            }
+            for row in files
+            if "reference_error" in row
+        )
+        issues.extend(
             {"kind": "orphaned", "path": path, "detail": "file is not manifested"}
             for path in orphaned
         )
@@ -296,7 +266,9 @@ class StatusManager:
                 if not row["exists"]:
                     continue
                 relative = str(row["partition_path"])
-                path = root / relative
+                path = self.paths.generation_path(
+                    source, dataset, row["partition_path"], row["generation_path"]
+                )
                 try:
                     frame = pl.read_parquet(path)
                     scanned += 1
@@ -374,7 +346,6 @@ class StatusManager:
         canonical_schema = self.metadata.dataset_schema(spec.source, spec.name)
         canonical_hash = _canonical_schema_hash(canonical_schema)
         rows = self.metadata.manifest(spec.source, spec.name)
-        root = self.paths.dataset_root(spec.source, spec.name)
         if rows and canonical_hash is None:
             issues.append(
                 _health_issue(
@@ -386,7 +357,15 @@ class StatusManager:
         if deep:
             for row in rows:
                 relative = str(row["partition_path"])
-                path = root / relative
+                try:
+                    path = self.paths.generation_path(
+                        spec.source,
+                        spec.name,
+                        row["partition_path"],
+                        row["generation_path"],
+                    )
+                except ValueError:
+                    continue
                 if not path.is_file():
                     continue
                 try:
@@ -425,6 +404,7 @@ class StatusManager:
                 issues.extend(_contract_issues(frame, spec, relative))
         from bagelquant_data.storage.recovery import inspect_partition
         from bagelquant_data.storage.parquet import ParquetStore
+
         parquet = ParquetStore(self.paths, self.metadata)
         recovery = []
         for row in rows:
@@ -433,7 +413,9 @@ class StatusManager:
                 values = json.loads(values)
             if not values.get("versioned"):
                 continue
-            evidence = inspect_partition(parquet, spec.source, spec.name, row["partition_path"], deep=deep)
+            evidence = inspect_partition(
+                parquet, spec.source, spec.name, row["partition_path"], deep=deep
+            )
             recovery.append(evidence)
             if evidence["recovery_state"] != "ready":
                 damaged_partition = any(
@@ -556,23 +538,43 @@ class StatusManager:
         reports = []
         for spec in selected_specs:
             manifest_rows = grouped[spec.name]
-            manifested = {str(row["partition_path"]) for row in manifest_rows}
+            invalid_references = []
+            from bagelquant_data.storage.paths import validate_generation
+
+            for row in manifest_rows:
+                try:
+                    validate_generation(
+                        str(row["partition_path"]), str(row["generation_path"])
+                    )
+                except ValueError as error:
+                    invalid_references.append(
+                        _health_issue(
+                            "invalid_reference", str(error), path=row["partition_path"]
+                        )
+                    )
+            manifested = {str(row["generation_path"]) for row in manifest_rows}
+            logical_paths = {
+                str(row["generation_path"]): str(row["partition_path"])
+                for row in manifest_rows
+            }
+            retained = self.metadata.known_generations(source, spec.name)
             actual = physical[spec.name]
             issues = [
                 _health_issue(
                     "missing_file",
                     "manifest file is missing",
-                    path=path,
+                    path=logical_paths[path],
                 )
                 for path in sorted(manifested - actual)
             ]
+            issues.extend(invalid_references)
             issues.extend(
                 _health_issue(
                     "orphan_file",
                     "file is not manifested",
                     path=path,
                 )
-                for path in sorted(actual - manifested)
+                for path in sorted(actual - retained)
             )
             if manifest_rows and spec.name not in schema_hashes:
                 issues.append(
@@ -609,7 +611,11 @@ class StatusManager:
         """Inventory selected dataset files with one traversal of the source root."""
 
         inventory = {dataset: set() for dataset in datasets}
-        source_root = (self.paths.root / "lake" / source).resolve()
+        source_root = (
+            self.paths.lake
+            / ("items" if source == "items" else "raw")
+            / ("" if source == "items" else source)
+        ).resolve()
         if not source_root.is_dir():
             return inventory
         roots: list[tuple[tuple[str, ...], str]] = []
@@ -626,106 +632,6 @@ class StatusManager:
                     inventory[dataset].add(Path(*parts[len(root_parts) :]).as_posix())
                     break
         return inventory
-
-    def quarantine_partitions(
-        self,
-        spec: DatasetSpec,
-        partition_paths: Iterable[str],
-        *,
-        reason: str,
-        confirm: bool = False,
-        repair_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Move suspect partitions aside and remove their manifest rows safely."""
-
-        if not confirm:
-            raise DestructiveOperationError(
-                "Pass confirm=True to quarantine canonical partitions"
-            )
-        if not reason.strip():
-            raise ValueError("quarantine reason must not be blank")
-        selected = tuple(
-            dict.fromkeys(_safe_relative_partition(path) for path in partition_paths)
-        )
-        if not selected:
-            return {
-                "source": spec.source,
-                "dataset": spec.name,
-                "repair_id": repair_id,
-                "quarantined": [],
-                "removed_manifests": [],
-            }
-        operation_id = repair_id or uuid.uuid4().hex
-        source_root = self.paths.dataset_root(spec.source, spec.name).resolve()
-        quarantine_root = (
-            self.paths.root
-            / ".health-repair-quarantine"
-            / operation_id
-            / spec.source
-            / spec.name
-        ).resolve()
-        if not quarantine_root.is_relative_to(self.paths.root.resolve()):
-            raise DestructiveOperationError("quarantine path escapes lake root")
-        journal = quarantine_root / "journal.json"
-        moves: list[tuple[Path, Path, str]] = []
-        for relative in selected:
-            source_path = (source_root / Path(relative)).resolve()
-            if not source_path.is_relative_to(source_root):
-                raise DestructiveOperationError(
-                    f"Partition path escapes dataset root: {relative}"
-                )
-            if source_path.is_file():
-                moves.append((source_path, quarantine_root / Path(relative), relative))
-        _atomic_json(
-            journal,
-            {
-                "schema": "bagelquant-data.health-quarantine.v1",
-                "repair_id": operation_id,
-                "source": spec.source,
-                "dataset": spec.name,
-                "reason": reason,
-                "state": "planned",
-                "partitions": list(selected),
-            },
-        )
-        moved: list[tuple[Path, Path, str]] = []
-        removed: list[dict[str, Any]] = []
-        try:
-            for source_path, target, relative in moves:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(source_path, target)
-                moved.append((source_path, target, relative))
-            removed = self.metadata.remove_manifests(spec.source, spec.name, selected)
-            _atomic_json(
-                journal,
-                {
-                    "schema": "bagelquant-data.health-quarantine.v1",
-                    "repair_id": operation_id,
-                    "source": spec.source,
-                    "dataset": spec.name,
-                    "reason": reason,
-                    "state": "committed",
-                    "partitions": list(selected),
-                    "manifest_rows": [str(row["partition_path"]) for row in removed],
-                },
-            )
-        except Exception:
-            if removed:
-                self.metadata.upsert_manifests(removed)
-            for source_path, target, _ in reversed(moved):
-                source_path.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists():
-                    os.replace(target, source_path)
-            raise
-        return {
-            "source": spec.source,
-            "dataset": spec.name,
-            "repair_id": operation_id,
-            "journal": str(journal),
-            "quarantine_root": str(quarantine_root),
-            "quarantined": [relative for _, _, relative in moved],
-            "removed_manifests": [str(row["partition_path"]) for row in removed],
-        }
 
 
 def _partition_values(relative_path: Path) -> dict[str, Any]:
@@ -901,23 +807,3 @@ def _health_issue(
         "actual": actual,
         "detail": detail,
     }
-
-
-def _safe_relative_partition(value: object) -> str:
-    path = Path(str(value))
-    if path.is_absolute() or ".." in path.parts or path.suffix != ".parquet":
-        raise DestructiveOperationError(f"Unsafe partition path: {value}")
-    return path.as_posix()
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)

@@ -8,7 +8,7 @@ import pytest
 from bagelquant_data import DataLake, DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.storage.recovery import repair_partition, reconstruct
-from bagelquant_data.query import frozen_raw_reads
+from bagelquant_data import input_read_boundary
 
 
 def instant(day):
@@ -18,7 +18,7 @@ def instant(day):
 def daily_spec(**extra):
     return DatasetSpec(
         "prices",
-        "by_daily",
+        "by_date",
         date_kind="calendar",
         date_param="trade_date",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
@@ -30,16 +30,17 @@ def daily_spec(**extra):
 
 
 def test_version_evidence_uses_exact_observation_cutoff_and_frozen_commit(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = daily_spec()
-    lake.ingest(spec,price(),mode="initialize",ingested_at=instant("08-26"))
-    frozen = lake.query.frozen()
+    lake.raw.ingest(spec,price(),mode="initialize",ingested_at=instant("08-26"))
+    with input_read_boundary(lake.data_meta_path, lake.inputs.max_commit()):
+        frozen = DataLake.open(data_meta_path=lake.data_meta_path, lake_path=lake.lake_path, read_only=True).raw
     original = frozen.version_evidence("prices",source="custom",observation_start="2026-08-25",observation_end="2026-08-25")
-    assert original and lake.query.version_evidence("prices",source="custom",observation_start="2026-08-26",observation_end="2026-08-31") == []
-    lake.ingest(spec,price(120.),ingested_at=instant("09-10"))
+    assert original and lake.raw.version_evidence("prices",source="custom",observation_start="2026-08-26",observation_end="2026-08-31") == []
+    lake.raw.ingest(spec,price(120.),ingested_at=instant("09-10"))
     assert frozen.version_evidence("prices",source="custom",observation_start="2026-08-25",observation_end="2026-08-25") == original
-    assert lake.query.version_evidence("prices",source="custom",as_of_date="2026-09-08",observation_start="2026-08-25",observation_end="2026-08-25") == original
-    assert len(lake.query.version_evidence("prices",source="custom",as_of_date="2026-09-09",observation_start="2026-08-25",observation_end="2026-08-25")) == 2
+    assert lake.raw.version_evidence("prices",source="custom",as_of_date="2026-09-08",observation_start="2026-08-25",observation_end="2026-08-25") == original
+    assert len(lake.raw.version_evidence("prices",source="custom",as_of_date="2026-09-09",observation_start="2026-08-25",observation_end="2026-08-25")) == 2
 
 
 def price(value=100.0):
@@ -50,26 +51,27 @@ def price(value=100.0):
 
 def test_frozen_scope_pins_new_readers_and_survives_worker_handoff(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    boundary = lake.query.freeze()
-    lake.ingest(daily_spec(), price(120.), ingested_at=instant("09-10"))
-    with frozen_raw_reads(tmp_path, boundary):
-        pinned = DataLake.open(tmp_path).query
-        assert pinned.freeze() == boundary
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    boundary = lake.inputs.max_commit()
+    lake.raw.ingest(daily_spec(), price(120.), ingested_at=instant("09-10"))
+    with input_read_boundary(tmp_path / "data_meta.sqlite", boundary):
+        pinned_lake = DataLake.open(data_meta_path=lake.data_meta_path, lake_path=lake.lake_path, read_only=True)
+        pinned = pinned_lake.raw
+        assert pinned_lake.inputs.max_commit() == boundary
         with pytest.raises(ValueError, match="frozen"):
-            pinned.query("prices", source="custom", max_commit=boundary + 1)
+            pinned.read("prices", source="custom", max_commit=boundary + 1)
         with pytest.raises(ValueError, match="nested"):
-            with frozen_raw_reads(tmp_path, boundary + 1):
+            with input_read_boundary(tmp_path / "data_meta.sqlite", boundary + 1):
                 pass
-        with frozen_raw_reads(tmp_path, boundary):
-            assert DataLake.open(tmp_path).query.freeze() == boundary
+        with input_read_boundary(tmp_path / "data_meta.sqlite", boundary):
+            assert DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake").inputs.max_commit() == boundary
     def read():
-        return pinned.query("prices", source="custom").collect()["close"].item()
+        return pinned.read("prices", source="custom").collect()["close"].item()
     with ThreadPoolExecutor(max_workers=1) as workers:
         assert workers.submit(read).result() == 100.
-    assert DataLake.open(tmp_path).query.query("prices", source="custom").collect()["close"].item() == 120.
-    assert lake.query.frozen(max_commit=boundary).query("prices", source="custom").collect()["close"].item() == 100.
+    assert DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake").raw.read("prices", source="custom", view="latest").collect()["close"].item() == 120.
+    assert lake.raw.read("prices", source="custom", max_commit=boundary, view="latest").collect()["close"].item() == 100.
 
 
 @pytest.mark.parametrize("clock,expected", [
@@ -80,15 +82,15 @@ def test_frozen_scope_pins_new_readers_and_survives_worker_handoff(tmp_path):
     ("18:48:00", "2026-09-16"),
 ])
 def test_next_open_cutoff_never_backdates_a_late_revision(tmp_path, clock, expected):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = daily_spec()
-    lake.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
-    lake.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(f"2026-09-16T{clock}+08:00"))
-    versions = lake.query.query("prices", source="custom", view="versions").collect()
+    lake.raw.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.raw.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(f"2026-09-16T{clock}+08:00"))
+    versions = lake.raw.read("prices", source="custom", view="versions").collect()
     assert versions.filter(~pl.col("_baseline"))["time"].item() == date.fromisoformat(expected)
     previous = date.fromordinal(date.fromisoformat(expected).toordinal() - 1)
-    assert lake.query.query("prices", source="custom", as_of_date=previous).collect()["close"].item() == 100.
-    assert lake.query.observations("prices", source="custom").collect()["close"].item() == 100.
+    assert lake.raw.read("prices", source="custom", as_of_date=previous, view="latest").collect()["close"].item() == 100.
+    assert lake.raw.observations("prices", source="custom").collect()["close"].item() == 100.
 
 
 @pytest.mark.parametrize("instant_text,expected", [
@@ -98,28 +100,29 @@ def test_next_open_cutoff_never_backdates_a_late_revision(tmp_path, clock, expec
     ("2026-10-01T18:48:00+08:00", "2026-10-02"),
 ])
 def test_close_cutoff_uses_local_timezone_and_conservative_calendar_date(tmp_path, instant_text, expected):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = replace(daily_spec(), availability_day_offset=0, availability_cutoff_time="15:00:00")
-    lake.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
-    lake.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(instant_text))
-    versions = lake.query.query("prices", source="custom", view="versions").collect()
+    lake.raw.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.raw.ingest(spec, price(999.), ingested_at=datetime.fromisoformat(instant_text))
+    versions = lake.raw.read("prices", source="custom", view="versions").collect()
     assert versions.filter(~pl.col("_baseline"))["time"].item() == date.fromisoformat(expected)
 
 
 def test_negative_offset_without_cutoff_is_rejected(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     with pytest.raises(ConfigurationError, match="cutoff"):
-        lake.admin.datasets.register(replace(daily_spec(), availability_cutoff_time=None))
+        lake.raw.register(replace(daily_spec(), availability_cutoff_time=None))
 
 
 def test_cross_month_versions_cutoffs_and_idempotence(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = daily_spec()
-    lake.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
-    lake.ingest(spec, price(120.0), ingested_at=instant("09-10"))
+    lake.raw.ingest(spec, price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.raw.ingest(spec, price(120.0), ingested_at=instant("09-10"))
 
     def read(**kwargs):
-        return lake.query.query("prices", source="custom", **kwargs).collect()
+        kwargs.setdefault('view', 'latest')
+        return lake.raw.read("prices", source="custom", **kwargs).collect()
 
     assert read(as_of_date="2026-09-08")["close"].to_list() == [100.0]
     assert read(as_of_date="2026-09-09")["close"].to_list() == [120.0]
@@ -128,37 +131,36 @@ def test_cross_month_versions_cutoffs_and_idempotence(tmp_path):
         "time"
     ].to_list() == [date(2026, 9, 9)]
     assert read(view="versions").height == 2
-    before = lake.metadata.manifest("custom", "prices")
+    before = lake._data_meta.manifest("custom", "prices")
     assert (
-        lake.ingest(spec, price(120.0), ingested_at=instant("09-11")).rows_committed
+        lake.raw.ingest(spec, price(120.0), ingested_at=instant("09-11")).rows_committed
         == 0
     )
-    assert lake.metadata.manifest("custom", "prices") == before
+    assert lake._data_meta.manifest("custom", "prices") == before
     with pytest.raises(ValueError, match="initialization"):
-        lake.ingest(spec, price(999.0), mode="initialize")
+        lake.raw.ingest(spec, price(999.0), mode="initialize")
 
 
 def test_local_recovery_preserves_old_versions_and_metadata(tmp_path):
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    lake.ingest(daily_spec(), price(120.0), ingested_at=instant("09-10"))
-    manifest = lake.metadata.manifest("custom", "prices")
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.raw.ingest(daily_spec(), price(120.0), ingested_at=instant("09-10"))
+    manifest = lake._data_meta.manifest("custom", "prices")
     partition = manifest[0]["partition_path"]
-    expected = reconstruct(lake.parquet, "custom", "prices", partition)
-    path = lake.paths.dataset_root("custom", "prices") / partition
+    expected = reconstruct(lake._parquet, "custom", "prices", partition)
+    path = lake._paths.dataset_root("custom", "prices") / next(row["generation_path"] for row in lake.raw.manifest("prices", source="custom") if row["partition_path"] == partition)
     path.write_bytes(b"damaged")
-    repair_partition(lake.parquet, "custom", "prices", partition)
+    repair_partition(lake._parquet, "custom", "prices", partition)
     assert pl.read_parquet(path, hive_partitioning=False).equals(expected)
-    assert lake.metadata.manifest("custom", "prices") == manifest
-    journal = path.with_name("recovery.sqlite")
-    with sqlite3.connect(journal) as db:
-        db.execute("update batches set payload=x'00'")
+    assert lake._data_meta.manifest("custom", "prices") == manifest
+    with sqlite3.connect(lake.data_meta_path) as db:
+        db.execute("update version_batches set payload=x'00'")
     with pytest.raises(Exception):
-        reconstruct(lake.parquet, "custom", "prices", partition)
+        reconstruct(lake._parquet, "custom", "prices", partition)
 
 
 def test_general_keeps_distinct_complete_snapshots(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "reference",
         "general",
@@ -166,20 +168,20 @@ def test_general_keeps_distinct_complete_snapshots(tmp_path):
         availability_day_offset=-1,
         availability_cutoff_time="09:30:00",
     )
-    lake.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
-    lake.ingest(spec, pl.DataFrame({"code": ["B"]}), ingested_at=instant("09-10"))
-    assert lake.query.query_general("reference", source="custom").collect()[
+    lake.raw.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
+    lake.raw.ingest(spec, pl.DataFrame({"code": ["B"]}), ingested_at=instant("09-10"))
+    assert lake.raw.read("reference", source="custom", view="latest").collect()[
         "code"
     ].to_list() == ["B"]
-    assert lake.query.query_general(
+    assert lake.raw.read(
         "reference", source="custom", as_of_date="2026-09-08"
-    ).collect()["code"].to_list() == ["A"]
-    partition = lake.metadata.manifest("custom", "reference")[0]["partition_path"]
-    assert reconstruct(lake.parquet, "custom", "reference", partition).height == 2
+    , view="latest").collect()["code"].to_list() == ["A"]
+    partition = lake._data_meta.manifest("custom", "reference")[0]["partition_path"]
+    assert reconstruct(lake._parquet, "custom", "reference", partition).height == 2
 
 
 def test_general_empty_update_is_a_complete_snapshot(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "reference",
         "general",
@@ -187,15 +189,15 @@ def test_general_empty_update_is_a_complete_snapshot(tmp_path):
         availability_day_offset=-1,
         availability_cutoff_time="09:30:00",
     )
-    lake.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
-    lake.ingest(
+    lake.raw.ingest(spec, pl.DataFrame({"code": ["A"]}), ingested_at=instant("09-09"))
+    lake.raw.ingest(
         spec,
         pl.DataFrame(schema={"code": pl.String}),
         ingested_at=instant("09-10"),
     )
 
-    assert lake.query.query_general("reference", source="custom").collect().is_empty()
-    snapshots = lake.query.snapshots("reference", source="custom")
+    assert lake.raw.read("reference", source="custom", view="latest").collect().is_empty()
+    snapshots = lake.raw.snapshots("reference", source="custom")
     assert [snapshot["row_count"] for snapshot in snapshots] == [1, 0]
 
 
@@ -204,7 +206,7 @@ def test_general_empty_update_is_a_complete_snapshot(tmp_path):
     [pl.DataFrame({"code": ["A"]}), pl.DataFrame(schema={"code": pl.String})],
 )
 def test_unchanged_general_snapshot_records_only_a_check(tmp_path, frame):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "reference",
         "general",
@@ -212,19 +214,19 @@ def test_unchanged_general_snapshot_records_only_a_check(tmp_path, frame):
         availability_day_offset=-1,
         availability_cutoff_time="09:30:00",
     )
-    lake.ingest(spec, frame, ingested_at=instant("09-09"))
-    before_manifest = lake.metadata.manifest("custom", "reference")
-    before_boundary = lake.query.freeze()
+    lake.raw.ingest(spec, frame, ingested_at=instant("09-09"))
+    before_manifest = lake._data_meta.manifest("custom", "reference")
+    before_boundary = lake.inputs.max_commit()
 
-    report = lake.ingest(spec, frame, ingested_at=instant("09-10"))
+    report = lake.raw.ingest(spec, frame, ingested_at=instant("09-10"))
 
     assert report.rows_committed == 0
     assert report.partitions_rewritten == 0
     assert report.partitions_skipped == 1
-    assert lake.query.freeze() == before_boundary
-    assert lake.metadata.manifest("custom", "reference") == before_manifest
-    assert len(lake.query.snapshots("reference", source="custom")) == 1
-    checks = lake.metadata._rows(
+    assert lake.inputs.max_commit() == before_boundary
+    assert lake._data_meta.manifest("custom", "reference") == before_manifest
+    assert len(lake.raw.snapshots("reference", source="custom")) == 1
+    checks = lake._data_meta._rows(
         "select visible_commit,row_count from version_checks "
         "where source='custom' and dataset='reference'"
     )
@@ -232,7 +234,7 @@ def test_unchanged_general_snapshot_records_only_a_check(tmp_path, frame):
 
 
 def test_unchanged_general_snapshot_commits_new_definition_identity(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     original = DatasetSpec(
         "reference",
         "general",
@@ -250,31 +252,31 @@ def test_unchanged_general_snapshot_commits_new_definition_identity(tmp_path):
         availability_cutoff_time="09:30:00",
     )
     frame = pl.DataFrame({"code": ["A"]})
-    lake.ingest(original, frame, ingested_at=instant("09-09"))
-    before_boundary = lake.query.freeze()
+    lake.raw.ingest(original, frame, ingested_at=instant("09-09"))
+    before_boundary = lake.inputs.max_commit()
 
-    report = lake.ingest(revised, frame, ingested_at=instant("09-10"))
+    report = lake.raw.ingest(revised, frame, ingested_at=instant("09-10"))
 
     assert report.rows_committed == 1
     assert report.partitions_rewritten == 1
-    assert lake.query.freeze() > before_boundary
-    assert lake.query.query_general("reference", source="custom").collect()[
+    assert lake.inputs.max_commit() > before_boundary
+    assert lake.raw.read("reference", source="custom", view="latest").collect()[
         "code"
     ].to_list() == ["A"]
-    commits = lake.metadata._rows(
+    commits = lake._data_meta._rows(
         "select spec_hash from version_commits "
         "where source='custom' and dataset='reference' and status='committed' "
         "order by seq"
     )
     assert len(commits) == 2
     assert commits[0]["spec_hash"] != commits[1]["spec_hash"]
-    assert commits[-1]["spec_hash"] == lake.metadata.dataset_spec_hash(
+    assert commits[-1]["spec_hash"] == lake._data_meta.dataset_spec_hash(
         "custom", "reference"
     )
 
 
 def test_general_initial_snapshot_is_not_visible_before_its_pit_date(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "reference",
         "general",
@@ -282,19 +284,19 @@ def test_general_initial_snapshot_is_not_visible_before_its_pit_date(tmp_path):
         availability_day_offset=-1,
         availability_cutoff_time="09:30:00",
     )
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame({"code": ["A"]}),
         mode="initialize",
         ingested_at=instant("09-10"),
     )
 
-    assert lake.query.query_general(
+    assert lake.raw.read(
         "reference", source="custom", as_of_date="2026-09-08"
-    ).collect().is_empty()
-    assert lake.query.query_general(
+    , view="latest").collect().is_empty()
+    assert lake.raw.read(
         "reference", source="custom", as_of_date="2026-09-09"
-    ).collect()["code"].to_list() == ["A"]
+    , view="latest").collect()["code"].to_list() == ["A"]
 
 
 class DailySource:
@@ -317,13 +319,13 @@ class DailySource:
 
 
 def test_calendar_days_fanout_empty_scopes_and_recent_rechecks(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = DailySource()
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         daily_spec(source_api_param_sets=({"ts_code": ["A", "B"]},))
     )
-    result = lake.update.dataset(
+    result = lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-25",
@@ -333,12 +335,12 @@ def test_calendar_days_fanout_empty_scopes_and_recent_rechecks(tmp_path):
     )
     assert result.status == "success"
     assert len(source.calls) == 12
-    scopes = lake.admin.update_scopes("prices", source="custom")
+    scopes = lake.integrity.update_scopes("prices", source="custom")
     assert len(scopes) == 12
     assert sum(s["status"] == "empty" for s in scopes) == 2
     assert all(s["scope_kind"] == "date" for s in scopes)
     source.calls.clear()
-    result = lake.update.dataset(
+    result = lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-25",
@@ -352,7 +354,7 @@ def test_calendar_days_fanout_empty_scopes_and_recent_rechecks(tmp_path):
         "2026-08-30",
     }
     with pytest.raises(ConfigurationError, match="Initialization"):
-        lake.update.dataset(
+        lake.raw.update(
             "prices",
             source="custom",
             start="2026-08-25",
@@ -378,21 +380,21 @@ def test_new_general_catalog_members_expand_into_daily_parameter_scopes(tmp_path
                 }
             )
 
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     catalog = DatasetSpec(
         "stock_basic", "general", field_mappings={"ts_code": "asset_id"}
     )
     source = ParameterSource()
-    lake.admin.sources.register(source)
-    lake.ingest(catalog, pl.DataFrame({"ts_code": ["A"]}))
-    lake.admin.datasets.register(
+    lake.catalog.sources.register(source)
+    lake.raw.ingest(catalog, pl.DataFrame({"ts_code": ["A"]}))
+    lake.raw.register(
         daily_spec(
             parameter_dataset="stock_basic",
             parameter_field="asset_id",
             parameter_name="ts_code",
         )
     )
-    lake.update.dataset(
+    lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-01",
@@ -401,8 +403,8 @@ def test_new_general_catalog_members_expand_into_daily_parameter_scopes(tmp_path
     )
     source.calls.clear()
 
-    lake.ingest(catalog, pl.DataFrame({"ts_code": ["A", "B"]}))
-    lake.update.dataset(
+    lake.raw.ingest(catalog, pl.DataFrame({"ts_code": ["A", "B"]}))
+    lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-01",
@@ -418,7 +420,7 @@ def test_new_general_catalog_members_expand_into_daily_parameter_scopes(tmp_path
         "2026-08-04",
         "2026-08-05",
     }
-    coverage = lake.admin.coverage(
+    coverage = lake.integrity.coverage(
         "prices", source="custom", start="2026-08-01", end="2026-08-05"
     )
     assert coverage["complete"] is True
@@ -445,13 +447,13 @@ def test_multiple_date_parameters_share_daily_coverage_without_duplicate_content
                 }
             )
 
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = AnnouncementSource()
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         DatasetSpec(
             "dividend",
-            "by_daily",
+            "by_date",
             date_kind="calendar",
             date_params=("ann_date", "imp_ann_date"),
             source_time_fields=("imp_ann_date", "ann_date"),
@@ -460,7 +462,7 @@ def test_multiple_date_parameters_share_daily_coverage_without_duplicate_content
         )
     )
 
-    report = lake.update.dataset(
+    report = lake.raw.update(
         "dividend",
         source="custom",
         start="2026-08-25",
@@ -473,10 +475,10 @@ def test_multiple_date_parameters_share_daily_coverage_without_duplicate_content
         ("ann_date",),
         ("imp_ann_date",),
     }
-    assert lake.query.query(
+    assert lake.raw.read(
         "dividend", source="custom", view="versions"
     ).collect().height == 1
-    assert len(lake.admin.update_scopes("dividend", source="custom")) == 2
+    assert len(lake.integrity.update_scopes("dividend", source="custom")) == 2
 
 
 def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tmp_path):
@@ -498,11 +500,11 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
                 }
             )
 
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = RevisingSource()
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(daily_spec())
-    lake.update.dataset(
+    lake.catalog.sources.register(source)
+    lake.raw.register(daily_spec())
+    lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-01",
@@ -511,7 +513,7 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
     )
     source.revised = True
     source.calls.clear()
-    ordinary = lake.update.dataset(
+    ordinary = lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-01",
@@ -526,7 +528,7 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
     }
 
     source.calls.clear()
-    refreshed = lake.update.dataset(
+    refreshed = lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-01",
@@ -538,20 +540,20 @@ def test_refresh_rechecks_old_dates_and_dates_revisions_when_they_are_learned(tm
     assert {call["trade_date"] for call in source.calls} == {
         f"2026-08-0{day}" for day in range(1, 6)
     }
-    assert lake.query.query(
+    assert lake.raw.read(
         "prices", source="custom", as_of_date="2026-09-08"
-    ).collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 100.0
-    assert lake.query.query(
+    , view="latest").collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 100.0
+    assert lake.raw.read(
         "prices", source="custom", as_of_date="2026-09-09"
-    ).collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 120.0
+    , view="latest").collect().filter(pl.col("source_time") == date(2026, 8, 1))["close"].item() == 120.0
 
 
 def test_provider_gap_repair_cannot_backdate_new_or_revised_observations(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = daily_spec()
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {"trade_date": ["20260824"], "ts_code": ["A"], "close": [90.0]}
@@ -562,7 +564,7 @@ def test_provider_gap_repair_cannot_backdate_new_or_revised_observations(
     missing = pl.DataFrame(
         {"trade_date": ["20260825"], "ts_code": ["A"], "close": [100.0]}
     )
-    lake.ingest(spec, missing, ingested_at=instant("09-10"))
+    lake.raw.ingest(spec, missing, ingested_at=instant("09-10"))
 
     committed = lake._pipeline.commit_frame(
         spec,
@@ -573,19 +575,19 @@ def test_provider_gap_repair_cannot_backdate_new_or_revised_observations(
     )
 
     assert committed.rows_committed == 0
-    repaired = lake.query.query(
+    repaired = lake.raw.read(
         "prices",
         source="custom",
         as_of_date="2026-08-25",
-    ).collect()
+     view="latest").collect()
     assert repaired.filter(pl.col("source_time") == date(2026, 8, 25)).is_empty()
     lake._pipeline.commit_frame(
         spec,
         pl.DataFrame({"trade_date": ["20260824"], "ts_code": ["A"], "close": [999.0]}),
         run_id="provider-revision", ingested_at=instant("09-11"),
     )
-    assert lake.query.observations("prices", source="custom").collect()["close"].to_list() == [90.0]
-    versions = lake.query.query(
+    assert lake.raw.observations("prices", source="custom").collect()["close"].to_list() == [90.0]
+    versions = lake.raw.read(
         "prices",
         source="custom",
         observation_start="2026-08-25",
@@ -594,19 +596,19 @@ def test_provider_gap_repair_cannot_backdate_new_or_revised_observations(
     ).collect()
     assert versions.height == 1
     assert versions.filter(pl.col("_baseline")).is_empty()
-    lake.admin.sources.register(DailySource())
+    lake.catalog.sources.register(DailySource())
     with pytest.raises(ConfigurationError, match="Unsupported update option"):
-        lake.update.dataset("prices", source="custom", baseline_repair=True)
+        lake.raw.update("prices", source="custom", baseline_repair=True)
 
 
 def test_repeating_pagination_never_claims_complete(tmp_path):
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = DailySource()
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(
+    lake.catalog.sources.register(source)
+    lake.raw.register(
         daily_spec(request_options={"pagination": "offset", "page_size": 1})
     )
-    result = lake.update.dataset(
+    result = lake.raw.update(
         "prices",
         source="custom",
         start="2026-08-25",
@@ -617,49 +619,51 @@ def test_repeating_pagination_never_claims_complete(tmp_path):
     assert result.status == "failed"
     assert result.rows_committed == 0
     assert len(source.calls) == 2
-    assert lake.admin.update_scopes("prices", source="custom")[0]["status"] == "invalid"
+    assert lake.integrity.update_scopes("prices", source="custom")[0]["status"] == "invalid"
 
 
 def test_old_schema_rejected_without_writes(tmp_path):
-    path = tmp_path / "metadata" / "lake.db"
-    path.parent.mkdir()
+    path = tmp_path / "data_meta.sqlite"
+    path.parent.mkdir(exist_ok=True)
     with sqlite3.connect(path) as db:
-        db.execute("create table metadata_state(key text primary key,value text)")
-        db.execute("insert into metadata_state values('schema_version','3')")
+        db.execute("create table data_meta_state(key text primary key,value text)")
+        db.execute("insert into data_meta_state values('schema_version','3')")
     original = path.read_bytes()
     files = set(tmp_path.rglob("*"))
     with pytest.raises(ConfigurationError, match="Incompatible"):
-        DataLake.open(tmp_path)
+        DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     assert path.read_bytes() == original
     assert set(tmp_path.rglob("*")) == files
 
 
 def test_same_pit_day_versions_and_frozen_commit(tmp_path):
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    boundary = lake.query.freeze()
-    lake.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
-    lake.ingest(daily_spec(), price(125), ingested_at=instant("09-10"))
-    assert lake.query.query("prices", source="custom", max_commit=boundary).collect()["close"].to_list() == [100]
-    assert lake.query.query("prices", source="custom", as_of_date="2026-09-09").collect()["close"].to_list() == [125]
-    assert lake.admin.validate_dataset("prices", source="custom", deep=True)["valid"]
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    boundary = lake.inputs.max_commit()
+    lake.raw.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
+    lake.raw.ingest(daily_spec(), price(125), ingested_at=instant("09-10"))
+    assert lake.raw.read("prices", source="custom", max_commit=boundary, view="latest").collect()["close"].to_list() == [100]
+    assert lake.raw.read("prices", source="custom", as_of_date="2026-09-09", view="latest").collect()["close"].to_list() == [125]
+    assert lake.integrity.scan("prices", source="custom", deep=True)["valid"]
 
 
 def test_damaged_journal_can_only_be_restored_from_verified_parquet(tmp_path):
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    row = lake.metadata.manifest("custom", "prices")[0]
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    row = lake._data_meta.manifest("custom", "prices")[0]
     partition = row["partition_path"]
-    path = lake.paths.dataset_root("custom", "prices") / partition
-    path.with_name("recovery.sqlite").write_bytes(b"broken journal")
-    repair_partition(lake.parquet, "custom", "prices", partition)
-    assert reconstruct(lake.parquet, "custom", "prices", partition).height == 1
-    path.with_name("recovery.sqlite").write_bytes(b"broken journal")
+    path = lake._paths.dataset_root("custom", "prices") / next(row["generation_path"] for row in lake.raw.manifest("prices", source="custom") if row["partition_path"] == partition)
+    with sqlite3.connect(lake.data_meta_path) as db:
+        db.execute("update version_batches set payload=x'00'")
+    repair_partition(lake._parquet, "custom", "prices", partition)
+    assert reconstruct(lake._parquet, "custom", "prices", partition).height == 1
+    with sqlite3.connect(lake.data_meta_path) as db:
+        db.execute("update version_batches set payload=x'00'")
     path.write_bytes(b"broken parquet")
     with pytest.raises(Exception):
-        repair_partition(lake.parquet, "custom", "prices", partition)
-    assert lake.metadata.manifest("custom", "prices")[0] == row
-    report = lake.admin.validate_dataset("prices", source="custom", deep=True)
+        repair_partition(lake._parquet, "custom", "prices", partition)
+    assert lake._data_meta.manifest("custom", "prices")[0] == row
+    report = lake.integrity.scan("prices", source="custom", deep=True)
     recovery_issue = next(
         issue for issue in report["issues"] if issue["code"] == "recovery_evidence"
     )
@@ -668,20 +672,20 @@ def test_damaged_journal_can_only_be_restored_from_verified_parquet(tmp_path):
 
 
 def test_failed_manifest_commit_leaves_no_visible_new_versions(tmp_path, monkeypatch):
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    before = lake.metadata.manifest("custom", "prices")
-    original = lake.parquet.commit_metadata
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    before = lake._data_meta.manifest("custom", "prices")
+    original = lake._parquet.commit_metadata
     def fail(*args, **kwargs):
         raise RuntimeError("injected metadata interruption")
-    monkeypatch.setattr(lake.parquet, "commit_metadata", fail)
+    monkeypatch.setattr(lake._parquet, "commit_metadata", fail)
     with pytest.raises(RuntimeError, match="injected"):
-        lake.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
-    assert lake.metadata.manifest("custom", "prices") == before
-    assert lake.query.query("prices", source="custom", view="versions").collect().height == 1
-    monkeypatch.setattr(lake.parquet, "commit_metadata", original)
-    lake.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
-    assert lake.query.query("prices", source="custom", view="versions").collect().height == 2
+        lake.raw.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
+    assert lake._data_meta.manifest("custom", "prices") == before
+    assert lake.raw.read("prices", source="custom", view="versions").collect().height == 1
+    monkeypatch.setattr(lake._parquet, "commit_metadata", original)
+    lake.raw.ingest(daily_spec(), price(120), ingested_at=instant("09-10"))
+    assert lake.raw.read("prices", source="custom", view="versions").collect().height == 2
 
 
 def test_general_failed_variant_preserves_previous_complete_snapshot(tmp_path):
@@ -692,23 +696,23 @@ def test_general_failed_variant_preserves_previous_complete_snapshot(tmp_path):
             if self.fail and request["group"] == "B":
                 raise RuntimeError("partial snapshot")
             return pl.DataFrame({"code": [request["group"]]})
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     source = Source()
-    lake.admin.sources.register(source)
-    lake.admin.datasets.register(DatasetSpec("reference", "general", source_api_param_sets=({"group": ["A", "B"]},)))
-    lake.update.dataset("reference", source="custom", end="2026-09-10", max_retries=1)
-    boundary = lake.query.freeze()
+    lake.catalog.sources.register(source)
+    lake.raw.register(DatasetSpec("reference", "general", source_api_param_sets=({"group": ["A", "B"]},)))
+    lake.raw.update("reference", source="custom", end="2026-09-10", max_retries=1)
+    boundary = lake.inputs.max_commit()
     source.fail = True
-    result = lake.update.dataset("reference", source="custom", end="2026-09-10", max_retries=1)
+    result = lake.raw.update("reference", source="custom", end="2026-09-10", max_retries=1)
     assert result.status == "failed"
-    assert lake.query.freeze() == boundary
-    assert sorted(lake.query.query_general("reference", source="custom").collect()["code"]) == ["A", "B"]
+    assert lake.inputs.max_commit() == boundary
+    assert sorted(lake.raw.read("reference", source="custom", view="latest").collect()["code"]) == ["A", "B"]
 
 
 def test_changed_schema_recovery_keeps_partition_schema(tmp_path):
-    lake = DataLake.open(tmp_path)
-    lake.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
-    lake.ingest(daily_spec(), price(120).with_columns(pl.lit(1).alias("extra")), ingested_at=instant("09-10"))
-    for row in lake.metadata.manifest("custom", "prices"):
-        reconstruct(lake.parquet, "custom", "prices", row["partition_path"])
-    assert lake.admin.validate_dataset("prices", source="custom", deep=True)["valid"]
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
+    lake.raw.ingest(daily_spec(), price(120).with_columns(pl.lit(1).alias("extra")), ingested_at=instant("09-10"))
+    for row in lake._data_meta.manifest("custom", "prices"):
+        reconstruct(lake._parquet, "custom", "prices", row["partition_path"])
+    assert lake.integrity.scan("prices", source="custom", deep=True)["valid"]

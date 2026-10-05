@@ -1,17 +1,22 @@
 # Sources
 
-Sources are small adapters that fetch a Polars DataFrame for one provider
-request. Register and configure them through `lake.admin.sources`.
+A source implements `name`, `configure(**options)`, `test_connection()` and
+`fetch(dataset, request) -> polars.DataFrame`. Register/configure through
+`lake.catalog.sources`. Reading stored data never calls a provider.
 
 ```python
 from bagelquant_data import TushareSource
 
-lake.admin.sources.register(TushareSource())
-lake.admin.sources.configure("tushare", token="...")
+lake.catalog.sources.register(TushareSource())
+lake.catalog.sources.configure("tushare", token="runtime-secret")
 ```
 
-Keep credentials in environment variables or runtime configuration, never in
-dataset declarations or committed files.
+Credentials remain runtime configuration and are redacted from persisted public
+configuration. Dataset mappings, China-market calendars and availability
+conventions are caller declarations. Data defaults to neutral UTC timing; it
+does not infer exchange sessions or China semantics.
 
-
-Adapters may provide the optional `wait_for_request(dataset, cancel_requested=...) -> bool` admission hook. The generic ingestion worker calls it before each provider request and stops that request when it returns false. Tushare uses this hook to coordinate workers sharing an endpoint: after a per-minute quota response, it observes a shared cooldown and spaces subsequent requests below the reported quota. The wait checks cancellation in short intervals. Other endpoints and already committed success/empty scopes remain independent.
+Sources support `list/get/register/configure/enable/disable/remove/test`. Removing
+a source with active datasets or categories fails. Registering an adapter is
+local; `test()` and update APIs perform explicit external calls. Tests use fake
+providers and temporary lakes.

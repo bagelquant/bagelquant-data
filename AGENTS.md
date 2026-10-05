@@ -1,12 +1,11 @@
 # Data agent entry
 
-This repository owns the provider-neutral Raw lake, dataset declarations,
-coverage, PIT queries, explicit updates and provider adapters. The refactor target
-also assigns neutral generic derived datasets, versions and frozen input evidence
-to Data; that expansion is pending stage 2, not an implemented API.
+This repository owns provider-neutral Raw and typed DataItems, declarations,
+category trees, coverage, versions, PIT, frozen input receipts and local recovery.
 Data has no BagelQuant package dependency; never import Core, BT or Workbench.
-The current library-only facades are `lake.admin`, `lake.update` and `lake.query`;
-stage 2 may replace their contracts without compatibility layers.
+The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
+`lake.integrity` and `lake.inputs`; pure statistics live in `exploration`.
+Both `data_meta_path` and `lake_path` are mandatory caller-owned paths.
 
 Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
 affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
@@ -20,12 +19,15 @@ Keep this entry short; detailed owner contracts live under `.ai/rules/`.
 - Do not commit, push, create PRs, merge, release, deploy, install services,
   call providers, update real data or change governance unless explicitly requested.
 - Coverage is commit-backed truth; queries never submit updates or call providers.
-- Schema v4 is a fresh-lake hard cut; do not add migration/compatibility readers,
+- Schema 5 is a fresh-lake hard cut; do not add migration/compatibility readers,
   adopt orphan files or substitute current provider bytes for historical evidence.
 - Expose neutral data and evidence; Core owns Domain/Panel conversion and numerical
   artifacts, BT owns account/evaluation artifacts. Do not duplicate their storage.
 - Workbench supplies China semantics and research intent through public APIs;
   it owns app metadata/governance/orchestration, not generic data mechanisms.
+- Workbench owns global scheduling, hardware detection, admission and runtime
+  policy. Data uses explicit local limits, one pool and serial metadata publication;
+  default execution is serial. Never infer worker counts from machine resources.
 
 For formal work in an integrated workspace, create/resume a root `.ai/tasks/`
 record using the workspace CLI. Discover the workspace with

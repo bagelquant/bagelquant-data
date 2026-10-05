@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import os
@@ -38,7 +39,7 @@ class StableDailySource:
 def _daily_spec() -> DatasetSpec:
     return DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         calendar="trade_cal",
         field_mappings={"trade_date": "time", "ts_code": "asset_id"},
     )
@@ -115,7 +116,7 @@ def test_arrow_content_hash_survives_foreign_strings_parquet_roundtrip(
 
 
 def test_general_foreign_frame_manifest_matches_durable_parquet(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "trade_cal",
         "general",
@@ -133,11 +134,11 @@ def test_general_foreign_frame_manifest_matches_durable_parquet(tmp_path) -> Non
         )
     )
 
-    first = lake.ingest(spec, foreign)
-    health = lake.admin.validate_manifest(
+    first = lake.raw.ingest(spec, foreign)
+    health = lake.integrity.validate_manifest(
         "trade_cal", source="tushare", deep=True
     )
-    second = lake.ingest(spec, foreign)
+    second = lake.raw.ingest(spec, foreign)
 
     assert health["valid"]
     assert first.partitions_rewritten == 1
@@ -148,7 +149,7 @@ def test_general_foreign_frame_manifest_matches_durable_parquet(tmp_path) -> Non
 def test_identical_ingest_skips_partition_and_preserves_manifest_and_file(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
     frame = pl.DataFrame(
         {
@@ -158,39 +159,39 @@ def test_identical_ingest_skips_partition_and_preserves_manifest_and_file(
         }
     )
 
-    first = lake.ingest(spec, frame)
-    manifest_before = lake.metadata.manifest("custom", "daily")
-    path = lake.paths.dataset_root("custom", "daily") / str(
-        manifest_before[0]["partition_path"]
+    first = lake.raw.ingest(spec, frame)
+    manifest_before = lake._data_meta.manifest("custom", "daily")
+    path = lake._paths.dataset_root("custom", "daily") / str(
+        manifest_before[0]["generation_path"]
     )
     mtime_before = path.stat().st_mtime_ns
-    second = lake.ingest(spec, frame)
+    second = lake.raw.ingest(spec, frame)
 
     assert first.partitions_rewritten == 1
     assert second.partitions_rewritten == 0
     assert second.partitions_skipped == 1
     assert path.stat().st_mtime_ns == mtime_before
-    assert lake.metadata.manifest("custom", "daily") == manifest_before
+    assert lake._data_meta.manifest("custom", "daily") == manifest_before
 
 
 def test_conflicting_same_request_rows_are_rejected_without_publication(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     frame = pl.DataFrame({"trade_date": ["20250102", "20250102"], "ts_code": ["A", "A"], "value": [1., 2.]})
     with pytest.raises(ValueError) as error:
-        lake.ingest(_daily_spec(), frame)
+        lake.raw.ingest(_daily_spec(), frame)
     message = str(error.value)
     assert "Conflicting rows" in message
-    assert 'record_id={"source_time":"2025-01-02","asset_id":"A"}' in message
+    assert re.search(r"record_id=[0-9a-f]{64};", message)
     assert "row_count=2" in message
     assert "differing_fields=['value']" in message
-    assert not lake.metadata.manifest("custom", "daily")
+    assert not lake._data_meta.manifest("custom", "daily")
 
 
 def test_declared_revision_key_preserves_same_day_provider_rows(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec(
         "daily",
-        "by_daily",
+        "by_date",
         source="custom",
         date_kind="calendar",
         primary_key_extra=("update_flag",),
@@ -205,80 +206,56 @@ def test_declared_revision_key_preserves_same_day_provider_rows(tmp_path) -> Non
         }
     )
 
-    lake.ingest(spec, frame)
+    lake.raw.ingest(spec, frame)
 
-    assert lake.query.query("daily", source="custom").collect().height == 2
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 2
 
 
-def test_compatibility_write_returns_clean_manifest_on_noop(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    spec = _daily_spec()
-    lake.ingest(
-        spec,
-        pl.DataFrame(
-            {"trade_date": ["20250102"], "ts_code": ["A"], "close": [1.0]}
-        ),
-    )
-    stored = lake.metadata.manifest("custom", "daily")[0]
-    relative = lake.paths.dataset_root("custom", "daily") / str(
-        stored["partition_path"]
-    )
-
-    _, manifest = lake.parquet.write_partition_file(
-        spec,
-        pl.read_parquet(relative),
-        relative.relative_to(lake.paths.dataset_root("custom", "daily")),
-        {"year": 2025, "month": 1},
-    )
-    lake.metadata.upsert_manifest(**manifest)
-
-    assert "updated_at" not in manifest
-    assert {key: manifest["partition_values"][key] for key in ("year", "month")} == {"year": 2025, "month": 1}
 
 
 def test_general_replacement_does_not_retain_removed_columns(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = DatasetSpec("stock_basic", "general")
-    lake.ingest(spec, pl.DataFrame({"asset_id": ["A"], "name": ["old"]}))
-    lake.ingest(spec, pl.DataFrame({"asset_id": ["A"]}))
+    lake.raw.ingest(spec, pl.DataFrame({"asset_id": ["A"], "name": ["old"]}))
+    lake.raw.ingest(spec, pl.DataFrame({"asset_id": ["A"]}))
 
-    frame = lake.query.query_general("stock_basic", source="custom").collect()
+    frame = lake.raw.read("stock_basic", source="custom", view="latest").collect()
 
     assert "name" not in frame.columns
     assert {"asset_id", "source", "_snapshot_id"} <= set(frame.columns)
 
 
 def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
-    lake.admin.sources.register(StableDailySource())
-    lake.ingest(
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+    lake.catalog.sources.register(StableDailySource())
+    lake.raw.ingest(
         DatasetSpec("trade_cal", "general"),
         pl.DataFrame({"time": ["20250102"], "is_open": [1]}),
     )
-    lake.admin.datasets.register(_daily_spec())
+    lake.raw.register(_daily_spec())
 
-    first = lake.update.dataset(
+    first = lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-02",
     )
-    manifest_before = lake.metadata.manifest("custom", "daily")
-    second = lake.update.dataset(
+    manifest_before = lake._data_meta.manifest("custom", "daily")
+    second = lake.raw.update(
         "daily",
         source="custom",
         start="2025-01-02",
         end="2025-01-02",
         today="2025-01-03",
     )
-    scope = lake.admin.status.update_scopes(dataset="daily", source="custom")[0]
+    scope = lake.integrity.update_scopes(dataset="daily", source="custom")[0]
 
     assert first.partitions_rewritten == 1
     assert second.partitions_rewritten == 0
     assert second.partitions_skipped == 1
     assert scope["status"] == "success"
-    assert lake.metadata.manifest("custom", "daily") == manifest_before
+    assert lake._data_meta.manifest("custom", "daily") == manifest_before
 
 
 
@@ -288,9 +265,9 @@ def test_noop_update_still_completes_scope_successfully(tmp_path) -> None:
 def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
     tmp_path,
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -302,7 +279,7 @@ def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
             }
         ),
     )
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -314,7 +291,7 @@ def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
             }
         ),
     )
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -326,7 +303,7 @@ def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
         ),
     )
 
-    frame = lake.query.query("daily", source="custom").collect().sort("time")
+    frame = lake.raw.read("daily", source="custom", view="latest").collect().sort("time")
 
     assert frame.schema["value"] == pl.Float64
     assert frame.schema["nullable"] == pl.Float64
@@ -337,9 +314,9 @@ def test_schema_reconciliation_handles_null_numeric_and_missing_columns(
 
 
 def test_unparseable_string_numeric_conflict_fails_commit(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -351,7 +328,7 @@ def test_unparseable_string_numeric_conflict_fails_commit(tmp_path) -> None:
     )
 
     with pytest.raises(ValidationError, match="canonical schema"):
-        lake.ingest(
+        lake.raw.ingest(
             spec,
             pl.DataFrame(
                 {
@@ -362,15 +339,15 @@ def test_unparseable_string_numeric_conflict_fails_commit(tmp_path) -> None:
             ),
         )
 
-    assert lake.query.query("daily", source="custom").collect().height == 1
+    assert lake.raw.read("daily", source="custom", view="latest").collect().height == 1
 
 
 def test_batch_write_failure_restores_all_old_partitions(
     tmp_path, monkeypatch
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {
@@ -380,11 +357,11 @@ def test_batch_write_failure_restores_all_old_partitions(
             }
         ),
     )
-    root = lake.paths.dataset_root("custom", "daily")
-    before_manifest = lake.metadata.manifest("custom", "daily")
+    root = lake._paths.dataset_root("custom", "daily")
+    before_manifest = lake._data_meta.manifest("custom", "daily")
     before_frames = {
-        str(row["partition_path"]): pl.read_parquet(
-            root / str(row["partition_path"])
+        str(row["generation_path"]): pl.read_parquet(
+            root / str(row["generation_path"])
         )
         for row in before_manifest
     }
@@ -404,7 +381,7 @@ def test_batch_write_failure_restores_all_old_partitions(
         parquet_module, "atomic_write_parquet", fail_second_write
     )
     with pytest.raises(PermissionError, match="fault injection"):
-        lake.ingest(
+        lake.raw.ingest(
             spec,
             pl.DataFrame(
                 {
@@ -415,7 +392,7 @@ def test_batch_write_failure_restores_all_old_partitions(
             ),
         )
 
-    assert lake.metadata.manifest("custom", "daily") == before_manifest
+    assert lake._data_meta.manifest("custom", "daily") == before_manifest
     assert all(
         pl.read_parquet(root / relative).equals(frame)
         for relative, frame in before_frames.items()
@@ -459,7 +436,7 @@ def test_partition_write_context_matches_parquet_physical_schema(tmp_path) -> No
 def test_hash_failure_drains_writers_and_removes_temporary_files(
     tmp_path, monkeypatch
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
     original = pl.DataFrame(
         {
@@ -468,12 +445,12 @@ def test_hash_failure_drains_writers_and_removes_temporary_files(
             "value": [1.0, 2.0, 3.0, 4.0],
         }
     )
-    lake.ingest(spec, original)
-    root = lake.paths.dataset_root("custom", "daily")
-    before_manifest = lake.metadata.manifest("custom", "daily")
+    lake.raw.ingest(spec, original)
+    root = lake._paths.dataset_root("custom", "daily")
+    before_manifest = lake._data_meta.manifest("custom", "daily")
     before_frames = {
-        str(row["partition_path"]): pl.read_parquet(
-            root / str(row["partition_path"])
+        str(row["generation_path"]): pl.read_parquet(
+            root / str(row["generation_path"])
         )
         for row in before_manifest
     }
@@ -492,13 +469,13 @@ def test_hash_failure_drains_writers_and_removes_temporary_files(
 
     monkeypatch.setattr(parquet_module, "frame_content_hash", fail_one_hash)
     with pytest.raises(RuntimeError, match="hash fault injection"):
-        lake.ingest(
+        lake.raw.ingest(
             spec,
             original.with_columns(pl.col("value") + 10),
         )
 
     assert 2 <= calls <= 4
-    assert lake.metadata.manifest("custom", "daily") == before_manifest
+    assert lake._data_meta.manifest("custom", "daily") == before_manifest
     assert all(
         pl.read_parquet(root / relative).equals(frame)
         for relative, frame in before_frames.items()
@@ -549,23 +526,23 @@ def test_partition_rewrite_supports_long_rollback_paths(tmp_path) -> None:
     )
     while len(str(root / rollback_suffix)) < 270:
         root /= "p"
-    lake = DataLake.open(root)
+    lake = DataLake.open(data_meta_path=(root) / "data_meta.sqlite", lake_path=(root) / "lake")
     spec = _daily_spec()
     original = pl.DataFrame(
         {"trade_date": ["20250102"], "ts_code": ["A"], "value": [1.0]}
     )
 
-    lake.ingest(spec, original)
-    lake.ingest(spec, original.with_columns(pl.lit(2.0).alias("value")))
+    lake.raw.ingest(spec, original)
+    lake.raw.ingest(spec, original.with_columns(pl.lit(2.0).alias("value")))
 
     values = (
-        lake.query.query(
+        lake.raw.read(
             "daily",
             source="custom",
             start="2025-01-02",
             end="2025-01-02",
             assets=["A"],
-        )
+         view="latest")
         .collect()
         .get_column("value")
         .to_list()
@@ -576,28 +553,28 @@ def test_partition_rewrite_supports_long_rollback_paths(tmp_path) -> None:
 def test_metadata_commit_failure_restores_parquet_manifest_and_schema(
     tmp_path, monkeypatch
 ) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     spec = _daily_spec()
-    lake.ingest(
+    lake.raw.ingest(
         spec,
         pl.DataFrame(
             {"trade_date": ["20250102"], "ts_code": ["A"], "value": [1.0]}
         ),
     )
-    root = lake.paths.dataset_root("custom", "daily")
-    before_manifest = lake.metadata.manifest("custom", "daily")
-    path = root / str(before_manifest[0]["partition_path"])
+    root = lake._paths.dataset_root("custom", "daily")
+    before_manifest = lake._data_meta.manifest("custom", "daily")
+    path = root / str(before_manifest[0]["generation_path"])
     before_frame = pl.read_parquet(path)
-    before_schema = lake.metadata.dataset_schema("custom", "daily")
+    before_schema = lake._data_meta.dataset_schema("custom", "daily")
 
     def fail_metadata(*args, **kwargs) -> None:
         raise sqlite3.OperationalError("fault injection")
 
     monkeypatch.setattr(
-        lake.metadata, "commit_dataset_metadata", fail_metadata
+        lake._data_meta, "commit_dataset_metadata", fail_metadata
     )
     with pytest.raises(sqlite3.OperationalError, match="fault injection"):
-        lake.ingest(
+        lake.raw.ingest(
             spec,
             pl.DataFrame(
                 {
@@ -609,14 +586,14 @@ def test_metadata_commit_failure_restores_parquet_manifest_and_schema(
         )
 
     assert pl.read_parquet(path).equals(before_frame)
-    assert lake.metadata.manifest("custom", "daily") == before_manifest
-    assert lake.metadata.dataset_schema("custom", "daily") == before_schema
+    assert lake._data_meta.manifest("custom", "daily") == before_manifest
+    assert lake._data_meta.dataset_schema("custom", "daily") == before_schema
 
 
 def test_api_request_json_is_compressed_and_transparently_decoded(tmp_path) -> None:
-    lake = DataLake.open(tmp_path)
+    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     params = {"fields": ",".join(f"field_{index}" for index in range(200))}
-    lake.metadata.record_api_calls(
+    lake._data_meta.record_api_calls(
         (
             {
                 "run_id": "run",
@@ -631,11 +608,11 @@ def test_api_request_json_is_compressed_and_transparently_decoded(tmp_path) -> N
         )
     )
 
-    with lake.metadata.connect() as db:
+    with lake._data_meta.connect() as db:
         raw = db.execute(
             "select typeof(request_params), length(request_params) from api_calls"
         ).fetchone()
-    decoded = lake.metadata._rows("select request_params from api_calls")[0]
+    decoded = lake._data_meta._rows("select request_params from api_calls")[0]
 
     assert raw[0] == "blob"
     assert int(raw[1]) < len(json.dumps(params))

@@ -1,42 +1,34 @@
-# Dataset declarations
+# Datasets and categories
 
-A dataset declares its provider API, date parameters, source date fields, business
-keys, date kind, fixed parameters, parameter expansion, and transport options.
+Declare `DatasetSpec(name, "general" | "by_date", source=...)` and register it
+through `lake.raw.register(spec)`. Source/name are stable safe path components.
+Provider-to-canonical field mappings are explicit. Daily datasets map a date to
+`time` and security identity to `asset_id`; extra primary keys may be declared.
+`date_kind="calendar"` plans natural days; trading dates require an explicit
+calendar dataset. Parameter variants are declared independently of transport pagination.
+
+`general` is fetched completely on each explicit update. Changed content creates a
+new complete snapshot, including an empty snapshot. Unchanged content records a
+check. Incomplete requests never replace the last complete snapshot. `by_date`
+updates declared daily scopes, retaining successful and validated empty outcomes;
+empty daily responses do not erase already observed records.
 
 ```python
-from bagelquant_data import DatasetSpec
-
-income = DatasetSpec(
-    "income", "by_daily", source="tushare", source_api="income_vip",
-    date_kind="calendar", date_params=("f_ann_date",),
-    source_time_fields=("f_ann_date",),
-    primary_key_extra=(
-        "ann_date", "end_date", "report_type", "comp_type", "end_type", "update_flag"
-    ),
-    nullable_primary_key_extra=("ann_date", "comp_type", "end_type"),
-    field_mappings={"f_ann_date": "time", "ts_code": "asset_id"},
-    availability_timezone="Asia/Shanghai", availability_day_offset=-1,
-    availability_cutoff_time="09:30:00",
-    request_options={"pagination": "offset", "page_size": 1000, "max_pages": 10000},
-)
+tree = lake.catalog.raw_categories("tushare")
+equity = tree.create("equity")
+market = tree.create("market", parent_id=equity["id"])
+tree.assign("daily", market["id"])
+tree.rename(market["id"], "prices")
+tree.move(market["id"], parent_id=None)
 ```
 
-`date_kind="trading"` requires a General calendar. `calendar` dates include
-weekends. Multiple `date_params` produce independent date/parameter scopes.
-`source_time_fields` uses the first non-null source date; original fields remain
-available. The business key is `source_time`, `asset_id`, and `primary_key_extra`.
-`nullable_primary_key_extra` explicitly names provider qualifiers whose missing value
-still participates in identity; time, asset, and every other key remain strict. The
-version key adds ingestion time and commit sequence.
+Each source has a separate Raw category tree. `lake.catalog.item_categories` is an
+independent tree. Trees support `list/get/create/rename/move/remove/assign/members`;
+cycles, duplicate sibling names and nonempty deletion fail. Category moves never
+rewrite data. `raw.remove` and `items.remove` unregister objects only after active
+dependencies have been removed. Committed history, recovery batches and frozen
+references remain available; there is no automatic cleanup API.
 
-`source_api_param_sets` expands list values as a Cartesian product. A registered
-General catalog can supply `parameter_dataset`, `parameter_field`, and
-`parameter_name`; this creates date × parameter requests and no asset watermark.
-`request_discovery` can discover parameter values through a declared provider API.
-Transport options are definition data, including pagination and null-payload rules.
-
-General needs no numerical key and stores each changed complete snapshot from an
-explicit update. An unchanged refresh records only a check. A failed variant or page
-cannot replace its last complete snapshot.
-The old asset update type, year/bucket layout, and revision-watermark options are
-unsupported. TOML registration and form-generated declarations use the same validator.
+TOML declarations use `raw.register_toml(path)` or `raw.register_toml_text(text)`.
+Definitions are persisted and recovered on reopen; runtime producer/provider
+instances must be registered again when needed for execution.

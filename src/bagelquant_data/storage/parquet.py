@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +15,10 @@ import pyarrow as pa
 
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.hashing import frame_content_hash
-from bagelquant_data.core.schema import compatible_schema
 from bagelquant_data.storage.atomic import _filesystem_path, atomic_write_parquet
-from bagelquant_data.storage.metadata import MetadataStore
+from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.paths import LakePaths
 
-logger = logging.getLogger(__name__)
 _LOAD_EXISTING_MANIFEST = object()
 
 
@@ -42,44 +39,14 @@ class PartitionWriteResult:
     manifest: dict[str, Any]
     rewritten: bool
     bytes_written: int
-    backup_path: Path | None = None
-    existed_before: bool = False
 
 
 class ParquetStore:
     """Read and write canonical lake Parquet files."""
 
-    def __init__(self, paths: LakePaths, metadata: MetadataStore) -> None:
+    def __init__(self, paths: LakePaths, metadata: DataMetaStore) -> None:
         self.paths = paths
         self.metadata = metadata
-
-    def write_partition(
-        self,
-        spec: DatasetSpec,
-        frame: pl.DataFrame,
-        relative_path: Path,
-        partition_values: dict[str, Any] | None = None,
-    ) -> Path:
-        result = self.write_partition_file_result(
-            spec, frame, relative_path, partition_values
-        )
-        if result.rewritten:
-            self.metadata.upsert_manifest(**result.manifest)
-        self._update_canonical_schema(spec, frame)
-        return result.path
-
-    def write_partition_file(
-        self,
-        spec: DatasetSpec,
-        frame: pl.DataFrame,
-        relative_path: Path,
-        partition_values: dict[str, Any] | None = None,
-    ) -> tuple[Path, dict[str, Any]]:
-        result = self.write_partition_file_result(
-            spec, frame, relative_path, partition_values
-        )
-        self._update_canonical_schema(spec, frame)
-        return result.path, result.manifest
 
     def write_partition_file_result(
         self,
@@ -89,12 +56,15 @@ class ParquetStore:
         partition_values: dict[str, Any] | None = None,
         *,
         existing_manifest: dict[str, Any] | None | object = _LOAD_EXISTING_MANIFEST,
-        retain_backup: bool = False,
         write_context: PartitionWriteContext | None = None,
     ) -> PartitionWriteResult:
         """Write one changed partition and retain a byte-identical manifest on no-op."""
 
-        path = self.paths.dataset_root(spec.source, spec.name) / relative_path
+        self.metadata.ensure_writable()
+        root = self.paths.dataset_root(spec.source, spec.name)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("Partition path escapes dataset root")
+        path = root / relative_path
         time_values = (
             frame.select(
                 pl.min("time").alias("min_time"), pl.max("time").alias("max_time")
@@ -114,6 +84,8 @@ class ParquetStore:
             )
         else:
             existing_manifest = cast(dict[str, Any] | None, existing_manifest)
+        if existing_manifest is not None:
+            path = self.paths.generation_path(spec.source, spec.name, existing_manifest["partition_path"], existing_manifest["generation_path"])
         if write_context is None:
             write_context = partition_write_context(pl.Schema(frame.schema))
         if (
@@ -137,21 +109,11 @@ class ParquetStore:
             return PartitionWriteResult(
                 path, _manifest_payload(existing_manifest), False, 0
             )
-        existed_before = _is_file(path)
-        backup_path = None
-        if retain_backup and existed_before:
-            backup_path = path.with_name(f".{path.name}.{uuid4().hex}.rollback")
-            os.link(_filesystem_path(path), _filesystem_path(backup_path))
-        try:
-            atomic_write_parquet(
-                frame,
-                path,
-                expected_schema=write_context.arrow_schema,
-            )
-        except BaseException:
-            if backup_path is not None:
-                _unlink_missing(backup_path)
-            raise
+        # A metadata transaction switches generations. Readers holding the old
+        # immutable path remain valid even if they collect their LazyFrame later.
+        generation = relative_path.with_name(f"data-{uuid4().hex}.parquet")
+        path = root / generation
+        atomic_write_parquet(frame, path, expected_schema=write_context.arrow_schema)
         if spec.update_type == "general":
             # Hash the durable representation.  Parquet normalizes foreign
             # Arrow buffers, so this is the value a later deep scan will see.
@@ -161,6 +123,7 @@ class ParquetStore:
             "source": spec.source,
             "dataset": spec.name,
             "partition_path": relative_path.as_posix(),
+            "generation_path": generation.as_posix(),
             "partition_values": partition_values or {},
             "row_count": frame.height,
             "file_size_bytes": file_size,
@@ -174,8 +137,6 @@ class ParquetStore:
             manifest,
             True,
             file_size,
-            backup_path,
-            existed_before,
         )
 
     def canonical_schema(self, source: str, dataset: str) -> pl.Schema | None:
@@ -187,19 +148,6 @@ class ParquetStore:
         arrow_schema = pa.ipc.read_schema(pa.BufferReader(payload))
         return pl.Schema(arrow_schema)
 
-    def set_canonical_schema(
-        self, source: str, dataset: str, schema: pl.Schema
-    ) -> None:
-        """Persist an Arrow schema after its canonical partitions are durable."""
-
-        arrow_schema = schema.to_arrow()
-        self.metadata.upsert_dataset_schema(
-            source,
-            dataset,
-            schema_ipc=arrow_schema.serialize().to_pybytes(),
-            schema_hash=_schema_payload_hash(schema),
-        )
-
     def commit_metadata(
         self,
         spec: DatasetSpec,
@@ -209,6 +157,9 @@ class ParquetStore:
         replace_manifests: bool = False,
         write_context: PartitionWriteContext | None = None,
         version_commit: dict[str, Any] | None = None,
+        scope_transitions: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        committed_rows: int = 0,
     ) -> None:
         """Publish manifest and schema metadata in one SQLite transaction."""
 
@@ -221,32 +172,10 @@ class ParquetStore:
             schema_hash=context.schema_hash,
             replace_manifests=replace_manifests,
             version_commit=version_commit,
+            scope_transitions=scope_transitions,
+            run_id=run_id,
+            committed_rows=committed_rows,
         )
-
-    def _update_canonical_schema(self, spec: DatasetSpec, frame: pl.DataFrame) -> None:
-        incoming = pl.Schema(frame.schema)
-        if spec.update_type == "general":
-            schema = incoming
-        else:
-            existing = self.canonical_schema(spec.source, spec.name)
-            schema = compatible_schema(
-                candidate for candidate in (existing, incoming) if candidate is not None
-            )
-        self.set_canonical_schema(spec.source, spec.name, schema)
-
-    def scan_dataset(
-        self, source: str, dataset: str, paths: list[Path] | None = None
-    ) -> pl.LazyFrame:
-        root = self.paths.dataset_root(source, dataset)
-        if paths:
-            files = [root / path for path in paths]
-        else:
-            files = sorted(root.glob("**/*.parquet"))
-        if not files:
-            from bagelquant_data.core.exceptions import DatasetNotFoundError
-
-            raise DatasetNotFoundError(f"No canonical data for {source}/{dataset}")
-        return pl.scan_parquet([str(path) for path in files])
 
 
 def _schema_hash(frame: pl.DataFrame) -> str:
@@ -277,6 +206,7 @@ def _manifest_payload(row: dict[str, Any]) -> dict[str, Any]:
         "source": row["source"],
         "dataset": row["dataset"],
         "partition_path": row["partition_path"],
+        "generation_path": row["generation_path"],
         "partition_values": partition_values,
         "row_count": row["row_count"],
         "file_size_bytes": row["file_size_bytes"],
@@ -287,58 +217,22 @@ def _manifest_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def finalize_partition_writes(results: list[PartitionWriteResult]) -> None:
-    """Discard rollback links after file and metadata publication succeeds."""
-
-    for result in results:
-        if result.backup_path is None:
-            continue
-        try:
-            _unlink_missing(result.backup_path)
-        except OSError as error:
-            logger.warning(
-                "Could not remove committed partition rollback link %s: %s",
-                result.backup_path,
-                error,
-            )
-
-
 def rollback_partition_writes(results: list[PartitionWriteResult]) -> None:
-    """Restore every changed destination after a batch publication failure."""
-
+    """Remove failed unpublished generations; prior committed files stay untouched."""
     failures: list[str] = []
     for result in reversed(results):
         if not result.rewritten:
             continue
         try:
-            if result.backup_path is not None and _exists(result.backup_path):
-                os.replace(
-                    _filesystem_path(result.backup_path),
-                    _filesystem_path(result.path),
-                )
-            elif not result.existed_before:
-                _unlink_missing(result.path)
+            _unlink_missing(result.path)
         except OSError as error:
             failures.append(f"{result.path}: {error}")
-    for result in results:
-        if result.backup_path is not None:
-            try:
-                _unlink_missing(result.backup_path)
-            except OSError as error:
-                failures.append(f"{result.backup_path}: {error}")
     if failures:
-        raise RuntimeError(
-            "Failed to roll back canonical partition publication: "
-            + "; ".join(failures)
-        )
+        raise RuntimeError("Failed to remove unpublished generations: " + "; ".join(failures))
 
 
 def _is_file(path: Path) -> bool:
     return os.path.isfile(_filesystem_path(path))
-
-
-def _exists(path: Path) -> bool:
-    return os.path.exists(_filesystem_path(path))
 
 
 def _unlink_missing(path: Path) -> None:

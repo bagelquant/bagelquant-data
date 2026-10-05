@@ -1,11 +1,23 @@
-# 数据集声明
+# 数据集和分类
 
-声明统一描述 Provider API、日期参数、源日期字段、业务主键、交易日或自然日、固定参数、参数展开与分页规则。
+通过 `lake.raw.register(DatasetSpec(...))` 声明稳定 source/name、更新类型、字段映射、
+额外主键、日期和参数范围。`by_date` 必须明确日期与 asset_id 映射；自然日使用
+`date_kind="calendar"`，交易日必须声明日历数据集。参数 variant 与传输分页分开。
 
-`date_kind="trading"` 必须声明 General 日历；`date_kind="calendar"` 包括周末。多个 `date_params` 会形成独立的日期 × 参数 scope。`source_time_fields` 按顺序选择首个非空源日期，并保留供应商原始字段。业务键由 `source_time`、`asset_id` 和 `primary_key_extra` 组成；版本顺序另由入库时间和提交序号确定。
+`general` 每次显式更新完整拉取，变化时新增完整快照（含空快照），不变时记录检查。
+部分参数或分页失败不会替换上一完整快照。`by_date` 逐日保存成功或有效空响应的覆盖；
+空响应不删除此前已经观察到的记录。
 
-`source_api_param_sets` 对列表值做笛卡尔展开；`parameter_dataset`、`parameter_field` 和 `parameter_name` 可以从已登记的 General 目录生成未来请求参数，但不会创建资产级水位。TOML 和表单生成的定义进入同一个校验器。
+```python
+tree = lake.catalog.raw_categories("tushare")
+equity = tree.create("equity")
+market = tree.create("market", parent_id=equity["id"])
+tree.assign("daily", market["id"])
+tree.rename(market["id"], "prices")
+tree.move(market["id"], parent_id=None)
+```
 
-旧的按资产更新类型、年/桶分区与修订水位参数均不受支持。
-
-`availability_cutoff_time` 显式规定本地信息截止时刻（`HH:MM:SS`）。达到或超过该时刻的采集先顺延一个自然日，再应用 `availability_day_offset`。负偏移必须声明截止时刻；例如偏移 −1、截止 09:30:00 对应次日开盘前采集口径，不能用于声称前一日收盘前已知的信息集。
+每个 source 有独立 Raw 分类树，`lake.catalog.item_categories` 是独立 DataItem 树。
+支持 list/get/create/rename/move/remove/assign/members，禁止循环、同级重复名称和非空删除。
+移动分类不移动文件。`raw.remove/items.remove` 只有在无活动依赖时注销对象；保留提交历史、
+恢复证据和冻结引用，不自动清理。TOML 声明通过 `raw.register_toml/register_toml_text` 注册。

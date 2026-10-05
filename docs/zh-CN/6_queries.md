@@ -1,26 +1,35 @@
-# PIT 查询
+# PIT 读取和冻结输入
 
 ```python
-latest = lake.query.query(
-    "daily", source="tushare",
-    observation_start="2026-01-01", observation_end="2026-01-31",
-)
-known = lake.query.query(
-    "daily", source="tushare", as_of_date="2026-09-09",
-    observation_start="2026-01-01", observation_end="2026-01-31",
-)
-versions = lake.query.query("daily", source="tushare", view="versions")
-observations = lake.query.observations(
-    "daily", source="tushare", start="2026-01-01",
-)
+history = lake.raw.read("daily", source="tushare")
+fixed = lake.raw.read("daily", source="tushare", as_of="2020-01-10",
+                      observation_start="2020-01-01", observation_end="2020-01-05")
+current = lake.raw.read("daily", source="tushare", view="latest")
+versions = lake.raw.read_versions("daily", source="tushare")
+item = lake.items.read("close")
+snapshot = lake.items.read("close", view="snapshot", as_of="2020-01-10")
 ```
 
-`source_time` 是观测或公告日期，`time` 是版本可用日期。`start`/`end` 过滤可用日期；`observation_start`/`observation_end` 独立过滤源日期。`as_of_date` 先限制可见版本再选择业务键的最新值；`ingested_before` 接受带时区的实际入库截止时间。
+按日期 Raw 与 DataItem 默认逐观测日选择当时可见版本。固定 as_of 是独立信息截止日；
+读取窗口终点不能替代它。Raw start/end 过滤可用轴，observation_start/end 过滤观测轴。
+`raw.observations` 在 PIT 选择后恢复观测 time 轴。General 读取完整快照，可给 as_of，
+没有隐含的逐日坐标网格。`strict=True` 排除不可验证的历史基线；后续相同值只能证明
+较晚可用性。普通 LazyFrame 在创建时固定已提交 generation，延迟 collect 不换到新版本。
 
-`view="history"` 返回每个观测日在当时已知的版本；`observations()` 在版本选择后把普通数值 `time` 轴恢复为源观测日期。`lake.query.frozen()` 冻结一次计算能看到的最高提交序号，`version_evidence()` 返回不可变批次身份，无变化检查时间不参与依赖指纹。
+```python
+from bagelquant_data import RawInput, ItemInput, input_read_boundary
 
-显式 `max_commit` 不能超过读取器的当前边界。`bagelquant_data.query` 中的
-`frozen_raw_reads(root, max_commit)` 会约束该目录内新建的读取器；嵌套上下文
-只能收窄边界。已捕获的读取器传给 worker 后仍保留边界，且不会修改数据湖。
+receipt = lake.inputs.freeze({"raw": RawInput("tushare", "daily"),
+                             "close": ItemInput("close")},
+                             information_cutoff="2020-01-10")
+print(lake.inputs.read(receipt, "close").collect())
+print(lake.inputs.verify(receipt))
+with input_read_boundary(lake.data_meta_path, receipt.max_commit,
+                         receipt.information_cutoff, max_check_id=receipt.max_check_id):
+    reader = DataLake.open(data_meta_path=lake.data_meta_path,
+                           lake_path=lake.lake_path, read_only=True)
+```
 
-General 使用 `query_general()`，默认读取最新完整快照，也支持 `as_of_date`、`snapshot_id`、`ingested_before` 和 `view="versions"`。`snapshots()` 会列出包括空快照在内的完整提交。
+冻结原子记录依赖、定义、schema、恢复批次、信息截止日、commit 与 check 上界。
+读冻结输入校验本地不可变证据，后续修订、注销或当前文件损坏不改变重现。
+receipt ID 用 `inputs.get` 重开；嵌套边界可收窄，明确扩大时拒绝。读取不触发 Provider。

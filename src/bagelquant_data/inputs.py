@@ -1,0 +1,642 @@
+"""Frozen neutral input receipts backed by central immutable ingestion batches."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
+
+import polars as pl
+import pyarrow as pa
+
+from bagelquant_data.core.schema import concat_compatible_frames
+from bagelquant_data.core.types import DateLike
+from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_from_payload, input_payload
+from bagelquant_data.query.raw import _date_value
+from bagelquant_data.storage.recovery import read_batch
+
+if TYPE_CHECKING:
+    from bagelquant_data.management.lake import DataLake
+
+
+@dataclass(frozen=True, slots=True)
+class InputReadBoundary:
+    data_meta_path: Path
+    max_commit: int
+    as_of: date | None = None
+    max_check_id: int | None = None
+
+
+_READ_BOUNDARIES: ContextVar[tuple[InputReadBoundary, ...]] = ContextVar("data_input_read_boundaries", default=())
+
+
+@contextmanager
+def input_read_boundary(data_meta_path: str | Path, max_commit: int, as_of: DateLike | None = None,
+                        *, max_check_id: int | None = None) -> Iterator[None]:
+    """Bound new readers in this context without opening or copying a database.
+
+    Readers capture the value on construction so callers can explicitly pass
+    them to worker threads. Nested contexts may only tighten an existing bound.
+    """
+    if max_commit < 0:
+        raise ValueError("max_commit must be non-negative")
+    resolved_data_meta_path = Path(data_meta_path).resolve()
+    explicit_check_boundary = max_check_id is not None
+    if max_check_id is None:
+        from bagelquant_data.storage.data_meta import DataMetaStore
+        store = DataMetaStore(data_meta_path=resolved_data_meta_path, read_only=True)
+        max_check_id = int(store._rows("select coalesce(max(id),0) as id from version_checks")[0]["id"])
+    if max_check_id < 0:
+        raise ValueError("max_check_id must be non-negative")
+    previous = _boundary_record(resolved_data_meta_path)
+    cutoff = None if as_of is None else _date_value(as_of)
+    if previous:
+        if max_commit > previous.max_commit:
+            raise ValueError("nested input boundary cannot widen max_commit")
+        if previous.as_of is not None and cutoff is not None and cutoff > previous.as_of:
+            raise ValueError("nested input boundary cannot widen the information cutoff")
+        max_commit = min(max_commit, previous.max_commit)
+        if previous.max_check_id is not None:
+            if explicit_check_boundary and max_check_id > previous.max_check_id:
+                raise ValueError("nested input boundary cannot widen max_check_id")
+            max_check_id = min(max_check_id, previous.max_check_id)
+        if previous.as_of is not None:
+            cutoff = previous.as_of if cutoff is None else min(cutoff, previous.as_of)
+    token = _READ_BOUNDARIES.set((*_READ_BOUNDARIES.get(), InputReadBoundary(resolved_data_meta_path, max_commit, cutoff, max_check_id)))
+    try:
+        yield
+    finally:
+        _READ_BOUNDARIES.reset(token)
+
+
+def _boundary_record(data_meta_path: str | Path) -> InputReadBoundary | None:
+    resolved_data_meta_path = Path(data_meta_path).resolve()
+    return next((value for value in reversed(_READ_BOUNDARIES.get()) if value.data_meta_path == resolved_data_meta_path), None)
+
+
+def current_input_boundary(data_meta_path: str | Path) -> tuple[int | None, date | None]:
+    """Return the applicable captured commit and information bounds."""
+    value = _boundary_record(data_meta_path)
+    return (value.max_commit, value.as_of) if value else (None, None)
+
+
+def current_input_check_boundary(data_meta_path: str | Path) -> int | None:
+    """Return the captured immutable same-value check boundary."""
+    value = _boundary_record(data_meta_path)
+    return value.max_check_id if value else None
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenInputReceipt:
+    receipt_id: str
+    max_commit: int
+    max_check_id: int
+    information_cutoff: date | None
+    requests: Mapping[str, DataInput]
+    evidence: Mapping[str, Mapping[str, Any]]
+    digest: str
+    dependency_digest: str
+
+
+class InputsAPI:
+    """Freeze contracts and exact registered immutable batch identities."""
+
+    def __init__(self, lake: DataLake) -> None:
+        self._lake = lake
+        self._store = lake._data_meta
+        self._boundary = _boundary_record(self._store.data_meta_path)
+        if not self._store.read_only:
+            with self._store.connect() as db:
+                db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null,created_at text not null)")
+
+    def max_commit(self) -> int:
+        value = int(self._store._rows("select coalesce(max(seq),0) as seq from version_commits where status='committed'")[0]["seq"])
+        return min(value, self._boundary.max_commit) if self._boundary else value
+
+    def max_check_id(self) -> int:
+        """Return the active unchanged-content evidence boundary."""
+        value = int(self._store._rows("select coalesce(max(id),0) as id from version_checks")[0]["id"])
+        return min(value, self._boundary.max_check_id) if self._boundary and self._boundary.max_check_id is not None else value
+
+    def freeze(
+        self, requests: Mapping[str, DataInput], *,
+        information_cutoff: DateLike | None = None, as_of: DateLike | None = None,
+        max_commit: int | None = None,
+    ) -> FrozenInputReceipt:
+        """Atomically capture definitions, schemas, cutoff and batch references."""
+        self._store.ensure_writable()
+        if information_cutoff is not None and as_of is not None:
+            raise ValueError("Specify information_cutoff once")
+        cutoff = information_cutoff if information_cutoff is not None else as_of
+        cutoff = _date_value(cutoff) if cutoff is not None else None
+        if self._boundary:
+            max_commit = self._boundary.max_commit if max_commit is None else min(max_commit, self._boundary.max_commit)
+            if self._boundary.as_of is not None:
+                cutoff = self._boundary.as_of if cutoff is None else min(cutoff, self._boundary.as_of)
+        if max_commit is not None and max_commit < 0:
+            raise ValueError("max_commit must be non-negative")
+        with self._store.connect() as db:
+            db.execute("begin immediate")
+            payload = self._capture(db, requests, cutoff=cutoff, max_commit=max_commit)
+            serialized = _json(payload)
+            digest = hashlib.sha256(serialized.encode()).hexdigest()
+            receipt_id = uuid4().hex
+            db.execute("insert into frozen_inputs values(?,?,?,?)", (receipt_id, serialized, digest, datetime.now(UTC).isoformat()))
+        return self._receipt(receipt_id, payload, digest)
+
+    def _capture(self, db: sqlite3.Connection, requests: Mapping[str, DataInput], *,
+                 cutoff: date | None, max_commit: int | None = None) -> dict[str, Any]:
+        """Capture definitions and immutable evidence in the caller's transaction."""
+        payload: dict[str, Any] = {"requests": {}, "evidence": {}, "information_cutoff": None if cutoff is None else cutoff.isoformat()}
+        latest = int(db.execute("select coalesce(max(seq),0) from version_commits where status='committed'").fetchone()[0])
+        boundary = latest if max_commit is None else min(max_commit, latest)
+        payload["max_commit"] = boundary
+        max_check_id = int(db.execute("select coalesce(max(id),0) from version_checks").fetchone()[0])
+        if self._boundary and self._boundary.max_check_id is not None:
+            max_check_id = min(max_check_id, self._boundary.max_check_id)
+        payload["max_check_id"] = max_check_id
+        for alias, request in sorted(requests.items()):
+            if not alias or not isinstance(request, (RawInput, ItemInput)):
+                raise TypeError("Frozen requests require non-empty aliases and RawInput/ItemInput definitions")
+            source, dataset = (request.source, request.dataset) if isinstance(request, RawInput) else ("items", request.name)
+            definition = db.execute("select spec_json,spec_hash,active from datasets where source=? and name=?", (source, dataset)).fetchone()
+            if definition is None or not definition["active"]:
+                raise KeyError(f"Unknown active input: {source}/{dataset}")
+            item_definition = db.execute("select spec_json,spec_hash,active from item_definitions where name=?", (dataset,)).fetchone() if isinstance(request, ItemInput) else None
+            if isinstance(request, ItemInput) and (item_definition is None or not item_definition["active"]):
+                raise KeyError(f"Unknown active input: {dataset}")
+            schema = db.execute("select schema_ipc,schema_hash from dataset_schemas where source=? and dataset=?", (source, dataset)).fetchone()
+            batches = db.execute(
+                "select b.commit_seq,b.partition_path,b.content_hash,b.row_count,c.mode,c.spec_hash,c.pit_date,c.input_receipt_id,c.baseline "
+                "from version_batches b join version_commits c on c.seq=b.commit_seq "
+                "where c.source=? and c.dataset=? and c.status='committed' and c.seq<=? order by b.commit_seq,b.partition_path",
+                (source, dataset, boundary),
+            ).fetchall()
+            audit_checks = db.execute(
+                "select v.*,c.baseline as content_baseline from version_checks v left join version_commits c on c.seq=v.visible_commit "
+                "where v.source=? and v.dataset=? and v.id<=? and (v.visible_commit is null or v.visible_commit<=?) "
+                "and (c.seq is null or c.status='committed') order by v.id",
+                (source, dataset, max_check_id, boundary),
+            ).fetchall()
+            record_checks = db.execute(
+                "select r.* from version_check_records r join version_checks v on v.id=r.check_id "
+                "join version_commits c on c.seq=r.version_commit "
+                "where v.source=? and v.dataset=? and v.id<=? and r.version_commit<=? "
+                "and v.baseline=0 and c.baseline=1 and c.status='committed' order by r.check_id,r.record_id",
+                (source, dataset, max_check_id, boundary),
+            ).fetchall()
+            # Keep every audit event, but only unknown original timing can
+            # gain new causal visibility from a same-content attestation.
+            general = json.loads(definition["spec_json"])["update_type"] == "general"
+            witnessed = {value["check_id"] for value in record_checks}
+            checks = [value for value in audit_checks if not value["baseline"] and (
+                value["content_baseline"] if general else value["id"] in witnessed
+            )]
+            general_snapshots = []
+            if general:
+                # A full empty snapshot is still a content version. Keep
+                # its identity independently of data rows so replay cannot
+                # resurrect the preceding nonempty snapshot.
+                general_snapshots = [dict(value) for value in db.execute(
+                    "select c.seq,c.pit_date,c.ingested_at,c.mode,c.spec_hash,c.baseline,"
+                    "coalesce(sum(b.row_count),0) as row_count,"
+                    "(select hex(schema_ipc) from version_batches where commit_seq=c.seq "
+                    "order by partition_path limit 1) as schema_ipc "
+                    "from version_commits c left join version_batches b on b.commit_seq=c.seq "
+                    "where c.source=? and c.dataset=? and c.status='committed' and c.seq<=? "
+                    "group by c.seq order by c.seq", (source, dataset, boundary),
+                )]
+            parent_receipts = {}
+            empty_item_build = None
+            if isinstance(request, ItemInput):
+                assert item_definition is not None
+                empty_item_build = db.execute(
+                    "select definition_hash,dependency_digest,start_date,end_date,input_commit,"
+                    "result_commit,frozen_receipt_id from item_builds b "
+                    "join frozen_inputs f on f.receipt_id=b.frozen_receipt_id where name=? and status='success' "
+                    "and definition_hash=? and input_commit<=? and (result_commit is null or result_commit<=?) "
+                    "and cast(json_extract(f.payload_json,'$.max_check_id') as integer)<=? "
+                    "and (? is null or start_date<=?) and (? is null or end_date>=?) "
+                    "order by b.id desc limit 1", (dataset, item_definition["spec_hash"], boundary, boundary, max_check_id,
+                    None if request.start is None else _date_value(request.start).isoformat(),
+                    None if request.start is None else _date_value(request.start).isoformat(),
+                    None if request.end is None else _date_value(request.end).isoformat(),
+                    None if request.end is None else _date_value(request.end).isoformat()),
+                ).fetchone()
+            parent_ids = {
+                str(value["input_receipt_id"]) for value in [*batches, *audit_checks]
+                if value["input_receipt_id"] is not None
+            }
+            if empty_item_build is not None and empty_item_build["frozen_receipt_id"] is not None:
+                parent_ids.add(str(empty_item_build["frozen_receipt_id"]))
+            for parent_id in sorted(parent_ids):
+                parent = db.execute("select payload_json,digest from frozen_inputs where receipt_id=?", (parent_id,)).fetchone()
+                if parent is None:
+                    raise RuntimeError("Committed input receipt evidence is missing")
+                if hashlib.sha256(str(parent["payload_json"]).encode()).hexdigest() != parent["digest"]:
+                    raise RuntimeError("Committed input receipt checksum mismatch")
+                parent_receipts[parent_id] = parent["digest"]
+            payload["requests"][alias] = input_payload(request)
+            payload["evidence"][alias] = {
+                "source": source, "dataset": dataset,
+                "definition": json.loads(item_definition["spec_json"] if item_definition else definition["spec_json"]),
+                "definition_hash": item_definition["spec_hash"] if item_definition else definition["spec_hash"],
+                "schema_hash": schema["schema_hash"] if schema else None,
+                "schema_ipc": bytes(schema["schema_ipc"]).hex() if schema else None,
+                "batches": [dict(value) for value in batches],
+                "checks": [dict(value) for value in checks],
+                "audit_checks": [dict(value) for value in audit_checks],
+                "empty_checks": [dict(value) for value in audit_checks if value["row_count"] == 0],
+                "record_checks": [dict(value) for value in record_checks],
+                "general_snapshots": general_snapshots,
+                "parent_receipts": parent_receipts,
+                "empty_item_build": None if empty_item_build is None else dict(empty_item_build),
+            }
+        semantic_evidence = {}
+        for alias, evidence in payload["evidence"].items():
+            semantic = {key: value for key, value in evidence.items()
+                        if key not in {"audit_checks", "parent_receipts", "empty_checks"}}
+            unknown_scopes = {}
+            for event in evidence["empty_checks"]:
+                if event["baseline"]:
+                    unknown_scopes[event["request_json"]] = event["id"]
+            semantic["empty_baseline_scopes"] = sorted(unknown_scopes.items())
+            epoch = max(unknown_scopes.values(), default=0)
+            range_proofs = {}
+            for event in evidence["empty_checks"]:
+                if event["baseline"] or event["id"] <= epoch:
+                    continue
+                for query in json.loads(event["request_json"]):
+                    scope = query.get("item_range")
+                    if scope is None:
+                        continue
+                    parent_digest = None
+                    if event["input_receipt_id"] is not None:
+                        row = db.execute("select payload_json from frozen_inputs where receipt_id=?", (event["input_receipt_id"],)).fetchone()
+                        parent_digest = json.loads(row["payload_json"])["dependency_digest"]
+                    key = _json({"scope": scope, "dependency_digest": parent_digest})
+                    range_proofs[key] = min(range_proofs.get(key, event["pit_date"]), event["pit_date"])
+            semantic["empty_range_proofs"] = sorted(range_proofs.items())
+            for collection in ("batches", "checks"):
+                semantic[collection] = [{key: value for key, value in event.items()
+                                         if key != "input_receipt_id"}
+                                        for event in semantic[collection]]
+            if semantic["empty_item_build"] is not None:
+                semantic["empty_item_build"] = {key: value for key, value in semantic["empty_item_build"].items()
+                                                 if key not in {"frozen_receipt_id", "input_commit"}}
+            semantic_evidence[alias] = semantic
+        semantic_payload = {key: value for key, value in payload.items()
+                            if key not in {"max_commit", "max_check_id", "evidence"}}
+        semantic_payload["evidence"] = semantic_evidence
+        payload["dependency_digest"] = hashlib.sha256(_json(semantic_payload).encode()).hexdigest()
+        return payload
+
+    def is_current(self, receipt: FrozenInputReceipt | str) -> bool:
+        """Compare current semantic evidence without creating a new receipt.
+
+        The original request windows and information cutoff are retained.
+        Revisions conservatively invalidate; pure verified rechecks do not.
+        Item inputs follow the newest retained dependency proof at the cutoff,
+        recursively checking upstream declarations and evidence in one read view.
+        Archived inputs and changed declarations return false. Missing or corrupt
+        frozen receipts fail explicitly; verify() separately checks retained bytes.
+        """
+        frozen = self.get(receipt)
+        checked: dict[str, bool] = {}
+        visiting: set[str] = set()
+        with self._store.connect() as db:
+            db.execute("begin")
+
+            def current(value: FrozenInputReceipt) -> bool:
+                if value.receipt_id in visiting:
+                    raise RuntimeError("Frozen input receipt dependency cycle")
+                if value.receipt_id in checked:
+                    return checked[value.receipt_id]
+                visiting.add(value.receipt_id)
+                try:
+                    payload = self._capture(db, value.requests, cutoff=value.information_cutoff,
+                        max_commit=None if self._boundary is None else self._boundary.max_commit)
+                except KeyError:
+                    checked[value.receipt_id] = False
+                    visiting.remove(value.receipt_id)
+                    return False
+                result = payload["dependency_digest"] == value.dependency_digest
+                if result:
+                    for alias, request in value.requests.items():
+                        if not isinstance(request, ItemInput):
+                            continue
+                        evidence = value.evidence[alias]
+                        frame = self._read_frame(value, alias)
+                        # Freshness follows the newest materialized dependency
+                        # proof; causal history replay still keeps original rows.
+                        cutoff = value.information_cutoff
+                        if cutoff is None and frame.height:
+                            cutoff = cast(date, frame["time"].max())
+                        selected = self._select(frame, replace(request, view="snapshot"), cutoff,
+                                                evidence=evidence) if cutoff is not None else frame
+                        parents: set[str] = set()
+                        if selected.height:
+                            commits = {int(batch["commit_seq"]): batch["input_receipt_id"]
+                                       for batch in evidence["batches"]}
+                            checks = {int(check["id"]): check["input_receipt_id"]
+                                      for check in evidence["checks"]}
+                            for row in selected.select("_commit_seq", "_attestation_id").unique().iter_rows(named=True):
+                                parent_id = checks.get(row["_attestation_id"]) if row["_attestation_id"] is not None else commits.get(row["_commit_seq"])
+                                if parent_id is not None:
+                                    parents.add(str(parent_id))
+                        elif evidence["empty_item_build"] is not None:
+                            parent_id = evidence["empty_item_build"]["frozen_receipt_id"]
+                            if parent_id is not None:
+                                parents.add(str(parent_id))
+                        elif evidence["definition"]["inputs"]:
+                            result = False
+                        if not all(current(self.get(parent_id)) for parent_id in parents):
+                            result = False
+                        if not result:
+                            break
+                visiting.remove(value.receipt_id)
+                checked[value.receipt_id] = result
+                return result
+
+            return current(frozen)
+
+    def get(self, receipt: FrozenInputReceipt | str) -> FrozenInputReceipt:
+        key = receipt.receipt_id if isinstance(receipt, FrozenInputReceipt) else receipt
+        rows = self._store._rows("select payload_json,digest from frozen_inputs where receipt_id=?", (key,))
+        if not rows:
+            raise KeyError(f"Unknown frozen input receipt: {key}")
+        serialized = str(rows[0]["payload_json"])
+        digest = hashlib.sha256(serialized.encode()).hexdigest()
+        if digest != rows[0]["digest"] or isinstance(receipt, FrozenInputReceipt) and digest != receipt.digest:
+            raise RuntimeError("Frozen input receipt checksum mismatch")
+        return self._receipt(key, json.loads(serialized), digest)
+
+    def _could_have_baseline(self, frozen: FrozenInputReceipt, alias: str,
+                             seen: frozenset[str] = frozenset()) -> bool:
+        """Prove verified timing from immutable flags, including empty parents."""
+        if frozen.receipt_id in seen:
+            raise RuntimeError("Frozen input receipt dependency cycle")
+        evidence = frozen.evidence[alias]
+        if any(batch["baseline"] for batch in evidence["batches"]) or any(
+            snapshot["baseline"] for snapshot in evidence["general_snapshots"]
+        ) or any(check["baseline"] for check in evidence.get("empty_checks", ())):
+            return True
+        build = evidence["empty_item_build"]
+        if build is None:
+            return isinstance(frozen.requests[alias], ItemInput) and bool(evidence["definition"]["inputs"])
+        parent = self.get(build["frozen_receipt_id"])
+        return any(self._could_have_baseline(parent, key, seen | {frozen.receipt_id})
+                   for key in parent.requests)
+
+    def _baseline_at(self, frozen: FrozenInputReceipt, alias: str, cutoff: date, *,
+                     frame: pl.DataFrame | None = None, max_commit: int | None = None,
+                     max_check_id: int | None = None,
+                     max_buffer_bytes: int | None = None,
+                     seen: frozenset[str] = frozenset()) -> bool:
+        """Select timing proof at one cutoff, following empty Item inputs."""
+        if frozen.receipt_id in seen:
+            raise RuntimeError("Frozen input receipt dependency cycle")
+        request = frozen.requests[alias]
+        evidence = frozen.evidence[alias]
+        cutoff = min(cutoff, frozen.information_cutoff) if frozen.information_cutoff is not None else cutoff
+        commit_bound = min(frozen.max_commit, max_commit) if max_commit is not None else frozen.max_commit
+        check_bound = min(frozen.max_check_id, max_check_id) if max_check_id is not None else frozen.max_check_id
+        versions = self._read_frame(frozen, alias) if frame is None else frame
+        if max_buffer_bytes is not None and versions.estimated_size() > max_buffer_bytes // 2:
+            raise MemoryError("Empty Item timing evidence exceeds max_buffer_bytes; use smaller declared input windows")
+        if "_commit_seq" in versions.columns:
+            versions = versions.filter(pl.col("_commit_seq") <= commit_bound)
+        if "_attestation_id" in versions.columns:
+            versions = versions.filter(pl.col("_attestation_id").is_null() | (pl.col("_attestation_id") <= check_bound))
+        selection = replace(request, view="snapshot") if request.view == "versions" else request
+        if isinstance(selection, RawInput):
+            selection = replace(selection, fields=())
+        bounded = {**evidence,
+                   "general_snapshots": [row for row in evidence["general_snapshots"] if row["seq"] <= commit_bound],
+                   "checks": [row for row in evidence["checks"] if row["id"] <= check_bound]}
+        selected = self._select(versions, selection, cutoff, evidence=bounded)
+        if "_baseline" in selected.columns and selected["_baseline"].fill_null(False).any():
+            return True
+        if isinstance(selection, RawInput) and bounded["general_snapshots"]:
+            from bagelquant_data.items.pit import _general_snapshot_identity
+            identity = _general_snapshot_identity(bounded["general_snapshots"], cutoff,
+                checks=bounded["checks"], strict=selection.strict,
+                include_historical_baseline=selection.include_historical_baseline)
+            return identity is not None and bool(identity["baseline"])
+        build = evidence["empty_item_build"]
+        if selected.height or request.strict:
+            return False
+        unknown_empty = [check for check in evidence.get("empty_checks", ())
+                         if check["baseline"] and check["id"] <= check_bound]
+        if isinstance(request, RawInput):
+            return bool(unknown_empty)
+        if unknown_empty:
+            # A dated empty response is not a whole-dataset attestation.
+            # Only an explicit complete Item range can supersede it here.
+            proven = []
+            if request.start is not None and request.end is not None:
+                for check in evidence.get("empty_checks", ()):
+                    if check["baseline"] or check["id"] > check_bound or _date_value(check["pit_date"]) > cutoff:
+                        continue
+                    for query in json.loads(check["request_json"]):
+                        scope = query.get("item_range")
+                        if scope and _date_value(scope["start"]) <= _date_value(request.start) and _date_value(scope["end"]) >= _date_value(request.end):
+                            proven.append(check["id"])
+            if not proven or max(proven) < max(check["id"] for check in unknown_empty):
+                return True
+        if build is None:
+            return bool(evidence["definition"]["inputs"])
+        parent = self.get(build["frozen_receipt_id"])
+        return any(self._baseline_at(parent, key, cutoff, max_commit=commit_bound,
+                   max_check_id=check_bound, max_buffer_bytes=max_buffer_bytes,
+                   seen=seen | {frozen.receipt_id})
+                   for key in parent.requests)
+
+    def _empty_baseline_boundaries(self, frozen: FrozenInputReceipt, alias: str,
+                                  seen: frozenset[str] = frozenset()) -> set[date]:
+        """Expose empty upstream proof revisions to ordinary producer execution."""
+        if frozen.receipt_id in seen:
+            raise RuntimeError("Frozen input receipt dependency cycle")
+        build = frozen.evidence[alias]["empty_item_build"]
+        if not self._could_have_baseline(frozen, alias):
+            return set()
+        days = {_date_value(row["pit_date"]) for row in frozen.evidence[alias].get("empty_checks", ())
+                if not row["baseline"] and row["id"] <= frozen.max_check_id
+                and any(query.get("item_range") for query in json.loads(row["request_json"]))}
+        if build is None:
+            return days
+        parent = self.get(build["frozen_receipt_id"])
+        for key, evidence in parent.evidence.items():
+            days.update(_date_value(row["pit_date"]) for row in evidence["batches"]
+                        if not row["baseline"] and row["commit_seq"] <= frozen.max_commit)
+            days.update(_date_value(row["pit_date"]) for row in evidence["checks"]
+                        if row["id"] <= frozen.max_check_id)
+            days.update(self._empty_baseline_boundaries(parent, key, seen | {frozen.receipt_id}))
+        return days
+
+    def read(
+        self, receipt: FrozenInputReceipt | str, alias: str, *,
+        view: str | None = None, as_of: DateLike | None = None,
+        fields: tuple[str, ...] | list[str] | None = None,
+        strict: bool | None = None,
+        observations: bool = False,
+    ) -> pl.LazyFrame:
+        """Replay frozen evidence with an optional tighter information cutoff.
+
+        View and projection overrides retain the original observation window,
+        definition, commit boundary and check boundary after object archival.
+        """
+        frozen = self.get(receipt)
+        if alias not in frozen.requests:
+            raise KeyError(f"Unknown frozen input alias: {alias}")
+        request = frozen.requests[alias]
+        cutoff = frozen.information_cutoff if as_of is None else _date_value(as_of)
+        if frozen.information_cutoff is not None and cutoff is not None and cutoff > frozen.information_cutoff:
+            raise ValueError("as_of exceeds the frozen information cutoff")
+        projection = request.fields if isinstance(request, RawInput) else ()
+        if fields is not None:
+            projection = tuple(fields)
+        request = replace(request, view=request.view if view is None else view,
+                          strict=request.strict if strict is None else strict)
+        if isinstance(request, RawInput):
+            request = replace(request, fields=())
+        frame = self._select(self._read_frame(frozen, alias), request, cutoff,
+                             evidence=frozen.evidence[alias])
+        if observations and isinstance(request, RawInput) and "source_time" in frame.columns:
+            frame = frame.with_columns(pl.col("source_time").alias("time"))
+        if projection:
+            missing = set(projection) - set(frame.columns)
+            if missing:
+                raise ValueError(f"Frozen input is missing requested fields: {sorted(missing)}")
+            frame = frame.select(projection)
+        return frame.lazy()
+
+    def _read_frame(self, frozen: FrozenInputReceipt, alias: str) -> pl.DataFrame:
+        """Load exact retained versions before view or field selection."""
+        if alias not in frozen.requests:
+            raise KeyError(f"Unknown frozen input alias: {alias}")
+        request = frozen.requests[alias]
+        evidence = frozen.evidence[alias]
+        pieces = [read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"]) for value in evidence["batches"]]
+        if pieces:
+            frame = concat_compatible_frames(pieces)
+        elif evidence["schema_ipc"]:
+            schema = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(evidence["schema_ipc"])))
+            frame = cast(pl.DataFrame, pl.from_arrow(pa.Table.from_batches([], schema=schema)))
+        elif isinstance(request, ItemInput):
+            from bagelquant_data.transforms import scalar_dtype
+            frame = pl.DataFrame(schema={"time": pl.Date,"source_time": pl.Date,"asset_id": pl.String,"value": scalar_dtype(evidence["definition"]["value_dtype"])})
+        else:
+            frame = pl.DataFrame()
+        from bagelquant_data.query.raw import _attested_versions
+        frame = _attested_versions(frame.lazy(), evidence["checks"], evidence["record_checks"],
+                                   as_of_date=frozen.information_cutoff,
+                                   max_check_id=frozen.max_check_id).collect()
+        return frame
+
+    def verify(self, receipt: FrozenInputReceipt | str) -> dict[str, Any]:
+        """Raise on lost or corrupt evidence, even after object archival."""
+        frozen = self.get(receipt)
+        batch_count = 0
+        verified: set[str] = set()
+        visiting: set[str] = set()
+
+        def verify_retained(value: FrozenInputReceipt) -> None:
+            nonlocal batch_count
+            if value.receipt_id in visiting:
+                raise RuntimeError("Frozen input receipt dependency cycle")
+            if value.receipt_id in verified:
+                return
+            visiting.add(value.receipt_id)
+            for evidence in value.evidence.values():
+                for batch in evidence["batches"]:
+                    read_batch(self._store, batch["partition_path"], int(batch["commit_seq"]), batch["content_hash"])
+                    batch_count += 1
+                for parent_id, parent_digest in evidence["parent_receipts"].items():
+                    parent = self.get(parent_id)
+                    if parent.digest != parent_digest:
+                        raise RuntimeError("Frozen upstream input receipt checksum mismatch")
+                    verify_retained(parent)
+            visiting.remove(value.receipt_id)
+            verified.add(value.receipt_id)
+
+        verify_retained(frozen)
+        return {"receipt_id": frozen.receipt_id, "valid": True, "batch_count": batch_count,
+                "upstream_receipt_count": len(verified) - 1, "digest": frozen.digest}
+
+    @staticmethod
+    def _receipt(key: str, payload: Mapping[str, Any], digest: str) -> FrozenInputReceipt:
+        return FrozenInputReceipt(key, int(payload["max_commit"]), int(payload["max_check_id"]), None if payload["information_cutoff"] is None else _date_value(payload["information_cutoff"]), {name: input_from_payload(value) for name, value in payload["requests"].items()}, payload["evidence"], digest, payload["dependency_digest"])
+
+    @staticmethod
+    def _select(frame: pl.DataFrame, request: DataInput, cutoff: date | None,
+                *, evidence: Mapping[str, Any] | None = None) -> pl.DataFrame:
+        view = request.view
+        if view not in {"history", "snapshot", "versions"}:
+            raise ValueError("Frozen input view must be history, snapshot, or versions")
+        if view == "snapshot" and cutoff is None:
+            raise ValueError("snapshot requests require an information cutoff")
+        if request.strict and "_baseline" in frame.columns:
+            frame = frame.filter(~pl.col("_baseline").fill_null(False))
+        if "_snapshot_id" in frame.columns:
+            if view != "versions" and evidence is not None:
+                from bagelquant_data.items.pit import general_input_snapshot
+                frame = general_input_snapshot(
+                    frame, cutoff, snapshots=evidence["general_snapshots"],
+                    checks=evidence["checks"], strict=request.strict,
+                    include_historical_baseline=isinstance(request, RawInput)
+                    and request.include_historical_baseline,
+                )
+            elif cutoff is not None:
+                visible = pl.col("snapshot_date") <= cutoff
+                if isinstance(request, RawInput) and request.include_historical_baseline and not request.strict:
+                    visible = visible | pl.col("_baseline").fill_null(False)
+                frame = frame.filter(visible)
+            if view != "versions" and evidence is None and frame.height:
+                frame = frame.filter(pl.col("_commit_seq") == frame["_commit_seq"].max())
+                latest = frame.sort([name for name in ("snapshot_date", "ingested_at", "_attestation_id") if name in frame.columns]).tail(1)
+                frame = frame.filter((pl.col("_commit_seq") == latest["_commit_seq"].item()) & (pl.col("snapshot_date") == latest["snapshot_date"].item()))
+                if "_attestation_id" in frame.columns:
+                    frame = frame.filter(pl.col("_attestation_id").fill_null(0) == (latest["_attestation_id"].item() or 0))
+        elif "_record_id" in frame.columns:
+            if cutoff is not None:
+                frame = frame.filter(pl.col("time") <= cutoff)
+            if view == "history":
+                frame = frame.filter(pl.col("time") <= pl.col("source_time"))
+            if view != "versions":
+                frame = frame.sort("time", "ingested_at", "_commit_seq").unique("_record_id", keep="last", maintain_order=True)
+        if isinstance(request, ItemInput):
+            frame = frame.rename({"time": "version_available_date", "source_time": "time"})
+            axis = "time"
+        else:
+            axis = "source_time" if "source_time" in frame.columns else "time"
+            if request.observation_start is not None and axis in frame.columns:
+                frame = frame.filter(pl.col(axis) >= _date_value(request.observation_start))
+            if request.observation_end is not None and axis in frame.columns:
+                frame = frame.filter(pl.col(axis) <= _date_value(request.observation_end))
+        if request.start is not None and axis in frame.columns:
+            frame = frame.filter(pl.col(axis) >= _date_value(request.start))
+        if request.end is not None and axis in frame.columns:
+            frame = frame.filter(pl.col(axis) <= _date_value(request.end))
+        if isinstance(request, RawInput) and request.fields:
+            missing = set(request.fields) - set(frame.columns)
+            if missing:
+                raise ValueError(f"Frozen input is missing requested fields: {sorted(missing)}")
+            frame = frame.select(request.fields)
+        sort = [name for name in (axis, "asset_id", "version_available_date", "_commit_seq") if name in frame.columns]
+        return frame.sort(sort) if sort else frame
+
+
+__all__ = ["InputsAPI", "FrozenInputReceipt", "InputReadBoundary", "input_read_boundary", "current_input_boundary", "current_input_check_boundary"]
