@@ -58,7 +58,7 @@ def test_daily_query_prunes_to_intersecting_month(tmp_path, monkeypatch) -> None
     assert sum(len(paths) for paths in calls) == 1
 
 
-def test_query_reads_manifested_partition_beyond_windows_path_limit(
+def test_query_reads_manifested_partition_in_deep_directory(
     tmp_path, monkeypatch
 ) -> None:
     from bagelquant_data.storage.atomic import _filesystem_path

@@ -59,12 +59,9 @@ class DataMetaStore:
                 )
             return
         self.ensure_writable()
-        try:
-            location = Path(
-                os.path.relpath(lake_path.resolve(), self.data_meta_path.resolve().parent)
-            ).as_posix()
-        except ValueError:  # Separate Windows volumes cannot have a relative link.
-            location = lake_path.resolve().as_posix()
+        location = Path(
+            os.path.relpath(lake_path.resolve(), self.data_meta_path.resolve().parent)
+        ).as_posix()
         with self.connect() as db:
             db.execute("begin immediate")
             current = db.execute(

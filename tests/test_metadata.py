@@ -31,7 +31,6 @@ def test_metadata_connection_is_closed_after_context_exit(tmp_path) -> None:
         connection.execute("SELECT 1")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="resource limits are POSIX-only")
 def test_repeated_manifest_reads_do_not_exhaust_file_descriptors() -> None:
     script = """
 import resource

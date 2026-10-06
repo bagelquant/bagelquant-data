@@ -62,3 +62,5 @@ uv run pytest
 uv run pyright
 uv run ruff check .
 ```
+
+Supported platforms: macOS and Linux. Windows support is retired.

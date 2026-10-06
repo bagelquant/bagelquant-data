@@ -66,16 +66,13 @@ def atomic_write_parquet(
 
 
 def _filesystem_path(path: Path) -> str:
-    """Return a native path that supports long local paths on Windows."""
+    """Return an absolute native filesystem path."""
 
-    resolved = str(path.resolve())
-    if os.name == "nt" and not resolved.startswith("\\\\?\\"):
-        return f"\\\\?\\{resolved}"
-    return resolved
+    return str(path.resolve())
 
 
 def replace_with_retry(source: Path, target: Path) -> None:
-    """Publish a local file with bounded retries for transient Windows locks."""
+    """Publish a local file with bounded retries for transient filesystem locks."""
     import logging
     for attempt in range(8):
         try:
