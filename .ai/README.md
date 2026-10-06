@@ -23,8 +23,8 @@ numerical artifact storage, BT owns account/evaluation artifact storage. Data
 does not become a second authority for their results. Keep provider specifics
 at the integration edge and pass neutral frames/schema/availability/identity
 evidence across the Data/Core boundary; neither package imports the other.
-Data docs are collected by the website from GitHub default branches rather than
-workspace gitlinks; edit package docs here, not in generated website content.
+Data docs stay in this repository. The website links to package documentation
+and does not collect or republish it.
 
 Integration discovery and standalone fallback are in [AGENTS.md](../AGENTS.md).
 After verifying an integration root, read its

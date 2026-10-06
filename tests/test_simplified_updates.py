@@ -766,8 +766,10 @@ def test_failed_daily_job_is_retried_before_new_jobs(tmp_path) -> None:
     )
 
     assert second.status == "success"
-    assert [request["date"] for _, request in source.requests] == [
-        "2025-01-02",
+    requested_dates = [request["date"] for _, request in source.requests]
+    assert requested_dates[0] == "2025-01-02"
+    # Forward scopes run concurrently after the failed scope has been retried.
+    assert sorted(requested_dates[1:]) == [
         "2025-01-03",
         "2025-01-04",
     ]
