@@ -10,6 +10,9 @@ from bagelquant_data.management.sources import SourceManager
 from bagelquant_data.storage.data_meta import DataMetaStore
 
 
+_UNSET = object()
+
+
 class CategoryTree:
     """A single-parent tree whose paths do not determine file locations."""
 
@@ -41,31 +44,37 @@ class CategoryTree:
         category_id = uuid4().hex
         with self._data_meta.connect() as db:
             db.execute("begin immediate")
-            self._check_sibling(db, name, parent_id)
-            db.execute(
-                "insert into category_nodes values(?,?,?,?,?)",
-                (category_id, self.kind, self.source, name, parent_id),
-            )
+            self._create(db, category_id, name, parent_id)
         return self.get(category_id)
+
+    def _create(self, db, category_id: str, name: str, parent_id: str | None) -> None:
+        self._check_name(name)
+        if parent_id is not None:
+            self.get(parent_id)
+        self._check_sibling(db, name, parent_id)
+        db.execute("insert into category_nodes values(?,?,?,?,?)",
+                   (category_id, self.kind, self.source, name, parent_id))
 
     def rename(self, category_id: str, name: str) -> dict[str, Any]:
-        self._data_meta.ensure_writable()
-        self._check_name(name)
-        node = self.get(category_id)
-        with self._data_meta.connect() as db:
-            db.execute("begin immediate")
-            self._check_sibling(db, name, node["parent_id"], category_id)
-            db.execute(
-                "update category_nodes set name=? where id=?", (name, category_id)
-            )
-        return self.get(category_id)
+        return self.update(category_id, name=name)
 
     def move(self, category_id: str, *, parent_id: str | None = None) -> dict[str, Any]:
+        return self.update(category_id, parent_id=parent_id)
+
+    def update(self, category_id: str, *, name: str | None = None,
+               parent_id: Any = _UNSET) -> dict[str, Any]:
+        """Rename and/or move a category in one validated transaction."""
         self._data_meta.ensure_writable()
-        node = self.get(category_id)
         with self._data_meta.connect() as db:
             db.execute("begin immediate")
-            parent = parent_id
+            node = db.execute("select name,parent_id from category_nodes where id=? and kind=? and source=?",
+                              (category_id, self.kind, self.source)).fetchone()
+            if node is None:
+                raise ConfigurationError(f"Unknown {self.kind} category: {category_id}")
+            selected_name = node[0] if name is None else name
+            selected_parent = node[1] if parent_id is _UNSET else parent_id
+            self._check_name(selected_name)
+            parent = selected_parent
             while parent is not None:
                 if parent == category_id:
                     raise ConfigurationError("Category move would create a cycle")
@@ -76,11 +85,9 @@ class CategoryTree:
                 if row is None:
                     raise ConfigurationError(f"Unknown parent category: {parent}")
                 parent = row[0]
-            self._check_sibling(db, node["name"], parent_id, category_id)
-            db.execute(
-                "update category_nodes set parent_id=? where id=?",
-                (parent_id, category_id),
-            )
+            self._check_sibling(db, selected_name, selected_parent, category_id)
+            db.execute("update category_nodes set name=?,parent_id=? where id=?",
+                       (selected_name, selected_parent, category_id))
         return self.get(category_id)
 
     def remove(self, category_id: str) -> None:
@@ -106,7 +113,8 @@ class CategoryTree:
             self.get(category_id)
         table = "datasets" if self.kind == "raw" else "item_definitions"
         with self._data_meta.connect() as db:
-            db.execute("begin immediate")
+            if not db.in_transaction:
+                db.execute("begin immediate")
             if self.kind == "raw":
                 exists = db.execute(
                     f"select 1 from {table} where source=? and name=? and active=1",
@@ -157,8 +165,9 @@ class CategoryTree:
 class LakeCatalog:
     """Sources and two independent category namespaces."""
 
-    def __init__(self, store: DataMetaStore, sources: SourceManager) -> None:
+    def __init__(self, store: DataMetaStore, sources: SourceManager, lake=None) -> None:
         self._data_meta = store
+        self._lake = lake
         self.sources = sources
         if not store.read_only:
             with store.connect() as db:
@@ -175,3 +184,30 @@ class LakeCatalog:
 
     def raw_categories(self, source: str) -> CategoryTree:
         return CategoryTree(self._data_meta, "raw", source)
+
+    def export_declarations(self) -> dict[str, Any]:
+        """Return portable declarations without credentials or data/result bytes."""
+        from bagelquant_data.management.declarations import export_declarations
+        return export_declarations(self._data_meta)
+
+    def plan_declaration_batch(self, payload) -> dict[str, Any]:
+        """Validate a prospective union and freeze its current catalog revision."""
+        from bagelquant_data.management.declarations import plan_batch
+        return plan_batch(self._data_meta, payload)
+
+    def apply_declaration_batch(self, plan, *, request_id: str,
+                                expected_revision: str) -> dict[str, Any]:
+        """Apply a validated declaration union in one idempotent transaction."""
+        from bagelquant_data.management.declarations import apply_batch
+        return apply_batch(self._lake, plan, request_id=request_id,
+                           expected_revision=expected_revision)
+
+    def declaration_batch_receipt(self, request_id: str) -> dict[str, Any] | None:
+        """Read immutable publication evidence by the caller's retry identity."""
+        from bagelquant_data.management.declarations import batch_receipt
+        return batch_receipt(self._data_meta, request_id)
+
+    def verify_declaration_batch_receipt(self, receipt) -> dict[str, Any]:
+        """Verify retained evidence separately from current declaration equality."""
+        from bagelquant_data.management.declarations import verify_receipt
+        return verify_receipt(self._data_meta, receipt)

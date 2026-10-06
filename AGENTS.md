@@ -6,6 +6,8 @@ Data has no BagelQuant package dependency; never import Core, BT or Workbench.
 The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
 `lake.integrity` and `lake.inputs`; pure statistics live in `exploration`.
 Both `data_meta_path` and `lake_path` are mandatory caller-owned paths.
+Catalog declaration batches are atomic and receipt-backed; integrity exposes
+actual storage usage and explicit frozen temporary cleanup without deleting history.
 
 Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
 affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
@@ -19,8 +21,11 @@ Keep this entry short; detailed owner contracts live under `.ai/rules/`.
 - Do not commit, push, create PRs, merge, release, deploy, install services,
   call providers, update real data or change governance unless explicitly requested.
 - Coverage is commit-backed truth; queries never submit updates or call providers.
-- Schema 5 is a fresh-lake hard cut; do not add migration/compatibility readers,
+- Schema 6 is a fresh-lake hard cut; do not add migration/compatibility readers,
   adopt orphan files or substitute current provider bytes for historical evidence.
+- `DataLake.inspect` checks current committed schema/lake binding without changing
+  original files or SQLite sidecars. Ordinary read-only queries use normal WAL
+  coordination; do not replace them with immutable main-file reads that omit WAL.
 - Expose neutral data and evidence; Core owns Domain/Panel conversion and numerical
   artifacts, BT owns account/evaluation artifacts. Do not duplicate their storage.
 - Workbench supplies China semantics and research intent through public APIs;

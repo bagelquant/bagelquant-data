@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 import zlib
 from collections.abc import Iterable, Iterator
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import local
 from typing import Any
 
@@ -19,11 +21,33 @@ from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.storage.paths import validate_generation
 
 
+def _probe_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _probe_schema(path: Path, *, immutable: bool) -> tuple[set[str], dict[str, str]]:
+    uri = path.as_uri() + "?mode=ro" + ("&immutable=1" if immutable else "")
+    db = sqlite3.connect(uri, uri=True)
+    try:
+        tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
+        state = (
+            {str(row[0]): str(row[1]) for row in db.execute("select key,value from data_meta_state")}
+            if "data_meta_state" in tables else {}
+        )
+        return tables, state
+    finally:
+        db.close()
+
+
 class DataMetaStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "5"
+    SCHEMA_VERSION = "6"
 
     def __init__(self, data_meta_path: str | Path, *, read_only: bool = False) -> None:
         self.data_meta_path = Path(data_meta_path)
@@ -84,31 +108,83 @@ class DataMetaStore:
                 )
 
     @classmethod
+    def _inspect_schema(cls, data_meta_path: Path) -> tuple[set[str], dict[str, str]]:
+        """Inspect committed schema without touching the original SQLite sidecars.
+
+        A normal read-only SQLite open may create or update WAL/SHM files. An
+        immutable open avoids those writes but ignores WAL. Read a stable private
+        DB/WAL snapshot when WAL is present; only a WAL-free database can be read
+        directly as immutable. Normal Data connections retain SQLite WAL locking.
+        Active/hot rollback journals are refused without attempting recovery;
+        invalidated zero-header PERSIST journals do not protect pending pages.
+        """
+        path = data_meta_path.resolve()
+        wal_path = path.with_name(path.name + "-wal")
+        journal_path = path.with_name(path.name + "-journal")
+        probe_paths = (path, wal_path, journal_path)
+        for _ in range(3):
+            before = tuple(_probe_file_signature(candidate) for candidate in probe_paths)
+            try:
+                if before[2] is not None:
+                    with journal_path.open("rb") as stream:
+                        if any(stream.read(8)):
+                            raise sqlite3.OperationalError("Data metadata has an active rollback journal")
+                if before[1] is None or before[1][2] == 0:
+                    tables, state = _probe_schema(path, immutable=True)
+                else:
+                    with TemporaryDirectory(prefix="bagelquant-data-schema-") as directory:
+                        snapshot = Path(directory) / path.name
+                        shutil.copyfile(path, snapshot)
+                        shutil.copyfile(wal_path, snapshot.with_name(snapshot.name + "-wal"))
+                        tables, state = _probe_schema(snapshot, immutable=False)
+            except (OSError, sqlite3.Error):
+                if before != tuple(_probe_file_signature(candidate) for candidate in probe_paths):
+                    continue
+                raise
+            if before == tuple(_probe_file_signature(candidate) for candidate in probe_paths):
+                break
+        else:
+            raise ConfigurationError("Data metadata changed during schema inspection; retry when it is stable")
+        return tables, state
+
+    @classmethod
     def check_compatibility(cls, data_meta_path: Path) -> None:
-        """Reject an existing incompatible lake before opening any write handle."""
+        """Reject an incompatible schema before any original storage writes."""
         if not data_meta_path.is_file() or data_meta_path.stat().st_size == 0:
             return
-        db = sqlite3.connect(data_meta_path.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            tables = {
-                row[0]
-                for row in db.execute(
-                    "select name from sqlite_master where type='table'"
-                )
-            }
-            row = (
-                db.execute(
-                    "select value from data_meta_state where key='schema_version'"
-                ).fetchone()
-                if "data_meta_state" in tables
-                else None
+        tables, state = cls._inspect_schema(data_meta_path)
+        if tables and (
+            state.get("schema_version") != cls.SCHEMA_VERSION
+            or "declaration_batch_receipts" not in tables
+        ):
+            raise ConfigurationError(
+                "Incompatible data-lake metadata schema; back up and rebuild the lake explicitly. Automatic migration is disabled."
             )
-            if tables and (row is None or str(row[0]) != cls.SCHEMA_VERSION):
-                raise ConfigurationError(
-                    "Incompatible data-lake metadata schema; back up and rebuild the lake explicitly. Automatic migration is disabled."
-                )
-        finally:
-            db.close()
+
+    @classmethod
+    def inspect(cls, data_meta_path: Path, lake_path: Path) -> dict[str, object]:
+        """Return schema and lake binding readiness without opening the lake."""
+        if not data_meta_path.exists() or (
+            data_meta_path.is_file() and data_meta_path.stat().st_size == 0
+        ):
+            return {"status": "uninitialized", "reason": "metadata_missing", "schema_version": None}
+        if not data_meta_path.is_file():
+            return {"status": "incompatible", "reason": "metadata_not_file", "schema_version": None}
+        try:
+            tables, state = cls._inspect_schema(data_meta_path)
+        except (OSError, sqlite3.Error, ConfigurationError):
+            return {"status": "incompatible", "reason": "metadata_unreadable", "schema_version": None}
+        version = state.get("schema_version")
+        if version != cls.SCHEMA_VERSION or "declaration_batch_receipts" not in tables:
+            return {"status": "incompatible", "reason": "metadata_schema_incompatible", "schema_version": version}
+        location = state.get("lake_location")
+        if (
+            not state.get("lake_id") or location is None
+            or not lake_path.is_dir()
+            or (data_meta_path.resolve().parent / location).resolve() != lake_path.resolve()
+        ):
+            return {"status": "incompatible", "reason": "lake_binding_invalid", "schema_version": version}
+        return {"status": "ready", "reason": None, "schema_version": version}
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -116,6 +192,9 @@ class DataMetaStore:
 
         active = getattr(self._thread_state, "writer_connection", None)
         if isinstance(active, sqlite3.Connection):
+            if getattr(self._thread_state, "atomic_transaction", False):
+                yield active
+                return
             with active as connection:
                 yield connection
             return
@@ -124,6 +203,24 @@ class DataMetaStore:
             with connection:
                 yield connection
         finally:
+            connection.close()
+
+    @contextmanager
+    def atomic_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Share one transaction across declaration helpers without nested commits."""
+        self.ensure_writable()
+        if getattr(self._thread_state, "writer_connection", None) is not None:
+            raise ConfigurationError("An atomic declaration transaction cannot be nested")
+        connection = self._new_connection()
+        self._thread_state.writer_connection = connection
+        self._thread_state.atomic_transaction = True
+        try:
+            with connection:
+                connection.execute("begin immediate")
+                yield connection
+        finally:
+            del self._thread_state.writer_connection
+            del self._thread_state.atomic_transaction
             connection.close()
 
     def _new_connection(self) -> sqlite3.Connection:
@@ -1621,6 +1718,12 @@ class DataMetaStore:
                     key text primary key,
                     value text not null,
                     updated_at text not null
+                );
+                create table if not exists declaration_batch_receipts (
+                    request_id text primary key,
+                    plan_hash text not null,
+                    receipt_json text not null,
+                    created_at text not null
                 );
                 create table if not exists partition_manifest (
                     source text not null,

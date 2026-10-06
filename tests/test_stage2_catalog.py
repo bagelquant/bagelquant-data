@@ -90,3 +90,23 @@ def test_repair_plan_requires_current_registered_evidence(tmp_path):
     foreign = DataLake.open(data_meta_path=tmp_path / 'other.sqlite', lake_path=tmp_path / 'other')
     with pytest.raises(ConfigurationError, match='different lake'):
         foreign.integrity.repair(current)
+
+
+def test_combined_category_update_is_atomic_and_provider_scoped(tmp_path):
+    lake = DataLake.open(data_meta_path=tmp_path / "meta.sqlite", lake_path=tmp_path / "lake")
+    tree = lake.catalog.raw_categories("custom")
+    root = tree.create("root")
+    child = tree.create("child", parent_id=root["id"])
+    other = tree.create("other")
+    sibling = tree.create("taken", parent_id=other["id"])
+    before = tree.list()
+    with pytest.raises(ConfigurationError, match="Duplicate"):
+        tree.update(child["id"], name=sibling["name"], parent_id=other["id"])
+    assert tree.list() == before
+    foreign = lake.catalog.raw_categories("foreign").create("foreign")
+    with pytest.raises(ConfigurationError, match="Unknown parent"):
+        tree.update(child["id"], name="moved", parent_id=foreign["id"])
+    assert tree.list() == before
+    changed = tree.update(child["id"], name="moved", parent_id=other["id"])
+    assert changed["name"] == "moved"
+    assert changed["parent_id"] == other["id"]

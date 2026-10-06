@@ -64,7 +64,7 @@ class DataLake:
         self._parquet = ParquetStore(self._paths, self._data_meta)
         self._datasets = DatasetManager(self._data_meta, self._paths)
         self.catalog = LakeCatalog(
-            self._data_meta, SourceManager(self._registries, self._data_meta)
+            self._data_meta, SourceManager(self._registries, self._data_meta), self
         )
         self._reader = _RawReader(
             RawQueryService(self._parquet, self._data_meta), self._datasets
@@ -94,6 +94,18 @@ class DataLake:
         return cls(
             data_meta_path=data_meta_path, lake_path=lake_path, read_only=read_only
         )
+
+    @classmethod
+    def inspect(
+        cls, *, data_meta_path: str | Path, lake_path: str | Path
+    ) -> dict[str, object]:
+        """Inspect committed schema and configured lake binding without writes.
+
+        The result status is ready, uninitialized or incompatible, with a reason
+        and schema_version. No directories, SQLite sidecars, recovery or runtime
+        extension instances are created in the configured storage paths.
+        """
+        return DataMetaStore.inspect(Path(data_meta_path), Path(lake_path))
 
     def close(self) -> None:
         """Connections are operation-scoped; discard runtime extension instances."""
@@ -383,6 +395,21 @@ class IntegrityAPI:
     def __init__(self, lake: DataLake) -> None:
         self._lake = lake
         self._status = StatusManager(lake._data_meta, lake._paths)
+
+    def storage_usage(self) -> dict[str, Any]:
+        """Read actual Data-owned storage usage, including retained history."""
+        from bagelquant_data.management.maintenance import storage_usage
+        return storage_usage(self._lake)
+
+    def temporary_cleanup_plan(self) -> dict[str, Any]:
+        """Freeze only known, unreferenced and inactive atomic temporary files."""
+        from bagelquant_data.management.maintenance import cleanup_plan
+        return cleanup_plan(self._lake)
+
+    def cleanup_temporary(self, plan: Mapping[str, Any]) -> dict[str, Any]:
+        """Delete exact frozen temporary files after owner and identity checks."""
+        from bagelquant_data.management.maintenance import cleanup_temporary
+        return cleanup_temporary(self._lake, plan)
 
     def backup(
         self, *, data_meta_path: str | Path, lake_path: str | Path

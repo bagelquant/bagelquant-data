@@ -40,8 +40,11 @@ print(lake.items.read("close").collect())
 
 Both paths are required. `data_meta_path` identifies the single Data SQLite file,
 including task state and compressed Arrow recovery evidence. Immutable Parquet
-generations retain year/month partitions. Read-only opens create nothing.
-Package 0.7 and metadata schema 5 are an incompatible fresh-database cut; old
+generations retain year/month partitions. Read-only queries never initialize or
+recover data; SQLite may create or update its WAL/SHM coordination sidecars.
+`DataLake.inspect(data_meta_path=..., lake_path=...)` checks schema and lake binding
+without changing any configured storage files or directories, including sidecars.
+Package 0.7 and metadata schema 6 are an incompatible fresh-database cut; old
 databases are rejected. No aliases, migrations or automatic history cleanup exist.
 
 Historical daily reads are causal by default. Explicit `as_of` selects a fixed

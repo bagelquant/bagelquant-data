@@ -15,6 +15,7 @@ from bagelquant_data.core import (
 from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.execution import ExecutionOptions
 from bagelquant_data.management import DataLake
+from bagelquant_data.management.lake import RawAPI
 from bagelquant_data.inputs import FrozenInputReceipt, input_read_boundary
 from bagelquant_data.items import (
     AvailabilityAlignment, AvailabilityPolicy, BuildContext, DataItemSpec,
@@ -36,6 +37,7 @@ from bagelquant_data.transforms import Align, Cast, Filter, Join, MapValues, Sel
 __all__ = [
     "BagelQuantDataError",
     "DataLake",
+    "RawAPI",
     "DataSource",
     "DatasetNotFoundError",
     "DatasetSpec",

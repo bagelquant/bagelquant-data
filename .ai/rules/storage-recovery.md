@@ -8,9 +8,16 @@
   statistics and Polars tables. Both data_meta_path and lake_path are explicit.
 - Data imports no Core/BT/Workbench. Core numerical and BT result artifacts have
   their own owners; Workbench stores authored closure and backend receipt references.
-- Schema 5 rejects old/unversioned databases before writes. No aliases, migrations,
+- Schema 6 rejects old/unversioned databases before writes. No aliases, migrations,
   orphan adoption, automatic cleanup or provider-backed historical recovery.
   Real data/service cutover is a later separately authorized operation.
+- `DataLake.inspect` is the public schema/lake-binding readiness query: no original
+  files, directories or SQLite sidecars are changed. Include committed live WAL
+  using a stable owner-internal temporary metadata snapshot; never infer readiness
+  from an immutable main-file read that ignores WAL.
+  Refuse a nonzero rollback-journal header without recovery; it may protect
+  uncommitted main-file pages. Include journal identity in stability checks.
+  An invalidated zero-header PERSIST journal does not block inspection.
 
 ## Storage authority
 
@@ -24,10 +31,18 @@
   used by admitted readers. Preserve older committed generations and histories.
 - Lake file references are relative and verified against their configured roots.
   A read-only open creates no directories/database/tables and performs no recovery.
+  Normal read-only queries retain SQLite WAL coordination and may create/update
+  WAL/SHM sidecars. Use the inspector for readiness checks requiring zero changes.
 - Canonical hashes cover schema, values, nulls and deterministic ordering.
   Preserve scalar and categorical types and committed batch schema.
 - Category moves change only catalog organization. Unregistering requires no
   active dependencies, preserves histories/receipts and removes active assignment.
+- Declaration batches export non-secret JSON, preserve category identities and
+  validate the prospective union. One Data SQLite transaction uses the individual
+  registration helpers and publishes an immutable caller request receipt; stale
+  plans and natural-key conflicts never overwrite existing declarations. Imported
+  descriptors never instantiate providers/producers or acquire data. Application
+  research UUIDs and governance remain Workbench responsibilities.
 
 ## Point-in-time and input evidence
 
@@ -62,3 +77,9 @@
   local evidence fails explicitly. Total metadata loss requires backup restoration.
 - Never refetch providers to replace historical evidence, fabricate original
   availability, backdate new observations or silently release live ownership.
+- Storage usage counts actual regular files with physical hard-link deduplication,
+  including metadata/recovery and retained history. Temporary cleanup is explicit:
+  freeze exact known atomic temporary files, acquire writer leases and revalidate
+  all identities/hashes before deletion. Protect active files, registered history,
+  rejected evidence, unknown files and symbolic/shared hard links. Repeated plans
+  only report already-missing files; they never broaden the approved candidates.

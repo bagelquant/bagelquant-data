@@ -86,7 +86,8 @@ class ItemAPI:
         physical = self._physical_spec(spec)
         self._store.upsert_source("items", "data_items", configured=True)
         with self._store.connect() as db:
-            db.execute("begin immediate")
+            if not db.in_transaction:
+                db.execute("begin immediate")
             # Verify dependencies and cycles against the prospective graph before
             # changing either the item definition or the physical dataset contract.
             for dependency in spec.inputs:
@@ -392,6 +393,19 @@ class ItemAPI:
         item = self._store._rows("select spec_hash from item_definitions where name=?", (name,))[0]
         builds = self._store._rows("select dependency_digest,input_commit,result_commit,frozen_receipt_id from item_builds where name=? and status='success' order by id desc limit 1", (name,))
         row["definition_hash"] = item["spec_hash"]
+        physical_hash = self._store.dataset_spec_hash("items", name)
+        manifests = self._store.manifest("items", name)
+        committed = self._store._rows(
+            "with latest as (select b.partition_path,max(c.seq) as seq from version_batches b "
+            "join version_commits c on c.seq=b.commit_seq where c.source='items' and c.dataset=? "
+            "and c.status='committed' group by b.partition_path) "
+            "select latest.partition_path,c.spec_hash from latest join version_commits c on c.seq=latest.seq",
+            (name,),
+        )
+        hashes = {value["partition_path"]: value["spec_hash"] for value in committed}
+        row["committed_definition_current"] = bool(manifests) and all(
+            hashes.get(value["partition_path"]) == physical_hash for value in manifests
+        )
         row.update(builds[0] if builds else {})
         # The physical manifest's time is availability; report the daily axis
         # separately using registered batch observation bounds.
