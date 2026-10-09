@@ -4,29 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import sqlite3
 import zlib
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import local
+from threading import get_ident, local
 from typing import Any
 
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.storage.paths import validate_generation
+from bagelquant_data.storage.snapshot import copy_database, file_signature
+
+
+_READ_VIEWS: ContextVar[tuple[tuple[Path, int, sqlite3.Connection], ...]] = ContextVar("data_read_views", default=())
 
 
 def _probe_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return None
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    return file_signature(path)
 
 
 def _probe_schema(path: Path, *, immutable: bool) -> tuple[set[str], dict[str, str]]:
@@ -134,8 +134,7 @@ class DataMetaStore:
                 else:
                     with TemporaryDirectory(prefix="bagelquant-data-schema-") as directory:
                         snapshot = Path(directory) / path.name
-                        shutil.copyfile(path, snapshot)
-                        shutil.copyfile(wal_path, snapshot.with_name(snapshot.name + "-wal"))
+                        copy_database(path, snapshot)
                         tables, state = _probe_schema(snapshot, immutable=False)
             except (OSError, sqlite3.Error):
                 if before != tuple(_probe_file_signature(candidate) for candidate in probe_paths):
@@ -199,7 +198,11 @@ class DataMetaStore:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         """Yield one transactional connection and close owned connections."""
-
+        path = self.data_meta_path.resolve()
+        for view_path, thread, connection in reversed(_READ_VIEWS.get()):
+            if view_path == path and thread == get_ident():
+                yield connection
+                return
         active = getattr(self._thread_state, "writer_connection", None)
         if isinstance(active, sqlite3.Connection):
             if getattr(self._thread_state, "atomic_transaction", False):
@@ -213,6 +216,25 @@ class DataMetaStore:
             with connection:
                 yield connection
         finally:
+            connection.close()
+
+    @contextmanager
+    def read_view(self) -> Iterator[sqlite3.Connection]:
+        """Share one operation-local SQLite snapshot across same-thread readers."""
+        path = self.data_meta_path.resolve()
+        for view_path, thread, connection in reversed(_READ_VIEWS.get()):
+            if view_path == path and thread == get_ident():
+                yield connection
+                return
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
+        connection.execute("begin")
+        token = _READ_VIEWS.set((*_READ_VIEWS.get(), (path, get_ident(), connection)))
+        try:
+            yield connection
+        finally:
+            _READ_VIEWS.reset(token)
             connection.close()
 
     @contextmanager
@@ -676,7 +698,8 @@ class DataMetaStore:
     def dataset_snapshot(self, source: str, dataset: str) -> dict[str, Any]:
         """Pin schema, manifests and commit visibility in one SQLite read snapshot."""
         with self.connect() as db:
-            db.execute("begin")
+            if not db.in_transaction:
+                db.execute("begin")
             manifests = [
                 dict(row)
                 for row in db.execute(

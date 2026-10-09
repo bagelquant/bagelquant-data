@@ -30,13 +30,13 @@ def setup(root):
 
 def observe_reads(data, monkeypatch):
     reads = []
-    original = data.inputs._read_frame
+    original = data.inputs._selected_item_parents
 
     def read(*args, **kwargs):
         reads.append(args[1])
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(data.inputs, "_read_frame", read)
+    monkeypatch.setattr(data.inputs, "_selected_item_parents", read)
     return reads
 
 

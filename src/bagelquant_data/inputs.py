@@ -5,24 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import get_ident
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_from_payload, input_payload
 from bagelquant_data.query.raw import _date_value
-from bagelquant_data.storage.recovery import read_batch, verify_batch
+from bagelquant_data.storage.recovery import project_batch, read_batch, verify_batch
 from bagelquant_data.execution import ExecutionOptions
 
 if TYPE_CHECKING:
@@ -97,7 +101,8 @@ def current_input_check_boundary(data_meta_path: str | Path) -> int | None:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      default=lambda value: dict(value) if isinstance(value, Mapping) else str(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +117,29 @@ class FrozenInputReceipt:
     dependency_digest: str
 
 
+def _readonly(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _readonly(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_readonly(item) for item in value)
+    return value
+
+
+@dataclass(slots=True)
+class _ReadContext:
+    path: Path
+    thread: int
+    receipts: dict[str, FrozenInputReceipt]
+    check_canceled: Callable[[], None] | None
+    options: ExecutionOptions
+    verified_batches: set[tuple[int, str, str]] = field(default_factory=set)
+    verified_graph: dict[str, tuple[int, tuple[FrozenInputReceipt, ...]]] = field(default_factory=dict)
+    currentness: dict[tuple[str, str, Path, InputReadBoundary | None], bool] = field(default_factory=dict)
+
+
+_READ_CONTEXTS: ContextVar[tuple[_ReadContext, ...]] = ContextVar("frozen_input_read_contexts", default=())
+
+
 class InputsAPI:
     """Freeze contracts and exact registered immutable batch identities."""
 
@@ -122,6 +150,66 @@ class InputsAPI:
         if not self._store.read_only:
             with self._store.connect() as db:
                 db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null,created_at text not null)")
+
+    def _read_context(self) -> _ReadContext | None:
+        path = self._store.data_meta_path.resolve()
+        return next((value for value in reversed(_READ_CONTEXTS.get())
+                     if value.path == path and value.thread == get_ident()), None)
+
+    @contextmanager
+    def read_context(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,
+                     config: ExecutionOptions | None = None,
+                     check_canceled: Callable[[], None] | None = None,
+                     progress: Callable[[dict[str, Any]], None] | None = None,
+                     verify: bool = True) -> Iterator[InputsAPI]:
+        """Load original metadata once within a finite, read-only operation.
+
+        Matching readers opened on this thread share a SQLite snapshot and
+        immutable receipt metadata. Caller receipt objects supply only ID/digest;
+        their mutable evidence is never trusted. No frames or validity proofs
+        survive exit. ``verify=False`` defers bytes to an explicit verify call.
+        """
+        single = isinstance(receipt, (FrozenInputReceipt, str))
+        supplied = [receipt] if single else list(receipt)
+        if not supplied:
+            raise ValueError("Read context requires at least one frozen input receipt")
+        state = _ReadContext(self._store.data_meta_path.resolve(), get_ident(), {}, check_canceled, config or ExecutionOptions())
+        token = _READ_CONTEXTS.set((*_READ_CONTEXTS.get(), state))
+        try:
+            with self._store.read_view():
+                roots = [self.get(value) for value in supplied]
+                visiting: set[str] = set()
+                loaded: set[str] = set()
+                def load(value: FrozenInputReceipt) -> None:
+                    if check_canceled is not None:
+                        check_canceled()
+                    if value.receipt_id in visiting:
+                        raise RuntimeError("Frozen input receipt dependency cycle")
+                    if value.receipt_id in loaded:
+                        return
+                    visiting.add(value.receipt_id)
+                    for evidence in value.evidence.values():
+                        for key, digest in evidence["parent_receipts"].items():
+                            parent = self.get(key)
+                            if parent.digest != digest:
+                                raise RuntimeError("Frozen upstream input receipt checksum mismatch")
+                            load(parent)
+                    visiting.remove(value.receipt_id)
+                    loaded.add(value.receipt_id)
+                for root in roots:
+                    load(root)
+                if verify:
+                    self.verify(roots[0] if single else roots, config=config,
+                                check_canceled=check_canceled, progress=progress)
+                yield self
+                if check_canceled is not None:
+                    check_canceled()
+        finally:
+            _READ_CONTEXTS.reset(token)
+            state.receipts.clear()
+            state.verified_batches.clear()
+            state.verified_graph.clear()
+            state.currentness.clear()
 
     def max_commit(self) -> int:
         value = int(self._store._rows("select coalesce(max(seq),0) as seq from version_commits where status='committed'")[0]["seq"])
@@ -378,7 +466,8 @@ class InputsAPI:
         payload["dependency_digest"] = hashlib.sha256(_json(semantic_payload).encode()).hexdigest()
         return payload
 
-    def is_current(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str]) -> bool:
+    def is_current(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,
+                   config: ExecutionOptions | None = None) -> bool:
         """Compare current semantic evidence without creating a new receipt.
 
         The original request windows and information cutoff are retained.
@@ -388,21 +477,32 @@ class InputsAPI:
         Archived inputs and changed declarations return false. Missing or corrupt
         frozen receipts fail explicitly; verify() separately checks retained bytes.
         A nonempty finite sequence checks every original root in the same read
-        view, sharing only this call's recursive dependency results.
+        view. An entered read context additionally reuses completed currentness
+        booleans for the same original digest and complete reader boundary only.
         """
         single = isinstance(receipt, (FrozenInputReceipt, str))
         roots = [self.get(receipt)] if single else [self.get(value) for value in receipt]
         if not roots:
             raise ValueError("Currentness requires at least one frozen input receipt")
         checked: dict[str, bool] = {}
+        context = self._read_context()
+        options = config or (context.options if context is not None else ExecutionOptions())
+        memo_keys: dict[str, tuple[str, str, Path, InputReadBoundary | None]] = {}
+        memo_path = self._store.data_meta_path.resolve()
         visiting: set[str] = set()
         with self._store.connect() as db:
-            db.execute("begin")
+            if not db.in_transaction:
+                db.execute("begin")
 
             def current(value: FrozenInputReceipt) -> bool:
                 if value.receipt_id in visiting:
                     raise RuntimeError("Frozen input receipt dependency cycle")
                 if value.receipt_id in checked:
+                    return checked[value.receipt_id]
+                memo_key = (value.receipt_id, value.digest, memo_path, self._boundary)
+                memo_keys[value.receipt_id] = memo_key
+                if context is not None and memo_key in context.currentness:
+                    checked[value.receipt_id] = context.currentness[memo_key]
                     return checked[value.receipt_id]
                 visiting.add(value.receipt_id)
                 # A newly added large verified baseline check changes semantic
@@ -451,30 +551,14 @@ class InputsAPI:
                         if proof is not None and proof["frozen_receipt_id"] in parent_ids:
                             if all(current(self.get(parent_id)) for parent_id in parent_ids):
                                 continue
-                        frame = self._read_frame(value, alias)
-                        # Freshness follows the newest materialized dependency
-                        # proof; causal history replay still keeps original rows.
-                        cutoff = value.information_cutoff
-                        if cutoff is None and frame.height:
-                            cutoff = cast(date, frame["time"].max())
-                        selected = self._select(frame, replace(request, view="snapshot"), cutoff,
-                                                evidence=evidence) if cutoff is not None else frame
-                        parents: set[str] = set()
-                        if selected.height:
-                            commits = {int(batch["commit_seq"]): batch["input_receipt_id"]
-                                       for batch in evidence["batches"]}
-                            checks = {int(check["id"]): check["input_receipt_id"]
-                                      for check in evidence["checks"]}
-                            for row in selected.select("_commit_seq", "_attestation_id").unique().iter_rows(named=True):
-                                parent_id = checks.get(row["_attestation_id"]) if row["_attestation_id"] is not None else commits.get(row["_commit_seq"])
+                        selected_rows, parents = self._selected_item_parents(value, alias, options)
+                        if not selected_rows:
+                            if evidence["empty_item_build"] is not None:
+                                parent_id = evidence["empty_item_build"]["frozen_receipt_id"]
                                 if parent_id is not None:
                                     parents.add(str(parent_id))
-                        elif evidence["empty_item_build"] is not None:
-                            parent_id = evidence["empty_item_build"]["frozen_receipt_id"]
-                            if parent_id is not None:
-                                parents.add(str(parent_id))
-                        elif evidence["definition"]["inputs"]:
-                            result = False
+                            elif evidence["definition"]["inputs"]:
+                                result = False
                         if not all(current(self.get(parent_id)) for parent_id in parents):
                             result = False
                         if not result:
@@ -486,10 +570,177 @@ class InputsAPI:
             # Visit every root even if another is stale; missing/corrupt/cyclic
             # evidence must not be hidden by a short-circuiting aggregate.
             results = [current(value) for value in roots]
+            if context is not None:
+                # Publish only after every original root completed successfully.
+                # Bound operation-local bookkeeping; no frames/proofs persist.
+                for receipt_id, result in checked.items():
+                    key = memo_keys[receipt_id]
+                    if key not in context.currentness and len(context.currentness) >= 4096:
+                        context.currentness.pop(next(iter(context.currentness)))
+                    context.currentness[key] = result
             return all(results)
+
+    def _selected_item_parents(self, frozen: FrozenInputReceipt, alias: str,
+                               options: ExecutionOptions) -> tuple[bool, set[str]]:
+        """Select exact lineage in bounded record shards, never value frames.
+
+        Hashing record identity keeps every revision and witnessed copy together,
+        including revisions crossing physical/month partitions. Each shard uses
+        the ordinary attestation and snapshot selectors with original row order.
+        Transient Parquet holds projected originals only and expires on failure.
+        """
+        evidence = frozen.evidence[alias]
+        request = frozen.requests[alias]
+        context = self._read_context()
+        check = None if context is None else context.check_canceled
+        columns = ("time", "source_time", "ingested_at", "_baseline", "_commit_seq",
+                   "_record_id", "_payload_hash")
+        limit = max(1, options.max_buffer_bytes // 8)
+        # Expected lineage row size only chooses sharding. Actual retained bytes
+        # below govern admission; a skewed or oversized shard fails closed.
+        expected = (sum(int(batch["row_count"]) for batch in evidence["batches"])
+                    + len(evidence["record_checks"])
+                    + sum(int(seal["row_count"]) for seal in evidence.get("full_commit_checks", ()))) * 384
+        shards = 1
+        while shards < 65536 and expected // shards > limit:
+            shards *= 2
+        sizes: dict[int, int] = {}
+        cutoff = frozen.information_cutoff
+        commits = {int(batch["commit_seq"]): batch["input_receipt_id"] for batch in evidence["batches"]}
+        checks = {int(event["id"]): event["input_receipt_id"] for event in evidence["checks"]}
+        from bagelquant_data.query.raw import _attested_versions
+        with tempfile.TemporaryDirectory(prefix="bagelquant-currentness-") as directory:
+            path = Path(directory) / "lineage.parquet"
+            writer: pq.ParquetWriter | None = None
+            buffered: dict[int, list[pa.Table]] = {}
+            buffered_sizes: dict[int, int] = {}
+            buffered_bytes = 0
+            buffer_limit = max(1, options.max_buffer_bytes // 4)
+            group_target = max(1, min(1024 * 1024, buffer_limit // 2))
+            def flush(shard: int) -> None:
+                nonlocal writer, buffered_bytes
+                pieces = buffered.pop(shard)
+                table = pa.concat_tables(pieces)
+                if writer is None:
+                    writer = pq.ParquetWriter(path, table.schema, compression="zstd")
+                writer.write_table(table)
+                buffered_bytes -= buffered_sizes.pop(shard)
+            try:
+                def consume(frame: pl.DataFrame) -> None:
+                    nonlocal buffered_bytes
+                    if check is not None:
+                        check()
+                    if "_record_id" not in frame.columns:
+                        raise RuntimeError("Retained Item lineage lacks record identity")
+                    frame = frame.with_columns(
+                        (pl.col("_record_id").hash(seed=0) % shards).alias("_lineage_shard"))
+                    for key, part in frame.partition_by("_lineage_shard", as_dict=True, maintain_order=True).items():
+                        shard = int(key[0])
+                        sizes[shard] = sizes.get(shard, 0) + int(part.estimated_size())
+                        if sizes[shard] > limit:
+                            raise MemoryError("Item currentness lineage shard exceeds max_buffer_bytes; increase the admitted budget")
+                        original = part.to_arrow()
+                        size = original.nbytes
+                        if size > buffer_limit:
+                            raise MemoryError("Item currentness staging fragment exceeds max_buffer_bytes")
+                        while buffered_bytes + size > buffer_limit:
+                            flush(max(buffered_sizes, key=lambda key: buffered_sizes[key]))
+                        # Copy projected buffers independently before the source
+                        # IPC mapping closes; clone/rechunk may retain its mmap.
+                        owned = pa.Table.from_arrays(
+                            [pa.concat_arrays(column.chunks) for column in original.columns],
+                            schema=original.schema)
+                        buffered.setdefault(shard, []).append(owned)
+                        buffered_sizes[shard] = buffered_sizes.get(shard, 0) + size
+                        buffered_bytes += size
+                        if buffered_sizes[shard] >= group_target:
+                            flush(shard)
+                for batch in evidence["batches"]:
+                    if check is not None:
+                        check()
+                    project_batch(self._store, batch["partition_path"], int(batch["commit_seq"]),
+                                  batch["content_hash"], columns=columns, consume=consume,
+                                  buffer_bytes=options.max_buffer_bytes,
+                                  check_canceled=check)
+                for shard in list(buffered):
+                    if check is not None:
+                        check()
+                    flush(shard)
+            finally:
+                buffered.clear()
+                buffered_sizes.clear()
+                if writer is not None:
+                    writer.close()
+            if writer is None:
+                return False, set()
+            records_by_shard: dict[int, list[Mapping[str, Any]]] = {}
+            records = evidence["record_checks"]
+            for first in range(0, len(records), 1024):
+                if check is not None:
+                    check()
+                chunk = records[first:first + 1024]
+                hashes = pl.Series([event["record_id"] for event in chunk], dtype=pl.String).hash(seed=0)
+                for event, hashed in zip(chunk, hashes, strict=True):
+                    key = int(hashed) % shards
+                    records_by_shard.setdefault(key, []).append(event)
+                    if len(records_by_shard[key]) * 384 > options.max_buffer_bytes // 4:
+                        raise MemoryError("Item currentness witnesses exceed max_buffer_bytes")
+            parents: set[str] = set()
+            nonempty = False
+            scan = pl.scan_parquet(path)
+            for shard in sorted(sizes):
+                if check is not None:
+                    check()
+                frame = scan.filter(pl.col("_lineage_shard") == shard).drop("_lineage_shard").collect()
+                if frame.estimated_size() > limit:
+                    raise MemoryError("Item currentness lineage shard exceeds max_buffer_bytes")
+                # Restrict witness construction to this record shard as well.
+                records = records_by_shard.get(shard, [])
+                # Admit witnessed expansion before the join/concat allocates it.
+                # Bound even malformed duplicate baseline keys conservatively.
+                baseline = frame.filter(pl.col("_baseline"))
+                multiplicity = 1
+                if records and baseline.height:
+                    multiplicity = int(baseline.group_by("_commit_seq", "_record_id", "_payload_hash").len()["len"].max())
+                copies = 0
+                for seal in evidence.get("full_commit_checks", ()):
+                    commit = int(seal["binding"]["check"]["visible_commit"])
+                    copies += baseline.filter(pl.col("_commit_seq") == commit).height
+                row_bytes = 128 + sum(
+                    int(frame[name].str.len_bytes().max() or 0) + 8 if dtype == pl.String else 16
+                    for name, dtype in frame.schema.items())
+                if (frame.height + copies + len(records) * multiplicity) * row_bytes > options.max_buffer_bytes // 2:
+                    raise MemoryError("Item currentness witnessed lineage exceeds max_buffer_bytes")
+                del baseline
+                frame = _attested_versions(frame.lazy(), evidence["checks"], records,
+                    as_of_date=frozen.information_cutoff, max_check_id=frozen.max_check_id,
+                    full_commit_checks=evidence.get("full_commit_checks", ())).collect()
+                if frame.estimated_size() > options.max_buffer_bytes // 2:
+                    raise MemoryError("Item currentness witnessed lineage exceeds max_buffer_bytes")
+                selected_cutoff = cutoff
+                if selected_cutoff is None and frame.height:
+                    selected_cutoff = cast(date, frame["time"].max())
+                selected = self._select(frame, replace(request, view="snapshot"), selected_cutoff,
+                                        evidence=evidence) if selected_cutoff is not None else frame
+                if selected.height:
+                    nonempty = True
+                    for row in selected.select("_commit_seq", "_attestation_id").unique().iter_rows(named=True):
+                        parent = checks.get(row["_attestation_id"]) if row["_attestation_id"] is not None else commits.get(row["_commit_seq"])
+                        if parent is not None:
+                            parents.add(str(parent))
+            return nonempty, parents
 
     def get(self, receipt: FrozenInputReceipt | str) -> FrozenInputReceipt:
         key = receipt.receipt_id if isinstance(receipt, FrozenInputReceipt) else receipt
+        context = self._read_context()
+        if context is not None:
+            if context.check_canceled is not None:
+                context.check_canceled()
+            cached = context.receipts.get(key)
+            if cached is not None:
+                if isinstance(receipt, FrozenInputReceipt) and receipt.digest != cached.digest:
+                    raise RuntimeError("Frozen input receipt checksum mismatch")
+                return cached
         rows = self._store._rows("select payload_json,digest from frozen_inputs where receipt_id=?", (key,))
         if not rows:
             raise KeyError(f"Unknown frozen input receipt: {key}")
@@ -497,7 +748,11 @@ class InputsAPI:
         digest = hashlib.sha256(serialized.encode()).hexdigest()
         if digest != rows[0]["digest"] or isinstance(receipt, FrozenInputReceipt) and digest != receipt.digest:
             raise RuntimeError("Frozen input receipt checksum mismatch")
-        return self._receipt(key, json.loads(serialized), digest)
+        result = self._receipt(key, json.loads(serialized), digest)
+        if context is not None:
+            result = replace(result, requests=_readonly(result.requests), evidence=_readonly(result.evidence))
+            context.receipts[key] = result
+        return result
 
     def _could_have_baseline(self, frozen: FrozenInputReceipt, alias: str,
                              seen: frozenset[str] = frozenset()) -> bool:
@@ -655,6 +910,7 @@ class InputsAPI:
         fields: tuple[str, ...] | list[str] | None = None,
         strict: bool | None = None,
         observations: bool = False,
+        start: DateLike | None = None, end: DateLike | None = None,
     ) -> pl.LazyFrame:
         """Replay frozen evidence with an optional tighter information cutoff.
 
@@ -665,6 +921,18 @@ class InputsAPI:
         if alias not in frozen.requests:
             raise KeyError(f"Unknown frozen input alias: {alias}")
         request = frozen.requests[alias]
+        lower, upper = request.start, request.end
+        if isinstance(request, RawInput):
+            lower = max((_date_value(value) for value in (lower, request.observation_start) if value is not None), default=None)
+            upper = min((_date_value(value) for value in (upper, request.observation_end) if value is not None), default=None)
+        if start is not None and lower is not None and _date_value(start) < _date_value(lower):
+            raise ValueError("start cannot widen the frozen observation window")
+        if end is not None and upper is not None and _date_value(end) > _date_value(upper):
+            raise ValueError("end cannot widen the frozen observation window")
+        request = replace(request, start=lower if start is None else start,
+                          end=upper if end is None else end)
+        if request.start is not None and request.end is not None and _date_value(request.start) > _date_value(request.end):
+            raise ValueError("end precedes start")
         cutoff = frozen.information_cutoff if as_of is None else _date_value(as_of)
         if frozen.information_cutoff is not None and cutoff is not None and cutoff > frozen.information_cutoff:
             raise ValueError("as_of exceeds the frozen information cutoff")
@@ -675,7 +943,7 @@ class InputsAPI:
                           strict=request.strict if strict is None else strict)
         if isinstance(request, RawInput):
             request = replace(request, fields=())
-        frame = self._select(self._read_frame(frozen, alias), request, cutoff,
+        frame = self._select(self._read_frame(frozen, alias, request=request), request, cutoff,
                              evidence=frozen.evidence[alias])
         if observations and isinstance(request, RawInput) and "source_time" in frame.columns:
             frame = frame.with_columns(pl.col("source_time").alias("time"))
@@ -686,12 +954,38 @@ class InputsAPI:
             frame = frame.select(projection)
         return frame.lazy()
 
+    def window_read_supported(self, receipt: FrozenInputReceipt | str, alias: str) -> bool:
+        """Whether captured evidence can safely prune physical observation reads.
+
+        A metadata-only planning query; never consult live batch summaries or
+        infer bounds for legacy/general inputs. Unknown batch bounds return false.
+        It does not verify input bytes or promise that a given window skips work.
+        """
+        frozen = self.get(receipt)
+        if alias not in frozen.requests:
+            raise KeyError(f"Unknown frozen input alias: {alias}")
+        evidence = frozen.evidence[alias]
+        if evidence["general_snapshots"] or evidence["definition"].get("update_type") == "general":
+            return False
+        from bagelquant_data.storage.full_commit_checks import validate_seal
+        sealed: set[tuple[int, str, str]] = set()
+        for seal in evidence.get("full_commit_checks", ()):
+            validate_seal(seal)
+            for bound in seal["batch_bounds"]:
+                if bound["observation_min"] is not None and bound["observation_max"] is not None:
+                    sealed.add((bound["commit_seq"], bound["partition_path"], bound["content_hash"]))
+        return all(
+            bool(evidence.get("scoped_batches"))
+            and batch.get("min_observation") is not None and batch.get("max_observation") is not None
+            or (batch["commit_seq"], batch["partition_path"], batch["content_hash"]) in sealed
+            for batch in evidence["batches"])
+
     def _read_frame(self, frozen: FrozenInputReceipt, alias: str, *,
-                    timing_cutoff: date | None = None) -> pl.DataFrame:
+                    timing_cutoff: date | None = None, request: DataInput | None = None) -> pl.DataFrame:
         """Load exact retained versions before view or field selection."""
         if alias not in frozen.requests:
             raise KeyError(f"Unknown frozen input alias: {alias}")
-        request = frozen.requests[alias]
+        request = frozen.requests[alias] if request is None else request
         evidence = frozen.evidence[alias]
         # Timing-only selection cannot observe future physical availability.
         # General snapshots and unknown/legacy bounds keep their broad reads.
@@ -721,7 +1015,10 @@ class InputsAPI:
             if bound is None:
                 return True
             return (request.start is None or _date_value(bound["observation_max"]) >= _date_value(request.start)) and (request.end is None or _date_value(bound["observation_min"]) <= _date_value(request.end))
-        pieces = [read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"]) for value in evidence["batches"] if needed(value)]
+        context = self._read_context()
+        pieces = [read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"],
+                            **({"check_canceled": context.check_canceled} if context is not None else {}))
+                  for value in evidence["batches"] if needed(value)]
         if pieces:
             frame = concat_compatible_frames(pieces)
         elif evidence["schema_ipc"]:
@@ -740,26 +1037,44 @@ class InputsAPI:
         return frame
 
     def verify(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,
-               config: ExecutionOptions | None = None) -> dict[str, Any]:
+               config: ExecutionOptions | None = None,
+               check_canceled: Callable[[], None] | None = None,
+               progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         """Raise on lost or corrupt evidence, even after object archival."""
         single = isinstance(receipt, (FrozenInputReceipt, str))
         roots = [self.get(receipt)] if single else [self.get(value) for value in receipt]
         if not roots:
             raise ValueError("Verification requires at least one frozen input receipt")
+        context = self._read_context()
+        if check_canceled is None and context is not None:
+            check_canceled = context.check_canceled
         retained_receipts = {value.receipt_id: value for value in roots}
         batch_count = 0
         verified: set[str] = set()
         verified_batches: set[tuple[int, str, str]] = set()
         batches_to_verify: list[tuple[int, str, str]] = []
         visiting: set[str] = set()
+        graph: dict[str, tuple[int, tuple[FrozenInputReceipt, ...]]] = {}
 
         def verify_retained(value: FrozenInputReceipt) -> None:
             nonlocal batch_count
+            if check_canceled is not None:
+                check_canceled()
             if value.receipt_id in visiting:
                 raise RuntimeError("Frozen input receipt dependency cycle")
             if value.receipt_id in verified:
                 return
             visiting.add(value.receipt_id)
+            prior = None if context is None else context.verified_graph.get(value.receipt_id)
+            if prior is not None:
+                batch_count += prior[0]
+                for parent in prior[1]:
+                    verify_retained(parent)
+                visiting.remove(value.receipt_id)
+                verified.add(value.receipt_id)
+                return
+            local_count = 0
+            parents: dict[str, FrozenInputReceipt] = {}
             for evidence in value.evidence.values():
                 from bagelquant_data.storage.full_commit_checks import validate_seal
                 for seal in evidence.get("full_commit_checks", ()):
@@ -768,11 +1083,15 @@ class InputsAPI:
                     if any((batch["commit_seq"], batch["partition_path"], batch["content_hash"], batch["row_count"]) not in retained for batch in seal["binding"]["batches"]):
                         raise RuntimeError("Full-commit check seal retained batch mismatch")
                 for batch in evidence["batches"]:
+                    if check_canceled is not None:
+                        check_canceled()
                     key = (int(batch["commit_seq"]), batch["partition_path"], batch["content_hash"])
                     if key not in verified_batches:
-                        batches_to_verify.append(key)
+                        if context is None or key not in context.verified_batches:
+                            batches_to_verify.append(key)
                         verified_batches.add(key)
                     batch_count += 1
+                    local_count += 1
                 for parent_id, parent_digest in evidence["parent_receipts"].items():
                     parent = retained_receipts.get(parent_id)
                     if parent is None:
@@ -780,12 +1099,19 @@ class InputsAPI:
                         retained_receipts[parent_id] = parent
                     if parent.digest != parent_digest:
                         raise RuntimeError("Frozen upstream input receipt checksum mismatch")
+                    parents[parent.receipt_id] = parent
                     verify_retained(parent)
             visiting.remove(value.receipt_id)
             verified.add(value.receipt_id)
+            graph[value.receipt_id] = local_count, tuple(parents.values())
 
         for frozen in roots:
             verify_retained(frozen)
+        completed = 0
+        def report() -> None:
+            if progress is not None:
+                progress({"stage": "verify_inputs", "completed": completed, "total": len(batches_to_verify)})
+        report()
         options = config or ExecutionOptions()
         workers = min(options.workers, options.max_in_flight or options.workers)
         # One pool for this call, joined before any caller publishes output.
@@ -794,15 +1120,24 @@ class InputsAPI:
         buffer_bytes = max(1, options.max_buffer_bytes // workers)
         if workers == 1:
             for seq, path, expected in batches_to_verify:
-                verify_batch(self._store, path, seq, expected, buffer_bytes=buffer_bytes)
+                verify_batch(self._store, path, seq, expected, buffer_bytes=buffer_bytes, check_canceled=check_canceled)
+                completed += 1
+                report()
         else:
             pending = iter(batches_to_verify)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 while group := [key for _, key in zip(range(workers), pending)]:
                     futures = [executor.submit(verify_batch, self._store, path, seq, expected,
-                                               buffer_bytes=buffer_bytes) for seq, path, expected in group]
+                                               buffer_bytes=buffer_bytes, check_canceled=check_canceled) for seq, path, expected in group]
                     for future in futures:
                         future.result()
+                        completed += 1
+                        report()
+        if check_canceled is not None:
+            check_canceled()
+        if context is not None:
+            context.verified_batches.update(verified_batches)
+            context.verified_graph.update(graph)
         if single:
             frozen = roots[0]
             return {"receipt_id": frozen.receipt_id, "valid": True, "batch_count": batch_count,

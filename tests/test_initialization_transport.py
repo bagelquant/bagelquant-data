@@ -166,7 +166,7 @@ def test_runtime_inspection_reads_committed_wal_without_copying(tmp_path, monkey
         writer.execute("PRAGMA wal_autocheckpoint=0")
         writer.execute("UPDATE data_meta_state SET updated_at='live' WHERE key='schema_version'")
         writer.commit()
-        monkeypatch.setattr(data_meta.shutil, "copyfile", lambda *args: pytest.fail("runtime copied SQLite"))
+        monkeypatch.setattr(data_meta, "copy_database", lambda *args: pytest.fail("runtime copied SQLite"))
         assert DataLake.inspect(data_meta_path=metadata, lake_path=root, runtime=True)["status"] == "ready"
         DataLake.open(data_meta_path=metadata, lake_path=root, read_only=True, runtime=True).close()
 

@@ -24,12 +24,13 @@ def fixture(root):
     return lake, receipt
 
 
+@pytest.mark.parametrize("buffer_bytes", [256, 1024 * 1024])
 @pytest.mark.parametrize("damage", ["truncated", "bad_compression", "changed_bytes", "valid_hash_bad_ipc", "missing", "uncommitted"])
-def test_streamed_verifier_rejects_original_damage_cases(tmp_path, damage):
+def test_streamed_verifier_rejects_original_damage_cases(tmp_path, damage, buffer_bytes):
     lake, receipt = fixture(tmp_path)
     batch = receipt.evidence["values"]["batches"][0]
     seq, path, digest = batch["commit_seq"], batch["partition_path"], batch["content_hash"]
-    verify_batch(lake._data_meta, path, seq, digest, buffer_bytes=256)
+    verify_batch(lake._data_meta, path, seq, digest, buffer_bytes=buffer_bytes)
     with sqlite3.connect(lake.data_meta_path) as db:
         payload = db.execute("select payload from version_batches where commit_seq=? and partition_path=?", (seq, path)).fetchone()[0]
         if damage == "missing":
@@ -44,7 +45,7 @@ def test_streamed_verifier_rejects_original_damage_cases(tmp_path, damage):
             elif damage == "changed_bytes":
                 payload = zlib.compress(b"changed retained bytes")
             else:
-                raw = b"valid SHA but invalid Arrow IPC"
+                raw = b"valid SHA but invalid Arrow IPC" * 100
                 payload = zlib.compress(raw)
                 digest = hashlib.sha256(raw).hexdigest()
                 db.execute("update version_batches set content_hash=? where commit_seq=? and partition_path=?", (digest, seq, path))
@@ -52,7 +53,7 @@ def test_streamed_verifier_rejects_original_damage_cases(tmp_path, damage):
     with pytest.raises(Exception):
         read_batch(lake._data_meta, path, seq, digest)
     with pytest.raises(RuntimeError):
-        verify_batch(lake._data_meta, path, seq, digest, buffer_bytes=256)
+        verify_batch(lake._data_meta, path, seq, digest, buffer_bytes=buffer_bytes)
 
 
 def test_parallel_verification_respects_inflight_and_rechecks_next_call(tmp_path, monkeypatch):
@@ -87,3 +88,48 @@ def test_parallel_verification_respects_inflight_and_rechecks_next_call(tmp_path
         db.execute("update version_batches set payload=x'00' where commit_seq=?", (receipt.evidence["values"]["batches"][0]["commit_seq"],))
     with pytest.raises(RuntimeError):
         lake.inputs.verify(receipt, config=config)
+
+
+def test_small_ipc_verification_avoids_temporary_file_and_mapping(tmp_path, monkeypatch):
+    from bagelquant_data.storage import recovery
+    lake, receipt = fixture(tmp_path)
+    def disk_io(*args, **kwargs):
+        pytest.fail("small IPC used temporary file or mmap")
+    monkeypatch.setattr(recovery.tempfile, "TemporaryFile", disk_io)
+    monkeypatch.setattr(recovery.mmap, "mmap", disk_io)
+    assert lake.inputs.verify(receipt, config=ExecutionOptions(max_buffer_bytes=1024 * 1024))["valid"]
+
+
+@pytest.mark.parametrize("large", [False, True])
+def test_verification_spills_with_bounded_memory_and_closes_transport(tmp_path, monkeypatch, large):
+    from bagelquant_data.storage import recovery
+    lake, receipt = fixture(tmp_path)
+    if large:
+        frame = pl.DataFrame({"time": [date(2020, 5, 1)] * 10000,
+                              "asset_id": [f"A{index}" for index in range(10000)],
+                              "value": [float(index) for index in range(10000)]})
+        spec = DatasetSpec("values", "by_date", date_kind="calendar", field_mappings={"time": "time", "asset_id": "asset_id"})
+        lake.raw.ingest(spec, frame, ingested_at=datetime(2020, 5, 2, tzinfo=UTC))
+        receipt = lake.inputs.freeze({"values": RawInput("custom", "values", view="versions")})
+    budget = 64 * 1024 if large else 256
+    files, buffers = [], []
+    original_file, original_buffer = recovery.tempfile.TemporaryFile, recovery.io.BytesIO
+    def temporary(*args, **kwargs):
+        result = original_file(*args, **kwargs)
+        files.append(result)
+        return result
+    class TrackedBuffer(original_buffer):
+        def __init__(self):
+            super().__init__()
+            self.peak = 0
+            buffers.append(self)
+        def write(self, value):
+            result = super().write(value)
+            self.peak = max(self.peak, self.tell())
+            return result
+    monkeypatch.setattr(recovery.tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(recovery.io, "BytesIO", TrackedBuffer)
+    assert lake.inputs.verify(receipt, config=ExecutionOptions(max_buffer_bytes=budget))["valid"]
+    assert files and all(file.closed for file in files)
+    assert buffers and all(buffer.closed for buffer in buffers)
+    assert max(buffer.peak for buffer in buffers) <= budget // 4

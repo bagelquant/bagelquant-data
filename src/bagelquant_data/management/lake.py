@@ -491,6 +491,17 @@ class IntegrityAPI:
 
         return verify(self._lake._data_meta, self._lake._paths)
 
+    def snapshot(self, *, data_meta_path: str | Path, lake_path: str | Path) -> dict[str, Any]:
+        """Copy a consistent independent lake without asserting full integrity.
+
+        Uses copy-on-write clones where supported. Callers must verify their
+        required original receipts before using the copy for computation.
+        ``backup`` remains the fully verified archival operation.
+        """
+        from bagelquant_data.management.backup import snapshot
+        return snapshot(self._lake._data_meta, self._lake._paths,
+                        data_meta_path=data_meta_path, lake_path=lake_path)
+
     def scan(self, dataset: str, *, source: str, deep: bool = True) -> dict[str, Any]:
         return self._status.validate_dataset(
             self._lake._datasets.get(dataset, source=source), deep=deep

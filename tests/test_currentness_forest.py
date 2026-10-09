@@ -57,13 +57,13 @@ def forest(tmp_path):
 
 def observe_reads(lake, monkeypatch):
     reads = Counter()
-    original = lake.inputs._read_frame
+    original = lake.inputs._selected_item_parents
 
     def read(*args, **kwargs):
         reads[args[1]] += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(lake.inputs, "_read_frame", read)
+    monkeypatch.setattr(lake.inputs, "_selected_item_parents", read)
     return reads
 
 

@@ -118,4 +118,21 @@ new paths. Backup and restore reject existing destinations. Complete history
 and frozen inputs remain in the single metadata file; older physical files are
 reconstructed from registered Arrow batches when needed.
 
+`integrity.snapshot(data_meta_path=..., lake_path=...)` creates a consistent,
+independent copy for isolated work without scanning all historical proof bytes.
+Its report explicitly returns `valid=None`, `verification="unverified"` and
+`generation_count`; it is not a verified archival backup. Verify the required
+original frozen input receipts in the copied lake before computation.
+
+The snapshot checks source main/WAL/journal signatures around copying and
+rejects active rollback journals. It includes committed WAL evidence without
+opening or checkpointing original metadata; recovery and binding relocation
+affect only the destination. macOS uses independent copy-on-write filesystem
+clones where supported; other filesystems/platforms fall back to independent
+file copies. Current immutable generations are copied; historical recovery and
+frozen receipts remain in SQLite. No symlinks/hardlinks connect original and copy.
+Destinations must be new and must not overlap original metadata/sidecars/lake;
+failed-copy cleanup removes only those newly created destinations. `backup` and
+`verify_backup` retain full verification of every retained proof.
+
 `raw_categories(source).update(id, name=..., parent_id=...)` and the item category API atomically rename/move a folder. Cycles, cross-provider parents and nonempty deletion are rejected. Classification changes do not alter data paths, versions or receipts.

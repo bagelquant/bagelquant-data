@@ -24,7 +24,8 @@ COMPACT_MIN_ROWS = 100_000
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      default=lambda value: dict(value) if isinstance(value, Mapping) else str(value))
 
 
 def validate_seal(seal: Mapping[str, Any]) -> None:

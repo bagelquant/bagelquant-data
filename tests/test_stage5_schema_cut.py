@@ -111,8 +111,8 @@ def test_probe_retries_if_source_changes_during_snapshot(tmp_path, monkeypatch):
         writer.commit()
         writer.execute("UPDATE data_meta_state SET value='7' WHERE key='schema_version'")
         writer.commit()
-        import bagelquant_data.storage.data_meta as module
-        original = module.shutil.copyfile
+        import bagelquant_data.storage.snapshot as module
+        original = module.copy_file
         changed = False
 
         def copy_and_change(source, destination):
@@ -124,7 +124,7 @@ def test_probe_retries_if_source_changes_during_snapshot(tmp_path, monkeypatch):
                 writer.commit()
             return result
 
-        monkeypatch.setattr(module.shutil, "copyfile", copy_and_change)
+        monkeypatch.setattr(module, "copy_file", copy_and_change)
         with pytest.raises(ConfigurationError, match="Automatic migration is disabled"):
             DataMetaStore.check_compatibility(metadata)
         assert changed

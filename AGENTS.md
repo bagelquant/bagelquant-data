@@ -7,24 +7,16 @@ The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
 `lake.integrity` and `lake.inputs`; pure statistics live in `exploration`.
 Read-only Raw/DataItem update plans select initialization, frozen-range resume and incremental work.
 Both `data_meta_path` and `lake_path` are mandatory caller-owned paths.
-Catalog declaration batches are atomic and receipt-backed; integrity exposes
-actual storage usage and explicit frozen temporary cleanup without deleting history.
+Catalog declaration batches are atomic and receipt-backed; integrity exposes actual storage usage and frozen temporary cleanup without deleting history.
 DataItem updates accept caller-declared input windows pinned in frozen receipts; new scoped freezes preserve late revisions and legacy receipt identity.
 Large complete by-date baseline checks may freeze exact batch-bound seals after bounded tuple equality proof; original witnesses remain immutable.
-Integrity can reopen premature Raw baseline completion at unchanged bounds/hash
-only before incremental evidence; the ordinary initializer retains historical receipts.
-`items.publication` groups explicit outputs under one operation-local input verification;
-`inputs.verify` accepts caller-owned limits and checks original bytes and IPC structure.
-Publication timing uses bounded, exact-date booleans within its receipt context.
-Timing reads skip provably future scoped batches while verifying all retained bytes.
-Strict positive timing proofs use uniform flags and entire captured coordinate containment;
-uncertain evidence always uses ordinary selection and byte checks remain mandatory.
-Frozen currentness may avoid value scans only with a covering build proof and all
-captured parents recursively current; stale parents retain exact selection fallback.
-Currentness accepts a nonempty finite original-receipt sequence, sharing recursive
-results only within one read view while checking every root and its original cutoff.
-Writable initialization maintains a derived metadata covering index; read-only
-schema-seven lakes need no index or historical evidence migration.
+Integrity can reopen premature Raw baseline completion at unchanged bounds/hash only before incremental evidence; the initializer retains historical receipts.
+`items.publication` groups outputs under one operation-local verification; `inputs.verify` accepts caller limits and checks original bytes/IPC structure.
+Publication timing uses bounded exact-date booleans in its receipt context; timing reads skip provably future scoped batches but verify all retained bytes.
+Strict positive proofs require uniform flags and entire captured coordinate containment; uncertain evidence uses ordinary selection and mandatory byte checks.
+Currentness avoids value scans only with a covering build proof and recursively current parents; stale parents retain exact selection fallback.
+Currentness accepts finite nonempty original-receipt sequences; entered read contexts reuse completed booleans only under matching reader boundaries, checking every root digest/cutoff.
+Writable initialization maintains a derived covering index; read-only schema-seven lakes need no index or historical evidence migration.
 
 Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
 affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
@@ -74,4 +66,15 @@ receipts. Each root identity/digest and every dependency edge are checked;
 shared parents and original batches are checked once within this invocation.
 The multi-root report lists original root IDs/digests and aggregate counts.
 There is no new aggregate receipt or cross-call validity cache; a later call
-rechecks bytes. Currentness remains a separate check.
+rechecks bytes. `inputs.is_current(..., config=...)` separately selects projected
+lineage in temporary record-ID shards with explicit admission and context budget inheritance.
+`inputs.read_context` shares deeply immutable original metadata and a same-thread
+SQLite read view for a finite operation; entry verifies bytes unless `verify=False`.
+External objects supply only ID/digest. Context-local verify reuses checked batch
+keys/graph summaries while checking every root digest; no frame/validity cache survives exit.
+`inputs.read` narrows inclusive observation windows using captured bounds only;
+verify retains every original batch and supports progress/cancellation during bounded decode/IPC checks.
+`inputs.window_read_supported` plans physical windows from captured bounds only.
+`integrity.snapshot` creates stable independent main/WAL/current-file copies with
+an explicitly unverified report, preserving originals/sidecars. Verify required original
+inputs before computing from the copy; strict backup remains unchanged.

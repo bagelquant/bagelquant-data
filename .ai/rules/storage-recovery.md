@@ -35,7 +35,11 @@
   cross-table atomicity. Every later context rechecks original proof bytes.
 - `inputs.verify` accepts explicit `ExecutionOptions`; one bounded pool verifies
   original IPC checksums and structural/type validity using bounded decompression
-  and temporary mapping. Defaults remain serial, no hardware detection, no
+  and bounded memory-first IPC transport. Retain at most min(64 MiB, one quarter
+  of each worker's allocation); decode chunks reserve another quarter and leave
+  the remainder for Arrow/type checks. Larger IPC spills to temporary mapping;
+  small IPC avoids disk and uses a zero-copy view. No temporary proof/frame cache
+  survives verification. Defaults remain serial, no hardware detection, no
   persistent validity cache. Join the pool before serial metadata publication.
 
 - Data 0.7 owns Raw and typed neutral DataItems, independent category trees,
@@ -140,13 +144,35 @@ result. Missing build proofs cannot establish currentness. Integrity verificatio
 still checks every original retained batch independently on every later call.
 Neither optimization changes receipt identity or PIT selection.
 
+The exact stale-parent fallback projects original IPC to timing, record identity,
+payload hash and lineage; it never converts numerical value columns. Stage these
+columns in an operation-local temporary Parquet spool, sharded by actual record-ID
+hash so cross-month revisions stay together. Preserve original ordering and use
+the existing attestation/snapshot selectors per shard. Original SHA, full Arrow
+structure and all original column types still validate. `is_current(..., config=)`
+uses explicit admission or the enclosing read_context budget (otherwise default
+ExecutionOptions); bound projected shards and witness/seal expansion before
+allocation and fail closed for oversized/skewed evidence. Staging keeps at most
+one quarter of the admitted budget in independently copied projected Arrow
+buffers, flushing the largest shard near1MiB groups in stable shard order; never
+retain source mmap buffers after batch exit or create one tiny group per fragment.
+Cancellation and every failure remove temporary files. No original receipt or
+physical artifact changes.
+
+
 `inputs.is_current` also accepts a nonempty finite sequence of original frozen
 receipts. Validate each supplied identity/digest before memo reuse; check every
 root in one SQLite read view with its own immutable request/cutoff and retained
-boundary. Share recursive boolean results only within that invocation, retaining
+boundary. Share recursive boolean results within that invocation, retaining
 cycle checks and exact selected-parent fallback for stale historical parents.
 Return whether all roots are current without short-circuiting root checks; a
-later invocation rereads current evidence. Do not create aggregate receipts,
+later invocation outside an entered read context rereads current evidence.
+Inside the same-thread, same-path fixed `inputs.read_context` view, completed
+booleans may be reused under original receipt ID/digest plus complete reader
+boundary (metadata path, commit/check limits and as_of). Check every supplied
+root digest before hits; publish results only after all roots complete successfully.
+Keep at most 4096 boolean entries, evict oldest entries and clear on context exit/
+failure. No exceptions, frames or cross-context results are cached. Do not create aggregate receipts,
 cache frames, persist validity, or replace independent full byte verification.
 
 Typed-row-v1 payload hashing retains exact persisted bytes and schema identity. Scalar token encoding avoids repeated JSON work; string tokens share a conservative 4 MiB reserve, at most 1 MiB per column and no more than the input-frame byte estimate. Cache fill is lazy from the existing bounded row iterator; no full unique-value list, unbounded string cache, additional worker pool or identity migration. Nested/decimal/binary values retain recursive canonical JSON; temporal native precision, signed zero, NaN/null and infinity remain distinct.
@@ -171,3 +197,40 @@ shared parents and original batches are checked once within this invocation.
 The multi-root report lists original root IDs/digests and aggregate counts.
 There is no new aggregate receipt or cross-call validity cache; a later call
 rechecks bytes. Currentness remains a separate check.
+
+`inputs.read_context(receipt_or_sequence, verify=True, ...)` is finite and read-only.
+Resolve original registered metadata once per receipt, sharing a same-thread SQLite
+snapshot with matching Data readers. Exposed cached metadata is deeply immutable;
+supplied receipt objects provide only original ID/digest, never evidence authority.
+Check every root digest and dependency edge even when metadata is reused. Default
+entry verifies every original byte; `verify=False` defers explicit verification and
+does not create proof authority. Release metadata/snapshot on failure/exit; no
+frames, validity proofs or cross-operation caches. No hardware discovery.
+Ordinary Raw/DataItem dataset snapshots reuse an ambient read transaction without
+nested BEGIN, COMMIT or ROLLBACK; standalone reads own their normal snapshot.
+Later verify calls within that same explicitly entered context may reuse successful
+original batch proof keys and immutable receipt graph summaries; every supplied
+root ID/digest is still checked, and all proof authority expires with the context.
+`inputs.read(start=..., end=...)` may tighten inclusive observation windows, never
+widen captured request/Raw observation bounds or change cutoff/commit/check/digest.
+Prune only with checksummed captured bounds; unknown/general/legacy reads stay
+conservative. Original-byte verification always retains all batches. Caller progress
+counts unique successful batches; caller cancellation exceptions propagate through
+receipt traversal, bounded decompression and IPC checks with temporary map/file and
+worker cleanup. Read contexts do not authorize publication or writes.
+
+`inputs.window_read_supported` is metadata-only and true only when every retained
+by-date batch has captured scoped or sealed observation bounds; general/unknown/
+legacy evidence remains conservative, with no live-summary lookup or validity claim.
+
+`integrity.snapshot` creates an independent task copy with `valid=None` and explicit
+unverified status; it does not replace strict backup/verify_backup. Copy stable
+main/WAL bytes, reject active rollback journals, and retry changing source signatures.
+Never open/checkpoint/write the original during copying. Recover WAL and relocate
+relative lake binding on the destination only, preserving lake identity and all
+historical SQLite evidence. Prefer independent filesystem clones with copy fallback;
+no shared writable inode, hard link or symlink. Copy current immutable generations.
+Reject existing/overlapping destinations, including original SQLite sidecars; failure
+cleanup is confined to the newly owned destinations. Required original receipts
+must pass normal verification before computation. Schema inspection uses the same
+efficient stable-copy primitive for committed live WAL and preserves original bytes.

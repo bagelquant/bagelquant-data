@@ -8,7 +8,10 @@ import mmap
 import sqlite3
 import tempfile
 import zlib
+from contextlib import ExitStack
+from typing import BinaryIO, cast
 from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import polars as pl
 import pyarrow as pa
@@ -66,8 +69,20 @@ def append_batch(data_meta: DataMetaStore, partition: str, seq: int, frame: pl.D
     return batch
 
 
-def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str) -> pl.DataFrame:
+def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
+               check_canceled: Callable[[], None] | None = None) -> pl.DataFrame:
     """Read committed evidence and verify its original byte checksum."""
+    cancellation: BaseException | None = None
+    def check() -> None:
+        nonlocal cancellation
+        if check_canceled is not None:
+            try:
+                check_canceled()
+            except BaseException as error:
+                cancellation = error
+                raise
+    if check_canceled is not None:
+        check_canceled()
     rows = data_meta._rows(
         "select b.content_hash,b.payload from version_batches b join version_commits c on c.seq=b.commit_seq "
         "where b.commit_seq=? and b.partition_path=? and c.status='committed'", (seq, partition)
@@ -75,19 +90,74 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str) 
     if not rows:
         raise RuntimeError(f"Committed recovery batch {seq} is missing")
     try:
-        payload = zlib.decompress(rows[0]["payload"])
+        decoder = zlib.decompressobj()
+        compressed = rows[0]["payload"]
+        with io.BytesIO() as buffer:
+            for offset in range(0, len(compressed), 1024 * 1024):
+                pending = compressed[offset:offset + 1024 * 1024]
+                while pending:
+                    check()
+                    buffer.write(decoder.decompress(pending, 1024 * 1024))
+                    pending = decoder.unconsumed_tail
+            if not decoder.eof:
+                raise zlib.error("incomplete compressed stream")
+            payload = buffer.getvalue()
     except (zlib.error, TypeError) as error:
+        if error is cancellation:
+            raise
         raise RuntimeError(f"Recovery batch {seq} compression is damaged") from error
     if rows[0]["content_hash"] != digest or hashlib.sha256(payload).hexdigest() != digest:
         raise RuntimeError(f"Recovery batch {seq} checksum mismatch")
+    if check_canceled is not None:
+        check_canceled()
     return pl.read_ipc(io.BytesIO(payload))
 
 
 def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str,
-                 *, buffer_bytes: int = 1024 * 1024) -> None:
+                 *, buffer_bytes: int = 1024 * 1024,
+                 check_canceled: Callable[[], None] | None = None) -> None:
     """Recheck original IPC bytes and structure with bounded decode buffers."""
-    chunk_bytes = max(1, min(1024 * 1024, buffer_bytes // 4))
-    with tempfile.TemporaryFile() as spool:
+    _inspect_batch(data_meta, partition, seq, digest, buffer_bytes=buffer_bytes,
+                   check_canceled=check_canceled)
+
+
+def project_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
+                  columns: tuple[str, ...], consume: Callable[[pl.DataFrame], None],
+                  buffer_bytes: int, check_canceled: Callable[[], None] | None = None) -> None:
+    """Visit bounded projected chunks after verifying the entire original IPC.
+
+    The consumer must not retain chunks. Original bytes, full Arrow structure and
+    all original column types are checked; discarded values are never converted
+    to Polars frames. This is an operation-local transport, not a frame cache.
+    """
+    _inspect_batch(data_meta, partition, seq, digest, buffer_bytes=buffer_bytes,
+                   check_canceled=check_canceled, columns=columns, consume=consume)
+
+
+def _inspect_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
+                   buffer_bytes: int, check_canceled: Callable[[], None] | None,
+                   columns: tuple[str, ...] | None = None,
+                   consume: Callable[[pl.DataFrame], None] | None = None) -> None:
+    cancellation: BaseException | None = None
+    consumer_error: BaseException | None = None
+    def check() -> None:
+        nonlocal cancellation
+        if check_canceled is not None:
+            try:
+                check_canceled()
+            except BaseException as error:
+                cancellation = error
+                raise
+    # Reserve at most a quarter for retained IPC, another quarter for compressed
+    # and decoded chunks, and the remaining budget for Arrow/type validation.
+    memory_bytes = min(64 * 1024 * 1024, max(0, buffer_bytes // 4))
+    chunk_bytes = max(1, min(1024 * 1024, buffer_bytes // 8))
+    if check_canceled is not None:
+        check_canceled()
+    with ExitStack() as cleanup:
+        memory = io.BytesIO()
+        cleanup.callback(memory.close)
+        spool: BinaryIO | None = None
         with data_meta.connect() as db:
             if not db.in_transaction:
                 db.execute("begin")
@@ -105,24 +175,44 @@ def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str
             try:
                 with db.blobopen("version_batches", "payload", row["batch_rowid"], readonly=True) as blob:
                     while compressed := blob.read(chunk_bytes):
+                        check()
                         pending = compressed
                         while pending:
+                            check()
                             piece = decoder.decompress(pending, chunk_bytes)
-                            spool.write(piece)
+                            if spool is None and memory.tell() + len(piece) > memory_bytes:
+                                spool = cleanup.enter_context(tempfile.TemporaryFile())
+                                with memory.getbuffer() as retained:
+                                    spool.write(retained)
+                                memory.close()
+                            if spool is None:
+                                memory.write(piece)
+                            else:
+                                spool.write(piece)
                             checksum.update(piece)
                             pending = decoder.unconsumed_tail
                     if not decoder.eof:
                         raise zlib.error("incomplete compressed stream")
             except (zlib.error, TypeError, sqlite3.Error) as error:
+                if error is cancellation or error is consumer_error:
+                    raise
                 raise RuntimeError(f"Recovery batch {seq} compression is damaged") from error
             if checksum.hexdigest() != digest:
                 raise RuntimeError(f"Recovery batch {seq} checksum mismatch")
-        spool.flush()
         # The exact original SHA is necessary but not sufficient: retain IPC
         # structural/type rejection, including valid-SHA non-IPC corruption.
         try:
-            mapping = mmap.mmap(spool.fileno(), 0, access=mmap.ACCESS_READ)
-            source = pa.BufferReader(mapping)
+            mapping = None
+            view = None
+            if spool is None:
+                view = memory.getbuffer()
+                cleanup.callback(view.release)
+                source = pa.BufferReader(view)
+            else:
+                spool.flush()
+                mapping = mmap.mmap(spool.fileno(), 0, access=mmap.ACCESS_READ)
+                cleanup.callback(mapping.close)
+                source = pa.BufferReader(mapping)
             reader = None
             batch = None
             structural_error = None
@@ -131,26 +221,49 @@ def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str
                 empty = pl.from_arrow(pa.Table.from_batches([], schema=reader.schema))
                 del empty
                 for index in range(reader.num_record_batches):
+                    check()
                     batch = reader.get_batch(index)
                     batch.validate(full=True)
-                    rows = max(1, chunk_bytes // max(1, batch.nbytes // max(1, batch.num_rows)))
-                    for offset in range(0, batch.num_rows, rows):
-                        decoded = pl.from_arrow(batch.slice(offset, rows), rechunk=False)
+                    projected = batch if columns is None else batch.select(
+                        [name for name in columns if name in batch.schema.names])
+                    rows = max(1, chunk_bytes // max(1, projected.nbytes // max(1, projected.num_rows)))
+                    for offset in range(0, projected.num_rows, rows):
+                        check()
+                        decoded = pl.from_arrow(projected.slice(offset, rows), rechunk=False)
+                        if consume is not None:
+                            try:
+                                consume(cast(pl.DataFrame, decoded))
+                            except BaseException as error:
+                                # A consumer traceback may hold exported Arrow
+                                # buffers; release it before closing the mmap.
+                                consumer_error = error.with_traceback(None)
+                                raise consumer_error
                         del decoded
+                    projected = None
                     batch = None
             except (pa.ArrowException, pl.exceptions.PolarsError, ValueError, TypeError) as error:
+                if error is cancellation or error is consumer_error:
+                    raise
                 # Do not retain the parser traceback's exported mmap buffers
                 # while closing the temporary evidence view.
                 structural_error = str(error)
             finally:
+                projected = None
+                decoded = None
+                del decoded
                 batch = None
                 reader = None
                 source.close()
                 del source
-                mapping.close()
+                if mapping is not None:
+                    mapping.close()
+                if view is not None:
+                    view.release()
             if structural_error is not None:
                 raise RuntimeError(f"Recovery batch {seq} IPC is damaged: {structural_error}")
         except (pa.ArrowException, pl.exceptions.PolarsError, ValueError, TypeError) as error:
+            if error is cancellation or error is consumer_error:
+                raise
             raise RuntimeError(f"Recovery batch {seq} IPC is damaged") from error
 
 

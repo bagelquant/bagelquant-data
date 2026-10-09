@@ -185,14 +185,14 @@ def test_stale_single_parent_falls_back_to_the_selected_window(tmp_path, monkeyp
     output = lake.inputs.freeze({"item": ItemInput("item")}, information_cutoff="2020-01-03")
     lake.raw.ingest(_spec(), _frame(2.0), ingested_at=_received(2))
     reader = _lake(tmp_path, read_only=True).inputs
-    original = reader._read_frame
+    original = reader._selected_item_parents
     scanned = []
 
-    def scan(receipt, alias):
+    def scan(receipt, alias, options):
         scanned.append(alias)
-        return original(receipt, alias)
+        return original(receipt, alias, options)
 
-    monkeypatch.setattr(reader, "_read_frame", scan)
+    monkeypatch.setattr(reader, "_selected_item_parents", scan)
     assert not reader.is_current(output)
     assert scanned == ["item"]
 

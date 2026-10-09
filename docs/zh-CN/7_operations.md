@@ -66,3 +66,15 @@ if plan["valid"]:
 `DataLake.restore(backup_data_meta_path=..., backup_lake_path=...,
 data_meta_path=..., lake_path=...)` 将同 schema 备份恢复到新路径；已有目标会被拒绝。
 完整历史和冻结输入保留在单个元数据库中，旧物理文件可按登记 Arrow 批次重现。
+
+`integrity.snapshot(data_meta_path=..., lake_path=...)` 为隔离计算创建一致、独立的
+副本，不扫描全部历史证明。报告明确为 `valid=None`、`verification="unverified"`，
+并提供 `generation_count`，不代表已校验的归档备份。计算前必须在副本中正常验证
+需要的原始冻结输入凭证。
+
+复制前后检查原始 SQLite main/WAL/journal 签名，拒绝活动回滚日志。包含已提交
+WAL，但不打开、checkpoint 或写入原始元数据；恢复 WAL 和修改相对 lake 绑定
+仅发生在目标，保留 lake 身份及完整历史。macOS 优先独立的文件系统写时复制，
+其他平台/不支持的文件系统使用独立文件复制。当前不可变 generation 随副本复制，
+不建立符号链接或硬链接。拒绝已有目标和原始 metadata/sidecar/lake 重叠；失败仅
+清理此次新建的目标。原 `backup` / `verify_backup` 仍完整校验全部保留证明。

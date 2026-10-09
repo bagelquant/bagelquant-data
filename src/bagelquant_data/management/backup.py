@@ -18,6 +18,7 @@ from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.paths import LakePaths
 from bagelquant_data.storage.parquet import ParquetStore
 from bagelquant_data.storage.recovery import reconstruct
+from bagelquant_data.storage.snapshot import copy_database, copy_file
 
 
 def verify(data_meta: DataMetaStore, paths: LakePaths) -> dict[str, Any]:
@@ -119,3 +120,50 @@ def _file(path: Path, kind: str, relative: str) -> dict[str, Any]:
         "sha256": digest,
         "bytes": os.stat(_filesystem_path(path)).st_size,
     }
+
+
+def snapshot(data_meta: DataMetaStore, paths: LakePaths, *,
+             data_meta_path: str | Path, lake_path: str | Path) -> dict[str, Any]:
+    """Create an independent consistent copy, explicitly without full verification."""
+    target = LakePaths.open(data_meta_path=data_meta_path, lake_path=lake_path)
+    sidecars = tuple(target.data_meta_path.with_name(target.data_meta_path.name + suffix)
+                     for suffix in ("", "-wal", "-shm", "-journal"))
+    original_metadata = {paths.data_meta_path.with_name(paths.data_meta_path.name + suffix)
+                         for suffix in ("", "-wal", "-shm", "-journal")}
+    if any(path.exists() or path.is_symlink() for path in (*sidecars, target.lake)):
+        raise FileExistsError("Data snapshot destinations must be new")
+    if (target.data_meta_path.is_relative_to(paths.lake)
+            or target.lake.is_relative_to(paths.lake)
+            or paths.lake.is_relative_to(target.lake)
+            or paths.data_meta_path.is_relative_to(target.lake)
+            or original_metadata.intersection(sidecars)):
+        raise ValueError("Data snapshot destinations must not overlap original storage")
+    if target.data_meta_path == target.lake or target.lake.is_relative_to(target.data_meta_path):
+        raise ValueError("Data metadata and lake destinations overlap")
+    target.data_meta_path.parent.mkdir(parents=True, exist_ok=True)
+    target.lake.mkdir(parents=True)
+    try:
+        copy_database(data_meta.data_meta_path, target.data_meta_path)
+        with closing(sqlite3.connect(target.data_meta_path)) as writer:
+            # Recovery/checkpoint affects copied files only. No full-history scan.
+            writer.execute("pragma journal_mode=delete")
+            location = Path(os.path.relpath(target.lake, target.data_meta_path.parent)).as_posix()
+            with writer:
+                writer.execute("update data_meta_state set value=? where key='lake_location'", (location,))
+        copied = DataMetaStore(data_meta_path=target.data_meta_path, read_only=True)
+        copied.bind_lake(target.lake)
+        count = 0
+        for row in copied.manifest():
+            source = paths.generation_path(row["source"], row["dataset"], row["partition_path"], row["generation_path"])
+            destination = target.generation_path(row["source"], row["dataset"], row["partition_path"], row["generation_path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(source, destination)
+            count += 1
+        return {"data_meta_path": str(target.data_meta_path), "lake_path": str(target.lake),
+                "valid": None, "verification": "unverified", "generation_count": count}
+    except BaseException:
+        # These destinations were new and belong solely to this failed operation.
+        shutil.rmtree(target.lake)
+        for path in sidecars:
+            path.unlink(missing_ok=True)
+        raise
