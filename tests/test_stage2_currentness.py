@@ -80,7 +80,8 @@ def test_public_build_receipts_survive_reopen_and_archive(tmp_path):
     reader = _lake(tmp_path, read_only=True)
     assert reader.inputs.is_current(latest["frozen_receipt_id"])
     lake.raw.ingest(_spec(), _frame(2.0), ingested_at=_received(2))
-    assert not reader.inputs.is_current(latest["frozen_receipt_id"])
+    # Future availability does not change this frozen Jan 1 computation.
+    assert reader.inputs.is_current(latest["frozen_receipt_id"])
     lake.items.remove("item")
     assert reader.items.builds("item") == builds
     with pytest.raises(KeyError):

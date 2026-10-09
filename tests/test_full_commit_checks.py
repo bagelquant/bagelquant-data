@@ -107,9 +107,9 @@ def test_month_window_prunes_batch_reads_without_changing_receipt_evidence(tmp_p
     from bagelquant_data import inputs
     original = inputs.read_batch
     partitions = []
-    def tracked(*args):
+    def tracked(*args, **kwargs):
         partitions.append(args[1])
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(inputs, "read_batch", tracked)
     result = lake.inputs.read(frozen, "raw").collect()
     assert result["value"].to_list() == [2.]

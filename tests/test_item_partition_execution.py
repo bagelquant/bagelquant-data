@@ -109,7 +109,7 @@ def test_recovery_compression_does_not_hold_sqlite_writer_lock(tmp_path, monkeyp
     monkeypatch.setattr(recovery.zlib, "compress", compress)
     report = lake.items.initialize("derived", start="2020-01-01", end="2020-04-30",
                                    config=ExecutionOptions(workers=1))
-    assert report.status == "success" and len(calls) == 4
+    assert report.status == "success" and len(calls) == 8
 
 
 def test_small_writer_reserve_falls_back_to_serial_preparation(tmp_path, monkeypatch):

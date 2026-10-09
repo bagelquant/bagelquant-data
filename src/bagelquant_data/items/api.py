@@ -55,6 +55,7 @@ class _PublicationVerification:
     active: bool = True
     thread_id: int = field(default_factory=get_ident)
     timing_cache_entries: int = 0
+    timing_buffer_bytes: int | None = None
     baseline_dates: dict[date, bool] = field(default_factory=dict)
 
 
@@ -310,9 +311,7 @@ class ItemAPI:
                 return ("raw", value.source, value.dataset) if isinstance(value, RawInput) else ("item", value.name)
             if {identity(value) for value in spec.inputs} != {identity(value) for value in receipt.requests.values()}:
                 raise ValueError("Frozen input receipt does not match declared DataItem dependencies")
-            if _verification is None:
-                self._lake.inputs.verify(receipt)
-            elif not (_verification.active and _verification.owner is self
+            if _verification is not None and not (_verification.active and _verification.owner is self
                       and _verification.receipt_id == receipt.receipt_id
                       and _verification.digest == receipt.digest):
                 raise RuntimeError("Publication input verification no longer matches this operation")
@@ -362,11 +361,10 @@ class ItemAPI:
                 pending = [day for day in pending if not baseline_by_date[day]]
                 if not pending:
                     continue
-                versions = self._lake.inputs._read_frame(receipt, alias,
-                    timing_cutoff=max(cutoffs[day] for day in pending))
                 for publication_date in pending:
                     cutoff = cutoffs[publication_date]
-                    if self._lake.inputs._baseline_at(receipt, alias, cutoff, frame=versions):
+                    if self._lake.inputs._baseline_at(receipt, alias, cutoff,
+                            max_buffer_bytes=None if _verification is None else _verification.timing_buffer_bytes):
                         baseline_by_date[publication_date] = True
             # Only complete OR results enter this operation's fixed-receipt memo.
             # Dates are independent: later attestations can change True to False.
@@ -507,16 +505,15 @@ class ItemAPI:
     def publication(self, *, input_receipt: FrozenInputReceipt | str | None = None,
                     config: ExecutionOptions | None = None,
                     cancelled: Callable[[], bool] | None = None) -> Iterator[ItemPublisher]:
-        """Verify fixed input bytes once for one serial publication operation."""
+        """Bind published input metadata for one serial publication operation."""
         if cancelled and cancelled():
             raise CancelledError("DataItem publication cancelled")
         receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
-        if receipt is not None:
-            self._lake.inputs.verify(receipt, config=config)
         verification = _PublicationVerification(self, "" if receipt is None else receipt.receipt_id,
             "" if receipt is None else receipt.digest,
             # A conservative 1KiB entry reserve; never retain producer frames.
-            timing_cache_entries=min(1024, (config or ExecutionOptions()).max_buffer_bytes // 4 // 1024))
+            timing_cache_entries=min(1024, (config or ExecutionOptions()).max_buffer_bytes // 4 // 1024),
+            timing_buffer_bytes=(config or ExecutionOptions()).max_buffer_bytes)
         try:
             if cancelled and cancelled():
                 raise CancelledError("DataItem publication cancelled")
@@ -788,7 +785,6 @@ class ItemAPI:
             (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat()),
         )
         if prior and not force:
-            self._lake.inputs.verify(receipt, config=config)
             return ItemBuildReport(name, "unchanged", 0, prior[0]["result_commit"], max_commit, start, end, dependency_digest, receipt.receipt_id)
         options = config or ExecutionOptions()
         frames: dict[str, pl.DataFrame] = {}

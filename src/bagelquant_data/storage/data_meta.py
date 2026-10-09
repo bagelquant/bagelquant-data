@@ -1820,6 +1820,8 @@ class DataMetaStore:
                 """
             )
             if not existing_tables:
+                from bagelquant_data import input_index
+                input_index.initialize(db)
                 now = _now()
                 db.execute(
                     """

@@ -67,3 +67,5 @@ uv run ruff check .
 ```
 
 Supported platforms: macOS and Linux. Windows support is retired.
+
+[Calculation records](docs/en/10_calculation_records.md) · [计算记录](docs/zh-CN/10_calculation_records.md)

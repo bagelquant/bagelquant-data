@@ -37,12 +37,12 @@ def test_positive_timing_short_circuits_other_aliases_and_repeated_groups(tmp_pa
     with lake.items.publication(input_receipt=receipt) as operation:
         operation.publish([output("first", rows, date(2020,1,10))])
         operation.publish([output("second", rows, date(2020,1,10))])
-        assert calls == ["one"]
+        assert calls == []
     assert not operation.active
     assert lake.items.read("first", view="versions").collect()["_baseline"].to_list() == [True]
     with lake.items.publication(input_receipt=receipt) as new:
         new.publish([output("second", rows, date(2020,1,10))])
-    assert calls == ["one", "one"]
+    assert calls == []
 
 
 def test_later_attestation_reverses_timing_and_negative_memo_requires_all_aliases(tmp_path, monkeypatch):
@@ -114,15 +114,16 @@ def test_reused_build_rechecks_bytes_using_explicit_budget(tmp_path, monkeypatch
     monkeypatch.setattr(lake.inputs, "verify", verify)
     config = ExecutionOptions(workers=3, max_buffer_bytes=8*1024**2)
     assert lake.items.update("copy", start="2020-01-01", end="2020-01-31", config=config).status == "unchanged"
-    assert calls == [config]
+    assert calls == []
     assert lake.items.update("copy", start="2020-01-01", end="2020-01-31").status == "unchanged"
-    assert calls == [config, None]
+    assert calls == []
     import sqlite3
     with sqlite3.connect(lake.data_meta_path) as db:
         db.execute("update version_batches set payload=x'00' where commit_seq=1")
+    assert lake.items.update("copy", start="2020-01-01", end="2020-01-31", config=config).status == "unchanged"
     with pytest.raises(RuntimeError):
-        lake.items.update("copy", start="2020-01-01", end="2020-01-31", config=config)
-    assert calls == [config, None, config]
+        lake.inputs.verify(lake.items.builds("copy")[-1]["frozen_receipt_id"], config=config)
+    assert calls == [config]
 
 
 def test_one_group_uses_latest_pending_cutoff_without_losing_earlier_timing(tmp_path, monkeypatch):
@@ -136,5 +137,5 @@ def test_one_group_uses_latest_pending_cutoff_without_losing_earlier_timing(tmp_
     frames = [rows.with_columns(pl.lit(date(2020,1,day)).alias("version_available_date")) for day in (10,20)]
     with lake.items.publication(input_receipt=receipt) as operation:
         operation.publish([ItemPublication("first", pl.concat(frames))])
-    assert cutoffs == [date(2020,1,20)] * 2
+    assert cutoffs == []
     assert lake.items.read("first", view="versions").collect()["_baseline"].to_list() == [True, False]

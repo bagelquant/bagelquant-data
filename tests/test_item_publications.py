@@ -45,21 +45,22 @@ def test_multi_publication_preserves_versions_empty_certificates_and_rechecks(tm
         return original(*args, **kwargs)
     monkeypatch.setattr(lake.inputs, "verify", verify)
     publish(lake, [publication(lake, "first", frame), publication(lake, "second", frame.head(0))], input_receipt=receipt)
-    assert len(calls) == 1
+    assert len(calls) == 0
     assert lake.items.read("first", view="snapshot", as_of="2020-01-10").collect()["value"].to_list() == [1.]
     assert lake.items.read("first", view="snapshot", as_of="2020-01-20").collect()["value"].to_list() == [9.]
     old = lake.inputs.freeze({"first": ItemInput("first", start="2020-01-01", end="2020-01-31")}, information_cutoff="2020-01-31")
     empty = lake.inputs.freeze({"second": ItemInput("second", start="2020-01-01", end="2020-01-31")}, information_cutoff="2020-01-31")
     assert lake.inputs.is_current(empty)
     publish(lake, [publication(lake, "first", frame.head(0))], input_receipt=receipt)
-    assert len(calls) == 2
+    assert len(calls) == 0
     assert lake.inputs.read(old, "first", view="snapshot").collect()["value"].to_list() == [9.]
     assert lake.items.read("first", view="snapshot", as_of="2020-01-31").collect()["value"].to_list() == [None]
     with sqlite3.connect(lake.data_meta_path) as db:
         db.execute("update version_batches set payload=x'00' where commit_seq=1")
+    publish(lake, [publication(lake, "second", frame)], input_receipt=receipt)
     with pytest.raises(RuntimeError):
-        publish(lake, [publication(lake, "second", frame)], input_receipt=receipt)
-    assert len(calls) == 3 and not lake.integrity.active_update_leases()
+        lake.inputs.verify(receipt)
+    assert len(calls) == 1 and not lake.integrity.active_update_leases()
 
 
 def test_multi_publication_keeps_committed_first_output_on_cancellation(tmp_path):
@@ -113,17 +114,18 @@ def test_operation_verifies_once_across_groups_expires_and_rechecks_next_entry(t
         assert operation.lake is lake and operation.input_receipt == receipt
         operation.publish([publication(lake, "first", frame)])
         operation.publish([publication(lake, "second", frame)])
-        assert len(calls) == 1
+        assert len(calls) == 0
     assert not operation.active
     with pytest.raises(RuntimeError, match="closed"):
         operation.publish([publication(lake, "first", frame.head(0))])
     assert lake.items.read("first", view="snapshot", as_of="2020-01-31").collect()["value"].to_list() == [9.]
     with sqlite3.connect(lake.data_meta_path) as db:
         db.execute("update version_batches set payload=x'00' where commit_seq=1")
+    with lake.items.publication(input_receipt=receipt):
+        pass
     with pytest.raises(RuntimeError):
-        with lake.items.publication(input_receipt=receipt):
-            pytest.fail("Corrupt input admitted")
-    assert len(calls) == 2 and not lake.integrity.active_update_leases()
+        lake.inputs.verify(receipt)
+    assert len(calls) == 1 and not lake.integrity.active_update_leases()
 
 
 def test_caught_group_failure_invalidates_operation_and_rejects_success_exit(tmp_path):

@@ -55,12 +55,12 @@ def test_external_object_evidence_is_never_authority_and_every_root_digest_check
 
 def test_later_context_rechecks_original_batch_bytes_and_failed_context_cleans_up(tmp_path):
     lake, frozen = frozen_months(tmp_path)
-    with lake.inputs.read_context(frozen):
+    with lake.inputs.read_context(frozen, verify=True):
         pass
     with sqlite3.connect(lake.data_meta_path) as db:
         db.execute("update version_batches set payload=x'00' where commit_seq=1")
     with pytest.raises(RuntimeError, match="compression"):
-        with lake.inputs.read_context(frozen):
+        with lake.inputs.read_context(frozen, verify=True):
             pass
     assert lake.inputs._read_context() is None
     assert lake.inputs.get(frozen).digest == frozen.digest
@@ -76,14 +76,14 @@ def test_verification_proofs_reuse_only_within_entered_context(tmp_path, monkeyp
     monkeypatch.setattr(inputs, "verify_batch", tracked)
     expected = lake.inputs.verify(frozen)
     batches.clear()
-    with lake.inputs.read_context(frozen) as reader:
+    with lake.inputs.read_context(frozen, verify=True) as reader:
         assert len(batches) == 3
         assert reader.verify(frozen) == expected
         assert reader.verify([frozen, frozen])["batch_count"] == expected["batch_count"]
         assert len(batches) == 3
         with pytest.raises(RuntimeError, match="checksum"):
             reader.verify(replace(frozen, digest="bad"))
-    with lake.inputs.read_context(frozen):
+    with lake.inputs.read_context(frozen, verify=True):
         assert len(batches) == 6
     lake.inputs.verify(frozen)
     assert len(batches) == 9
@@ -94,7 +94,7 @@ def test_progress_deduplicates_batch_work_and_cancel_propagates_with_cleanup(tmp
     lake, frozen = frozen_months(tmp_path)
     options = ExecutionOptions(workers=workers)
     events = []
-    with lake.inputs.read_context([frozen, frozen], config=options, progress=events.append):
+    with lake.inputs.read_context([frozen, frozen], verify=True, config=options, progress=events.append):
         pass
     assert events[0] == {"stage": "verify_inputs", "completed": 0, "total": 3}
     assert events[-1]["completed"] == 3
@@ -107,7 +107,7 @@ def test_progress_deduplicates_batch_work_and_cancel_propagates_with_cleanup(tmp
         if calls >= 10:
             raise Canceled()
     with pytest.raises(Canceled):
-        with lake.inputs.read_context(frozen, config=options, check_canceled=cancel):
+        with lake.inputs.read_context(frozen, verify=True, config=options, check_canceled=cancel):
             pass
     assert lake.inputs._read_context() is None
     assert lake.inputs.verify(frozen, config=options)["valid"]

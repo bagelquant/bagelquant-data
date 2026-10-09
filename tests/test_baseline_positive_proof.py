@@ -318,7 +318,8 @@ def test_publication_proves_timing_without_frames_but_rechecks_future_bytes(
             db.execute(
                 "update version_batches set payload=x'00' where partition_path like '%month=02%'"
             )
+        with data.items.publication(input_receipt=receipt) as operation:
+            operation.publish([publication])
         with pytest.raises(RuntimeError):
-            with data.items.publication(input_receipt=receipt) as operation:
-                operation.publish([publication])
+            data.inputs.verify(receipt)
         assert not data.integrity.active_update_leases()

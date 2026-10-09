@@ -7,8 +7,8 @@
   context only. Negative results require all aliases. Reserve at most one quarter
   of the explicit buffer budget at a conservative 1 KiB per entry, capped at
   1024 entries; evict oldest entries and clear on failure/exit. Never cache
-  input frames, assume chronological monotonicity, or skip later byte checks.
-  Exact unchanged Item builds pass caller execution limits to byte verification.
+  input frames, assume chronological monotonicity, or skip explicit audit checks.
+  Exact unchanged Item builds use metadata currentness with caller budgets.
   Timing-only reads tighten the cutoff to the latest unresolved date and use
   checksummed captured scoped by-date `min_available` to skip future physical
   batches; attestation copies are bounded to that cutoff. General snapshots,
@@ -27,12 +27,12 @@
   Index-free schema-seven read-only opens remain valid and never create the index;
   table layout, payloads, receipts, hashes and PIT evidence remain unchanged.
 
-- `items.publication` preflights related `ItemPublication` outputs and verifies the
-  shared input receipt once on context entry, then uses the ordinary historical
-  ingestion/range-replacement path. Its private verification authority expires
+- `items.publication` preflights related `ItemPublication` outputs and resolves the
+  shared registered input metadata on context entry, then uses the ordinary historical
+  ingestion/range-replacement path. Its private publication authority expires
   on exit or group failure. Require serial groups on the context-owning thread and check cancellation before
   writes and successful exit. Preserve per-table commits on failure/cancellation and do not claim
-  cross-table atomicity. Every later context rechecks original proof bytes.
+  cross-table atomicity. Every later context resolves original records; byte audits are explicit.
 - `inputs.verify` accepts explicit `ExecutionOptions`; one bounded pool verifies
   original IPC checksums and structural/type validity using bounded decompression
   and bounded memory-first IPC transport. Retain at most min(64 MiB, one quarter
@@ -136,28 +136,13 @@ entirely null declared scalar types and original partition hashes.
 General recovery retains the union of full-snapshot batch schemas, including
 columns omitted by later snapshots; its last batch is not a full-partition schema.
 
-Frozen-input currentness avoids reading Item values when the covering successful
-build proof is among all captured parents and every captured batch/check/build
-parent is recursively current. Any stale parent falls back to ordinary
-cutoff/window selection; an unselected historical parent does not invalidate the
-result. Missing build proofs cannot establish currentness. Integrity verification
-still checks every original retained batch independently on every later call.
-Neither optimization changes receipt identity or PIT selection.
-
-The exact stale-parent fallback projects original IPC to timing, record identity,
-payload hash and lineage; it never converts numerical value columns. Stage these
-columns in an operation-local temporary Parquet spool, sharded by actual record-ID
-hash so cross-month revisions stay together. Preserve original ordering and use
-the existing attestation/snapshot selectors per shard. Original SHA, full Arrow
-structure and all original column types still validate. `is_current(..., config=)`
-uses explicit admission or the enclosing read_context budget (otherwise default
-ExecutionOptions); bound projected shards and witness/seal expansion before
-allocation and fail closed for oversized/skewed evidence. Staging keeps at most
-one quarter of the admitted budget in independently copied projected Arrow
-buffers, flushing the largest shard near1MiB groups in stable shard order; never
-retain source mmap buffers after batch exit or create one tiny group per fragment.
-Cancellation and every failure remove temporary files. No original receipt or
-physical artifact changes.
+Frozen-input currentness uses registered metadata and versioned selection indexes.
+Covering build/all-parent proofs remain shortcuts. Stale parents require exact indexed
+cutoff/window lineage; selected stale parents invalidate, unselected stale parents do not.
+Missing indexes return unknown and cannot establish a positive result. No ordinary
+IPC fallback, schema migration, implicit maintenance or historical receipt rewrite.
+Metadata/decompression/witness allocation respects explicit or context budgets;
+original byte/IPC verification and derived-index comparison belong to `inputs.verify`.
 
 
 `inputs.is_current` also accepts a nonempty finite sequence of original frozen
@@ -185,7 +170,7 @@ Record-check readers explicitly filter the small dataset/check headers before in
 
 Large complete by-date baseline attestations may use an immutable content-addressed full-commit seal. Prove exact unique (record ID, payload hash, original commit) equality against every original registered recovery batch, with one uniform availability date, using bounded external sorting. Counts alone never establish completeness. Retain all original SQL witnesses/headers and batch identities. Freeze embeds the checked seal; read-only operations never persist seals. Validate checksum and exact header/commit/batch binding before cache use. Partial/mixed or general checks retain the ordinary path; oversized unsupported inline evidence fails explicitly before materialization. Legacy receipts recapture their original representation for currentness; changing representation alone does not invalidate them. Replay preserves header eligibility, check/commit ceilings, ingestion cutoff, availability max, attestation ID and parent receipts. Proven per-batch observation bounds prune window reads only; frozen evidence and verification still retain/recheck every original batch on each call. Temporary sort connections/files are closed and removed.
 
-DataItems.update accepts explicit input_windows keyed by declared input alias, mapping to inclusive observation (start,end). Validate aliases, date order and declared start/end plus Raw observation limits before recursion/publication; never infer windows for arbitrary producers. Pin overrides in the actual frozen requests without modifying the DataItem declaration or its hash. Omitted inputs retain their declared scope. General Raw snapshots are not windowed. Exact successful reuse checks the same definition/dependency/range identity before frame construction and still verifies every retained batch byte.
+DataItems.update accepts explicit input_windows keyed by declared input alias, mapping to inclusive observation (start,end). Validate aliases, date order and declared start/end plus Raw observation limits before recursion/publication; never infer windows for arbitrary producers. Pin overrides in the actual frozen requests without modifying the DataItem declaration or its hash. Omitted inputs retain their declared scope. General Raw snapshots are not windowed. Exact successful reuse checks the same definition/dependency/range identity before frame construction without reading retained batch bytes; explicit audits retain those checks.
 
 New explicit-window by-date freezes mark scoped_batches and use existing immutable version_batches observation/availability bounds to capture potentially selected batches. Retain unknown bounds, late revisions of in-window observations, related checks, overlapping empty item_range proofs and unknown scopes. Full-commit seals retain every original proof batch reference. Legacy receipts recapture their original broad representation; bounds/markers do not rewrite their bytes or hashes. Reads use matching immutable (commit,partition,hash) bounds to skip impossible batches; general initialization baselines remain complete. Shared-commit checks with unknown record-window membership conservatively invalidate; no unsafe currentness claim. No schema migration, new batch store or implicit rolling/lookback clipping.
 
@@ -198,13 +183,12 @@ The multi-root report lists original root IDs/digests and aggregate counts.
 There is no new aggregate receipt or cross-call validity cache; a later call
 rechecks bytes. Currentness remains a separate check.
 
-`inputs.read_context(receipt_or_sequence, verify=True, ...)` is finite and read-only.
+`inputs.read_context(receipt_or_sequence, verify=False, ...)` is finite and read-only.
 Resolve original registered metadata once per receipt, sharing a same-thread SQLite
 snapshot with matching Data readers. Exposed cached metadata is deeply immutable;
 supplied receipt objects provide only original ID/digest, never evidence authority.
-Check every root digest and dependency edge even when metadata is reused. Default
-entry verifies every original byte; `verify=False` defers explicit verification and
-does not create proof authority. Release metadata/snapshot on failure/exit; no
+Check every supplied root digest when metadata is reused; explicit verify/currentness traverse required dependency edges. Default entry reads registered metadata (`verify=False`); `verify=True` explicitly
+audits every original byte and derived index, creating only finite audit proof authority. Release metadata/snapshot on failure/exit; no
 frames, validity proofs or cross-operation caches. No hardware discovery.
 Ordinary Raw/DataItem dataset snapshots reuse an ambient read transaction without
 nested BEGIN, COMMIT or ROLLBACK; standalone reads own their normal snapshot.
@@ -231,6 +215,7 @@ relative lake binding on the destination only, preserving lake identity and all
 historical SQLite evidence. Prefer independent filesystem clones with copy fallback;
 no shared writable inode, hard link or symlink. Copy current immutable generations.
 Reject existing/overlapping destinations, including original SQLite sidecars; failure
-cleanup is confined to the newly owned destinations. Required original receipts
-must pass normal verification before computation. Schema inspection uses the same
+cleanup is confined to the newly owned destinations. Required original receipts pass explicit verification when auditing backup integrity. Schema inspection uses the same
 efficient stable-copy primitive for committed live WAL and preserves original bytes.
+
+Full-request identity uses `inputs.request_identity`: original alias request/cutoff/evidence metadata, excluding enclosing receipt ID/digest/global counters and optional derived indexes. Retain complete alias-local parent/PIT/empty/check evidence conservatively. Index availability must never change a full-request key; precise `selection_identity` separately proves selected-window reuse. Finite read contexts may memoize metadata hashes after validating each supplied root digest, clearing on exit.

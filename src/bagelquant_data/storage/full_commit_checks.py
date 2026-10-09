@@ -15,8 +15,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from bagelquant_data.storage.recovery import read_batch
-
 if TYPE_CHECKING:
     from bagelquant_data.storage.data_meta import DataMetaStore
 
@@ -37,12 +35,15 @@ def validate_seal(seal: Mapping[str, Any]) -> None:
 
 
 def full_commit_checks(store: DataMetaStore, db: sqlite3.Connection,
-                       checks: Sequence[Mapping[str, Any]], *, persist: bool = False) -> list[dict[str, Any]]:
+                       checks: Sequence[Mapping[str, Any]], *, persist: bool = False,
+                       max_buffer_bytes: int | None = None) -> list[dict[str, Any]]:
     """Prove exact tuple equality using bounded external sorting, never counts alone.
 
     Unsupported partial/mixed attestations retain the ordinary record path.
     Read-only calls can construct a proof but never publish a seal.
     """
+    from bagelquant_data.execution import ExecutionOptions
+    budget = max_buffer_bytes or ExecutionOptions().max_buffer_bytes
     seals = []
     for check in checks:
         if check["baseline"] or check["row_count"] < COMPACT_MIN_ROWS or check["visible_commit"] is None:
@@ -80,13 +81,23 @@ def full_commit_checks(store: DataMetaStore, db: sqlite3.Connection,
                 expected.execute("create table expected(record_id text,payload_hash text,version_commit integer)")
                 bounds = []
                 for batch in batches:
-                    frame = read_batch(store, batch["partition_path"], batch["commit_seq"], batch["content_hash"])
+                    from bagelquant_data import input_index
+                    frame = input_index.read(db, batch, max_bytes=budget // 4)
+                    if frame is None:
+                        # Missing historical indexes do not trigger hidden
+                        # original-batch scans during freeze/currentness.
+                        supported = False
+                        break
                     if frame.height != batch["row_count"] or not frame["_baseline"].all() or not (frame["_commit_seq"] == commit["seq"]).all():
                         raise RuntimeError("Full-commit check original batch is not a complete baseline")
                     expected.executemany("insert into expected values(?,?,?)",
                                          frame.select("_record_id", "_payload_hash", "_commit_seq").iter_rows())
                     axis = "source_time" if "source_time" in frame.columns else "time"
                     bounds.append({**batch, "observation_min": str(frame[axis].min()), "observation_max": str(frame[axis].max())})
+                else:
+                    supported = True
+                if not supported:
+                    continue
                 expected.commit()
                 original = iter(expected.execute("select * from expected order by record_id,payload_hash,version_commit"))
                 actual = db.execute("select record_id,payload_hash,version_commit,available_date from version_check_records not indexed where check_id=? order by record_id,payload_hash,version_commit", (check["id"],))

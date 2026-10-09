@@ -5,28 +5,26 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from threading import get_ident
+from threading import get_ident, RLock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_from_payload, input_payload
 from bagelquant_data.query.raw import _date_value
-from bagelquant_data.storage.recovery import project_batch, read_batch, verify_batch
+from bagelquant_data.storage.recovery import read_batch, verify_batch
 from bagelquant_data.execution import ExecutionOptions
 
 if TYPE_CHECKING:
@@ -135,6 +133,11 @@ class _ReadContext:
     verified_batches: set[tuple[int, str, str]] = field(default_factory=set)
     verified_graph: dict[str, tuple[int, tuple[FrozenInputReceipt, ...]]] = field(default_factory=dict)
     currentness: dict[tuple[str, str, Path, InputReadBoundary | None], bool] = field(default_factory=dict)
+    selections: dict[tuple[str, str, str], dict | None] = field(default_factory=dict)
+    request_identities: dict[tuple[str, str], str] = field(default_factory=dict)
+    parent: _ReadContext | None = None
+    closed: bool = False
+    lock: Any = field(default_factory=RLock)
 
 
 _READ_CONTEXTS: ContextVar[tuple[_ReadContext, ...]] = ContextVar("frozen_input_read_contexts", default=())
@@ -147,6 +150,7 @@ class InputsAPI:
         self._lake = lake
         self._store = lake._data_meta
         self._boundary = _boundary_record(self._store.data_meta_path)
+        self._shared_context: _ReadContext | None = None
         if not self._store.read_only:
             with self._store.connect() as db:
                 db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null,created_at text not null)")
@@ -161,7 +165,7 @@ class InputsAPI:
                      config: ExecutionOptions | None = None,
                      check_canceled: Callable[[], None] | None = None,
                      progress: Callable[[dict[str, Any]], None] | None = None,
-                     verify: bool = True) -> Iterator[InputsAPI]:
+                     verify: bool = False, source: InputsAPI | None = None) -> Iterator[InputsAPI]:
         """Load original metadata once within a finite, read-only operation.
 
         Matching readers opened on this thread share a SQLite snapshot and
@@ -173,7 +177,13 @@ class InputsAPI:
         supplied = [receipt] if single else list(receipt)
         if not supplied:
             raise ValueError("Read context requires at least one frozen input receipt")
+        parent = self._read_context() if source is None else source._shared_context
+        if source is not None and (parent is None or parent.closed or parent.path != self._store.data_meta_path.resolve()):
+            raise ValueError("Frozen metadata source is not an active matching read context")
         state = _ReadContext(self._store.data_meta_path.resolve(), get_ident(), {}, check_canceled, config or ExecutionOptions())
+        if parent is not None:
+            state.receipts, state.lock, state.parent = parent.receipts, parent.lock, parent
+        previous_shared, self._shared_context = self._shared_context, state
         token = _READ_CONTEXTS.set((*_READ_CONTEXTS.get(), state))
         try:
             with self._store.read_view():
@@ -196,9 +206,9 @@ class InputsAPI:
                             load(parent)
                     visiting.remove(value.receipt_id)
                     loaded.add(value.receipt_id)
-                for root in roots:
-                    load(root)
                 if verify:
+                    for root in roots:
+                        load(root)
                     self.verify(roots[0] if single else roots, config=config,
                                 check_canceled=check_canceled, progress=progress)
                 yield self
@@ -206,10 +216,239 @@ class InputsAPI:
                     check_canceled()
         finally:
             _READ_CONTEXTS.reset(token)
-            state.receipts.clear()
+            state.closed = True
+            self._shared_context = previous_shared
+            if parent is None:
+                state.receipts.clear()
             state.verified_batches.clear()
             state.verified_graph.clear()
             state.currentness.clear()
+            state.selections.clear()
+            state.request_identities.clear()
+
+    def describe(self, receipt: FrozenInputReceipt | str) -> dict[str, Any]:
+        """Describe registered identity without loading the recursive evidence tree."""
+        key = receipt.receipt_id if isinstance(receipt, FrozenInputReceipt) else receipt
+        rows = self._store._rows("SELECT receipt_id,digest,created_at,"
+            "json_extract(payload_json,'$.max_commit') AS max_commit,"
+            "json_extract(payload_json,'$.max_check_id') AS max_check_id,"
+            "json_extract(payload_json,'$.information_cutoff') AS information_cutoff,"
+            "json_extract(payload_json,'$.dependency_digest') AS dependency_digest "
+            "FROM frozen_inputs WHERE receipt_id=?", (key,))
+        if not rows:
+            raise KeyError(f"Unknown frozen input receipt: {key}")
+        value = dict(rows[0])
+        if isinstance(receipt, FrozenInputReceipt) and receipt.digest != value["digest"]:
+            raise RuntimeError("Frozen input receipt checksum mismatch")
+        return value
+
+    def request_identity(self, receipt: FrozenInputReceipt | str, alias: str) -> str:
+        """Identify an alias from original immutable request/evidence metadata.
+
+        Optional indexes and the enclosing receipt's ID, digest and global
+        counters never participate. Alias-local evidence and its parent links
+        are retained conservatively; selected-window reuse has a separate
+        ``selection_identity`` proof. No original batch values are read.
+        """
+        frozen = self.get(receipt)
+        if alias not in frozen.requests:
+            raise KeyError(f"Unknown frozen input alias: {alias}")
+        context = self._read_context()
+        key = (frozen.digest, alias)
+        if context is not None and key in context.request_identities:
+            return context.request_identities[key]
+        payload = {"version": "frozen_request.v1",
+                   "request": input_payload(frozen.requests[alias]),
+                   "information_cutoff": frozen.information_cutoff,
+                   "evidence": frozen.evidence[alias]}
+        identity = hashlib.sha256(_json(payload).encode()).hexdigest()
+        if context is not None:
+            context.request_identities[key] = identity
+        return identity
+
+    def selection_identity(self, receipt: FrozenInputReceipt | str, alias: str, *,
+                           start: DateLike | None = None, end: DateLike | None = None,
+                           as_of: DateLike | None = None, view: str | None = None,
+                           strict: bool | None = None) -> str | None:
+        """Return an exact selected-content token from index records, or unknown.
+
+        Root receipt IDs and unrelated aliases do not participate. This never
+        reads original batches, writes an index or relaxes the captured bounds.
+        """
+        frozen = self.get(receipt)
+        if alias not in frozen.requests:
+            raise KeyError(f"Unknown frozen input alias: {alias}")
+        request = frozen.requests[alias]
+        for supplied, bound, lower in ((start, request.start, True), (end, request.end, False)):
+            if supplied is not None and bound is not None and ((_date_value(supplied) < _date_value(bound)) if lower else (_date_value(supplied) > _date_value(bound))):
+                raise ValueError("selection cannot widen the frozen observation window")
+        cutoff = frozen.information_cutoff if as_of is None else _date_value(as_of)
+        if cutoff is not None and frozen.information_cutoff is not None and cutoff > frozen.information_cutoff:
+            raise ValueError("as_of exceeds the frozen information cutoff")
+        request = replace(request, start=request.start if start is None else start,
+                          end=request.end if end is None else end,
+                          view=request.view if view is None else view,
+                          strict=request.strict if strict is None else strict)
+        if request.start is not None and request.end is not None and _date_value(request.start) > _date_value(request.end):
+            raise ValueError("end precedes start")
+        value = self._indexed_selection(frozen, alias, request=request, cutoff=cutoff)
+        return None if value is None else value["identity"]
+
+    def _indexed_selection(self, frozen, alias, *, request=None, cutoff=None, db=None, recompute=False, options=None):
+        from bagelquant_data import input_index
+        request = frozen.requests[alias] if request is None else request
+        cutoff = frozen.information_cutoff if cutoff is None else cutoff
+        key = _json({"request": input_payload(request), "cutoff": cutoff})
+        context = self._read_context()
+        memo_key = (frozen.digest, alias, key)
+        if not recompute and context is not None and memo_key in context.selections:
+            return context.selections[memo_key]
+        if db is None:
+            with self._store.connect() as connection:
+                return self._indexed_selection(frozen, alias, request=request, cutoff=cutoff, db=connection,
+                    recompute=recompute, options=options)
+        saved = None if recompute else input_index.selection(db, frozen.digest, alias, key)
+        if saved is not None:
+            return saved
+        evidence = frozen.evidence[alias]
+        pieces = []
+        options = options or (context.options if context is not None else ExecutionOptions())
+        buffered = 0
+        for batch in evidence["batches"]:
+            if context is not None and context.check_canceled is not None:
+                context.check_canceled()
+            lower, upper = request.start, request.end
+            if isinstance(request, RawInput):
+                lower = max((_date_value(item) for item in (lower, request.observation_start) if item is not None), default=None)
+                upper = min((_date_value(item) for item in (upper, request.observation_end) if item is not None), default=None)
+            frame = input_index.read(db, batch, start=lower, end=upper, cutoff=cutoff,
+                                     max_bytes=max(0, options.max_buffer_bytes // 4 - buffered))
+            if frame is None:
+                return None
+            # Attestation joins and concatenation also need headroom.
+            buffered += frame.estimated_size() * 2
+            if buffered > options.max_buffer_bytes // 2:
+                # An incomplete index query never becomes a positive proof.
+                return None
+            if frame.width:
+                pieces.append(frame)
+        frame = concat_compatible_frames(pieces) if pieces else pl.DataFrame()
+        witnesses = len(evidence["record_checks"]) + frame.height * len(evidence.get("full_commit_checks", ()))
+        if witnesses * max(128, frame.estimated_size() // max(1, frame.height)) > options.max_buffer_bytes // 2:
+            return None
+        from bagelquant_data.query.raw import _attested_versions
+        if frame.width:
+            frame = _attested_versions(frame.lazy(), evidence["checks"], evidence["record_checks"],
+                as_of_date=cutoff, max_check_id=frozen.max_check_id,
+                full_commit_checks=evidence.get("full_commit_checks", ())).collect()
+        selected_general = None
+        if evidence["general_snapshots"]:
+            from bagelquant_data.items.pit import _general_snapshot_identity
+            selected_general = _general_snapshot_identity(evidence["general_snapshots"], cutoff,
+                checks=evidence["checks"], strict=request.strict,
+                include_historical_baseline=isinstance(request, RawInput) and request.include_historical_baseline)
+        metadata_evidence = {**evidence, "general_snapshots": [
+            {**item, "schema_ipc": None} for item in evidence["general_snapshots"]]}
+        selector = replace(request, fields=()) if isinstance(request, RawInput) else request
+        if selector.view == "snapshot" and cutoff is None and frame.height:
+            cutoff = cast(date, frame["time"].max())
+        selected = self._select(frame, selector, cutoff, evidence=metadata_evidence) if frame.width else frame
+        commits = {int(batch["commit_seq"]): batch["input_receipt_id"] for batch in evidence["batches"]}
+        checks = {int(item["id"]): item["input_receipt_id"] for item in evidence["checks"]}
+        parents = set()
+        if selected.height and "_commit_seq" in selected.columns:
+            for commit, attestation in selected.select("_commit_seq", "_attestation_id").unique().iter_rows():
+                parent = commits.get(commit) if attestation is None else checks.get(attestation)
+                if parent is not None:
+                    parents.add(str(parent))
+        empty = evidence["empty_item_build"] if not selected.height else None
+        if empty is not None and empty["frozen_receipt_id"] is not None:
+            parents.add(empty["frozen_receipt_id"])
+        # Empty full snapshots/range proofs and schema are part of identity.
+        body = {"version": input_index.VERSION, "definition": evidence["definition_hash"],
+            "schema": evidence["schema_hash"], "request": input_payload(request),
+            "rows": input_index.identity(selected) if selected.height else "empty", "general": selected_general,
+            "empty": None if empty is None else {k: v for k, v in empty.items()
+                if k not in {"input_commit", "frozen_receipt_id"}},
+            "empty_checks": evidence["empty_checks"] if not selected.height else []}
+        value = {"identity": hashlib.sha256(_json(body).encode()).hexdigest(),
+                 "parents": sorted(parents), "has_rows": bool(selected.height)}
+        if context is not None:
+            if len(context.selections) >= 4096:
+                context.selections.pop(next(iter(context.selections)))
+            context.selections[memo_key] = value
+        return value
+
+    def index_plan(self) -> dict[str, Any]:
+        """Freeze an explicit historical index build; never read original bytes."""
+        from bagelquant_data import input_index
+        with self._store.connect() as db:
+            batches = [dict(row) for row in db.execute("SELECT b.commit_seq,b.partition_path,b.content_hash "
+                "FROM version_batches b JOIN version_commits c ON c.seq=b.commit_seq "
+                "WHERE c.status='committed' ORDER BY b.commit_seq,b.partition_path")]
+            receipts = [dict(row) for row in db.execute("SELECT receipt_id,digest FROM frozen_inputs ORDER BY receipt_id")]
+        return {"version": input_index.VERSION, "data_meta_path": str(self._store.data_meta_path.resolve()),
+                "batches": batches, "receipts": receipts}
+
+    def build_index(self, plan: Mapping[str, Any], *, config: ExecutionOptions | None = None,
+                    check_canceled: Callable[[], None] = lambda: None,
+                    progress: Callable[[dict[str, Any]], None] = lambda _: None) -> dict[str, Any]:
+        """Explicitly rebuild derived records from frozen original evidence.
+
+        Each batch publishes atomically against its registered hash. Cancellation
+        retains complete batches only; absent selection summaries remain unknown.
+        """
+        from bagelquant_data import input_index
+        self._store.ensure_writable()
+        if plan.get("version") != input_index.VERSION or plan.get("data_meta_path") != str(self._store.data_meta_path.resolve()):
+            raise ValueError("Selection index plan belongs to another authority/version")
+        with self._store.connect() as db:
+            input_index.initialize(db)
+        for index, batch in enumerate(plan["batches"]):
+            check_canceled()
+            frame = input_index.project_original(self._store, batch,
+                max_bytes=(config or ExecutionOptions()).max_buffer_bytes, check_canceled=check_canceled)
+            payload = input_index.encode(frame, batch["content_hash"])
+            summary = input_index.bounds(frame)
+            del frame
+            with self._store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                check_canceled()
+                row = db.execute("SELECT content_hash FROM version_batches WHERE commit_seq=? AND partition_path=?",
+                    (batch["commit_seq"], batch["partition_path"])).fetchone()
+                if row is None or row[0] != batch["content_hash"]:
+                    raise RuntimeError("Selection index plan changed")
+                input_index.save(db, batch["partition_path"], batch["commit_seq"], batch["content_hash"], payload, summary)
+            progress({"completed": index + 1, "total": len(plan["batches"]), "stage": "dependency_index"})
+        completed, unknown = 0, 0
+        for item in plan["receipts"]:
+            with self.read_context(item["receipt_id"], config=config, check_canceled=check_canceled):
+                frozen = self.get(item["receipt_id"])
+                if frozen.digest != item["digest"]:
+                    raise RuntimeError("Selection index receipt changed")
+                selections = []
+                for alias, request in frozen.requests.items():
+                    check_canceled()
+                    value = self._indexed_selection(frozen, alias, recompute=True)
+                    if value is None:
+                        unknown += 1
+                    else:
+                        key = _json({"request": input_payload(request), "cutoff": frozen.information_cutoff})
+                        selections.append((alias, key, value))
+            # Publish one receipt's complete summaries at a time, after releasing
+            # its captured read view; never hold all historical summaries in RAM.
+            with self._store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                check_canceled()
+                row = db.execute("SELECT digest FROM frozen_inputs WHERE receipt_id=?",
+                    (item["receipt_id"],)).fetchone()
+                if row is None or row[0] != item["digest"]:
+                    raise RuntimeError("Selection index receipt changed")
+                for alias, key, value in selections:
+                    input_index.save_selection(db, frozen.digest, alias, key, value)
+                    completed += 1
+        return {"status": "partial" if unknown else "complete", "batches": len(plan["batches"]),
+                "selections": completed, "unknown_selections": unknown}
 
     def max_commit(self) -> int:
         value = int(self._store._rows("select coalesce(max(seq),0) as seq from version_commits where status='committed'")[0]["seq"])
@@ -246,6 +485,14 @@ class InputsAPI:
             digest = hashlib.sha256(serialized.encode()).hexdigest()
             receipt_id = uuid4().hex
             db.execute("insert into frozen_inputs values(?,?,?,?)", (receipt_id, serialized, digest, datetime.now(UTC).isoformat()))
+            from bagelquant_data import input_index
+            if input_index.available(db):
+                registered = self._receipt(receipt_id, payload, digest)
+                for alias, request in registered.requests.items():
+                    indexed = self._indexed_selection(registered, alias, db=db)
+                    if indexed is not None:
+                        key = _json({"request": input_payload(request), "cutoff": cutoff})
+                        input_index.save_selection(db, digest, alias, key, indexed)
         return self._receipt(receipt_id, payload, digest)
 
     def _capture(self, db: sqlite3.Connection, requests: Mapping[str, DataInput], *,
@@ -316,9 +563,12 @@ class InputsAPI:
                     return db.execute(f"select 1 from version_check_records where check_id=? and version_commit in ({commits_sql}) limit 1", (check["id"],)).fetchone() is not None
                 audit_checks = [check for check in audit_checks if relevant_check(check)]
             from bagelquant_data.storage.full_commit_checks import full_commit_checks
+            context = self._read_context()
             seals = full_commit_checks(self._store, db,
                 [{key: value for key, value in dict(row).items() if key != "content_baseline"} for row in audit_checks],
-                persist=persist_checks) if compact_aliases is None or alias in compact_aliases else []
+                persist=persist_checks,
+                max_buffer_bytes=None if context is None else context.options.max_buffer_bytes
+                ) if compact_aliases is None or alias in compact_aliases else []
             sealed_ids = {seal["binding"]["check"]["id"] for seal in seals}
             excluded = ",".join(str(int(value)) for value in sealed_ids) or "-1"
             if scoped:
@@ -536,6 +786,13 @@ class InputsAPI:
                     visiting.remove(value.receipt_id)
                     return False
                 result = payload["dependency_digest"] == value.dependency_digest
+                if not result:
+                    captured = self._receipt("current", payload, hashlib.sha256(_json(payload).encode()).hexdigest())
+                    result = all(
+                        (original := self._indexed_selection(value, alias)) is not None
+                        and (latest := self._indexed_selection(captured, alias)) is not None
+                        and original["identity"] == latest["identity"]
+                        for alias in value.requests)
                 if result:
                     for alias, request in value.requests.items():
                         if not isinstance(request, ItemInput):
@@ -551,7 +808,11 @@ class InputsAPI:
                         if proof is not None and proof["frozen_receipt_id"] in parent_ids:
                             if all(current(self.get(parent_id)) for parent_id in parent_ids):
                                 continue
-                        selected_rows, parents = self._selected_item_parents(value, alias, options)
+                        selected = self._selected_item_parents(value, alias, options)
+                        if selected is None:
+                            result = False
+                            break
+                        selected_rows, parents = selected
                         if not selected_rows:
                             if evidence["empty_item_build"] is not None:
                                 parent_id = evidence["empty_item_build"]["frozen_receipt_id"]
@@ -581,158 +842,24 @@ class InputsAPI:
             return all(results)
 
     def _selected_item_parents(self, frozen: FrozenInputReceipt, alias: str,
-                               options: ExecutionOptions) -> tuple[bool, set[str]]:
-        """Select exact lineage in bounded record shards, never value frames.
-
-        Hashing record identity keeps every revision and witnessed copy together,
-        including revisions crossing physical/month partitions. Each shard uses
-        the ordinary attestation and snapshot selectors with original row order.
-        Transient Parquet holds projected originals only and expires on failure.
-        """
-        evidence = frozen.evidence[alias]
-        request = frozen.requests[alias]
-        context = self._read_context()
-        check = None if context is None else context.check_canceled
-        columns = ("time", "source_time", "ingested_at", "_baseline", "_commit_seq",
-                   "_record_id", "_payload_hash")
-        limit = max(1, options.max_buffer_bytes // 8)
-        # Expected lineage row size only chooses sharding. Actual retained bytes
-        # below govern admission; a skewed or oversized shard fails closed.
-        expected = (sum(int(batch["row_count"]) for batch in evidence["batches"])
-                    + len(evidence["record_checks"])
-                    + sum(int(seal["row_count"]) for seal in evidence.get("full_commit_checks", ()))) * 384
-        shards = 1
-        while shards < 65536 and expected // shards > limit:
-            shards *= 2
-        sizes: dict[int, int] = {}
-        cutoff = frozen.information_cutoff
-        commits = {int(batch["commit_seq"]): batch["input_receipt_id"] for batch in evidence["batches"]}
-        checks = {int(event["id"]): event["input_receipt_id"] for event in evidence["checks"]}
-        from bagelquant_data.query.raw import _attested_versions
-        with tempfile.TemporaryDirectory(prefix="bagelquant-currentness-") as directory:
-            path = Path(directory) / "lineage.parquet"
-            writer: pq.ParquetWriter | None = None
-            buffered: dict[int, list[pa.Table]] = {}
-            buffered_sizes: dict[int, int] = {}
-            buffered_bytes = 0
-            buffer_limit = max(1, options.max_buffer_bytes // 4)
-            group_target = max(1, min(1024 * 1024, buffer_limit // 2))
-            def flush(shard: int) -> None:
-                nonlocal writer, buffered_bytes
-                pieces = buffered.pop(shard)
-                table = pa.concat_tables(pieces)
-                if writer is None:
-                    writer = pq.ParquetWriter(path, table.schema, compression="zstd")
-                writer.write_table(table)
-                buffered_bytes -= buffered_sizes.pop(shard)
-            try:
-                def consume(frame: pl.DataFrame) -> None:
-                    nonlocal buffered_bytes
-                    if check is not None:
-                        check()
-                    if "_record_id" not in frame.columns:
-                        raise RuntimeError("Retained Item lineage lacks record identity")
-                    frame = frame.with_columns(
-                        (pl.col("_record_id").hash(seed=0) % shards).alias("_lineage_shard"))
-                    for key, part in frame.partition_by("_lineage_shard", as_dict=True, maintain_order=True).items():
-                        shard = int(key[0])
-                        sizes[shard] = sizes.get(shard, 0) + int(part.estimated_size())
-                        if sizes[shard] > limit:
-                            raise MemoryError("Item currentness lineage shard exceeds max_buffer_bytes; increase the admitted budget")
-                        original = part.to_arrow()
-                        size = original.nbytes
-                        if size > buffer_limit:
-                            raise MemoryError("Item currentness staging fragment exceeds max_buffer_bytes")
-                        while buffered_bytes + size > buffer_limit:
-                            flush(max(buffered_sizes, key=lambda key: buffered_sizes[key]))
-                        # Copy projected buffers independently before the source
-                        # IPC mapping closes; clone/rechunk may retain its mmap.
-                        owned = pa.Table.from_arrays(
-                            [pa.concat_arrays(column.chunks) for column in original.columns],
-                            schema=original.schema)
-                        buffered.setdefault(shard, []).append(owned)
-                        buffered_sizes[shard] = buffered_sizes.get(shard, 0) + size
-                        buffered_bytes += size
-                        if buffered_sizes[shard] >= group_target:
-                            flush(shard)
-                for batch in evidence["batches"]:
-                    if check is not None:
-                        check()
-                    project_batch(self._store, batch["partition_path"], int(batch["commit_seq"]),
-                                  batch["content_hash"], columns=columns, consume=consume,
-                                  buffer_bytes=options.max_buffer_bytes,
-                                  check_canceled=check)
-                for shard in list(buffered):
-                    if check is not None:
-                        check()
-                    flush(shard)
-            finally:
-                buffered.clear()
-                buffered_sizes.clear()
-                if writer is not None:
-                    writer.close()
-            if writer is None:
-                return False, set()
-            records_by_shard: dict[int, list[Mapping[str, Any]]] = {}
-            records = evidence["record_checks"]
-            for first in range(0, len(records), 1024):
-                if check is not None:
-                    check()
-                chunk = records[first:first + 1024]
-                hashes = pl.Series([event["record_id"] for event in chunk], dtype=pl.String).hash(seed=0)
-                for event, hashed in zip(chunk, hashes, strict=True):
-                    key = int(hashed) % shards
-                    records_by_shard.setdefault(key, []).append(event)
-                    if len(records_by_shard[key]) * 384 > options.max_buffer_bytes // 4:
-                        raise MemoryError("Item currentness witnesses exceed max_buffer_bytes")
-            parents: set[str] = set()
-            nonempty = False
-            scan = pl.scan_parquet(path)
-            for shard in sorted(sizes):
-                if check is not None:
-                    check()
-                frame = scan.filter(pl.col("_lineage_shard") == shard).drop("_lineage_shard").collect()
-                if frame.estimated_size() > limit:
-                    raise MemoryError("Item currentness lineage shard exceeds max_buffer_bytes")
-                # Restrict witness construction to this record shard as well.
-                records = records_by_shard.get(shard, [])
-                # Admit witnessed expansion before the join/concat allocates it.
-                # Bound even malformed duplicate baseline keys conservatively.
-                baseline = frame.filter(pl.col("_baseline"))
-                multiplicity = 1
-                if records and baseline.height:
-                    multiplicity = int(baseline.group_by("_commit_seq", "_record_id", "_payload_hash").len()["len"].max())
-                copies = 0
-                for seal in evidence.get("full_commit_checks", ()):
-                    commit = int(seal["binding"]["check"]["visible_commit"])
-                    copies += baseline.filter(pl.col("_commit_seq") == commit).height
-                row_bytes = 128 + sum(
-                    int(frame[name].str.len_bytes().max() or 0) + 8 if dtype == pl.String else 16
-                    for name, dtype in frame.schema.items())
-                if (frame.height + copies + len(records) * multiplicity) * row_bytes > options.max_buffer_bytes // 2:
-                    raise MemoryError("Item currentness witnessed lineage exceeds max_buffer_bytes")
-                del baseline
-                frame = _attested_versions(frame.lazy(), evidence["checks"], records,
-                    as_of_date=frozen.information_cutoff, max_check_id=frozen.max_check_id,
-                    full_commit_checks=evidence.get("full_commit_checks", ())).collect()
-                if frame.estimated_size() > options.max_buffer_bytes // 2:
-                    raise MemoryError("Item currentness witnessed lineage exceeds max_buffer_bytes")
-                selected_cutoff = cutoff
-                if selected_cutoff is None and frame.height:
-                    selected_cutoff = cast(date, frame["time"].max())
-                selected = self._select(frame, replace(request, view="snapshot"), selected_cutoff,
-                                        evidence=evidence) if selected_cutoff is not None else frame
-                if selected.height:
-                    nonempty = True
-                    for row in selected.select("_commit_seq", "_attestation_id").unique().iter_rows(named=True):
-                        parent = checks.get(row["_attestation_id"]) if row["_attestation_id"] is not None else commits.get(row["_commit_seq"])
-                        if parent is not None:
-                            parents.add(str(parent))
-            return nonempty, parents
+                               options: ExecutionOptions) -> tuple[bool, set[str]] | None:
+        """Resolve selected lineage from owner index records, never original IPC."""
+        request = replace(frozen.requests[alias], view="snapshot")
+        value = self._indexed_selection(frozen, alias, request=request, options=options)
+        if value is None:
+            return None
+        return value["has_rows"], set(value["parents"])
 
     def get(self, receipt: FrozenInputReceipt | str) -> FrozenInputReceipt:
+        context = self._read_context()
+        with context.lock if context is not None else nullcontext():
+            return self._get(receipt)
+
+    def _get(self, receipt: FrozenInputReceipt | str) -> FrozenInputReceipt:
         key = receipt.receipt_id if isinstance(receipt, FrozenInputReceipt) else receipt
         context = self._read_context()
+        if context is not None and (context.closed or context.parent is not None and context.parent.closed):
+            raise RuntimeError("Frozen metadata source has expired")
         if context is not None:
             if context.check_canceled is not None:
                 context.check_canceled()
@@ -831,7 +958,33 @@ class InputsAPI:
         cutoff = min(cutoff, frozen.information_cutoff) if frozen.information_cutoff is not None else cutoff
         commit_bound = min(frozen.max_commit, max_commit) if max_commit is not None else frozen.max_commit
         check_bound = min(frozen.max_check_id, max_check_id) if max_check_id is not None else frozen.max_check_id
-        versions = self._read_frame(frozen, alias, timing_cutoff=cutoff) if frame is None else frame
+        if frame is None:
+            from bagelquant_data import input_index
+            from bagelquant_data.query.raw import _attested_versions
+            pieces, buffered = [], 0
+            context = self._read_context()
+            budget = max_buffer_bytes or (context.options.max_buffer_bytes if context else ExecutionOptions().max_buffer_bytes)
+            with self._store.connect() as db:
+                for batch in evidence["batches"]:
+                    if context is not None and context.check_canceled is not None:
+                        context.check_canceled()
+                    projected = input_index.read(db, batch, cutoff=cutoff,
+                        max_bytes=max(0, budget // 2 - buffered))
+                    if projected is None:
+                        raise ValueError("Timing index is unknown; run explicit dependency index maintenance")
+                    buffered += projected.estimated_size() * 2
+                    if projected.width:
+                        pieces.append(projected)
+            versions = concat_compatible_frames(pieces) if pieces else pl.DataFrame()
+            witnesses = len(evidence["record_checks"]) + versions.height * len(evidence.get("full_commit_checks", ()))
+            if witnesses * max(128, versions.estimated_size() // max(1, versions.height)) > budget // 2:
+                raise MemoryError("Timing metadata exceeds max_buffer_bytes")
+            if versions.width:
+                versions = _attested_versions(versions.lazy(), evidence["checks"], evidence["record_checks"],
+                    as_of_date=cutoff, max_check_id=check_bound,
+                    full_commit_checks=evidence.get("full_commit_checks", ())).collect()
+        else:
+            versions = frame
         if max_buffer_bytes is not None and versions.estimated_size() > max_buffer_bytes // 2:
             raise MemoryError("Empty Item timing evidence exceeds max_buffer_bytes; use smaller declared input windows")
         if "_commit_seq" in versions.columns:
@@ -842,9 +995,10 @@ class InputsAPI:
         if isinstance(selection, RawInput):
             selection = replace(selection, fields=())
         bounded = {**evidence,
-                   "general_snapshots": [row for row in evidence["general_snapshots"] if row["seq"] <= commit_bound],
+                   "general_snapshots": [{**row, "schema_ipc": None if frame is None else row["schema_ipc"]}
+                                         for row in evidence["general_snapshots"] if row["seq"] <= commit_bound],
                    "checks": [row for row in evidence["checks"] if row["id"] <= check_bound]}
-        selected = self._select(versions, selection, cutoff, evidence=bounded)
+        selected = self._select(versions, selection, cutoff, evidence=bounded) if versions.width else versions
         if "_baseline" in selected.columns and selected["_baseline"].fill_null(False).any():
             return True
         if isinstance(selection, RawInput) and bounded["general_snapshots"]:
@@ -1017,7 +1171,7 @@ class InputsAPI:
             return (request.start is None or _date_value(bound["observation_max"]) >= _date_value(request.start)) and (request.end is None or _date_value(bound["observation_min"]) <= _date_value(request.end))
         context = self._read_context()
         pieces = [read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"],
-                            **({"check_canceled": context.check_canceled} if context is not None else {}))
+                            check_canceled=None if context is None else context.check_canceled)
                   for value in evidence["batches"] if needed(value)]
         if pieces:
             frame = concat_compatible_frames(pieces)
@@ -1112,7 +1266,7 @@ class InputsAPI:
             if progress is not None:
                 progress({"stage": "verify_inputs", "completed": completed, "total": len(batches_to_verify)})
         report()
-        options = config or ExecutionOptions()
+        options = config or (context.options if context is not None else ExecutionOptions())
         workers = min(options.workers, options.max_in_flight or options.workers)
         # One pool for this call, joined before any caller publishes output.
         # Chunk/decode buffers divide the explicit local allocation.
@@ -1133,6 +1287,34 @@ class InputsAPI:
                         future.result()
                         completed += 1
                         report()
+        if check_canceled is not None:
+            check_canceled()
+        # Derived records are audited against their original owner evidence.
+        from bagelquant_data import input_index
+        for seq, path, expected in verified_batches:
+            input_index.audit(self._store, {"commit_seq": seq, "partition_path": path,
+                "content_hash": expected}, max_bytes=options.max_buffer_bytes,
+                check_canceled=check_canceled)
+        with self._store.connect() as db:
+            if input_index.available(db):
+                for frozen in retained_receipts.values():
+                    rows = db.execute("SELECT alias,request_key FROM input_selection_index "
+                        "WHERE receipt_digest=? AND version=?", (frozen.digest, input_index.VERSION)).fetchall()
+                    for row in rows:
+                        if check_canceled is not None:
+                            check_canceled()
+                        key = json.loads(row[1])
+                        saved = input_index.selection(db, frozen.digest, row[0], row[1])
+                        expected_selection = self._indexed_selection(frozen, row[0],
+                            request=input_from_payload(key["request"]),
+                            cutoff=None if key["cutoff"] is None else _date_value(key["cutoff"]),
+                            db=db, recompute=True, options=options)
+                        if check_canceled is not None:
+                            check_canceled()
+                        if expected_selection is None:
+                            raise MemoryError("Selection summary audit exceeds max_buffer_bytes")
+                        if saved != expected_selection:
+                            raise RuntimeError("Selection summary differs from original evidence")
         if check_canceled is not None:
             check_canceled()
         if context is not None:

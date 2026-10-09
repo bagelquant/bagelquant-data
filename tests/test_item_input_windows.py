@@ -50,7 +50,7 @@ def test_invalid_window_fails_before_build_evidence(tmp_path, windows, error):
     assert not lake.items.builds("derived")
 
 
-def test_reuse_verifies_original_bytes_without_input_decoding(tmp_path, monkeypatch):
+def test_reuse_trusts_records_and_explicit_audit_verifies_original_bytes(tmp_path, monkeypatch):
     lake, _, _ = fixture(tmp_path)
     options = {"start": "2020-02-01", "end": "2020-02-29", "input_windows": {"raw": ("2020-02-01", "2020-02-29")}}
     first = lake.items.update("derived", **options)
@@ -61,8 +61,10 @@ def test_reuse_verifies_original_bytes_without_input_decoding(tmp_path, monkeypa
     assert reused.status == "unchanged" and reused.commit_seq == first.commit_seq
     with sqlite3.connect(lake.data_meta_path) as db:
         db.execute("update version_batches set payload=x'00' where commit_seq=1")
+    assert lake.items.update("derived", **options).status == "unchanged"
     with pytest.raises(RuntimeError):
-        lake.items.update("derived", **options)
+        assert reused.frozen_receipt_id is not None
+        lake.inputs.verify(reused.frozen_receipt_id)
 
 
 def test_month_pruning_keeps_later_revision_of_earlier_observation(tmp_path, monkeypatch):
@@ -73,9 +75,9 @@ def test_month_pruning_keeps_later_revision_of_earlier_observation(tmp_path, mon
     from bagelquant_data import inputs
     original = inputs.read_batch
     partitions = []
-    def tracked(*args):
+    def tracked(*args, **kwargs):
         partitions.append(args[1])
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(inputs, "read_batch", tracked)
     result = lake.inputs.read(receipt, "raw").collect()
     assert result["value"].to_list() == [9.]

@@ -50,6 +50,12 @@ def append_batch(data_meta: DataMetaStore, partition: str, seq: int, frame: pl.D
         "min_observation": str(frame["source_time"].min()) if "source_time" in frame.columns and frame.height else None,
         "max_observation": str(frame["source_time"].max()) if "source_time" in frame.columns and frame.height else None,
     }
+    from bagelquant_data import input_index
+    # Preserve the authoritative IPC's canonical row order, including ties.
+    original = pa.ipc.open_file(pa.BufferReader(payload)).read_all()
+    projected = cast(pl.DataFrame, pl.from_arrow(original.select(
+        [name for name in input_index.COLUMNS if name in original.column_names])))
+    index_payload = input_index.encode(projected, batch["content_hash"])
     with data_meta.connect() as db:
         db.execute("begin immediate")
         commit = db.execute("select status from version_commits where seq=?", (seq,)).fetchone()
@@ -66,12 +72,15 @@ def append_batch(data_meta: DataMetaStore, partition: str, seq: int, frame: pl.D
             (seq, partition, batch["content_hash"], frame.height, batch["schema_ipc"], compressed,
              batch["min_available"], batch["max_available"], batch["min_observation"], batch["max_observation"]),
         )
+        input_index.initialize(db)
+        input_index.save(db, partition, seq, batch["content_hash"], index_payload, input_index.bounds(frame))
     return batch
 
 
 def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
-               check_canceled: Callable[[], None] | None = None) -> pl.DataFrame:
-    """Read committed evidence and verify its original byte checksum."""
+               check_canceled: Callable[[], None] | None = None,
+               verify: bool = False) -> pl.DataFrame:
+    """Decode committed evidence; explicit audits additionally verify its bytes."""
     cancellation: BaseException | None = None
     def check() -> None:
         nonlocal cancellation
@@ -84,7 +93,7 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
     if check_canceled is not None:
         check_canceled()
     rows = data_meta._rows(
-        "select b.content_hash,b.payload from version_batches b join version_commits c on c.seq=b.commit_seq "
+        "select b.content_hash,b.payload,b.schema_ipc,b.row_count from version_batches b join version_commits c on c.seq=b.commit_seq "
         "where b.commit_seq=? and b.partition_path=? and c.status='committed'", (seq, partition)
     )
     if not rows:
@@ -106,11 +115,15 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
         if error is cancellation:
             raise
         raise RuntimeError(f"Recovery batch {seq} compression is damaged") from error
-    if rows[0]["content_hash"] != digest or hashlib.sha256(payload).hexdigest() != digest:
+    if rows[0]["content_hash"] != digest or verify and hashlib.sha256(payload).hexdigest() != digest:
         raise RuntimeError(f"Recovery batch {seq} checksum mismatch")
     if check_canceled is not None:
         check_canceled()
-    return pl.read_ipc(io.BytesIO(payload))
+    frame = pl.read_ipc(payload)
+    schema = pl.Schema(pa.ipc.read_schema(pa.BufferReader(rows[0]["schema_ipc"])))
+    if frame.schema != schema or frame.height != rows[0]["row_count"]:
+        raise RuntimeError(f"Recovery batch {seq} typed schema/row count mismatch")
+    return frame
 
 
 def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str,
@@ -281,7 +294,7 @@ def reconstruct(parquet: ParquetStore, source: str, dataset: str, partition: str
     batches = registered_batches(parquet, source, dataset, partition)
     if not batches:
         raise RuntimeError("No registered recovery evidence; historical recovery is blocked")
-    frames = [read_batch(parquet.metadata, partition, int(b["commit_seq"]), b["content_hash"]) for b in batches]
+    frames = [read_batch(parquet.metadata, partition, int(b["commit_seq"]), b["content_hash"], verify=True) for b in batches]
     frame = sort_versions(concat_compatible_frames(frames))
     # A by-date delta was aligned to the full committed partition's schema.
     # Concatenation's provider-inference normalization can turn entirely null

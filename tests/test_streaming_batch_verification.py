@@ -128,8 +128,13 @@ def test_verification_spills_with_bounded_memory_and_closes_transport(tmp_path, 
             self.peak = max(self.peak, self.tell())
             return result
     monkeypatch.setattr(recovery.tempfile, "TemporaryFile", temporary)
-    monkeypatch.setattr(recovery.io, "BytesIO", TrackedBuffer)
-    assert lake.inputs.verify(receipt, config=ExecutionOptions(max_buffer_bytes=budget))["valid"]
+    from types import SimpleNamespace
+    monkeypatch.setattr(recovery, "io", SimpleNamespace(BytesIO=TrackedBuffer))
+    # This test covers original-byte transport. Full receipt verification also
+    # audits selection summaries, which may need more than this tiny budget.
+    for batch in receipt.evidence["values"]["batches"]:
+        verify_batch(lake._data_meta, batch["partition_path"], batch["commit_seq"],
+                     batch["content_hash"], buffer_bytes=budget)
     assert files and all(file.closed for file in files)
     assert buffers and all(buffer.closed for buffer in buffers)
     assert max(buffer.peak for buffer in buffers) <= budget // 4
