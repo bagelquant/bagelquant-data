@@ -34,7 +34,7 @@ print(lake.items.read("close").collect())
 | `lake.catalog` | Sources and independent Raw/DataItem category trees |
 | `lake.raw` | Declarations, initialize/update/refresh/ingest, reads and coverage |
 | `lake.items` | Typed long tables, transformations, external producers and builds |
-| `lake.integrity` | Passive scans, plans and evidence-based local repairs |
+| `lake.integrity` | Passive scans, plans, guarded baseline reopening and evidence-based local repairs |
 | `lake.inputs` | Durable frozen input receipts, reads and verification |
 | `bagelquant_data.exploration` | Pure statistics and Polars result tables |
 
@@ -44,7 +44,7 @@ generations retain year/month partitions. Read-only queries never initialize or
 recover data; SQLite may create or update its WAL/SHM coordination sidecars.
 `DataLake.inspect(data_meta_path=..., lake_path=...)` checks schema and lake binding
 without changing any configured storage files or directories, including sidecars.
-Package 0.7 and metadata schema 6 are an incompatible fresh-database cut; old
+Package 0.7 and metadata schema 7 are an incompatible fresh-database cut; old
 databases are rejected. No aliases, migrations or automatic history cleanup exist.
 
 Historical daily reads are causal by default. Explicit `as_of` selects a fixed

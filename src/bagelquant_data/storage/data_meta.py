@@ -47,9 +47,9 @@ class DataMetaStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "6"
+    SCHEMA_VERSION = "7"
 
-    def __init__(self, data_meta_path: str | Path, *, read_only: bool = False) -> None:
+    def __init__(self, data_meta_path: str | Path, *, read_only: bool = False, runtime: bool = False) -> None:
         self.data_meta_path = Path(data_meta_path)
         self.read_only = read_only
         if read_only and not self.data_meta_path.is_file():
@@ -58,7 +58,7 @@ class DataMetaStore:
             raise ConfigurationError(
                 "Read-only Data metadata has no initialized schema"
             )
-        self.check_compatibility(self.data_meta_path)
+        self.check_compatibility(self.data_meta_path, runtime=runtime)
         self._thread_state = local()
         if not read_only:
             self.data_meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,11 +148,11 @@ class DataMetaStore:
         return tables, state
 
     @classmethod
-    def check_compatibility(cls, data_meta_path: Path) -> None:
+    def check_compatibility(cls, data_meta_path: Path, *, runtime: bool = False) -> None:
         """Reject an incompatible schema before any original storage writes."""
         if not data_meta_path.is_file() or data_meta_path.stat().st_size == 0:
             return
-        tables, state = cls._inspect_schema(data_meta_path)
+        tables, state = cls._runtime_schema(data_meta_path) if runtime else cls._inspect_schema(data_meta_path)
         if tables and (
             state.get("schema_version") != cls.SCHEMA_VERSION
             or "declaration_batch_receipts" not in tables
@@ -162,7 +162,17 @@ class DataMetaStore:
             )
 
     @classmethod
-    def inspect(cls, data_meta_path: Path, lake_path: Path) -> dict[str, object]:
+    def _runtime_schema(cls, path: Path) -> tuple[set[str], dict[str, str]]:
+        """Use ordinary WAL coordination for initialized runtime reads, without copies."""
+        journal = path.with_name(path.name + "-journal")
+        if journal.is_file():
+            with journal.open("rb") as stream:
+                if any(stream.read(8)):
+                    raise sqlite3.OperationalError("Data metadata has an active rollback journal")
+        return _probe_schema(path.resolve(), immutable=False)
+
+    @classmethod
+    def inspect(cls, data_meta_path: Path, lake_path: Path, *, runtime: bool = False) -> dict[str, object]:
         """Return schema and lake binding readiness without opening the lake."""
         if not data_meta_path.exists() or (
             data_meta_path.is_file() and data_meta_path.stat().st_size == 0
@@ -171,7 +181,7 @@ class DataMetaStore:
         if not data_meta_path.is_file():
             return {"status": "incompatible", "reason": "metadata_not_file", "schema_version": None}
         try:
-            tables, state = cls._inspect_schema(data_meta_path)
+            tables, state = cls._runtime_schema(data_meta_path) if runtime else cls._inspect_schema(data_meta_path)
         except (OSError, sqlite3.Error, ConfigurationError):
             return {"status": "incompatible", "reason": "metadata_unreadable", "schema_version": None}
         version = state.get("schema_version")
@@ -701,11 +711,19 @@ class DataMetaStore:
                     (source, dataset),
                 )
             ]
+            from bagelquant_data.storage.full_commit_checks import full_commit_checks
+            seals = full_commit_checks(self, db, checks)
+            excluded = ",".join(str(int(seal["binding"]["check"]["id"])) for seal in seals) or "-1"
+            inline_count = db.execute(
+                "select count(*) from version_checks c cross join version_check_records r on c.id=r.check_id "
+                f"where c.source=? and c.dataset=? and c.id not in ({excluded})", (source, dataset)).fetchone()[0]
+            if inline_count > db.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) // 300:
+                raise MemoryError("Partial/mixed witnesses exceed the bounded metadata snapshot size limit")
             record_checks = [
                 dict(row)
                 for row in db.execute(
-                    "select r.* from version_check_records r join version_checks c on c.id=r.check_id "
-                    "where c.source=? and c.dataset=? order by r.check_id,r.record_id",
+                    "select r.* from version_checks c cross join version_check_records r on c.id=r.check_id "
+                    f"where c.source=? and c.dataset=? and c.id not in ({excluded}) order by c.id,r.record_id",
                     (source, dataset),
                 )
             ]
@@ -716,6 +734,7 @@ class DataMetaStore:
             "batch_schemas": batch_schemas,
             "checks": checks,
             "record_checks": record_checks,
+            "full_commit_checks": seals,
         }
 
     def known_generations(self, source: str, dataset: str) -> set[str]:
@@ -825,6 +844,7 @@ class DataMetaStore:
         rows_downloaded: int,
         rows_committed: int,
         error_message: str | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         """Finalize a run even when the update scheduler raises."""
 
@@ -835,7 +855,7 @@ class DataMetaStore:
                 update ingestion_runs set
                     finished_at=?, status=?, request_count=?, success_count=?,
                     empty_count=?, failure_count=?, rows_downloaded=?, rows_committed=?,
-                    error_message=?
+                    error_message=?, metrics_json=?
                 where run_id=?
                 """,
                 (
@@ -848,9 +868,17 @@ class DataMetaStore:
                     int(rows_downloaded),
                     int(rows_committed),
                     error_message,
+                    json.dumps(metrics or {}, sort_keys=True, allow_nan=False),
                     run_id,
                 ),
             )
+
+    def record_run_metrics(self, *, run_id: str, metrics: dict[str, Any]) -> None:
+        """Checkpoint measured progress in the run's existing metadata authority."""
+        self.ensure_writable()
+        with self.connect() as db:
+            db.execute("update ingestion_runs set metrics_json=? where run_id=? and status='running'",
+                       (json.dumps(metrics, sort_keys=True, allow_nan=False), run_id))
 
     def record_rejected(
         self,
@@ -905,7 +933,7 @@ class DataMetaStore:
                     where run_id=? and status='running'
                     """,
                     (
-                        len(run_rows),
+                        sum(int(row.get("metrics", {}).get("request_attempts", 1)) for row in run_rows),
                         sum(
                             int(row.get("row_count", 0))
                             for row in run_rows
@@ -927,9 +955,9 @@ class DataMetaStore:
             insert into api_calls(
                 run_id, source, dataset, request_key, asset_id, request_params,
                 status, result_kind, row_count, retry_count, started_at, finished_at,
-                error_message, scope_id, request_kind
+                error_message, scope_id, request_kind, metrics_json
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -953,6 +981,7 @@ class DataMetaStore:
                     row.get("error_message"),
                     row.get("scope_id"),
                     row.get("request_kind"),
+                    json.dumps(row.get("metrics", {}), sort_keys=True, allow_nan=False),
                 )
                 for row in rows
             ],
@@ -1548,6 +1577,8 @@ class DataMetaStore:
             rows = [dict(row) for row in db.execute(sql, tuple(params)).fetchall()]
         for row in rows:
             request_params = row.get("request_params")
+            if "metrics_json" in row:
+                row["metrics"] = json.loads(row.pop("metrics_json"))
             if isinstance(request_params, bytes):
                 row["request_params"] = zlib.decompress(request_params).decode("utf-8")
         return rows
@@ -1647,7 +1678,8 @@ class DataMetaStore:
                     rows_downloaded integer not null default 0,
                     rows_committed integer not null default 0,
                     error_message text,
-                    owner_id text
+                    owner_id text,
+                    metrics_json text not null default '{}'
                 );
                 create table if not exists api_calls (
                     run_id text not null,
@@ -1666,7 +1698,8 @@ class DataMetaStore:
                     finished_at text,
                     error_message text,
                     scope_id integer,
-                    request_kind text
+                    request_kind text,
+                    metrics_json text not null default '{}'
                 );
                 create table if not exists update_scopes (
                     id integer primary key autoincrement,
@@ -1775,6 +1808,20 @@ class DataMetaStore:
                         now,
                     ),
                 )
+            # Trailing metadata follows a potentially huge BLOB in the table.
+            # Keep a derived covering index so metadata reads need no overflow
+            # traversal. Index/statistics publication is atomic and idempotent.
+            if db.execute("select 1 from sqlite_master where type='index' and name='version_batches_metadata'").fetchone() is None:
+                if not db.in_transaction:
+                    db.execute("begin immediate")
+                # Another writable opener may have created it while we waited.
+                if db.execute("select 1 from sqlite_master where type='index' and name='version_batches_metadata'").fetchone() is None:
+                    db.execute(
+                        "create index if not exists version_batches_metadata on version_batches("
+                        "commit_seq,partition_path,content_hash,row_count,schema_ipc,"
+                        "min_available,max_available,min_observation,max_observation,length(payload))"
+                    )
+                    db.execute("analyze version_batches")
 
 
 def _now() -> str:
@@ -1792,7 +1839,7 @@ def _insert_version_check(
     baseline: bool,
     request_json: str,
     row_count: int,
-    records: list[dict[str, Any]],
+    records: Iterable[tuple[Any, ...]],
     input_receipt_id: str | None = None,
 ) -> None:
     """Record immutable unchanged-content witnesses in the publication transaction."""
@@ -1817,16 +1864,16 @@ def _insert_version_check(
         raise RuntimeError("Failed to allocate an unchanged-content witness")
     db.executemany(
         "insert into version_check_records(check_id,record_id,payload_hash,version_commit,available_date) values(?,?,?,?,?)",
-        [
+        (
             (
                 check_id,
-                row["_record_id"],
-                row["_payload_hash"],
-                int(row["_commit_seq"]),
-                str(row["time"]),
+                record_id,
+                payload_hash,
+                int(version_commit),
+                str(available_date),
             )
-            for row in records
-        ],
+            for record_id, payload_hash, version_commit, available_date in records
+        ),
     )
 
 

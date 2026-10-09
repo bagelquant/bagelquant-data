@@ -36,7 +36,8 @@ class RawQueryService:
         snapshot = self.metadata.dataset_snapshot(source, dataset)
         frame = self._scan(dataset, source=source, snapshot=snapshot)
         frame = _attested_versions(frame, snapshot["checks"], snapshot["record_checks"],
-                                   as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id)
+                                   as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id,
+                                   full_commit_checks=snapshot.get("full_commit_checks", ()))
         names = frame.collect_schema().names()
         if strict and "_baseline" in names:
             frame = frame.filter(~pl.col("_baseline"))
@@ -103,7 +104,8 @@ class RawQueryService:
             snapshot=snapshot,
         )
         frame = _attested_versions(frame, snapshot["checks"], snapshot["record_checks"],
-                                   as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id)
+                                   as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id,
+                                   full_commit_checks=snapshot.get("full_commit_checks", ()))
         names = frame.collect_schema().names()
         if strict and "_baseline" in names:
             frame = frame.filter(~pl.col("_baseline"))
@@ -224,6 +226,7 @@ def _attested_versions(
     frame: pl.LazyFrame, checks: Sequence[Mapping], record_checks: Sequence[Mapping], *,
     as_of_date: DateLike | None = None, ingested_before: datetime | None = None,
     max_check_id: int | None = None,
+    full_commit_checks: Sequence[Mapping] = (),
 ) -> pl.LazyFrame:
     """Overlay exact unchanged-content witnesses without replacing stored history.
 
@@ -266,8 +269,19 @@ def _attested_versions(
             and (cutoff is None or _date_value(record["available_date"]) <= cutoff)
         ]
     originals = frame.with_columns(pl.lit(None, dtype=pl.Int64).alias("_attestation_id"))
+    copies = []
+    from bagelquant_data.storage.full_commit_checks import validate_seal
+    for seal in full_commit_checks:
+        validate_seal(seal)
+        check = seal["binding"]["check"]
+        if int(check["id"]) not in eligible or cutoff is not None and _date_value(seal["available_date"]) > cutoff:
+            continue
+        copies.append(frame.filter(pl.col("_baseline") & (pl.col("_commit_seq") == int(check["visible_commit"]))).with_columns(
+            pl.max_horizontal(pl.col("time"), pl.lit(_date_value(seal["available_date"]))).alias("time"),
+            pl.lit(datetime.fromisoformat(str(check["checked_at"])), dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
+            pl.lit(False).alias("_baseline"), pl.lit(int(check["id"]), dtype=pl.Int64).alias("_attestation_id")))
     if not witnesses:
-        return originals
+        return pl.concat([originals, *copies], how="vertical") if copies else originals
     witnessed = frame.filter(pl.col("_baseline")).join(pl.DataFrame(witnesses, schema=schema).lazy(), on=keys, how="inner")
     axis = "snapshot_date" if general else "time"
     witnessed = witnessed.with_columns(
@@ -275,7 +289,7 @@ def _attested_versions(
         pl.col("_attested_ingested").alias("ingested_at"),
         pl.lit(False).alias("_baseline"),
     ).drop("_attested_date", "_attested_ingested")
-    return pl.concat([originals, witnessed.select(originals.collect_schema().names())], how="vertical")
+    return pl.concat([originals, witnessed.select(originals.collect_schema().names()), *copies], how="vertical")
 
 
 def _date_value(value: DateLike) -> date:

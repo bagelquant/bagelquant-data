@@ -154,3 +154,76 @@ def test_empty_built_window_uses_its_proof_when_other_windows_have_rows(tmp_path
     outside = lake.inputs.freeze({"item": ItemInput("item", start="2020-01-03", end="2020-01-03",
                                                      view="snapshot")}, information_cutoff="2020-01-03")
     assert not lake.inputs.is_current(outside)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_single_current_parent_proves_item_freshness_without_value_scan(tmp_path, monkeypatch, empty):
+    lake = _lake(tmp_path)
+    lake.raw.ingest(_spec(), _frame(), ingested_at=_received(1))
+    raw = RawInput("custom", "raw", view="versions")
+    lake.items.register(DataItemSpec("item", (raw,), producer_key="external", producer_revision="1"))
+    inputs = lake.inputs.freeze({"raw": raw}, information_cutoff="2020-01-03")
+    lake.items.ingest("item", _frame().head(0) if empty else _frame(),
+                      available_date="2020-01-01", input_receipt=inputs)
+    output = lake.inputs.freeze({"item": ItemInput("item")}, information_cutoff="2020-01-03")
+    reader = _lake(tmp_path, read_only=True).inputs
+
+    def scan(*_args, **_kwargs):
+        pytest.fail("a single current dependency proof must not scan Item values")
+
+    monkeypatch.setattr(reader, "_read_frame", scan)
+    assert reader.is_current(output)
+
+
+def test_stale_single_parent_falls_back_to_the_selected_window(tmp_path, monkeypatch):
+    lake = _lake(tmp_path)
+    lake.raw.ingest(_spec(), _frame(), ingested_at=_received(1))
+    raw = RawInput("custom", "raw", view="versions")
+    lake.items.register(DataItemSpec("item", (raw,), producer_key="external", producer_revision="1"))
+    inputs = lake.inputs.freeze({"raw": raw}, information_cutoff="2020-01-03")
+    lake.items.ingest("item", _frame(), available_date="2020-01-01", input_receipt=inputs)
+    output = lake.inputs.freeze({"item": ItemInput("item")}, information_cutoff="2020-01-03")
+    lake.raw.ingest(_spec(), _frame(2.0), ingested_at=_received(2))
+    reader = _lake(tmp_path, read_only=True).inputs
+    original = reader._read_frame
+    scanned = []
+
+    def scan(receipt, alias):
+        scanned.append(alias)
+        return original(receipt, alias)
+
+    monkeypatch.setattr(reader, "_read_frame", scan)
+    assert not reader.is_current(output)
+    assert scanned == ["item"]
+
+
+def test_shared_batches_verify_once_per_request_and_recheck_next_request(tmp_path, monkeypatch):
+    from bagelquant_data import inputs as module
+
+    lake = _lake(tmp_path)
+    lake.raw.ingest(_spec(), _frame(), mode="initialize", ingested_at=_received(1))
+    for name in ("first", "second"):
+        lake.items.register(DataItemSpec(name, (RawInput("custom", "raw"),), time_column="source_time"))
+        lake.items.initialize(name, start="2020-01-01", end="2020-01-01")
+    frozen = lake.inputs.freeze({name: ItemInput(name) for name in ("first", "second")},
+                                information_cutoff="2020-01-03")
+    original = module.verify_batch
+    calls = []
+
+    def read(store, path, commit, expected_hash, **options):
+        calls.append((commit, path, expected_hash))
+        return original(store, path, commit, expected_hash, **options)
+
+    monkeypatch.setattr(module, "verify_batch", read)
+    first = lake.inputs.verify(frozen)
+    assert first["batch_count"] == 4 and len(calls) == len(set(calls)) == 3
+    calls.clear()
+    assert lake.inputs.verify(frozen) == first
+    assert len(calls) == 3
+
+    def lost_batch(*_args, **_kwargs):
+        raise RuntimeError("fixture lost immutable batch")
+
+    monkeypatch.setattr(module, "verify_batch", lost_batch)
+    with pytest.raises(RuntimeError, match="lost immutable batch"):
+        lake.inputs.verify(frozen)

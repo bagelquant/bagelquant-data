@@ -113,6 +113,23 @@ Producer: TypeAlias = Callable[[BuildContext], pl.DataFrame | pl.LazyFrame]
 
 
 @dataclass(frozen=True, slots=True)
+class ItemPublication:
+    """Historical versions followed by an optional complete-range replacement."""
+    name: str
+    frame: pl.DataFrame
+    expected_definition_hash: str | None = None
+    start: DateLike | None = None
+    end: DateLike | None = None
+    complete_at: DateLike | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name or not isinstance(self.frame, pl.DataFrame):
+            raise ValueError("ItemPublication requires an item name and DataFrame")
+        if (self.start is None) != (self.end is None) or (self.start is None) != (self.complete_at is None):
+            raise ValueError("Complete publication requires start, end and complete_at together")
+
+
+@dataclass(frozen=True, slots=True)
 class ItemBuildReport:
     name: str
     status: str

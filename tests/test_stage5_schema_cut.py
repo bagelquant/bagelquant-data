@@ -1,4 +1,4 @@
-"""Declaration receipts require an explicit fresh schema-six lake."""
+"""Declaration receipts require an explicit fresh schema-seven lake."""
 from contextlib import closing
 import sqlite3
 
@@ -44,11 +44,11 @@ def test_schema_five_open_rejects_before_any_storage_changes(tmp_path, previous_
     assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
 
 
-def test_new_lake_has_schema_six_and_read_only_declaration_receipts(tmp_path):
+def test_new_lake_has_schema_seven_and_read_only_declaration_receipts(tmp_path):
     metadata, root = tmp_path / "data_meta.sqlite", tmp_path / "lake"
     DataLake.open(data_meta_path=metadata, lake_path=root).close()
     with closing(sqlite3.connect(metadata.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-        assert connection.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "6"
+        assert connection.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "7"
     lake = DataLake.open(data_meta_path=metadata, lake_path=root, read_only=True)
     assert lake.catalog.declaration_batch_receipt("missing-request") is None
 
@@ -64,7 +64,7 @@ def test_fresh_lake_schema_can_be_entirely_in_live_wal(tmp_path):
         with closing(sqlite3.connect(metadata.as_uri() + "?mode=ro&immutable=1", uri=True)) as main_only:
             assert main_only.execute("SELECT name FROM sqlite_master WHERE name='data_meta_state'").fetchone() is None
         keeper.rollback()
-        assert keeper.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "6"
+        assert keeper.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "7"
         before = _files(tmp_path)
         DataMetaStore.check_compatibility(metadata)
         assert DataLake.inspect(data_meta_path=metadata, lake_path=root)["status"] == "ready"
@@ -74,7 +74,7 @@ def test_fresh_lake_schema_can_be_entirely_in_live_wal(tmp_path):
         lake.close()
 
 
-@pytest.mark.parametrize("checkpointed,committed", [("5", "6"), ("6", "5")])
+@pytest.mark.parametrize("checkpointed,committed", [("5", "7"), ("7", "5")])
 def test_compatibility_probe_reads_live_wal_without_any_source_writes(tmp_path, checkpointed, committed):
     metadata, root = tmp_path / "data_meta.sqlite", tmp_path / "lake"
     DataLake.open(data_meta_path=metadata, lake_path=root).close()
@@ -88,7 +88,7 @@ def test_compatibility_probe_reads_live_wal_without_any_source_writes(tmp_path, 
         with closing(sqlite3.connect(metadata.as_uri() + "?mode=ro&immutable=1", uri=True)) as main_only:
             assert main_only.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == checkpointed
         before = _files(tmp_path)
-        if committed == "6":
+        if committed == "7":
             DataMetaStore.check_compatibility(metadata)
         else:
             with pytest.raises(ConfigurationError, match="Automatic migration is disabled"):
@@ -98,7 +98,7 @@ def test_compatibility_probe_reads_live_wal_without_any_source_writes(tmp_path, 
                     DataLake.open(data_meta_path=metadata, lake_path=root, read_only=read_only)
         inspection = DataLake.inspect(data_meta_path=metadata, lake_path=root)
         assert inspection["schema_version"] == committed
-        assert inspection["status"] == ("ready" if committed == "6" else "incompatible")
+        assert inspection["status"] == ("ready" if committed == "7" else "incompatible")
         assert _files(tmp_path) == before
 
 
@@ -109,7 +109,7 @@ def test_probe_retries_if_source_changes_during_snapshot(tmp_path, monkeypatch):
         writer.execute("PRAGMA wal_autocheckpoint=0")
         writer.execute("UPDATE data_meta_state SET value='5' WHERE key='schema_version'")
         writer.commit()
-        writer.execute("UPDATE data_meta_state SET value='6' WHERE key='schema_version'")
+        writer.execute("UPDATE data_meta_state SET value='7' WHERE key='schema_version'")
         writer.commit()
         import bagelquant_data.storage.data_meta as module
         original = module.shutil.copyfile
@@ -149,7 +149,7 @@ def test_public_inspect_never_creates_directories_or_checkpointed_sidecars(tmp_p
     assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*")} == entries
 
 
-def test_schema_six_missing_receipt_authority_is_not_auto_created(tmp_path):
+def test_schema_seven_missing_receipt_authority_is_not_auto_created(tmp_path):
     metadata, root = tmp_path / "data_meta.sqlite", tmp_path / "lake"
     DataLake.open(data_meta_path=metadata, lake_path=root).close()
     with closing(sqlite3.connect(metadata)) as writer:
@@ -173,14 +173,14 @@ def test_probe_refuses_uncommitted_rollback_pages_without_recovery(tmp_path):
         writer.execute("PRAGMA cache_size=1")
         writer.execute("PRAGMA cache_spill=ON")
         writer.execute("BEGIN IMMEDIATE")
-        writer.execute("UPDATE data_meta_state SET value='6' WHERE key='schema_version'")
+        writer.execute("UPDATE data_meta_state SET value='7' WHERE key='schema_version'")
         writer.executemany("INSERT INTO padding(value) VALUES(?)", [(b"x" * 65536,) for _ in range(40)])
         journal = metadata.with_name(metadata.name + "-journal")
         assert journal.stat().st_size > 0 and any(journal.read_bytes()[:8])
-        # SQLite has spilled an uncommitted schema-six page into the main file.
+        # SQLite has spilled an uncommitted schema-seven page into the main file.
         # A main-only immutable read would incorrectly declare this lake ready.
         with closing(sqlite3.connect(metadata.as_uri() + "?mode=ro&immutable=1", uri=True)) as unsafe:
-            assert unsafe.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "6"
+            assert unsafe.execute("SELECT value FROM data_meta_state WHERE key='schema_version'").fetchone()[0] == "7"
         before = _files(tmp_path)
         assert DataLake.inspect(data_meta_path=metadata, lake_path=root) == {
             "status": "incompatible", "reason": "metadata_unreadable", "schema_version": None,

@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import nullcontext
 import polars as pl
 
 from bagelquant_data.execution import ExecutionOptions
@@ -146,6 +147,12 @@ def general_input_snapshot(
     return baseline.filter(pl.col("snapshot_date") == baseline["snapshot_date"].max())
 
 
+def _same_ordered_rows(left: pl.DataFrame, right: pl.DataFrame, fields: Sequence[str]) -> bool:
+    """Prove exact ordered equality without allocating a hash-join working set."""
+    lhs, rhs = left.select(fields), right.select(fields)
+    return lhs.schema == rhs.schema and lhs.equals(rhs, null_equal=True)
+
+
 def iter_computed_versions(
     *, raw: Mapping[str, pl.DataFrame], items: Mapping[str, pl.DataFrame],
     start: date, end: date, evaluate: Callable[[dict, dict], pl.DataFrame],
@@ -154,6 +161,7 @@ def iter_computed_versions(
     evaluate_at: Callable[[dict, dict, date], pl.DataFrame] | None = None,
     config: ExecutionOptions | None = None,
     cancelled: Callable[[], bool] | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) :
     """Yield causal revisions with one caller-bounded evaluation worker pool.
 
@@ -168,7 +176,8 @@ def iter_computed_versions(
         | {day for day in extra_boundaries if start < day <= end}
     ))
     previous: pl.DataFrame | None = None
-    admission = min(options.max_in_flight or options.workers, options.workers, options.batch_size or options.workers)
+    admission = min(options.max_in_flight or options.workers, options.workers,
+                    options.batch_size or options.workers, len(boundaries))
     output_limit = options.max_buffer_bytes // (admission + 1)
 
     def calculate(index: int) -> tuple[date | None, pl.DataFrame]:
@@ -194,12 +203,15 @@ def iter_computed_versions(
         changed = frame
         if previous is not None:
             identity = [name for name in ("time", "asset_id", "value", "observation_date", "available_date", "_build_baseline") if name in previous.columns]
-            changed = frame.join(previous.select(identity), on=identity, how="anti", nulls_equal=True)
-            removed = previous.join(frame.select("time", "asset_id"), on=["time", "asset_id"], how="anti")
-            if removed.height:
-                removed = removed.with_columns(pl.lit(None, dtype=previous.schema["value"]).alias("value"),
-                                               pl.max_horizontal(pl.col("time"), pl.lit(boundary)).alias(VERSION_DATE))
-                changed = pl.concat([changed, removed], how="diagonal_relaxed")
+            if _same_ordered_rows(frame, previous, identity):
+                changed = frame.head(0)
+            else:
+                changed = frame.join(previous.select(identity), on=identity, how="anti", nulls_equal=True)
+                removed = previous.join(frame.select("time", "asset_id"), on=["time", "asset_id"], how="anti")
+                if removed.height:
+                    removed = removed.with_columns(pl.lit(None, dtype=previous.schema["value"]).alias("value"),
+                                                   pl.max_horizontal(pl.col("time"), pl.lit(boundary)).alias(VERSION_DATE))
+                    changed = pl.concat([changed, removed], how="diagonal_relaxed")
         previous = frame
         return changed.filter(pl.col("time").is_between(start, end) & (pl.col(VERSION_DATE) <= end))
 
@@ -207,18 +219,26 @@ def iter_computed_versions(
         for index in range(len(boundaries)):
             yield reconcile(*calculate(index))
         return
-    with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="data-item") as executor:
-        for first in range(0, len(boundaries), admission):
-            if cancelled and cancelled():
-                raise CancelledError("DataItem build cancelled")
-            pending = [executor.submit(calculate, index) for index in range(first, min(first + admission, len(boundaries)))]
-            buffered = 0
+    # Builds share this pool with partition preparation; yielding a revision
+    # must not admit a second, independently sized writer pool.
+    with (nullcontext(executor) if executor is not None else
+          ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="data-item")) as pool:
+        pending = []
+        try:
+            for first in range(0, len(boundaries), admission):
+                if cancelled and cancelled():
+                    raise CancelledError("DataItem build cancelled")
+                pending = [pool.submit(calculate, index) for index in range(first, min(first + admission, len(boundaries)))]
+                buffered = 0
+                for future in pending:
+                    boundary, frame = future.result()
+                    buffered += frame.estimated_size()
+                    if buffered > options.max_buffer_bytes:
+                        raise MemoryError("Admitted producer outputs exceed max_buffer_bytes; reduce max_in_flight")
+                    yield reconcile(boundary, frame)
+        finally:
             for future in pending:
-                boundary, frame = future.result()
-                buffered += frame.estimated_size()
-                if buffered > options.max_buffer_bytes:
-                    raise MemoryError("Admitted producer outputs exceed max_buffer_bytes; reduce max_in_flight")
-                yield reconcile(boundary, frame)
+                future.cancel()
 
 
 def compute_versions(*, raw: Mapping[str, pl.DataFrame], items: Mapping[str, pl.DataFrame], start: date, end: date,
@@ -241,4 +261,3 @@ def compute_versions(*, raw: Mapping[str, pl.DataFrame], items: Mapping[str, pl.
             .sort(VERSION_DATE, "time", "asset_id"))
 
 __all__ = ['revision_dates', 'select_versions', 'input_snapshot', 'general_input_snapshot', 'compute_versions', 'iter_computed_versions']
-

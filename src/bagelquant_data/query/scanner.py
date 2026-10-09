@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from pathlib import Path
 
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.storage.data_meta import DataMetaStore
@@ -37,15 +36,6 @@ def manifest_rows(
             continue
         rows.append(row)
     return rows
-
-
-def manifest_paths(metadata: DataMetaStore, source: str, dataset: str) -> list[Path]:
-    """Return all known manifest paths for compatibility."""
-
-    return [
-        Path(str(row["partition_path"]))
-        for row in manifest_rows(metadata, source, dataset)
-    ]
 
 
 def _date_value(value: DateLike) -> date:

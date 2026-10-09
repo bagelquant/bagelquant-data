@@ -241,7 +241,9 @@ def inspect_coverage(spec, raw, metadata, *, start, end):
         commits = raw._commits(spec.source, spec.name, None, None)
         manifests = metadata.manifest(spec.source, spec.name)
         complete = bool(commits and commits[-1]["spec_hash"] == current_hash and manifests) and all(
-            (raw.parquet.paths.dataset_root(spec.source, spec.name) / m["partition_path"]).is_file()
+            raw.parquet.paths.generation_path(
+                spec.source, spec.name, m["partition_path"], m["generation_path"]
+            ).is_file()
             for m in manifests
         )
         return {"complete": complete, "missing": [] if complete else ["complete_snapshot"],
@@ -270,11 +272,30 @@ def compact_daily_range_backfill(
     spec: DatasetSpec,
     requests: Sequence[LedgerRequest],
     source_options: Mapping[str, object] | None,
+    *, initialize: bool = False,
 ) -> tuple[LedgerRequest, ...]:
     """Compact untouched daily backlog into bounded physical range requests."""
 
     if spec.update_type != "by_date" or not source_options:
         return tuple(requests)
+    scan = source_options.get("initialization_scan")
+    if scan is not None:
+        if not isinstance(scan, Mapping):
+            raise ConfigurationError("initialization_scan must be a mapping")
+        result = [request for request in requests if not request.range_backfill_eligible]
+        by_variant: dict[str, list[LedgerRequest]] = {}
+        for request in requests:
+            if request.range_backfill_eligible:
+                by_variant.setdefault(request.variant_hash or "", []).append(request)
+        for pending in by_variant.values():
+            first = pending[0]
+            params = dict(first.params)
+            params.pop(spec.date_param or "date", None)
+            result.append(LedgerRequest(params=params, request_kind="initial_full_scan",
+                target_end=pending[-1].target_end,
+                daily_scopes=tuple(scope for request in pending for scope in request.daily_scopes),
+                scope_ordinal=first.scope_ordinal, variant_hash=first.variant_hash))
+        return tuple(result)
     raw_policy = source_options.get("daily_range_backfill")
     if raw_policy is None:
         return tuple(requests)
@@ -287,13 +308,21 @@ def compact_daily_range_backfill(
             "daily_range_backfill start_param and end_param must differ"
         )
     max_scopes = _positive_option(raw_policy, "max_scopes", 1024)
+    window = raw_policy.get("window", "bounded")
+    if window not in {"bounded", "calendar_month"}:
+        raise ConfigurationError("daily_range_backfill window must be bounded or calendar_month")
     _positive_option(raw_policy, "row_limit")
     _positive_option(raw_policy, "max_pages", 10_000)
 
-    result = [request for request in requests if not request.range_backfill_eligible]
+    monthly_recheck = (initialize or bool(source_options.get("refresh"))) and window == "calendar_month"
+
+    def eligible_for_range(request: LedgerRequest) -> bool:
+        return request.range_backfill_eligible or (monthly_recheck and bool(request.daily_scopes))
+
+    result = [request for request in requests if not eligible_for_range(request)]
     eligible_by_variant: dict[str, list[LedgerRequest]] = {}
     for request in requests:
-        if request.range_backfill_eligible:
+        if eligible_for_range(request):
             eligible_by_variant.setdefault(request.variant_hash or "", []).append(
                 request
             )
@@ -308,6 +337,8 @@ def compact_daily_range_backfill(
                 and len(group) < max_scopes
                 and group[-1].scope_ordinal is not None
                 and pending[cursor].scope_ordinal == group[-1].scope_ordinal + 1
+                and (window != "calendar_month" or
+                     pending[cursor].daily_scopes[0].scope_key[:7] == group[0].daily_scopes[0].scope_key[:7])
             ):
                 group.append(pending[cursor])
                 cursor += 1

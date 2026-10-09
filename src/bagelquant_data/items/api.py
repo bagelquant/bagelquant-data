@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
-from concurrent.futures import CancelledError
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from contextlib import closing, contextmanager
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, cast, overload
+from threading import Lock, get_ident
 from uuid import uuid4
 
 import polars as pl
@@ -19,8 +22,8 @@ from bagelquant_data.pipeline.versions import VERSION_FIELDS, commit_versions
 from bagelquant_data.query.raw import RawQueryService, _date_value
 from bagelquant_data.transforms import apply_transforms, scalar_dtype
 
-from .types import BuildContext, DataItemSpec, ItemBuildReport, ItemInput, Producer, RawInput, spec_from_payload, spec_payload
-from .pit import general_input_snapshot, iter_computed_versions
+from .types import BuildContext, DataItemSpec, ItemBuildReport, ItemInput, ItemPublication, Producer, RawInput, spec_from_payload, spec_payload
+from .pit import _same_ordered_rows, general_input_snapshot, iter_computed_versions
 
 if TYPE_CHECKING:
     from bagelquant_data.management.lake import DataLake
@@ -29,6 +32,70 @@ if TYPE_CHECKING:
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _baseline_publication_groups(frame: pl.DataFrame, rows: int, byte_limit: int):
+    """Keep independent baseline coordinates in causal, bounded batches."""
+    for group in frame.sort("version_available_date", "time", "asset_id").iter_slices(rows):
+        pending = [group]
+        while pending:
+            part = pending.pop()
+            if part.height > 1 and part.estimated_size() > byte_limit:
+                middle = part.height // 2
+                pending.extend((part.slice(middle), part.head(middle)))
+                continue
+            yield _date_value(cast(DateLike, part["version_available_date"].max())), part
+
+
+@dataclass(slots=True)
+class _PublicationVerification:
+    owner: ItemAPI
+    receipt_id: str
+    digest: str
+    active: bool = True
+    thread_id: int = field(default_factory=get_ident)
+    timing_cache_entries: int = 0
+    baseline_dates: dict[date, bool] = field(default_factory=dict)
+
+
+class ItemPublisher:
+    """Serial output groups in one verified immutable-input operation."""
+
+    def __init__(self, owner: ItemAPI, receipt: FrozenInputReceipt | None,
+                 verification: _PublicationVerification,
+                 cancelled: Callable[[], bool] | None) -> None:
+        self._owner, self._receipt = owner, receipt
+        self._verification, self._cancelled = verification, cancelled
+        self._lock = Lock()
+
+    @property
+    def lake(self) -> DataLake:
+        return self._owner._lake
+
+    @property
+    def input_receipt(self) -> FrozenInputReceipt | None:
+        return self._receipt
+
+    @property
+    def active(self) -> bool:
+        return self._verification.active
+
+    def publish(self, publications: Sequence[ItemPublication]) -> dict[str, ItemBuildReport | None]:
+        if not self._verification.active:
+            raise RuntimeError("DataItem publication operation has closed")
+        if get_ident() != self._verification.thread_id:
+            raise RuntimeError("DataItem publication requires its owning thread")
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("DataItem publication groups must be serial")
+        try:
+            return self._owner._publish(publications, input_receipt=self._receipt,
+                cancelled=self._cancelled, _verification=self._verification)
+        except BaseException:
+            self._verification.active = False
+            self._verification.baseline_dates.clear()
+            raise
+        finally:
+            self._lock.release()
 
 
 class ItemAPI:
@@ -145,6 +212,19 @@ class ItemAPI:
             db.execute("delete from catalog_assignments where kind='item' and object_key=?", (name,))
             db.execute("update datasets set active=0,enabled=0 where source='items' and name=?", (name,))
 
+    def plan_update(self, name: str, *, end: DateLike, start: DateLike = "2000-01-01") -> list[dict[str, str]]:
+        """Plan initialization/resume/incremental work from committed evidence, including empties."""
+        from bagelquant_data.pipeline.planning import initialization_actions
+        definition_hash = hashlib.sha256(_json(spec_payload(self.get(name))).encode()).hexdigest()
+        rows = self._store._rows("select * from item_initializations where name=?", (name,))
+        row = rows[0] if rows else None
+        initialization = None if row is None else {"status": row["status"], "start": row["start_date"],
+            "end": row["end_date"], "definition_hash": row["definition_hash"]}
+        history = bool(self._store._rows("select 1 from version_commits where source='items' and dataset=? and status='committed' limit 1", (name,)))
+        history = history or bool(self._store._rows("select 1 from item_builds where name=? and status='success' limit 1", (name,)))
+        return initialization_actions(start=_date_value(start), end=_date_value(end),
+            definition_hash=definition_hash, initialization=initialization, has_history=history)
+
     def initialize(self, name: str, *, end: DateLike, start: DateLike = "2000-01-01", config: ExecutionOptions | None = None,
                    progress: Callable[[ItemBuildReport], None] | None = None, cancelled: Callable[[], bool] | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
@@ -173,15 +253,19 @@ class ItemAPI:
 
     def update(self, name: str, *, end: DateLike, start: DateLike | None = None, config: ExecutionOptions | None = None,
                progress: Callable[[ItemBuildReport], None] | None = None, cancelled: Callable[[], bool] | None = None,
-               force: bool = False) -> ItemBuildReport:
+               force: bool = False,
+               input_windows: Mapping[str, tuple[DateLike, DateLike]] | None = None) -> ItemBuildReport:
         """Conservatively recompute the persisted materialized range.
 
         No unverified lookback or producer formula is used to infer how far a
         historical revision propagates. Dependency identity controls reuse.
+        Explicit input_windows are caller-declared dependency observation
+        windows, pinned in the actual frozen requests without changing the
+        stored DataItem definition. Omitted dependencies retain their scope.
         """
         rows = self._store._rows("select min(start_date) as start_date from item_builds where name=? and status='success'", (name,))
         first = start or (rows[0]["start_date"] if rows and rows[0]["start_date"] else "2000-01-01")
-        return self._build(name, start=_date_value(first), end=_date_value(end), initialize=False, config=config, stack=(), progress=progress, cancelled=cancelled, force=force)
+        return self._build(name, start=_date_value(first), end=_date_value(end), initialize=False, config=config, stack=(), progress=progress, cancelled=cancelled, force=force, input_windows=input_windows)
 
     def ingest(
         self, name: str, frame: pl.DataFrame, *, available_date: DateLike | None = None,
@@ -202,7 +286,15 @@ class ItemAPI:
                 input_receipt: FrozenInputReceipt | str | None,
                 expected_definition_hash: str | None, run_id: str,
                 _baseline_proven: bool = False,
-                _declared_range: tuple[date, date] | None = None) -> ItemBuildReport:
+                _declared_range: tuple[date, date] | None = None,
+                writer_executor: ThreadPoolExecutor | None = None,
+                partition_workers: int = 1,
+                writer_buffer_bytes: int = 0,
+                commit_batch_rows: int | None = None,
+                commit_batch_bytes: int | None = None,
+                cancelled: Callable[[], bool] | None = None,
+                on_commit: Callable[[int, int | None], None] | None = None,
+                _verification: _PublicationVerification | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
         spec = self.get(name)
         explicit_availability = "available_date" in frame.columns or "version_available_date" in frame.columns
@@ -218,7 +310,12 @@ class ItemAPI:
                 return ("raw", value.source, value.dataset) if isinstance(value, RawInput) else ("item", value.name)
             if {identity(value) for value in spec.inputs} != {identity(value) for value in receipt.requests.values()}:
                 raise ValueError("Frozen input receipt does not match declared DataItem dependencies")
-            self._lake.inputs.verify(receipt)
+            if _verification is None:
+                self._lake.inputs.verify(receipt)
+            elif not (_verification.active and _verification.owner is self
+                      and _verification.receipt_id == receipt.receipt_id
+                      and _verification.digest == receipt.digest):
+                raise RuntimeError("Publication input verification no longer matches this operation")
         now = ingested_at or datetime.now(UTC)
         if now.tzinfo is None:
             raise ValueError("ingested_at must be timezone-aware")
@@ -239,25 +336,46 @@ class ItemAPI:
             publication_dates = [_date_value(available_date) if available_date is not None else now.astimezone(UTC).date()]
         baseline_by_date = {cutoff: historical_baseline for cutoff in publication_dates}
         if receipt is not None and not historical_baseline and not _baseline_proven:
+            cutoffs = {day: min(day, receipt.information_cutoff) if receipt.information_cutoff is not None else day
+                       for day in publication_dates}
+            cache = {} if _verification is None else _verification.baseline_dates
+            unresolved = [day for day in publication_dates if cutoffs[day] not in cache]
+            for day in publication_dates:
+                if cutoffs[day] in cache:
+                    baseline_by_date[day] = cache[cutoffs[day]]
             # A caller cannot promote unknown input timing by omitting the
             # output baseline flag. Retained original baselines cease to
             # taint a later version once exact input attestations are visible.
             for alias in receipt.requests:
+                pending = [day for day in unresolved if not baseline_by_date[day]]
+                if not pending:
+                    break
                 # Every immutable commit records the timing flag written on
                 # all its rows; empty general identities carry the same proof.
                 # Selection and attestations can only remove a baseline, never
                 # create one. Verified inputs need no repeated prefix replay.
                 if not self._lake.inputs._could_have_baseline(receipt, alias):
                     continue
-                versions = self._lake.inputs._read_frame(receipt, alias)
-                for publication_date in publication_dates:
-                    if baseline_by_date[publication_date]:
-                        continue
-                    cutoff = publication_date
-                    if receipt.information_cutoff is not None:
-                        cutoff = min(cutoff, receipt.information_cutoff)
+                for day in pending:
+                    if self._lake.inputs._proven_baseline_at(receipt, alias, cutoffs[day]) is True:
+                        baseline_by_date[day] = True
+                pending = [day for day in pending if not baseline_by_date[day]]
+                if not pending:
+                    continue
+                versions = self._lake.inputs._read_frame(receipt, alias,
+                    timing_cutoff=max(cutoffs[day] for day in pending))
+                for publication_date in pending:
+                    cutoff = cutoffs[publication_date]
                     if self._lake.inputs._baseline_at(receipt, alias, cutoff, frame=versions):
                         baseline_by_date[publication_date] = True
+            # Only complete OR results enter this operation's fixed-receipt memo.
+            # Dates are independent: later attestations can change True to False.
+            if _verification is not None and _verification.timing_cache_entries:
+                for day in unresolved:
+                    key = cutoffs[day]
+                    if key not in cache and len(cache) >= _verification.timing_cache_entries:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = baseline_by_date[day]
         if frame.select("time", "asset_id", "version_available_date").is_duplicated().any():
             raise ValueError("DataItem contains duplicate version keys")
         first = _date_value(cast(DateLike, frame["time"].min())) if frame.height else date(2000, 1, 1)
@@ -271,20 +389,42 @@ class ItemAPI:
         # to sequence. One atomic commit preserves its row availability dates and
         # writes each month once. Existing content, repeated coordinates and mixed
         # timing proof retain chronological publications below.
+        has_committed = bool(self._store._rows(
+            "select 1 from version_commits where source='items' and dataset=? "
+            "and status='committed' limit 1", (name,),
+        ))
         initial_bulk = (
             frame.height > 0 and len(publication_dates) > 1
             and len(set(baseline_by_date.values())) == 1
             and not frame.select("time", "asset_id").is_duplicated().any()
-            and not self._store._rows(
-                "select 1 from version_commits where source='items' and dataset=? "
-                "and status='committed' limit 1", (name,),
-            )
+            and not has_committed
         )
         if initial_bulk:
             publication_dates = [publication_dates[-1]]
+        # Resuming an internally evaluated unverified baseline need not rewrite
+        # a month for every day. Each coordinate has one causal version, and
+        # baseline checks cannot promote strict visibility. Verified no-op
+        # witnesses retain date-by-date checks (their check date is causal).
+        resume_bulk = (frame.height > 0 and has_committed and _baseline_proven and historical_baseline
+                       and commit_batch_rows is not None and commit_batch_bytes is not None
+                       and len(set(baseline_by_date.values())) == 1
+                       and not frame.select("time", "asset_id").is_duplicated().any())
+        # Only first-publication deltas have bounded old-partition memory (zero).
+        # Use the still-unused previous-revision reserve for preparation, with
+        # a conservative allowance for sort/hash/Arrow/compressed copies.
+        admitted_writers = 1
+        if initial_bulk and partition_workers > 1 and writer_buffer_bytes:
+            parts = frame.with_columns(pl.col("version_available_date").dt.strftime("%Y-%m").alias("_writer_month")).partition_by("_writer_month")
+            largest = max(int(part.estimated_size()) for part in parts)
+            admitted_writers = max(1, min(partition_workers, len(parts), writer_buffer_bytes // max(1, 6 * largest)))
+            del parts
         rows_committed = 0
-        for publication_date in publication_dates:
-            group = frame if initial_bulk else frame.filter(pl.col("version_available_date") == publication_date)
+        groups = _baseline_publication_groups(frame, cast(int, commit_batch_rows), cast(int, commit_batch_bytes)) if resume_bulk else (
+                      (day, frame if initial_bulk else frame.filter(pl.col("version_available_date") == day))
+                      for day in publication_dates)
+        for publication_date, group in groups:
+            if cancelled and cancelled():
+                raise CancelledError("DataItem publication cancelled")
             delta = group.rename({"time": "source_time", "version_available_date": "time"})
             result = commit_versions(
                 physical, delta, self._parquet, run_id=run_id,
@@ -293,8 +433,15 @@ class ItemAPI:
                 historical_baseline=baseline_by_date[publication_date],
                 input_receipt_id=None if receipt is None else receipt.receipt_id,
                 requests=None if _declared_range is None else [{"item_range": {"start": first.isoformat(), "end": last.isoformat()}}],
+                writer_executor=writer_executor if admitted_writers > 1 else None,
+                partition_workers=admitted_writers,
             )
             rows_committed += result.rows_committed
+            if on_commit:
+                latest = self._store._rows("select max(seq) as seq from version_commits where source='items' and dataset=? and status='committed'", (name,))[0]["seq"]
+                on_commit(rows_committed, latest)
+        if cancelled and cancelled():
+            raise CancelledError("DataItem publication cancelled")
         commits = self._store._rows("select max(seq) as seq from version_commits where source='items' and dataset=? and status='committed'", (name,))
         seq = commits[0]["seq"] if commits else None
         if receipt is not None:
@@ -304,14 +451,24 @@ class ItemAPI:
 
     def _publish_proven(self, name: str, frame: pl.DataFrame, *, historical_baseline: bool,
                         input_receipt: FrozenInputReceipt,
-                        expected_definition_hash: str) -> ItemBuildReport:
+                        expected_definition_hash: str,
+                        writer_executor: ThreadPoolExecutor | None = None,
+                        partition_workers: int = 1,
+                        writer_buffer_bytes: int = 0,
+                        commit_batch_rows: int | None = None,
+                        commit_batch_bytes: int | None = None,
+                        cancelled: Callable[[], bool] | None = None,
+                        on_commit: Callable[[int, int | None], None] | None = None) -> ItemBuildReport:
         """Publish only internally evaluated frames with selected timing proof."""
         run_id = uuid4().hex
         with self._store.dataset_writer("items", name, run_id):
             return self._ingest(name, frame, available_date=None,
                 historical_baseline=historical_baseline, ingested_at=None,
                 input_receipt=input_receipt, expected_definition_hash=expected_definition_hash,
-                run_id=run_id, _baseline_proven=True)
+                run_id=run_id, _baseline_proven=True,
+                writer_executor=writer_executor, partition_workers=partition_workers,
+                writer_buffer_bytes=writer_buffer_bytes, commit_batch_rows=commit_batch_rows,
+                commit_batch_bytes=commit_batch_bytes, cancelled=cancelled, on_commit=on_commit)
 
     def replace_range(self, name: str, frame: pl.DataFrame, *, start: DateLike, end: DateLike,
                       available_date: DateLike, input_receipt: FrozenInputReceipt | str | None = None,
@@ -320,22 +477,127 @@ class ItemAPI:
         """Publish a complete coordinate range, with null events for withdrawn keys."""
         run_id = uuid4().hex
         with self._store.dataset_writer("items", name, run_id):
-            spec = self.get(name)
-            first, last, cutoff = _date_value(start), _date_value(end), _date_value(available_date)
-            if last < first:
-                raise ValueError("end precedes start")
-            normalized = self._normalize(spec, frame)
-            if normalized.filter(~pl.col("time").is_between(first, last)).height:
-                raise ValueError("Replacement output lies outside its declared range")
-            existing = self.read(name, start=first, end=last, view="snapshot", as_of=cutoff).collect()
-            removed = existing.join(normalized.select("time", "asset_id"), on=["time", "asset_id"], how="anti")
-            tombstones = removed.select("time", "asset_id").with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"))
-            from bagelquant_data.core.schema import concat_compatible_frames
-            combined = concat_compatible_frames([normalized, tombstones]) if tombstones.height else normalized
-            return self._ingest(name, combined, available_date=cutoff,
-                historical_baseline=historical_baseline, ingested_at=None,
+            return self._replace_range(name, frame, start=start, end=end, available_date=available_date,
                 input_receipt=input_receipt, expected_definition_hash=expected_definition_hash,
-                run_id=run_id, _declared_range=(first, last))
+                historical_baseline=historical_baseline, run_id=run_id)
+
+    def _replace_range(self, name: str, frame: pl.DataFrame, *, start: DateLike, end: DateLike,
+                       available_date: DateLike, input_receipt: FrozenInputReceipt | str | None,
+                       expected_definition_hash: str | None, historical_baseline: bool,
+                       run_id: str, _verification: _PublicationVerification | None = None,
+                       cancelled: Callable[[], bool] | None = None) -> ItemBuildReport:
+        spec = self.get(name)
+        first, last, cutoff = _date_value(start), _date_value(end), _date_value(available_date)
+        if last < first:
+            raise ValueError("end precedes start")
+        normalized = self._normalize(spec, frame)
+        if normalized.filter(~pl.col("time").is_between(first, last)).height:
+            raise ValueError("Replacement output lies outside its declared range")
+        existing = self.read(name, start=first, end=last, view="snapshot", as_of=cutoff).collect()
+        removed = existing.join(normalized.select("time", "asset_id"), on=["time", "asset_id"], how="anti")
+        tombstones = removed.select("time", "asset_id").with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"))
+        from bagelquant_data.core.schema import concat_compatible_frames
+        combined = concat_compatible_frames([normalized, tombstones]) if tombstones.height else normalized
+        return self._ingest(name, combined, available_date=cutoff,
+            historical_baseline=historical_baseline, ingested_at=None,
+            input_receipt=input_receipt, expected_definition_hash=expected_definition_hash,
+            run_id=run_id, _declared_range=(first, last), _verification=_verification, cancelled=cancelled)
+
+    @contextmanager
+    def publication(self, *, input_receipt: FrozenInputReceipt | str | None = None,
+                    config: ExecutionOptions | None = None,
+                    cancelled: Callable[[], bool] | None = None) -> Iterator[ItemPublisher]:
+        """Verify fixed input bytes once for one serial publication operation."""
+        if cancelled and cancelled():
+            raise CancelledError("DataItem publication cancelled")
+        receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
+        if receipt is not None:
+            self._lake.inputs.verify(receipt, config=config)
+        verification = _PublicationVerification(self, "" if receipt is None else receipt.receipt_id,
+            "" if receipt is None else receipt.digest,
+            # A conservative 1KiB entry reserve; never retain producer frames.
+            timing_cache_entries=min(1024, (config or ExecutionOptions()).max_buffer_bytes // 4 // 1024))
+        try:
+            if cancelled and cancelled():
+                raise CancelledError("DataItem publication cancelled")
+            yield ItemPublisher(self, receipt, verification, cancelled)
+            if get_ident() != verification.thread_id:
+                raise RuntimeError("DataItem publication requires its owning thread")
+            if not verification.active:
+                raise RuntimeError("DataItem publication operation failed")
+            if cancelled and cancelled():
+                raise CancelledError("DataItem publication cancelled")
+        finally:
+            verification.active = False
+            verification.baseline_dates.clear()
+
+    def _publish(self, publications: Sequence[ItemPublication], *,
+                input_receipt: FrozenInputReceipt | str | None = None,
+                _verification: _PublicationVerification,
+                cancelled: Callable[[], bool] | None = None) -> dict[str, ItemBuildReport | None]:
+        """Publish a preflighted group through the ordinary writer mechanics.
+
+        Keep historical versions, complete-range certificates and per-item
+        writer transactions. Earlier committed outputs survive later failures;
+        this operation does not claim atomic publication across items.
+        """
+        values = tuple(publications)
+        if any(not isinstance(value, ItemPublication) for value in values):
+            raise TypeError("publish requires ItemPublication values")
+        if len({value.name for value in values}) != len(values):
+            raise ValueError("Publication item names must be unique")
+        receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
+        def identity(value):
+            return ("raw", value.source, value.dataset) if isinstance(value, RawInput) else ("item", value.name)
+        for value in values:
+            spec = self.get(value.name)
+            definition_hash = hashlib.sha256(_json(spec_payload(spec)).encode()).hexdigest()
+            if value.expected_definition_hash is not None and value.expected_definition_hash != definition_hash:
+                raise RuntimeError("DataItem definition changed while computing producer output")
+            if spec.inputs and receipt is None:
+                raise ValueError("DataItem dependency publication requires an input_receipt")
+            if receipt is not None and {identity(v) for v in spec.inputs} != {identity(v) for v in receipt.requests.values()}:
+                raise ValueError("Frozen input receipt does not match declared DataItem dependencies")
+            if value.start is not None and value.end is not None and _date_value(value.end) < _date_value(value.start):
+                raise ValueError("end precedes start")
+            if not value.frame.is_empty() or value.start is not None:
+                normalized = self._normalize(spec, value.frame)
+                if value.start is not None and value.end is not None and normalized.filter(
+                        ~pl.col("time").is_between(_date_value(value.start), _date_value(value.end))).height:
+                    raise ValueError("Replacement output lies outside its declared range")
+        if cancelled and cancelled():
+            raise CancelledError("DataItem publication cancelled")
+        verification = _verification
+        results: dict[str, ItemBuildReport | None] = {}
+        for value in values:
+            if cancelled and cancelled():
+                raise CancelledError("DataItem publication cancelled")
+            run_id = uuid4().hex
+            result = None
+            with self._store.dataset_writer("items", value.name, run_id):
+                if not value.frame.is_empty():
+                    result = self._ingest(value.name, value.frame, available_date=None,
+                        historical_baseline=False, ingested_at=None, input_receipt=receipt,
+                        expected_definition_hash=value.expected_definition_hash, run_id=run_id,
+                        cancelled=cancelled, _verification=verification)
+                if value.start is not None and value.end is not None and value.complete_at is not None:
+                    if cancelled and cancelled():
+                        raise CancelledError("DataItem publication cancelled")
+                    latest = value.frame
+                    spec = self.get(value.name)
+                    if "version_available_date" in latest.columns:
+                        latest = latest.sort("version_available_date").unique([spec.time_column, spec.asset_column], keep="last")
+                    result = self._replace_range(value.name, latest, start=value.start, end=value.end,
+                        available_date=value.complete_at, input_receipt=receipt,
+                        expected_definition_hash=value.expected_definition_hash,
+                        historical_baseline=False, run_id=run_id, _verification=verification,
+                        cancelled=cancelled)
+            if cancelled and cancelled():
+                raise CancelledError("DataItem publication cancelled")
+            results[value.name] = result
+        if cancelled and cancelled():
+            raise CancelledError("DataItem publication cancelled")
+        return results
 
     def read(
         self, name: str, *, start: DateLike | None = None, end: DateLike | None = None,
@@ -479,7 +741,8 @@ class ItemAPI:
         return frame.sort("time", "asset_id", *( ["version_available_date"] if "version_available_date" in frame.columns else []))
 
     def _build(self, name: str, *, start: date, end: date, initialize: bool, config: ExecutionOptions | None, stack: tuple[str, ...],
-               progress: Callable[[ItemBuildReport], None] | None, cancelled: Callable[[], bool] | None, force: bool = False) -> ItemBuildReport:
+               progress: Callable[[ItemBuildReport], None] | None, cancelled: Callable[[], bool] | None, force: bool = False,
+               input_windows: Mapping[str, tuple[DateLike, DateLike]] | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
         if end < start:
             raise ValueError("end precedes start")
@@ -488,6 +751,27 @@ class ItemAPI:
         if cancelled and cancelled():
             return ItemBuildReport(name, "cancelled", 0, None, 0, start, end, "")
         spec = self.get(name)
+        from dataclasses import replace
+        requests = {value.key: replace(value, view="versions", fields=(), include_historical_baseline=True) if isinstance(value, RawInput)
+                    else replace(value, view="versions") for value in spec.inputs}
+        for key, window in (input_windows or {}).items():
+            if key not in requests:
+                raise ValueError(f"Unknown input window alias: {key}")
+            first, last = (_date_value(value) for value in window)
+            if last < first:
+                raise ValueError("input window end precedes start")
+            original = requests[key]
+            if (original.start is not None and first < _date_value(original.start)
+                    or original.end is not None and last > _date_value(original.end)):
+                raise ValueError("input window cannot widen the declared dependency window")
+            if isinstance(original, RawInput):
+                if (original.observation_start is not None and first < _date_value(original.observation_start)
+                        or original.observation_end is not None and last > _date_value(original.observation_end)):
+                    raise ValueError("input window cannot widen the declared observation window")
+                definition = self._store.get_dataset(original.source, original.dataset)
+                if definition is None or json.loads(definition["spec_json"])["update_type"] != "by_date":
+                    raise ValueError("input windows require by-date dependencies")
+            requests[key] = replace(original, start=first, end=last)
         for dependency in sorted((value for value in spec.inputs if isinstance(value, ItemInput)), key=lambda value: value.name):
             if self.get(dependency.name).inputs:
                 self._build(dependency.name, start=start, end=end, initialize=initialize, config=config, stack=(*stack, name), progress=progress, cancelled=cancelled)
@@ -495,11 +779,17 @@ class ItemAPI:
         max_commit = int(row["seq"])
         # Frozen receipts capture dependency contracts and central immutable bytes
         # in one SQLite read transaction, independently from later publications.
-        from dataclasses import replace
-        requests = {value.key: replace(value, view="versions", fields=(), include_historical_baseline=True) if isinstance(value, RawInput)
-                    else replace(value, view="versions") for value in spec.inputs}
         receipt = self._lake.inputs.freeze(requests, information_cutoff=end, max_commit=max_commit)
         max_commit = receipt.max_commit
+        definition_hash = hashlib.sha256(_json(spec_payload(spec)).encode()).hexdigest()
+        dependency_digest = receipt.dependency_digest
+        prior = self._store._rows(
+            "select result_commit from item_builds where name=? and definition_hash=? and dependency_digest=? and start_date=? and end_date=? and status='success' order by id desc limit 1",
+            (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat()),
+        )
+        if prior and not force:
+            self._lake.inputs.verify(receipt, config=config)
+            return ItemBuildReport(name, "unchanged", 0, prior[0]["result_commit"], max_commit, start, end, dependency_digest, receipt.receipt_id)
         options = config or ExecutionOptions()
         frames: dict[str, pl.DataFrame] = {}
         buffered = 0
@@ -509,14 +799,6 @@ class ItemAPI:
             if buffered > options.max_buffer_bytes // 2:
                 raise MemoryError("Frozen DataItem inputs exceed max_buffer_bytes; use smaller declared input windows")
             frames[key] = frame
-        definition_hash = hashlib.sha256(_json(spec_payload(spec)).encode()).hexdigest()
-        dependency_digest = receipt.dependency_digest
-        prior = self._store._rows(
-            "select result_commit from item_builds where name=? and definition_hash=? and dependency_digest=? and start_date=? and end_date=? and status='success' order by id desc limit 1",
-            (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat()),
-        )
-        if prior and not force:
-            return ItemBuildReport(name, "unchanged", 0, prior[0]["result_commit"], max_commit, start, end, dependency_digest, receipt.receipt_id)
         if not spec.inputs:
             raise ValueError("An initialized DataItem must declare inputs")
         producer = None
@@ -589,32 +871,64 @@ class ItemAPI:
 
         committed_rows = 0
         result_commit: int | None = None
-        try:
-            output_options = replace(options, max_buffer_bytes=options.max_buffer_bytes - buffered)
-            for output in iter_computed_versions(raw=raw, items=items, start=start, end=end, evaluate=lambda raw, items: evaluate(raw, items, end), evaluate_at=evaluate, raw_resolvers=resolvers, extra_boundaries=sorted(general_boundaries), config=output_options, cancelled=cancelled):
-                if cancelled and cancelled():
-                    raise CancelledError("DataItem build cancelled")
-                for baseline in (False, True):
-                    if output.is_empty():
-                        continue
-                    group = output.filter(pl.col("_build_baseline") == baseline).drop("_build_baseline")
-                    if group.is_empty():
-                        continue
-                    report = self._publish_proven(name, group, historical_baseline=baseline, input_receipt=receipt, expected_definition_hash=definition_hash)
-                    committed_rows += report.rows_committed
-                    result_commit = report.commit_seq
-                    if progress:
-                        progress(ItemBuildReport(name, "running", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id))
-        except CancelledError:
-            return ItemBuildReport(name, "cancelled", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id)
-        if "frame" in final_output and self._store.manifest("items", name):
-            existing = self.read(name, start=start, end=end, view="snapshot", as_of=end).collect()
-            removed = existing.join(final_output["frame"].select("time", "asset_id"), on=["time", "asset_id"], how="anti")
-            if removed.height:
-                removed = removed.with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"), pl.max_horizontal("time", pl.lit(end)).alias("version_available_date"))
-                report = self._publish_proven(name, removed, historical_baseline=final_baseline, input_receipt=receipt, expected_definition_hash=definition_hash)
-                committed_rows += report.rows_committed
-                result_commit = report.commit_seq
+
+        def publish_group(frame, baseline, *, executor, writer_buffer=0,
+                          publication_bytes=None):
+            before = committed_rows
+            def published(rows, commit):
+                nonlocal committed_rows, result_commit
+                committed_rows = before + rows
+                result_commit = commit
+                if progress:
+                    progress(ItemBuildReport(name, "running", committed_rows, result_commit, max_commit,
+                        start, end, dependency_digest, receipt.receipt_id))
+            return self._publish_proven(name, frame, historical_baseline=baseline,
+                input_receipt=receipt, expected_definition_hash=definition_hash,
+                writer_executor=executor, partition_workers=partition_workers,
+                writer_buffer_bytes=writer_buffer, commit_batch_rows=options.commit_batch_rows,
+                commit_batch_bytes=publication_bytes, cancelled=cancelled, on_commit=published)
+
+        partition_workers = min(options.workers, options.max_in_flight or options.workers,
+                                options.batch_size or options.workers)
+        with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="data-item") as executor:
+            try:
+                output_options = replace(options, max_buffer_bytes=options.max_buffer_bytes - buffered)
+                writer_buffer = output_options.max_buffer_bytes // (options.workers + 1)
+                publication_bytes = max(1, writer_buffer // 6)
+                with closing(iter_computed_versions(raw=raw, items=items, start=start, end=end, evaluate=lambda raw, items: evaluate(raw, items, end), evaluate_at=evaluate, raw_resolvers=resolvers, extra_boundaries=sorted(general_boundaries), config=output_options, cancelled=cancelled, executor=executor)) as outputs:
+                    for output in outputs:
+                        if cancelled and cancelled():
+                            raise CancelledError("DataItem build cancelled")
+                        for baseline in (False, True):
+                            if output.is_empty():
+                                continue
+                            group = output.filter(pl.col("_build_baseline") == baseline).drop("_build_baseline")
+                            if group.is_empty():
+                                continue
+                            publish_group(group, baseline, executor=executor,
+                                          writer_buffer=writer_buffer, publication_bytes=publication_bytes)
+                        if progress:
+                            progress(ItemBuildReport(name, "running", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id))
+                        writer_buffer = 0
+            except CancelledError:
+                return ItemBuildReport(name, "cancelled", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id)
+            if "frame" in final_output and self._store.manifest("items", name):
+                existing = self.read(name, start=start, end=end, view="snapshot", as_of=end)
+                keys = ["time", "asset_id"]
+                existing_keys = existing.select(keys).collect()
+                current_keys = final_output["frame"].select(keys)
+                removed_keys = (existing_keys.head(0) if _same_ordered_rows(existing_keys, current_keys, keys)
+                                else existing_keys.join(current_keys, on=keys, how="anti"))
+                if removed_keys.height:
+                    # Only actual withdrawals need the old values/extra columns.
+                    removed = existing.join(removed_keys.lazy(), on=keys, how="inner",
+                                            maintain_order="left").collect()
+                    removed = removed.with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"), pl.max_horizontal("time", pl.lit(end)).alias("version_available_date"))
+                    try:
+                        publish_group(removed, final_baseline, executor=executor)
+                    except CancelledError:
+                        return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
+                            max_commit, start, end, dependency_digest, receipt.receipt_id)
         with self._store.connect() as db:
             db.execute("insert into item_builds(name,definition_hash,dependency_digest,start_date,end_date,input_commit,result_commit,status,created_at,frozen_receipt_id) values(?,?,?,?,?,?,?,'success',?,?)", (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat(), max_commit, result_commit, datetime.now(UTC).isoformat(), receipt.receipt_id))
         return ItemBuildReport(name, "success", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id)

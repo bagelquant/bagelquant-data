@@ -46,6 +46,13 @@ class IngestionReport:
     bytes_written: int = 0
     bytes_read: int = 0
     peak_partition_in_flight: int = 0
+    provider_seconds: float = 0.0
+    limiter_wait_seconds: float = 0.0
+    retry_wait_seconds: float = 0.0
+    prepare_seconds: float = 0.0
+    claim_seconds: float = 0.0
+    discarded_rows: int = 0
+    peak_buffer_bytes: int = 0
 
 
 class IngestionPipeline:

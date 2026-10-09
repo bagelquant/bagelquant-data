@@ -19,7 +19,7 @@ from bagelquant_data.management.lake import RawAPI
 from bagelquant_data.inputs import FrozenInputReceipt, input_read_boundary
 from bagelquant_data.items import (
     AvailabilityAlignment, AvailabilityPolicy, BuildContext, DataItemSpec,
-    ItemBuildReport, ItemInput, RawInput, advance_available_date,
+    ItemBuildReport, ItemInput, ItemPublication, ItemPublisher, RawInput, advance_available_date,
     advance_available_date_in_sessions, materialize_daily_pit,
 )
 from bagelquant_data.items.pit import (
@@ -44,8 +44,8 @@ __all__ = [
     "RequestDiscoverySpec",
     "DatasetSpecError",
     "DuplicateResolutionError",
-    "ConfigurationError", "ExecutionOptions", "DataItemSpec", "RawInput", "ItemInput",
-    "BuildContext", "ItemBuildReport", "FrozenInputReceipt", "input_read_boundary",
+    "ConfigurationError", "ExecutionOptions", "DataItemSpec", "RawInput", "ItemInput", "ItemPublication",
+    "BuildContext", "ItemBuildReport", "ItemPublisher", "FrozenInputReceipt", "input_read_boundary",
     "IngestionReport", "AvailabilityAlignment", "AvailabilityPolicy",
     "advance_available_date", "advance_available_date_in_sessions", "materialize_daily_pit",
     "frame_content_hash", "input_snapshot", "general_input_snapshot", "compute_versions",

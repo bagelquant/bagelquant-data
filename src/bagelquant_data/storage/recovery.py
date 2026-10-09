@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import mmap
 import sqlite3
+import tempfile
 import zlib
 from typing import TYPE_CHECKING
 
@@ -32,6 +34,9 @@ def append_batch(data_meta: DataMetaStore, partition: str, seq: int, frame: pl.D
     """Durably prepare evidence; it remains invisible until its commit publishes."""
     data_meta.ensure_writable()
     payload = _encode_batch(frame)
+    # Compression is pure preparation. Holding SQLite's writer lock here
+    # would serialize all admitted partition workers on their CPU-heavy work.
+    compressed = zlib.compress(payload, 3)
     batch = {
         "partition_path": partition,
         "content_hash": hashlib.sha256(payload).hexdigest(),
@@ -55,7 +60,7 @@ def append_batch(data_meta: DataMetaStore, partition: str, seq: int, frame: pl.D
         db.execute(
             "insert or ignore into version_batches(commit_seq,partition_path,content_hash,row_count,schema_ipc,payload,"
             "min_available,max_available,min_observation,max_observation) values(?,?,?,?,?,?,?,?,?,?)",
-            (seq, partition, batch["content_hash"], frame.height, batch["schema_ipc"], zlib.compress(payload, 3),
+            (seq, partition, batch["content_hash"], frame.height, batch["schema_ipc"], compressed,
              batch["min_available"], batch["max_available"], batch["min_observation"], batch["max_observation"]),
         )
     return batch
@@ -78,6 +83,77 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str) 
     return pl.read_ipc(io.BytesIO(payload))
 
 
+def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str,
+                 *, buffer_bytes: int = 1024 * 1024) -> None:
+    """Recheck original IPC bytes and structure with bounded decode buffers."""
+    chunk_bytes = max(1, min(1024 * 1024, buffer_bytes // 4))
+    with tempfile.TemporaryFile() as spool:
+        with data_meta.connect() as db:
+            if not db.in_transaction:
+                db.execute("begin")
+            row = db.execute(
+                "select b.rowid as batch_rowid,b.content_hash from version_batches b "
+                "join version_commits c on c.seq=b.commit_seq where b.commit_seq=? "
+                "and b.partition_path=? and c.status='committed'", (seq, partition),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Committed recovery batch {seq} is missing")
+            if row["content_hash"] != digest:
+                raise RuntimeError(f"Recovery batch {seq} checksum mismatch")
+            checksum = hashlib.sha256()
+            decoder = zlib.decompressobj()
+            try:
+                with db.blobopen("version_batches", "payload", row["batch_rowid"], readonly=True) as blob:
+                    while compressed := blob.read(chunk_bytes):
+                        pending = compressed
+                        while pending:
+                            piece = decoder.decompress(pending, chunk_bytes)
+                            spool.write(piece)
+                            checksum.update(piece)
+                            pending = decoder.unconsumed_tail
+                    if not decoder.eof:
+                        raise zlib.error("incomplete compressed stream")
+            except (zlib.error, TypeError, sqlite3.Error) as error:
+                raise RuntimeError(f"Recovery batch {seq} compression is damaged") from error
+            if checksum.hexdigest() != digest:
+                raise RuntimeError(f"Recovery batch {seq} checksum mismatch")
+        spool.flush()
+        # The exact original SHA is necessary but not sufficient: retain IPC
+        # structural/type rejection, including valid-SHA non-IPC corruption.
+        try:
+            mapping = mmap.mmap(spool.fileno(), 0, access=mmap.ACCESS_READ)
+            source = pa.BufferReader(mapping)
+            reader = None
+            batch = None
+            structural_error = None
+            try:
+                reader = pa.ipc.open_file(source)
+                empty = pl.from_arrow(pa.Table.from_batches([], schema=reader.schema))
+                del empty
+                for index in range(reader.num_record_batches):
+                    batch = reader.get_batch(index)
+                    batch.validate(full=True)
+                    rows = max(1, chunk_bytes // max(1, batch.nbytes // max(1, batch.num_rows)))
+                    for offset in range(0, batch.num_rows, rows):
+                        decoded = pl.from_arrow(batch.slice(offset, rows), rechunk=False)
+                        del decoded
+                    batch = None
+            except (pa.ArrowException, pl.exceptions.PolarsError, ValueError, TypeError) as error:
+                # Do not retain the parser traceback's exported mmap buffers
+                # while closing the temporary evidence view.
+                structural_error = str(error)
+            finally:
+                batch = None
+                reader = None
+                source.close()
+                del source
+                mapping.close()
+            if structural_error is not None:
+                raise RuntimeError(f"Recovery batch {seq} IPC is damaged: {structural_error}")
+        except (pa.ArrowException, pl.exceptions.PolarsError, ValueError, TypeError) as error:
+            raise RuntimeError(f"Recovery batch {seq} IPC is damaged") from error
+
+
 def registered_batches(parquet: ParquetStore, source: str, dataset: str, partition: str) -> list[dict]:
     return parquet.metadata._rows(
         "select b.commit_seq,b.partition_path,b.content_hash,b.row_count,b.schema_ipc,"
@@ -94,6 +170,12 @@ def reconstruct(parquet: ParquetStore, source: str, dataset: str, partition: str
         raise RuntimeError("No registered recovery evidence; historical recovery is blocked")
     frames = [read_batch(parquet.metadata, partition, int(b["commit_seq"]), b["content_hash"]) for b in batches]
     frame = sort_versions(concat_compatible_frames(frames))
+    # A by-date delta was aligned to the full committed partition's schema.
+    # Concatenation's provider-inference normalization can turn entirely null
+    # String/scalar columns into Null; recovery must restore the retained types.
+    schema = pl.Schema(pa.ipc.read_schema(pa.BufferReader(batches[-1]["schema_ipc"])))
+    if "_record_id" in schema:
+        frame = align_frame(frame, schema)
     manifest = next((row for row in parquet.metadata.manifest(source, dataset) if row["partition_path"] == partition), None)
     if manifest is None:
         raise RuntimeError("Committed manifest evidence is missing")

@@ -52,13 +52,13 @@ class DataLake:
         data_meta_path: str | Path,
         lake_path: str | Path,
         read_only: bool = False,
+        runtime: bool = False,
     ) -> None:
         self._paths = LakePaths.open(
             data_meta_path=data_meta_path, lake_path=lake_path, read_only=read_only
         )
-        DataMetaStore.check_compatibility(self._paths.data_meta_path)
+        self._data_meta = DataMetaStore(data_meta_path=self._paths.data_meta_path, read_only=read_only, runtime=runtime)
         self._paths.ensure()
-        self._data_meta = DataMetaStore(data_meta_path=self._paths.data_meta_path, read_only=read_only)
         self._data_meta.bind_lake(self._paths.lake)
         self._registries: FrameworkRegistries = default_registries()
         self._parquet = ParquetStore(self._paths, self._data_meta)
@@ -90,14 +90,15 @@ class DataLake:
         data_meta_path: str | Path,
         lake_path: str | Path,
         read_only: bool = False,
+        runtime: bool = False,
     ) -> DataLake:
         return cls(
-            data_meta_path=data_meta_path, lake_path=lake_path, read_only=read_only
+            data_meta_path=data_meta_path, lake_path=lake_path, read_only=read_only, runtime=runtime
         )
 
     @classmethod
     def inspect(
-        cls, *, data_meta_path: str | Path, lake_path: str | Path
+        cls, *, data_meta_path: str | Path, lake_path: str | Path, runtime: bool = False
     ) -> dict[str, object]:
         """Inspect committed schema and configured lake binding without writes.
 
@@ -105,7 +106,7 @@ class DataLake:
         and schema_version. No directories, SQLite sidecars, recovery or runtime
         extension instances are created in the configured storage paths.
         """
-        return DataMetaStore.inspect(Path(data_meta_path), Path(lake_path))
+        return DataMetaStore.inspect(Path(data_meta_path), Path(lake_path), runtime=runtime)
 
     def close(self) -> None:
         """Connections are operation-scoped; discard runtime extension instances."""
@@ -265,6 +266,55 @@ class RawAPI:
             spec, frame, mode=mode, ingested_at=ingested_at
         )
 
+    def plan_updates(
+        self, datasets: Sequence[str], *, source: str, start: DateLike = "2000-01-01",
+        end: DateLike, source_options: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Plan dependency-ordered initialization/resume/incremental actions without I/O jobs."""
+        from bagelquant_data.pipeline.planning import initialization_actions
+        from bagelquant_data.query.raw import _date_value
+
+        specs = {name: self.get(name, source=source) for name in dict.fromkeys(datasets)}
+        ordered: list[str] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        actions_by_name = {}
+        store = self._lake._data_meta
+        for name in specs:
+            rows = store._rows("select * from dataset_initializations where source=? and dataset=?", (source, name))
+            row = rows[0] if rows else None
+            initialization = None if row is None else {"status": row["status"],
+                "start": row["initial_start"], "end": row["initial_end"], "definition_hash": row["spec_hash"]}
+            history = bool(store._rows("select 1 from version_commits where source=? and dataset=? and status='committed' limit 1", (source, name)))
+            actions_by_name[name] = initialization_actions(start=_date_value(start), end=_date_value(end),
+                definition_hash=self.definition_hash(name, source=source), initialization=initialization,
+                has_history=history)
+
+        def visit(name: str) -> None:
+            if name in visiting:
+                raise ConfigurationError("Raw prerequisite cycle")
+            if name in visited:
+                return
+            visiting.add(name)
+            spec = specs[name]
+            parents = {spec.calendar, spec.parameter_dataset}
+            policy = (source_options or {}).get(name, {}).get("initialization_scan")
+            if isinstance(policy, Mapping) and any(action["mode"] == "initialize" for action in actions_by_name[name]):
+                parent = str(policy.get("parameter_dataset") or "")
+                parents.add(parent.removeprefix(source + "/"))
+            for parent in sorted({p for p in parents if p in specs}):
+                visit(parent)
+            visiting.remove(name)
+            visited.add(name)
+            ordered.append(name)
+
+        for name in sorted(specs):
+            visit(name)
+        result = []
+        for name in ordered:
+            result.extend({"source": source, "dataset": name, **action} for action in actions_by_name[name])
+        return result
+
     def initialize(
         self,
         dataset: str,
@@ -395,6 +445,17 @@ class IntegrityAPI:
     def __init__(self, lake: DataLake) -> None:
         self._lake = lake
         self._status = StatusManager(lake._data_meta, lake._paths)
+
+    def reopen_raw_initialization(self, dataset: str, *, source: str, start: DateLike, end: DateLike,
+                                  reason: str) -> dict[str, Any]:
+        """Reopen unchanged, prematurely completed Raw before any incremental evidence.
+
+        Preserve versions and frozen receipts; ordinary initialize resumes the
+        original bounds and appends explicitly unverified historical baselines.
+        """
+        from bagelquant_data.pipeline.initialization import reopen_initialization
+        return reopen_initialization(self._lake._data_meta, self._lake.raw.get(dataset, source=source),
+                                     start=_as_date(start), end=_as_date(end), reason=reason)
 
     def storage_usage(self) -> dict[str, Any]:
         """Read actual Data-owned storage usage, including retained history."""
@@ -679,6 +740,23 @@ class _RawUpdater:
                 **dict(context.options.get("source_options") or {}),
             }
             raw_source_options["refresh"] = context.options.get("mode") == "refresh"
+            scan = raw_source_options.get("initialization_scan")
+            if scan is not None:
+                if context.options["mode"] != "initialize" or not isinstance(scan, Mapping):
+                    raise ConfigurationError("initialization_scan requires initialize mode and a mapping")
+                scan = dict(scan)
+                if scan.get("parameter_dataset"):
+                    parent_source, separator, parent = str(scan["parameter_dataset"]).partition("/")
+                    if not separator:
+                        parent_source, parent = source, parent_source
+                    field = str(scan.get("parameter_field", "asset_id"))
+                    parent_frame = raw.query_general(parent, source=parent_source).select(field).collect()
+                    values = sorted({str(value) for value in parent_frame[field].drop_nulls()})
+                    if not values:
+                        raise ConfigurationError("initialization_scan parameter dataset has no values")
+                    scan["parameter_values"] = values
+                raw_source_options["initialization_scan"] = scan
+            context = replace(context, options={**context.options, "source_options": raw_source_options})
             if raw_source_options is not None and not isinstance(
                 raw_source_options, Mapping
             ):
@@ -699,6 +777,7 @@ class _RawUpdater:
                 spec,
                 requests,
                 raw_source_options,
+                initialize=context.options["mode"] == "initialize",
             )
             works.append(
                 DatasetUpdateWork(
@@ -731,11 +810,12 @@ class _RawUpdater:
         )
         self.lake._data_meta.acquire_update_leases(leases, owner_id=owner_id)
         try:
-            report = update_datasets(
-                source_adapter=adapter,
-                pipeline=self.lake._pipeline,
-                works=tuple(works),
-            )
+            with self.lake._data_meta.writer_session():
+                report = update_datasets(
+                    source_adapter=adapter,
+                    pipeline=self.lake._pipeline,
+                    works=tuple(works),
+                )
         finally:
             self.lake._data_meta.release_update_leases(work.run_id for work in works)
         from bagelquant_data.pipeline.initialization import finish_initialization
@@ -804,6 +884,8 @@ def _request_context(
         raise ConfigurationError("mode must be initialize, incremental, or refresh")
     workers = kwargs.pop("workers", 1)
     batch_size = kwargs.pop("batch_size", None)
+    commit_batch_rows = kwargs.pop("commit_batch_rows", None)
+    commit_interval_seconds = kwargs.pop("commit_interval_seconds", 30.0)
     max_in_flight = kwargs.pop("max_in_flight", None)
     max_buffer_mb = kwargs.pop("max_buffer_mb", None)
     max_buffer_bytes = kwargs.pop("max_buffer_bytes", None)
@@ -822,6 +904,7 @@ def _request_context(
     for name, value in (
         ("workers", workers),
         ("batch_size", batch_size),
+        ("commit_batch_rows", commit_batch_rows),
         ("max_in_flight", max_in_flight),
         ("max_buffer_bytes", max_buffer_bytes),
         ("max_buffer_mb", max_buffer_mb),
@@ -831,6 +914,15 @@ def _request_context(
         ):
             raise ConfigurationError(f"{name} must be a positive integer")
     options: dict[str, Any] = {"mode": mode}
+    import math
+    if (isinstance(commit_interval_seconds, bool)
+            or not isinstance(commit_interval_seconds, (int, float))
+            or not math.isfinite(commit_interval_seconds)
+            or commit_interval_seconds <= 0):
+        raise ConfigurationError("commit_interval_seconds must be positive and finite")
+    options["commit_interval_seconds"] = commit_interval_seconds
+    if commit_batch_rows is not None:
+        options["commit_batch_rows"] = commit_batch_rows
     if ingested_at is not None:
         options["ingested_at"] = ingested_at
     if workers is not None:

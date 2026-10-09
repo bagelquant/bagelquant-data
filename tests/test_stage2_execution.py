@@ -79,3 +79,21 @@ def test_item_input_buffers_respect_explicit_budget(tmp_path):
     with pytest.raises(MemoryError, match="max_buffer_bytes"):
         lake.items.update("derived", end="2020-01-01", config=ExecutionOptions(max_buffer_bytes=128))
     assert lake.items.manifest("derived") == []
+
+
+def test_single_revision_receives_actual_admission_buffer_with_many_requested_workers(tmp_path):
+    lake = DataLake.open(data_meta_path=tmp_path / "data_meta.sqlite", lake_path=tmp_path / "lake")
+    lake.raw.ingest(DatasetSpec("seed", "by_date", date_kind="calendar",
+                              field_mappings={"time": "time", "asset_id": "asset_id"}),
+                    pl.DataFrame({"time": [date(2020, 1, 1)], "asset_id": ["A"], "value": [1.0]}),
+                    mode="initialize", ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    def producer(context):
+        return pl.DataFrame({"time": [date(2020, 1, 1)] * 128,
+            "asset_id": [f"A{index}" for index in range(128)], "value": [1.0] * 128})
+    lake.items.register_producer("fixture", "1", producer)
+    lake.items.register(DataItemSpec("expanded", (RawInput("custom", "seed"),),
+                                   producer_key="fixture", producer_revision="1"))
+    report = lake.items.initialize("expanded", start="2020-01-01", end="2020-01-01",
+        config=ExecutionOptions(workers=8, max_in_flight=8, max_buffer_bytes=8192))
+    assert report.status == "success" and report.rows_committed == 128
+    assert lake.items.read("expanded").collect().height == 128

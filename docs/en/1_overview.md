@@ -33,6 +33,6 @@ are serial. Workbench owns hardware detection, global scheduling, admission and
 native thread budgets. Core computes external producer results in memory; Data
 publishes neutral results once. Core and BT keep their own numerical/result artifacts.
 
-Version 0.7 uses metadata schema 6. Reject old or unversioned databases; no migration,
+Version 0.7 uses metadata schema 7. Reject old or unversioned databases; no migration,
 provider refetch, orphan adoption or automatic history deletion is performed.
 Real database/service cutover belongs to the separately authorized operations stage.

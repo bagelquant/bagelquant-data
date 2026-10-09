@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
+from queue import Empty, SimpleQueue
 
 import polars as pl
 
@@ -115,6 +116,12 @@ class FetchPage:
     error_message: str | None = None
     asset_id: str | None = None
     fatal: bool = False
+    buffer_limit_exceeded: bool = False
+    request_attempts: int = 1
+    provider_seconds: float = 0.0
+    limiter_wait_seconds: float = 0.0
+    retry_wait_seconds: float = 0.0
+    discarded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +131,8 @@ class PreparedFetch:
     pages: tuple[FetchPage, ...]
     frame: pl.DataFrame | None
     validation_error: str | None = None
+    buffer_limit_exceeded: bool = False
+    prepare_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -143,6 +152,8 @@ class _RunState:
     errors: list[str] = field(default_factory=list)
     buffered: list[tuple[pl.DataFrame, LedgerRequest]] = field(default_factory=list)
     buffered_bytes: int = 0
+    buffered_rows: int = 0
+    buffered_since: float | None = None
     started_at: float = field(default_factory=time.perf_counter)
     fetch_seconds: float = 0.0
     commit_seconds: float = 0.0
@@ -157,6 +168,15 @@ class _RunState:
     fatal_error: str | None = None
     cancelled: bool = False
     pending_api_calls: list[dict[str, Any]] = field(default_factory=list)
+    provider_seconds: float = 0.0
+    limiter_wait_seconds: float = 0.0
+    retry_wait_seconds: float = 0.0
+    prepare_seconds: float = 0.0
+    claim_seconds: float = 0.0
+    discarded_rows: int = 0
+    peak_buffer_bytes: int = 0
+    observed_requests: int = 0
+    observed_rows: int = 0
 
 
 type UpdateTask = tuple[DatasetUpdateWork, LedgerRequest]
@@ -297,6 +317,10 @@ def _update_datasets(
             )
             tasks.extend((work, request) for request in work.requests)
         ordered_tasks = _partition_affinity_order(_fair_tasks(tasks))
+        if any(request.request_kind == "initial_full_scan" for _, request in ordered_tasks):
+            # One complete logical scan retains bounded pages across cohorts.
+            # Its configured pool still prepares independent partitions later.
+            max_in_flight = 1
         with nullcontext(writer_executor) as executor:
             repair_tasks = [
                 task
@@ -393,11 +417,13 @@ def _run_fetches(
     request_index_offset: int = 0,
 ) -> None:
     task_iter = iter(enumerate(tasks, start=request_index_offset))
+    next_split_index = request_index_offset + len(tasks)
     ready: deque[tuple[int, UpdateTask]] = deque()
     futures: dict[Future[PreparedFetch], tuple[float, UpdateTask]] = {}
     stop_submission = False
     next_heartbeat = time.monotonic() + 30.0
     next_activity = time.monotonic()
+    page_activity: SimpleQueue[tuple[str, int, int]] = SimpleQueue()
 
     def cancellation_requested() -> bool:
         return any(_cancel_requested(state.work.context) for state in states.values())
@@ -426,10 +452,14 @@ def _run_fetches(
         by_run: dict[str, list[int]] = {}
         for _, (work, request) in candidates:
             by_run.setdefault(work.run_id, []).extend(_scope_ids(request))
+        claim_started = time.perf_counter()
         claimed_by_run = {
             run_id: set(pipeline.metadata.claim_update_scopes(scope_ids, run_id=run_id))
             for run_id, scope_ids in by_run.items()
         }
+        for run_id in by_run:
+            state = next(value for value in states.values() if value.work.run_id == run_id)
+            state.claim_seconds += time.perf_counter() - claim_started
         for candidate in candidates:
             _, (work, request) = candidate
             ids = _scope_ids(request)
@@ -475,6 +505,8 @@ def _run_fetches(
                 "_buffer_limit_bytes": max(
                     1, _buffer_limit(work.context) // (2 * max_in_flight)
                 ),
+                "_page_callback": lambda page, name=work.spec.name: page_activity.put(
+                    (name, page.request_attempts, page.row_count if page.status == "success" else 0)),
             },
             max_retries=max(1, int(work.context.options.get("max_retries", 3))),
             retry_backoff_seconds=float(
@@ -491,6 +523,13 @@ def _run_fetches(
     while len(futures) < max_in_flight and submit_next():
         pass
     while futures:
+        while True:
+            try:
+                name, calls, rows = page_activity.get_nowait()
+            except Empty:
+                break
+            states[name].observed_requests += calls
+            states[name].observed_rows += rows
         if time.monotonic() >= next_activity:
             request_status = getattr(source_adapter, "request_status", None)
             for state in states.values():
@@ -522,11 +561,18 @@ def _run_fetches(
         if time.monotonic() >= next_heartbeat:
             for state in states.values():
                 pipeline.metadata.refresh_update_lease(run_id=state.work.run_id)
+                pipeline.metadata.record_run_metrics(run_id=state.work.run_id, metrics=_run_metrics(state))
             next_heartbeat = time.monotonic() + 30.0
         if cancellation_requested():
             stop_submission = True
             mark_cancelled()
         done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+        for state in states.values():
+            if (state.work.spec.update_type != "general" and state.buffered_since is not None
+                    and time.monotonic() - state.buffered_since >= float(
+                        state.work.context.options.get("commit_interval_seconds", 30.0))):
+                _commit_state(pipeline, state, callbacks[state.work.spec.name],
+                              completed[state.work.spec.name], totals[state.work.spec.name], writer_executor)
         if not done:
             continue
         for future in done:
@@ -537,6 +583,32 @@ def _run_fetches(
             state.wait_seconds = 0.0
             prepared = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
+            state.prepare_seconds += prepared.prepare_seconds
+            state.provider_seconds += sum(page.provider_seconds for page in prepared.pages)
+            state.limiter_wait_seconds += sum(page.limiter_wait_seconds for page in prepared.pages)
+            state.retry_wait_seconds += sum(page.retry_wait_seconds for page in prepared.pages)
+            state.discarded_rows += sum(page.row_count for page in prepared.pages if page.discarded)
+            if (
+                prepared.buffer_limit_exceeded
+                and request.request_kind == "initial_range_backfill"
+                and len(request.daily_scopes) > 1
+            ):
+                # The daily scopes are already claimed by this run. Retry only
+                # their transport in smaller bundles, retaining no parent bytes
+                # and publishing no coverage from an oversized response.
+                pages = tuple(
+                    page for page in prepared.pages if not page.buffer_limit_exceeded
+                )
+                pipeline.metadata.record_api_calls(_api_call_rows(work, request, pages))
+                state.request_count += sum(page.request_attempts for page in pages)
+                state.rows_downloaded += sum(page.row_count for page in pages)
+                split = _split_daily_range_request(work, request)
+                children = []
+                for child in split:
+                    children.append((next_split_index, (work, child)))
+                    next_split_index += 1
+                ready.extendleft(reversed(children))
+                continue
             incoming_bytes = (
                 int(prepared.frame.estimated_size())
                 if prepared.frame is not None
@@ -558,6 +630,7 @@ def _run_fetches(
                 )
             started = time.perf_counter()
             _harvest_request(pipeline, state, request, prepared)
+            state.peak_buffer_bytes = max(state.peak_buffer_bytes, state.buffered_bytes)
             state.metadata_seconds += time.perf_counter() - started
             completed[work.spec.name] += _scope_count(request)
             _emit_progress(
@@ -568,12 +641,14 @@ def _run_fetches(
                 total=totals[work.spec.name],
             )
             configured_batch_size = work.context.options.get("batch_size")
+            commit_batch_rows = work.context.options.get("commit_batch_rows")
             max_bytes = buffer_limit
             if work.spec.update_type != "general" and (
                 (
                     configured_batch_size is not None
                     and len(state.buffered) >= max(1, int(configured_batch_size))
                 )
+                or (commit_batch_rows is not None and state.buffered_rows >= int(commit_batch_rows))
                 or state.buffered_bytes >= max_bytes
             ):
                 _commit_state(
@@ -589,6 +664,44 @@ def _run_fetches(
                 pass
 
 
+def _split_daily_range_request(
+    work: DatasetUpdateWork, request: LedgerRequest
+) -> tuple[LedgerRequest, LedgerRequest]:
+    """Bisect claimed daily coverage, retaining native range pagination safeguards."""
+    options = {**work.spec.request_options, **_request_options(work.context)}
+    policy = options["daily_range_backfill"]
+    start_param = str(policy.get("start_param", "start"))
+    end_param = str(policy.get("end_param", "end"))
+    midpoint = len(request.daily_scopes) // 2
+    children = []
+    for offset, scopes in (
+        (0, request.daily_scopes[:midpoint]),
+        (midpoint, request.daily_scopes[midpoint:]),
+    ):
+        params = {
+            key: value
+            for key, value in request.params.items()
+            if key not in {start_param, end_param}
+        }
+        params[start_param] = scopes[0].scope_key
+        params[end_param] = scopes[-1].scope_key
+        children.append(
+            replace(
+                request,
+                params=params,
+                scope_id=scopes[0].scope_id if len(scopes) == 1 else None,
+                request_kind="initial_range_backfill",
+                target_end=scopes[-1].scope_key,
+                recheck_after=scopes[-1].recheck_after,
+                daily_scopes=scopes,
+                scope_ordinal=(
+                    None if request.scope_ordinal is None else request.scope_ordinal + offset
+                ),
+            )
+        )
+    return children[0], children[1]
+
+
 def _harvest_request(
     pipeline: IngestionPipeline,
     state: _RunState,
@@ -597,7 +710,7 @@ def _harvest_request(
 ) -> None:
     pages = prepared.pages
     calls = _api_call_rows(state.work, request, pages)
-    request_count = len(pages)
+    request_count = sum(page.request_attempts for page in pages)
     downloaded = sum(page.row_count for page in pages if page.status == "success")
     failures = [page for page in pages if page.status != "success"]
     if failures:
@@ -633,7 +746,9 @@ def _harvest_request(
         return
     if state.work.spec.update_type == "by_date" and request.daily_scopes:
         nonempty, empty = _split_daily_scope_results(state.work.spec, request, frame)
-        required_empty, allowed_empty = _classify_empty_daily_scopes(state.work, empty)
+        required_empty, allowed_empty = _classify_empty_daily_scopes(
+            {**state.work.spec.request_options, **_request_options(state.work.context)}, empty
+        )
         if required_empty:
             pipeline.metadata.record_api_calls(calls)
             message = "provider response omitted a required dense trading-date scope"
@@ -687,12 +802,18 @@ def _harvest_request(
         for scope_frame, scope_request in nonempty:
             state.buffered.append((scope_frame, scope_request))
             state.buffered_bytes += int(scope_frame.estimated_size())
+            state.buffered_rows += scope_frame.height
+        if nonempty and state.buffered_since is None:
+            state.buffered_since = time.monotonic()
         return
     state.pending_api_calls.extend(calls)
     state.request_count += request_count
     state.rows_downloaded += downloaded
     state.buffered.append((frame, request))
     state.buffered_bytes += int(frame.estimated_size())
+    state.buffered_rows += frame.height
+    if state.buffered_since is None:
+        state.buffered_since = time.monotonic()
 
 
 def _split_daily_scope_results(
@@ -710,14 +831,14 @@ def _split_daily_scope_results(
         else _source_column(spec, "time")
     )
     scoped = frame.with_columns(_date_expr(time_column).alias("__scope_date"))
+    groups = {key[0]: value.drop("__scope_date")
+              for key, value in scoped.partition_by("__scope_date", as_dict=True, maintain_order=True).items()}
     nonempty: list[tuple[pl.DataFrame, LedgerRequest]] = []
     empty: list[DailyScope] = []
     for scope in request.daily_scopes:
         scope_day = _date_value(scope.scope_key)
-        scope_frame = scoped.filter(
-            pl.col("__scope_date") == pl.lit(scope_day, dtype=pl.Date)
-        ).drop("__scope_date")
-        if scope_frame.is_empty():
+        scope_frame = groups.get(scope_day)
+        if scope_frame is None or scope_frame.is_empty():
             empty.append(scope)
             continue
         nonempty.append(
@@ -737,12 +858,11 @@ def _split_daily_scope_results(
 
 
 def _classify_empty_daily_scopes(
-    work: DatasetUpdateWork,
+    options: Mapping[str, Any],
     scopes: Sequence[DailyScope],
 ) -> tuple[list[DailyScope], list[DailyScope]]:
     """Apply the caller's explicit dense-series completeness contract."""
 
-    options = {**work.spec.request_options, **_request_options(work.context)}
     value = options.get("require_nonempty_scopes", False)
     if not isinstance(value, bool):
         raise ValueError("source_options.require_nonempty_scopes must be boolean")
@@ -788,6 +908,11 @@ def _api_call_rows(
             "asset_id": page.asset_id,
             "scope_id": request.scope_id,
             "request_kind": request.request_kind,
+            "metrics": {"request_attempts": page.request_attempts,
+                        "provider_seconds": page.provider_seconds,
+                        "limiter_wait_seconds": page.limiter_wait_seconds,
+                        "retry_wait_seconds": page.retry_wait_seconds,
+                        "discarded_rows": page.row_count if page.discarded else 0},
             "result_kind": (
                 None
                 if page.status != "success"
@@ -796,7 +921,7 @@ def _api_call_rows(
                 else "nonempty"
             ),
         }
-        for page in pages
+        for page in pages if page.request_attempts
     ]
 
 
@@ -879,6 +1004,7 @@ def _commit_state(
         )
         state.success_count += sum(not f.is_empty() for f, _ in buffered)
         state.empty_count += sum(f.is_empty() for f, _ in buffered)
+        pipeline.metadata.record_run_metrics(run_id=state.work.run_id, metrics=_run_metrics(state))
     except Exception as exc:
         message = f"commit failed: {exc}"
         for _, request in buffered:
@@ -887,6 +1013,8 @@ def _commit_state(
     finally:
         state.buffered.clear()
         state.buffered_bytes = 0
+        state.buffered_rows = 0
+        state.buffered_since = None
 
 
 def _transition(
@@ -1042,6 +1170,20 @@ def _remaining_scope_count(pipeline: IngestionPipeline, state: _RunState) -> int
     return len(rows)
 
 
+def _run_metrics(state: _RunState) -> dict[str, int | float]:
+    """Persist worker service times separately from concurrent wall duration."""
+    metrics = {name: getattr(state, name) for name in (
+        "fetch_seconds", "commit_seconds", "metadata_seconds", "provider_seconds",
+        "limiter_wait_seconds", "retry_wait_seconds", "prepare_seconds", "claim_seconds",
+        "discarded_rows", "peak_buffer_bytes", "commit_count", "partitions_rewritten",
+        "partitions_skipped", "bytes_written", "bytes_read", "peak_in_flight",
+        "peak_partition_in_flight", "request_count", "rows_downloaded", "rows_committed")}
+    metrics["elapsed_seconds"] = time.perf_counter() - state.started_at
+    metrics["request_count"] = max(state.request_count, state.observed_requests)
+    metrics["rows_downloaded"] = max(state.rows_downloaded, state.observed_rows)
+    return metrics
+
+
 def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
     _flush_api_calls(pipeline, state)
     remaining = _remaining_scope_count(pipeline, state)
@@ -1076,6 +1218,7 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         rows_downloaded=state.rows_downloaded,
         rows_committed=state.rows_committed,
         error_message=error,
+        metrics=_run_metrics(state),
     )
     return IngestionReport(
         run_id=state.work.run_id,
@@ -1102,6 +1245,13 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         peak_partition_in_flight=state.peak_partition_in_flight,
         peak_in_flight=state.peak_in_flight,
         error_message=error,
+        provider_seconds=state.provider_seconds,
+        limiter_wait_seconds=state.limiter_wait_seconds,
+        retry_wait_seconds=state.retry_wait_seconds,
+        prepare_seconds=state.prepare_seconds,
+        claim_seconds=state.claim_seconds,
+        discarded_rows=state.discarded_rows,
+        peak_buffer_bytes=state.peak_buffer_bytes,
     )
 
 
@@ -1131,7 +1281,7 @@ def _combine(
 
 
 def combine_reports(source: str, reports: Sequence[IngestionReport]) -> UpdateReport:
-    """Combine already-finished reports for compatibility with empty selections."""
+    """Aggregate finished reports, including an empty dataset selection."""
 
     return _combine(
         source,
@@ -1208,12 +1358,15 @@ def _bound_pages(
     )
     if retained <= limit:
         return True
-    pages[:] = [replace(page, frame=None) for page in pages]
+    pages[:] = [replace(page, frame=None, discarded=page.discarded or page.frame is not None) for page in pages]
     pages.append(
-        _invalid_pagination_page(
-            request_key,
-            request,
-            "Provider response exceeds the configured max_buffer_bytes allocation",
+        replace(
+            _invalid_pagination_page(
+                request_key,
+                request,
+                "Provider response exceeds the configured max_buffer_bytes allocation",
+            ),
+            buffer_limit_exceeded=True,
         )
     )
     return False
@@ -1233,10 +1386,16 @@ def _fetch_and_prepare_request(
     """Fetch, combine, and validate one logical request in its fetch worker."""
 
     request = ledger_request.params
+    started = time.perf_counter()
     request_options = {**spec.request_options, **request_options}
+    if ledger_request.request_kind != "initial_full_scan" and len(ledger_request.daily_scopes) == 1:
+        required, _ = _classify_empty_daily_scopes(request_options, ledger_request.daily_scopes)
+        request_options["_require_nonempty_response"] = bool(required)
     if ledger_request.request_kind == "initial_range_backfill":
         request_options = _daily_range_request_options(request_options)
-    pages = _fetch_request_pages(
+    fetch_pages = (_fetch_initialization_scan if ledger_request.request_kind == "initial_full_scan"
+                   else _fetch_request_pages)
+    pages = fetch_pages(
         spec=spec,
         source_adapter=source_adapter,
         request=request,
@@ -1249,7 +1408,13 @@ def _fetch_and_prepare_request(
     if not _bound_pages(pages, request_options, request_index, request) or any(
         page.status != "success" for page in pages
     ):
-        return PreparedFetch(tuple(pages), None)
+        return PreparedFetch(
+            tuple(pages),
+            None,
+            buffer_limit_exceeded=any(page.buffer_limit_exceeded for page in pages),
+            prepare_seconds=max(0.0, time.perf_counter() - started - sum(
+                page.provider_seconds + page.limiter_wait_seconds + page.retry_wait_seconds for page in pages)),
+        )
     frames = [
         page.frame for page in pages if page.frame is not None and page.frame.height
     ]
@@ -1260,19 +1425,86 @@ def _fetch_and_prepare_request(
         if len(frames) == 1
         else concat_compatible_frames(frames)
     )
+    if ledger_request.request_kind == "initial_full_scan":
+        policy = request_options["initialization_scan"]
+        if frame.is_empty() and policy.get("require_nonempty", False):
+            return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
+                                 "initialization_scan returned no data for the complete parameter inventory")
+        if frame.height:
+            time_column = _source_column(spec, "time")
+            if time_column not in frame.columns:
+                return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
+                                     f"response missing source date column: {time_column}")
+            selected_dates = [_date_value(scope.scope_key) for scope in ledger_request.daily_scopes]
+            frame = frame.filter(_date_expr(time_column).is_in(selected_dates))
     allow_all_null_payload = request_options.get("allow_all_null_payload", False)
     if not isinstance(allow_all_null_payload, bool):
         raise ValueError("source_options.allow_all_null_payload must be boolean")
+    validation_error = _validate_response(spec, ledger_request, frame,
+                                          allow_all_null_payload=allow_all_null_payload)
     return PreparedFetch(
         tuple(replace(page, frame=None) for page in pages),
         frame,
-        _validate_response(
-            spec,
-            ledger_request,
-            frame,
-            allow_all_null_payload=allow_all_null_payload,
-        ),
+        validation_error,
+        prepare_seconds=max(0.0, time.perf_counter() - started - sum(
+            page.provider_seconds + page.limiter_wait_seconds + page.retry_wait_seconds for page in pages)),
     )
+
+
+def _notify_page(options: dict[str, Any], page: FetchPage) -> None:
+    callback = options.get("_page_callback")
+    if callable(callback):
+        callback(page)
+
+
+def _fetch_initialization_scan(
+    *, spec: DatasetSpec, source_adapter: object, request: dict[str, Any],
+    request_index: int, request_options: dict[str, Any], max_retries: int,
+    retry_backoff_seconds: float, cancel_requested: Callable[[], bool] | None,
+) -> list[FetchPage]:
+    """Fetch a complete parameter-cohort inventory before daily coverage publication."""
+    policy = request_options.get("initialization_scan")
+    if not isinstance(policy, Mapping):
+        raise ValueError("initialization_scan requires a mapping")
+    values = policy.get("parameter_values")
+    requests = [(dict(request), None)]
+    if values is not None:
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError("initialization_scan parameter_values must be a nonempty sequence")
+        size = policy.get("cohort_size", 64)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError("initialization_scan cohort_size must be a positive integer")
+        parameter = str(policy.get("target_param", "id"))
+        separator = str(policy.get("separator", ","))
+        values = sorted({str(value) for value in values})
+        if not parameter or not separator or any(not value or separator in value for value in values):
+            raise ValueError("initialization_scan has invalid parameter values or separator")
+        if parameter in request:
+            raise ValueError("initialization_scan cannot overwrite a declared parameter")
+        requests = [(dict(request, **{parameter: separator.join(values[offset:offset + size])}),
+                     set(values[offset:offset + size])) for offset in range(0, len(values), size)]
+    pages: list[FetchPage] = []
+    options = {**request_options, **policy, "pagination": "offset"}
+    asset_column = _source_column(spec, "asset_id")
+    for index, (params, expected_assets) in enumerate(requests):
+        cohort = _fetch_offset_pages(spec=spec, source_adapter=source_adapter, request=params,
+            request_index=f"{request_index}:cohort:{index}", request_options=options,
+            max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
+            cancel_requested=cancel_requested)
+        pages.extend(cohort)
+        if any(page.status != "success" for page in cohort):
+            return pages
+        if expected_assets is not None:
+            for page in cohort:
+                if page.frame is not None and page.frame.height and (
+                        asset_column not in page.frame.columns or
+                        not set(page.frame[asset_column].cast(pl.String)).issubset(expected_assets)):
+                    pages.append(_invalid_pagination_page(request_index, params,
+                        "initialization_scan response contains assets outside the requested cohort"))
+                    return pages
+        if not _bound_pages(pages, options, request_index, request):
+            return pages
+    return pages
 
 
 def _fetch_request_pages(
@@ -1307,7 +1539,9 @@ def _fetch_request_pages(
             max_retries,
             retry_backoff_seconds,
             cancel_requested,
+            require_nonempty=bool(request_options.get("_require_nonempty_response", False)),
         )
+        _notify_page(request_options, page)
         limit = request_options.get("row_limit")
         if limit is not None and page.row_count >= int(limit):
             return [
@@ -1361,7 +1595,9 @@ def _fetch_offset_pages(
             max_retries,
             retry_backoff_seconds,
             cancel_requested,
+            require_nonempty=(page_index == 0 and bool(request_options.get("_require_nonempty_response", False))),
         )
+        _notify_page(request_options, page)
         pages.append(page)
         if not _bound_pages(pages, request_options, request_index, request):
             return pages
@@ -1390,6 +1626,7 @@ def _fetch_offset_pages(
             0,
             "pagination exhausted configured max_pages",
             _request_asset(request),
+            request_attempts=0,
         )
     )
     return pages
@@ -1489,6 +1726,7 @@ def _fetch_adaptive_date_range(
             retry_backoff_seconds,
             cancel_requested,
         )
+        _notify_page(request_options, page)
         pages.append(page)
         if not _bound_pages(pages, request_options, request_index, request):
             return pages
@@ -1499,7 +1737,7 @@ def _fetch_adaptive_date_range(
             if span_days <= minimum_window_days:
                 continue
             midpoint = lower + timedelta(days=span_days // 2)
-            pages[-1] = replace(page, frame=None)
+            pages[-1] = replace(page, frame=None, discarded=True)
             pending.appendleft(
                 (midpoint + timedelta(days=1), upper, f"{request_key}:1")
             )
@@ -1508,7 +1746,7 @@ def _fetch_adaptive_date_range(
         if page.row_count < row_limit:
             continue
         if span_days <= minimum_window_days:
-            pages[-1] = replace(page, frame=None)
+            pages[-1] = replace(page, frame=None, discarded=True)
             pages.extend(
                 _fetch_offset_pages(
                     spec=spec,
@@ -1530,7 +1768,7 @@ def _fetch_adaptive_date_range(
                 return pages
             continue
         midpoint = lower + timedelta(days=span_days // 2)
-        pages[-1] = replace(page, frame=None)
+        pages[-1] = replace(page, frame=None, discarded=True)
         pending.appendleft((midpoint + timedelta(days=1), upper, f"{request_key}:1"))
         pending.appendleft((lower, midpoint, f"{request_key}:0"))
     return pages
@@ -1550,6 +1788,7 @@ def _invalid_pagination_page(
         0,
         message,
         _request_asset(request),
+        request_attempts=0,
     )
 
 
@@ -1561,62 +1800,60 @@ def _fetch_one(
     max_retries: int,
     retry_backoff_seconds: float,
     cancel_requested: Callable[[], bool] | None = None,
+    *,
+    require_nonempty: bool = False,
 ) -> FetchPage:
     last_error: Exception | None = None
+    attempts = 0
+    empty_response = False
+    provider_seconds = limiter_seconds = retry_seconds = 0.0
     for attempt in range(max_retries):
         admission = getattr(source_adapter, "wait_for_request", None)
         canceled = cancel_requested is not None and cancel_requested()
         if not canceled and callable(admission):
+            started = time.perf_counter()
             canceled = not admission(spec.source_api or spec.name, cancel_requested)
+            limiter_seconds += time.perf_counter() - started
         if canceled:
-            return FetchPage(
-                request_key,
-                request,
-                None,
-                "cancelled",
-                0,
-                attempt,
-                "update cancelled before provider retry completed",
-                _request_asset(request),
-            )
+            return FetchPage(request_key, request, None, "cancelled", 0,
+                max(0, attempts - 1), "update cancelled before provider retry completed",
+                _request_asset(request), request_attempts=attempts,
+                provider_seconds=provider_seconds, limiter_wait_seconds=limiter_seconds,
+                retry_wait_seconds=retry_seconds)
+        started = time.perf_counter()
+        attempts += 1
+        empty_response = False
         try:
             frame = source_adapter.fetch(spec.source_api or spec.name, request)  # type: ignore[attr-defined]
             if not isinstance(frame, pl.DataFrame):
                 raise TypeError("source adapter must return a Polars DataFrame")
-            return FetchPage(
-                request_key,
-                request,
-                frame,
-                "success",
-                frame.height,
-                attempt,
-                asset_id=_request_asset(request),
-            )
+            if require_nonempty and frame.is_empty():
+                empty_response = True
+                raise ValueError("provider response omitted a required dense trading-date scope")
         except Exception as exc:  # noqa: BLE001
+            provider_seconds += time.perf_counter() - started
             last_error = exc
-            if attempt + 1 < max_retries and not _cooperative_backoff(
-                retry_backoff_seconds, cancel_requested=cancel_requested
-            ):
-                return FetchPage(
-                    request_key,
-                    request,
-                    None,
-                    "cancelled",
-                    0,
-                    attempt,
-                    "update cancelled during provider retry backoff",
-                    _request_asset(request),
-                )
-    return FetchPage(
-        request_key,
-        request,
-        None,
-        "failed",
-        0,
-        max_retries - 1,
-        str(last_error) if last_error else "unknown provider error",
-        _request_asset(request),
-    )
+            if attempt + 1 < max_retries:
+                started = time.perf_counter()
+                continued = _cooperative_backoff(retry_backoff_seconds,
+                    cancel_requested=cancel_requested)
+                retry_seconds += time.perf_counter() - started
+                if not continued:
+                    return FetchPage(request_key, request, None, "cancelled", 0,
+                        max(0, attempts - 1), "update cancelled during provider retry backoff",
+                        _request_asset(request), request_attempts=attempts,
+                        provider_seconds=provider_seconds, limiter_wait_seconds=limiter_seconds,
+                        retry_wait_seconds=retry_seconds)
+            continue
+        provider_seconds += time.perf_counter() - started
+        return FetchPage(request_key, request, frame, "success", frame.height, attempt,
+            asset_id=_request_asset(request), request_attempts=attempts,
+            provider_seconds=provider_seconds, limiter_wait_seconds=limiter_seconds,
+            retry_wait_seconds=retry_seconds)
+    return FetchPage(request_key, request, None, "invalid" if empty_response else "failed", 0, max(0, attempts - 1),
+        str(last_error) if last_error else "unknown provider error", _request_asset(request),
+        request_attempts=attempts, provider_seconds=provider_seconds,
+        limiter_wait_seconds=limiter_seconds, retry_wait_seconds=retry_seconds)
 
 
 def _request_options(context: RequestContext) -> dict[str, Any]:
@@ -1649,7 +1886,8 @@ def _daily_range_request_options(options: dict[str, Any]) -> dict[str, Any]:
     return {
         **options,
         **raw,
-        "pagination": "adaptive_date_range",
+        "pagination": "offset" if raw.get("window") == "calendar_month" else "adaptive_date_range",
+        "page_size": int(raw["row_limit"]),
         "minimum_window_days": 0,
     }
 
@@ -1759,7 +1997,7 @@ def _emit_progress(
             total=final_total,
             success_count=state.success_count,
             failure_count=state.failure_count,
-            rows_downloaded=state.rows_downloaded,
+            rows_downloaded=max(state.rows_downloaded, state.observed_rows),
             status=status,
             rows_committed=state.rows_committed,
             empty_count=state.empty_count,
@@ -1767,7 +2005,7 @@ def _emit_progress(
             remaining_count=max(0, final_total - completed),
             current_scope=state.current_scope,
             in_flight=state.in_flight,
-            request_count=state.request_count,
+            request_count=max(state.request_count, state.observed_requests),
             wait_reason=state.wait_reason,
             wait_seconds=state.wait_seconds,
         )

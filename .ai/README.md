@@ -12,7 +12,7 @@ topic rules; rules are authoritative instructions and linked docs explain use.
 Data is independently versioned and imports no BagelQuant package. Its target
 owns Raw and neutral DataItems, categories, storage/query/versions/PIT, frozen
 input receipts and recovery. Version 0.7 implements the stage-2 public facades
-with explicit data_meta_path/lake_path and one Data SQLite (schema 6). Data's
+with explicit data_meta_path/lake_path and one Data SQLite (schema 7). Data's
 guides describe this implemented contract; real database/service cutover remains
 separate. Exploration returns pure statistics and Polars tables.
 `DataLake.inspect` reports committed schema and lake binding without changing

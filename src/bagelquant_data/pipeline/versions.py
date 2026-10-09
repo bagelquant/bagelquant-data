@@ -85,25 +85,66 @@ def _payload_expression(expression: pl.Expr, dtype: pl.DataType | DataTypeClass)
     return expression
 
 
-def _payload_hashes(frame: pl.DataFrame, fields: list[str]) -> pl.Series:
-    """Hash typed rows without retaining Python copies of the whole payload.
+def _payload_encoder(dtype: pl.DataType | DataTypeClass,
+                     cache_budget: list[int]) -> Callable[[object], bytes]:
+    """Encode one scalar, sharing a conservative bounded string-token reserve."""
+    def generic(value: object) -> bytes:
+        return json.dumps(_payload_value(value), sort_keys=True,
+                          separators=(",", ":")).encode()
 
-    Schema makes type revisions content revisions. Floating hex retains signed
-    zero, infinities and ordinary precision; NaN stays distinct from null.
-    Nested values use the same recursive representation. Iteration is bounded
-    to Polars' row buffer and the required resulting digest column.
+    if dtype == pl.String:
+        tokens: dict[object, bytes] = {}
+        column_bytes = 0
+
+        def string_token(value: object) -> bytes:
+            nonlocal column_bytes
+            cached = tokens.get(value)
+            if cached is not None:
+                return cached
+            encoded = generic(value)
+            # Reserve dictionary, Python key/value and encoded-token storage.
+            # Build lazily from the bounded row iterator: never collect uniques.
+            reserve = 512 + 2 * len(encoded)
+            if reserve <= min(1024**2 - column_bytes, cache_budget[0]):
+                tokens[value] = encoded
+                column_bytes += reserve
+                cache_budget[0] -= reserve
+            return encoded
+
+        return string_token
+    if dtype.is_integer():
+        return lambda value: b"null" if value is None else str(value).encode()
+    if dtype.is_float():
+        return lambda value: (b"null" if value is None else
+                              b'{"float":"' + cast(float, value).hex().encode() + b'"}')
+    if dtype == pl.Boolean:
+        return lambda value: b"null" if value is None else b"true" if value else b"false"
+    if dtype == pl.Null:
+        return lambda value: b"null"
+    return generic
+
+
+def _payload_hashes(frame: pl.DataFrame, fields: list[str]) -> pl.Series:
+    """Hash the unchanged typed-row-v1 bytes with bounded scalar token reuse.
+
+    Schema and temporal precision remain part of identity; floating hex retains
+    signed zero, infinities and NaN/null distinction. Nested values retain the
+    recursive JSON representation. String caches share a conservative 4 MiB
+    reserve (at most 1 MiB per column), further bounded by input-frame bytes,
+    with no unique-value materialization.
     """
     selected = frame.select(fields)
     header = json.dumps([(name, str(dtype)) for name, dtype in selected.schema.items()],
                         separators=(",", ":")).encode()
     selected = selected.select(_payload_expression(pl.col(name), dtype).alias(name)
                                for name, dtype in selected.schema.items())
+    cache_budget = [min(4 * 1024**2, int(selected.estimated_size()))]
+    encoders = [_payload_encoder(dtype, cache_budget) for dtype in selected.schema.values()]
     base = hashlib.sha256(b"typed-row-v1\0" + header + b"\0")
     hashes = []
     for row in selected.iter_rows():
         digest = base.copy()
-        digest.update(json.dumps([_payload_value(value) for value in row],
-                                 sort_keys=True, separators=(",", ":")).encode())
+        digest.update(b"[" + b",".join(encode(value) for encode, value in zip(encoders, row)) + b"]")
         hashes.append(digest.hexdigest())
     return pl.Series("_payload_hash", hashes, dtype=pl.String)
 
@@ -434,7 +475,9 @@ def _check_evidence(spec, run_id, now, available, baseline, requests, checked_ro
         "source": spec.source, "dataset": spec.name, "run_id": run_id,
         "checked_at": now.isoformat(), "pit_date": available.isoformat(), "baseline": baseline,
         "request_json": json.dumps(requests or [], sort_keys=True, default=str),
-        "row_count": checked_rows, "records": records.to_dicts(),
+        "row_count": checked_rows,
+        "records": records.select("_record_id", "_payload_hash", "_commit_seq", "time").iter_rows()
+        if records.height else iter(()),
         "input_receipt_id": input_receipt_id,
     }
 

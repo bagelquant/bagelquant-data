@@ -28,7 +28,7 @@ Data 默认串行，执行调用者传入的 worker、在途任务、批次和�
 Core 通过公开内存计算接口生成中性结果，由 Data 发布一次；Core/BT 的计算和结果
 artifact 仍由各自管理。真实数据库与服务切换留在后续经授权的阶段。
 
-Package 0.7 使用不兼容 schema 6。旧库直接拒绝，没有别名、迁移或自动历史清理。
+Package 0.7 使用不兼容 schema 7。旧库直接拒绝，没有别名、迁移或自动历史清理。
 继续阅读 [快速开始](2_quickstart.md)、[数据集](3_datasets.md)、[数据源](4_sources.md)、
 [更新](5_updates.md)、[读取](6_queries.md)、[运维](7_operations.md)、
 [DataItem](8_items.md) 和 [探索](9_exploration.md)。
