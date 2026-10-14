@@ -1,4 +1,6 @@
 """Public temporary lakes exercise currentness without weakening byte proofs."""
+from storage_fixtures import damage_original_segments
+
 
 from datetime import UTC, date, datetime
 import sqlite3
@@ -70,7 +72,7 @@ def test_all_current_parents_prove_nonempty_or_empty_without_value_scan(
         assert data.inputs.verify(receipt)["valid"]
         # Integrity still rechecks the original retained bytes on every call.
         with sqlite3.connect(data.data_meta_path) as db:
-            db.execute("update version_batches set payload=x'00' where commit_seq=1")
+            damage_original_segments(db, 'commit_seq=1', ())
         with pytest.raises(RuntimeError, match="compression|checksum"):
             data.inputs.verify(receipt)
 

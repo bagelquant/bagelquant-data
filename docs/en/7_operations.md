@@ -9,22 +9,20 @@ restored = lake.integrity.repair(plan)
 
 Scans report manifest/schema/key/hash/partition/recovery facts without mutation.
 They do not adopt orphan files or call providers. Shallow scans compare registered
-file inventories; deep scans verify content and registered Arrow evidence.
+file inventories; deep scans verify exact original Parquet bytes and typed evidence.
 Plans bind lake identity and committed manifest. Execution rejects stale or
 foreign plans and holds the dataset's update lease during repair.
 
-`data_meta_path` alone determines committed visibility. Publication prepares
-compressed Arrow evidence in that SQLite and immutable Parquet files, then
-atomically publishes manifest, schema, commit and coverage. Prepared/unregistered
-files are invisible; retained older registered generations are historical evidence.
+`data_meta_path` determines committed visibility. Publication prepares one
+immutable Parquet segment and compact SQLite file/schema/change metadata, then
+atomically publishes manifest, schema, commit and coverage. Prepared or
+unregistered files are invisible. Every registered segment remains historical
+authority; there is no SQLite Arrow body or historical per-row proof index.
 
-Local repair reproduces registered original hashes and identities. Verified
-recovery batches restore damaged Parquet. Verified committed Parquet can restore
-recovery payloads only when every original batch hash/schema is reproduced.
-If evidence is insufficient, repair fails explicitly. A completely lost metadata
-database requires backup restoration; loose files or current provider bytes
-cannot reconstruct authoritative history. No automatic cleanup/quarantine/
-manifest adoption or metadata migration exists.
+Repair audits registered original segments. Missing or damaged original files
+require a trusted backup, and repair reports that requirement explicitly.
+Current provider responses and loose files cannot reconstruct authoritative
+history. No automatic cleanup, adoption or schema migration exists.
 
 Run history, failures, scopes, coverage and active leases are available through
 `lake.integrity`; object summaries through `lake.raw.status/status_many` and
@@ -39,6 +37,19 @@ declaration validation without creating a lake or metadata database.
 Expired heartbeat is reported without releasing ownership. Only a caller that
 has verified owner termination should call `abandon_update_owner`; publishing
 also checks the still-owned run id, parent generation and current definition.
+
+Use `with lake.integrity.update_owner(workflow_id):` around a workflow's Data
+writes. Raw and native Item publishers, including separate lake instances for
+the same metadata path, then record that owner in their existing lease rows.
+The binding follows the calling execution context; independent caller threads
+must enter it or explicitly copy the context. Internal publication workers
+retain the enclosing lease. Same-owner nesting is allowed; conflicting owners
+fail. After all of that owner's publishers have exited, the coordinator calls
+`lake.integrity.abandon_update_owner(workflow_id, reason=...)`. Successful scopes,
+flags, immutable originals and frozen receipts remain intact. The context does
+not reclaim any lease automatically, and an expired heartbeat never establishes
+process exit. An interrupted standalone lease can be recovered by its exact
+reported owner only after the coordinator verifies its publisher has exited.
 
 ## Storage usage and temporary cleanup
 
@@ -66,6 +77,42 @@ acquires the selected dataset writer leases and revalidates every candidate
 before deleting any file. Changed files fail as a stale plan. Repeating an
 already executed plan reports already-missing candidates without broadening its
 scope. Browsing usage and planning cleanup never delete or release ownership.
+
+## Explicit removal of Item evidence
+
+```python
+preview = lake.integrity.item_removal_plan(["obsolete.model.exposures", "obsolete.model.carry"])
+# The caller first releases every external reference to the discarded receipts.
+plan = lake.integrity.item_removal_plan(
+    preview["names"], discard_receipts=preview["required_receipts"],
+)
+if not plan["blockers"]:
+    result = lake.integrity.remove_items(plan)
+```
+
+This explicit operation permanently removes only the named Items' declarations,
+publications, visibility files, complete flags/builds and explicitly discarded
+whole frozen receipts. `items.remove` continues to archive without deleting
+history. The plan uses metadata and file attributes; application verifies exact
+original checksums. It is bound to the logical/physical lake, schema, scoped
+metadata and owned file inventory. Stale or foreign plans, active Data owners
+(including expired leases), retained dependencies, creator/build/output receipt
+references, parent receipts and unknown/shared/linked files reject removal.
+
+`required_receipts` includes frozen selections of the target Items and their
+descendants. Shared upstream Raw/Item sources cannot be discarded. A mixed
+receipt must be explicitly discarded whole or retained, which blocks deletion;
+retained immutable receipts are never rewritten. External Core/BT/application
+references cannot be discovered by Data: their owners must release them first.
+The API accepts exact names, not wildcard or whole-root deletion.
+
+Metadata detaches atomically before file cleanup. A bounded operation receipt in
+the existing metadata state records the exact old inventory, so repeating the
+same plan resumes interrupted cleanup without deleting new generations under
+a recreated name. Normal errors release its leases; after a forced process exit,
+the caller must verify publisher exit before exact owner abandonment. Unrelated
+rows/originals, shared selectors/summaries and global sequence state remain
+unchanged. Empty directories remain; unknown files are reported as blockers.
 
 ## Portable declaration batches
 
@@ -114,9 +161,8 @@ snapshot and its committed immutable files into new caller paths; it returns
 verified owned file hashes. `integrity.verify_backup()` validates the bundle.
 `DataLake.restore(backup_data_meta_path=..., backup_lake_path=...,
 data_meta_path=..., lake_path=...)` restores a verified same-schema bundle into
-new paths. Backup and restore reject existing destinations. Complete history
-and frozen inputs remain in the single metadata file; older physical files are
-reconstructed from registered Arrow batches when needed.
+new paths. Backup and restore reject existing destinations. Frozen inputs remain in SQLite; every retained value and visibility segment is
+backed up as its exact original file.
 
 `integrity.snapshot(data_meta_path=..., lake_path=...)` creates a consistent,
 independent copy for isolated work without scanning all historical proof bytes.
@@ -129,8 +175,8 @@ rejects active rollback journals. It includes committed WAL evidence without
 opening or checkpointing original metadata; recovery and binding relocation
 affect only the destination. macOS uses independent copy-on-write filesystem
 clones where supported; other filesystems/platforms fall back to independent
-file copies. Current immutable generations are copied; historical recovery and
-frozen receipts remain in SQLite. No symlinks/hardlinks connect original and copy.
+file copies. All committed immutable value and visibility segments are copied; frozen
+receipts and compact headers remain in SQLite. No symlinks/hardlinks connect original and copy.
 Destinations must be new and must not overlap original metadata/sidecars/lake;
 failed-copy cleanup removes only those newly created destinations. `backup` and
 `verify_backup` retain full verification of every retained proof.

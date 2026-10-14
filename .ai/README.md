@@ -12,7 +12,7 @@ topic rules; rules are authoritative instructions and linked docs explain use.
 Data is independently versioned and imports no BagelQuant package. Its target
 owns Raw and neutral DataItems, categories, storage/query/versions/PIT, frozen
 input receipts and recovery. Version 0.7 implements the stage-2 public facades
-with explicit data_meta_path/lake_path and one Data SQLite (schema 7). Data's
+with explicit data_meta_path/lake_path and one Data SQLite (schema 8). Data's
 guides describe this implemented contract; real database/service cutover remains
 separate. Exploration returns pure statistics and Polars tables.
 `DataLake.inspect` reports committed schema and lake binding without changing
@@ -26,6 +26,9 @@ numerical artifact storage, BT owns account/evaluation artifact storage. Data
 does not become a second authority for their results. Keep provider specifics
 at the integration edge and pass neutral frames/schema/availability/identity
 evidence across the Data/Core boundary; neither package imports the other.
+Explicit `integrity.item_removal_plan/remove_items` owns exact committed Item
+deletion with frozen-reference blockers and resumable file cleanup; ordinary
+item archival and temporary cleanup retain their existing contracts.
 Data docs stay in this repository. The website links to package documentation
 and does not collect or republish it.
 

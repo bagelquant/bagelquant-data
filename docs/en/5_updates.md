@@ -24,6 +24,18 @@ before a later incremental action; completed or previously committed objects upd
 Validated empty initialization counts as completed. Plans never fetch or publish, and
 changed unfinished definitions/start or an earlier end are rejected.
 
+For a default General incremental request, an already verified complete
+same-target snapshot is reused without discovery, Provider calls or value reads.
+The proof binds its declaration, terminal scopes and complete parameter inventory
+to one atomic publication or unchanged-content check. Dynamic discovery remains
+fixed for that target; a new target or explicit `raw.refresh` discovers again.
+Dynamic inventories without the native `complete.v1` default-inventory marker
+require one genuine complete update; historical receipts are never retrofitted.
+An unverified initialization still needs a real verification request. Resets,
+incomplete inventories and declaration changes retrieve all requested cohorts;
+retry and forward cohorts publish together, preserving the previous snapshot
+if either phase fails. Subset and parameter-dataset requests retain normal planning.
+
 Daily incremental updates recheck the latest three natural days by default.
 Older terminal scopes need an explicit refresh/reset or definition change.
 Declared date/parameter scopes determine coverage; row density does not.
@@ -54,7 +66,7 @@ change content identity. Workbench supplies local ceilings and native thread pol
 
 `batch_size` counts logical scopes, while `commit_batch_rows` counts rows.
 Completed publication buffers also flush every `commit_interval_seconds`
-(default 30); an incomplete general snapshot never flushes early. Schema 7
+(default 30); an incomplete general snapshot never flushes early. Schema 8
 stores run/API-call metrics, separating provider calls, limiter/backoff waits,
 preparation, scope claims, commits and discarded parent rows.
 
@@ -85,3 +97,11 @@ schema through ordinary read-only WAL coordination without copying the database.
 Their default strict preflight preserves original database/sidecar bytes.
 
 Required nonempty single-day requests and their first offset page retry transient empty responses within the existing physical-attempt budget. Persistent empties remain invalid; permitted sparse empties and pagination completion pages are unchanged.
+
+For historical General inventories, callers may supply
+`source_options={"preserve_nonempty_history": True}`. Previously nonempty
+same-definition variants retry transient empty first pages within that same
+budget. Persistent empties reject the complete snapshot and preserve old data;
+new/previously empty variants and pagination end pages keep valid-empty semantics.
+Verify a genuine complete withdrawal explicitly before disabling this runtime
+guard for that update. The guard does not change the Dataset definition hash.

@@ -28,7 +28,8 @@ def test_null_nan_and_signed_infinities_are_separate_revisions(tmp_path):
         lake.raw.ingest(_spec(), _frame(value), ingested_at=datetime(2020, 1, day, tzinfo=UTC))
     versions = lake.raw.read_versions("values", source="custom").collect().sort("time")
     assert versions.height == 4
-    assert versions["_payload_hash"].n_unique() == 4
+    assert "_payload_hash" not in versions.columns
+    assert versions.height == 4
     values = versions["value"].to_list()
     assert values[0] is None and isnan(values[1])
     assert isinf(values[2]) and values[2] > 0

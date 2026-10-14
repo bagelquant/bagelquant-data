@@ -1,221 +1,218 @@
 # Storage, PIT and recovery
 
-## Implemented authority
+## Authority and hard cut
 
-- Publication baseline timing short-circuits after positive evidence and memoizes
-  final booleans by exact effective cutoff within the verified owner/receipt
-  context only. Negative results require all aliases. Reserve at most one quarter
-  of the explicit buffer budget at a conservative 1 KiB per entry, capped at
-  1024 entries; evict oldest entries and clear on failure/exit. Never cache
-  input frames, assume chronological monotonicity, or skip explicit audit checks.
-  Exact unchanged Item builds use metadata currentness with caller budgets.
-  Timing-only reads tighten the cutoff to the latest unresolved date and use
-  checksummed captured scoped by-date `min_available` to skip future physical
-  batches; attestation copies are bounded to that cutoff. General snapshots,
-  unknown/legacy bounds and ordinary value reads retain their original behavior.
-  Empty Item recursion uses its own effective cutoff. Every original retained
-  batch remains in the receipt and integrity verification, including future ones.
-  A timing-only positive proof may avoid frames when every captured scoped batch
-  has a uniform baseline flag, all known observation bounds lie entirely inside
-  the request, and a nonempty batch proves physical availability by the cutoff.
-  Require no eligible nonbaseline witness; validate full seals. Strict/history,
-  general, legacy, unknown/mixed or partially overlapping evidence falls back.
-  Never infer False from this proof or override a caller-supplied frame.
-- Writable initialization creates the derived `version_batches_metadata`
-  covering index and analyzes `version_batches` once in the same transaction.
-  Recheck existence under the writer lock. Repeat opens do not rebuild statistics.
-  Index-free schema-seven read-only opens remain valid and never create the index;
-  table layout, payloads, receipts, hashes and PIT evidence remain unchanged.
+Data owns Raw, neutral typed DataItems, categories, versions, coverage and frozen
+inputs. Data imports no other BagelQuant package. Workbench supplies market
+semantics, authored definitions and orchestration through public APIs; Core and
+BT own their numerical and financial artifacts.
 
-- `items.publication` preflights related `ItemPublication` outputs and resolves the
-  shared registered input metadata on context entry, then uses the ordinary historical
-  ingestion/range-replacement path. Its private publication authority expires
-  on exit or group failure. Require serial groups on the context-owning thread and check cancellation before
-  writes and successful exit. Preserve per-table commits on failure/cancellation and do not claim
-  cross-table atomicity. Every later context resolves original records; byte audits are explicit.
-- `inputs.verify` accepts explicit `ExecutionOptions`; one bounded pool verifies
-  original IPC checksums and structural/type validity using bounded decompression
-  and bounded memory-first IPC transport. Retain at most min(64 MiB, one quarter
-  of each worker's allocation); decode chunks reserve another quarter and leave
-  the remainder for Arrow/type checks. Larger IPC spills to temporary mapping;
-  small IPC avoids disk and uses a zero-copy view. No temporary proof/frame cache
-  survives verification. Defaults remain serial, no hardware detection, no
-  persistent validity cache. Join the pool before serial metadata publication.
+Schema 8 requires a fresh lake. Reject other schemas before writes; do not add
+migration readers, aliases, orphan adoption or provider-backed recovery.
+`data_meta_path` is the sole Data SQLite metadata authority. `lake_path` contains
+the sole original immutable Parquet evidence, partitioned by year/month.
 
-- Data 0.7 owns Raw and typed neutral DataItems, independent category trees,
-  versions, coverage, frozen input receipts and registered local recovery.
-  Public facades: catalog/raw/items/integrity/inputs; pure exploration returns
-  statistics and Polars tables. Both data_meta_path and lake_path are explicit.
-- Data imports no Core/BT/Workbench. Core numerical and BT result artifacts have
-  their own owners; Workbench stores authored closure and backend receipt references.
-- Schema 7 rejects old/unversioned databases before writes. No aliases, migrations,
-  orphan adoption, automatic cleanup or provider-backed historical recovery.
-  Real data/service cutover is a later separately authorized operation.
-- `DataLake.inspect` is the public schema/lake-binding readiness query: no original
-  files, directories or SQLite sidecars are changed. Include committed live WAL
-  using a stable owner-internal temporary metadata snapshot; never infer readiness
-  from an immutable main-file read that ignores WAL.
-  Refuse a nonzero rollback-journal header without recovery; it may protect
-  uncommitted main-file pages. Include journal identity in stability checks.
-  An invalidated zero-header PERSIST journal does not block inspection.
-- Explicit `DataLake.inspect(runtime=True)` and `DataLake.open(runtime=True)`
-  use ordinary read-only WAL coordination for compatibility checks without
-  copying metadata. Runtime callers accept SQLite WAL/SHM coordination. Default
-  inspections/opens retain strict unchanged-source compatibility preflight.
+Each actual content delta is one immutable Parquet segment. Never rewrite/copy
+an entire historical month for an append. SQLite stores file references, exact
+file-byte checksums, typed schema, row counts, bounds and compact per-field change
+summaries. Initial/all-new coordinate fields share one original-file token and
+common bounds; actual revisions retain affected fields and semantic timing.
+General field tokens bind unique date/asset coordinates; nonunique unkeyed
+matrices retain a conservative whole-file token rather than false marginal
+column equality. Explicit audits verify file-bound tokens or admitted typed
+General projections against their originals. It stores no data body, per-row integrity/index payload or duplicate
+Arrow recovery copy. Typed observation key tokens are temporary read/commit
+projections; `_record_id` and `_payload_hash` are not stored in original Parquet.
 
-## Storage authority
+A first verification of unknown baseline timing may publish an immutable natural
+key visibility event (observation keys, original creator commit and first known
+availability). Its small SQLite header binds the exact file bytes, schema and
+bounds. Already known identical rechecks create no content or visibility file.
+An earlier or repeated identical check never backdates that first-known event.
+These are causal information events, not another content/integrity index.
+An equal DataItem response from a newer producer Source may retain a compact
+check scope: original commit, complete natural-key-set identity and row count.
+That metadata rebinds the creator only for a fully matching original file scope;
+it creates no new value body, row proof or whole-range completion.
 
-- DataMetaStore is the sole Data SQLite authority for metadata, task state,
-  schemas, manifests, versions, coverage, checks, freezes and compressed Arrow
-  recovery batches. Do not create per-month SQLite or duplicate state stores.
-- Raw and DataItems retain year/month partitioning using immutable Parquet
-  generations. Prepare recovery batches/files, then atomically publish manifest,
-  schema, commit and coverage in SQLite. Prepared evidence is invisible.
-- Normal LazyFrames pin committed generations at creation; do not replace files
-  used by admitted readers. Preserve older committed generations and histories.
-- Lake file references are relative and verified against their configured roots.
-  A read-only open creates no directories/database/tables and performs no recovery.
-  Normal read-only queries retain SQLite WAL coordination and may create/update
-  WAL/SHM sidecars. Use the inspector for readiness checks requiring zero changes.
-- Canonical hashes cover schema, values, nulls and deterministic ordering.
-  Preserve scalar and categorical types and committed batch schema.
-- Category moves change only catalog organization. Unregistering requires no
-  active dependencies, preserves histories/receipts and removes active assignment.
-- Declaration batches export non-secret JSON, preserve category identities and
-  validate the prospective union. One Data SQLite transaction uses the individual
-  registration helpers and publishes an immutable caller request receipt; stale
-  plans and natural-key conflicts never overwrite existing declarations. Imported
-  descriptors never instantiate providers/producers or acquire data. Application
-  research UUIDs and governance remain Workbench responsibilities.
+Prepare files before publishing metadata. Only committed segments are visible.
+Publish schema, manifests, version identity and successful scope transitions
+under one definition/parent/lease fence. Cancellation/failure preserves committed
+partial work and the previous complete receipt. Every registered original is
+immutable and retained for frozen replay; queries never adopt loose files.
 
-## Point-in-time and input evidence
+## Completion flags and normal planning
 
-- Daily history selects each observation's then-visible version. Fixed as_of
-  selection is explicit and distinct from observation windows and commit upper
-  bounds. General is a complete selected snapshot, not an implicit daily grid.
-- Distinguish panel date, observation date, availability date, ingestion/revision
-  identity, content commit and availability-check evidence. History initialization
-  is an unverified baseline; strict reads exclude it until later verified evidence
-  establishes a later availability. Never invent earlier publication timing.
-- Identical later acquisition preserves availability evidence without duplicate
-  content generations. Freeze both commit and check evidence ceilings atomically.
-- Inputs.freeze pins dependencies, definitions/schema, batch hashes, cutoff and
-  upper bounds. Inputs.read/verify use exact registered evidence; later updates,
-  unregistering and current-file damage never substitute current bytes.
-- Nested/captured read boundaries may tighten and reject explicit expansion.
-  Queries/verification never invoke providers or submit updates.
-- DataItem transformations validate unique (time,asset_id); null is default
-  missingness. Ffill requires a finite supplied period and explicit coordinates,
-  follows availability and stops at null events. Unknown producer impact rebuilds
-  conservatively, retaining producer revision and dependency receipt evidence.
+`raw.completion_statuses` and `items.completion_statuses` batch-read small node
+flags and their dependency metadata in one finite SQLite snapshot.
+`items.completion_guard(names=...)` holds the Data publication fence through a
+consumer’s finite reference CAS using those batch flags. It reads no input
+values, freezes no Source and permits no kernels, providers or Data writes.
+The number of queries is fixed; work is proportional to nodes and declared edges, never data
+rows. Each success flag binds definition, covered interval, checked target,
+publication revision, input state, semantic version and result reference.
+Raw and Item numerical definition hashes exclude only their top-level
+`description`. Complete declarations, exports and immutable frozen receipt
+digests retain that prose; arbitrary metadata and all other declaration fields
+remain authoritative. Description edits preserve flags, dependency/range
+identities and completed numerical history.
 
-## Integrity and recovery
+Advance flags only after successful whole requested range publication. Default
+Raw acquisition uses the request ledger for interrupted retry; subset acquisitions
+cannot certify the whole node. Beginning an admitted update marks it incomplete;
+actual content/visibility publication advances its dataset revision. A retained
+success flag cannot hide a pending, failed or newer partial publication. Scope
+reset invalidates the complete flag. Do not release writer ownership based solely
+on an expired heartbeat; explicit recovery verifies publisher exit first.
 
-- Scan reports facts only. Report orphan/unregistered files without adoption;
-  retained registered generation histories are not orphans. No scan mutates data.
-- Repair plans bind lake identity and current manifest. Repair holds writer
-  ownership, reproduces original registered hashes/schema/identity, and rejects
-  stale plans or unknown partitions. Cancellation retains already repaired work.
-- Compressed batches may restore Parquet; complete verified Parquet may restore
-  batch payloads only if every original batch hash is reproduced. Insufficient
-  local evidence fails explicitly. Total metadata loss requires backup restoration.
-- Never refetch providers to replace historical evidence, fabricate original
-  availability, backdate new observations or silently release live ownership.
-- Storage usage counts actual regular files with physical hard-link deduplication,
-  including metadata/recovery and retained history. Temporary cleanup is explicit:
-  freeze exact known atomic temporary files, acquire writer leases and revalidate
-  all identities/hashes before deletion. Protect active files, registered history,
-  rejected evidence, unknown files and symbolic/shared hard links. Repeated plans
-  only report already-missing files; they never broaden the approved candidates.
+Wrap orchestration writes in `integrity.update_owner(owner_id)` so all Raw and
+native Item leases share the same externally recoverable workflow identity.
+The binding is execution-context local and applies to separate lake instances
+with the same resolved metadata path. Same-owner nesting is permitted; replacing
+an enclosing owner or supplying a conflicting explicit Raw owner fails before
+publication. Independent caller threads must explicitly copy the context or
+enter it; internal publication workers retain their enclosing dataset lease.
+The context never adopts, clears or expires another publisher's lease. Only
+after every publisher for an exact owner has exited may orchestration call
+`integrity.abandon_update_owner(owner_id, reason=...)`. That public operation
+retains successful scopes, flags, original bodies and frozen evidence, while
+releasing only that owner's unfinished runs/scopes/leases. Legacy standalone
+leases expose their exact `owner_id` through `active_update_leases`; recovery
+requires external owner/process evidence, not date or heartbeat inference.
 
-Recovery compression is completed before acquiring SQLite write ownership;
-prepared-status/hash checks and evidence insertion stay transactional. Replay
-restores the last registered by-date batch schema after concatenation, preserving
-entirely null declared scalar types and original partition hashes.
+Covered ranges must contain the requested start/end. Union overlapping or
+adjacent successful windows only when the earlier publication revision and
+direct dependency state remain current and no unfinished update exists. Changed
+authority requires the new completion itself to cover the whole requested span.
+Disjoint windows do not certify the hole between them. An unchanged older branch
+cannot replace the latest checked target. Empty successful results and
+nontrading dates can complete without an invented content version. Keep checked
+target separate from last nonempty date and covered observation end. External
+`complete_at` or `replace_range(..., available_date=...)` sets the checked target
+to that acquisition cutoff while retaining the declared covered interval.
+Completion/acquisition dates and internally generated producer timestamps do
+not create equal-value content copies. Explicit historical version dates
+supplied to `ingest` or a publication frame remain semantic PIT events.
 
-General recovery retains the union of full-snapshot batch schemas, including
-columns omitted by later snapshots; its last batch is not a full-partition schema.
+Normal prerequisites/currentness read metadata only: no provider calls, original
+Parquet decode/rehash, producer execution or implicit proof preparation. Generic
+General inventory completeness uses the success flag, not historical response or
+per-row proof scans. Historical General initialization has no verified current
+flag; a subsequent real observation creates it. Enabling preservation of earlier
+nonempty inventory reopens a latest response that contained empty variants.
+Explicit freshness does not certify original-byte integrity.
 
-Frozen-input currentness uses registered metadata and versioned selection indexes.
-Covering build/all-parent proofs remain shortcuts. Stale parents require exact indexed
-cutoff/window lineage; selected stale parents invalidate, unselected stale parents do not.
-Missing indexes return unknown and cannot establish a positive result. No ordinary
-IPC fallback, schema migration, implicit maintenance or historical receipt rewrite.
-Metadata/decompression/witness allocation respects explicit or context budgets;
-original byte/IPC verification and derived-index comparison belong to `inputs.verify`.
+## Range identities and incremental calculation
 
+Frozen receipts pin declarations, typed schema, original segment/visibility
+headers, cutoff, committed/check ceilings and dependency edges. Receipt IDs,
+global counters and resource settings do not participate in range content tokens.
+Historical replay never substitutes current files or provider bytes.
 
-`inputs.is_current` also accepts a nonempty finite sequence of original frozen
-receipts. Validate each supplied identity/digest before memo reuse; check every
-root in one SQLite read view with its own immutable request/cutoff and retained
-boundary. Share recursive boolean results within that invocation, retaining
-cycle checks and exact selected-parent fallback for stale historical parents.
-Return whether all roots are current without short-circuiting root checks; a
-later invocation outside an entered read context rereads current evidence.
-Inside the same-thread, same-path fixed `inputs.read_context` view, completed
-booleans may be reused under original receipt ID/digest plus complete reader
-boundary (metadata path, commit/check limits and as_of). Check every supplied
-root digest before hits; publish results only after all roots complete successfully.
-Keep at most 4096 boolean entries, evict oldest entries and clear on context exit/
-failure. No exceptions, frames or cross-context results are cached. Do not create aggregate receipts,
-cache frames, persist validity, or replace independent full byte verification.
+`inputs.range_identity` and ordinary `selection_identity`/descriptors return
+metadata range tokens. Disjoint date ranges, unconsumed field changes and proven
+nonintersecting date/asset change bounds preserve identity. Bounds conservatively
+invalidate an intersecting change whose exact consumed equality is unavailable.
+Changing optional summaries must never change ordinary range identity.
 
-Typed-row-v1 payload hashing retains exact persisted bytes and schema identity. Scalar token encoding avoids repeated JSON work; string tokens share a conservative 4 MiB reserve, at most 1 MiB per column and no more than the input-frame byte estimate. Cache fill is lazy from the existing bounded row iterator; no full unique-value list, unbounded string cache, additional worker pool or identity migration. Nested/decimal/binary values retain recursive canonical JSON; temporal native precision, signed zero, NaN/null and infinity remain distinct.
+Explicit `prepare_coordinate_selector` stores only a caller-supplied finite
+Domain mask, without reading source rows. `prepare_range_selections` stores small
+metadata scope summaries during Snapshot preparation. Unchanged readiness reuses
+those headers without decoding the selector. Compatible later scopes retain the
+original summary Source; original receipts remain immutable.
 
-Identical ordered reconciliation fields with identical schema may bypass revision hash joins. Shape, ordering, null/value/availability/baseline differences fall back to ordinary reconciliation. Final withdrawal checks first project time/asset keys; exact keys skip the join and full old payloads are read only for actual withdrawals. Tombstones and frozen historical evidence remain unchanged.
+Explicit `index_selection(s)` may consume/audit bounded original Parquet to create
+small exact consumed-value summaries. They are a stronger equality proof, not a
+second ordinary identity authority. `selection_equivalent(summaries_only=True)`
+compares only registered exact summaries when metadata cannot prove equality.
+No per-batch row/scalar index or automatic full-history maintenance exists.
 
-Unchanged-content witnesses stream only record identity, payload hash, original commit and availability through the bounded Polars row iterator into SQLite. Keep every witness and original insertion order in the same header/publication transaction; iteration or constraint failures roll back the whole transaction. Do not materialize full-panel dictionary/parameter lists, split transactions or relax WAL/FULL durability to accelerate attestations.
+DataItem producer policies declare affected output intervals and read windows.
+Append computes new outputs; bounded repairs reuse unaffected history. Newly
+visible original segments use registered date bounds and availability delay to
+bound impact. First-visibility changes begin at the actual information
+availability boundary, not the earlier observation date. Unknown or full-history impact is actionable, never silent replay.
+Completed-range authority and pending visibility publish with the success flag;
+row-only ingestion cannot create a complete-range certificate.
 
-Record-check readers explicitly filter the small dataset/check headers before indexed witness lookup. The joined header ID defines the same ordering as check_id, avoiding a full-record sort. Unrelated datasets must not add per-record work to frozen capture or ordinary metadata snapshots. Preserve selected rows, cutoffs, proof hashes and historical receipts; do not add a schema migration or drop stored evidence.
+## PIT and typed consumption
 
-Large complete by-date baseline attestations may use an immutable content-addressed full-commit seal. Prove exact unique (record ID, payload hash, original commit) equality against every original registered recovery batch, with one uniform availability date, using bounded external sorting. Counts alone never establish completeness. Retain all original SQL witnesses/headers and batch identities. Freeze embeds the checked seal; read-only operations never persist seals. Validate checksum and exact header/commit/batch binding before cache use. Partial/mixed or general checks retain the ordinary path; oversized unsupported inline evidence fails explicitly before materialization. Legacy receipts recapture their original representation for currentness; changing representation alone does not invalidate them. Replay preserves header eligibility, check/commit ceilings, ingestion cutoff, availability max, attestation ID and parent receipts. Proven per-batch observation bounds prune window reads only; frozen evidence and verification still retain/recheck every original batch on each call. Temporary sort connections/files are closed and removed.
+Observation date, availability date, ingestion/version identity, content commit
+and successful check are separate. Daily history selects each observation's
+then-visible version; explicit as_of is a fixed information cutoff. General is a
+complete selected event, including a genuinely empty event, not a daily grid.
 
-DataItems.update accepts explicit input_windows keyed by declared input alias, mapping to inclusive observation (start,end). Validate aliases, date order and declared start/end plus Raw observation limits before recursion/publication; never infer windows for arbitrary producers. Pin overrides in the actual frozen requests without modifying the DataItem declaration or its hash. Omitted inputs retain their declared scope. General Raw snapshots are not windowed. Exact successful reuse checks the same definition/dependency/range identity before frame construction without reading retained batch bytes; explicit audits retain those checks.
+Bounded observation reads apply `source_time` predicates to original Parquet
+scans before computing temporary typed natural-key identities. Retained visibility
+events receive the same observation predicates before key encoding and joining.
+Validate the whole original's physical schema and row count from its Parquet
+footer before bounded consumption; selected row counts are not whole-file counts.
+Keep availability lower bounds after latest-version resolution, preserve the
+actual first-known date, and leave General event selection unchanged. Ordinary
+reads do not audit file bytes; explicit verification still checks the complete
+original. Unbounded internal reads retain their full-row contract.
 
-New explicit-window by-date freezes mark scoped_batches and use existing immutable version_batches observation/availability bounds to capture potentially selected batches. Retain unknown bounds, late revisions of in-window observations, related checks, overlapping empty item_range proofs and unknown scopes. Full-commit seals retain every original proof batch reference. Legacy receipts recapture their original broad representation; bounds/markers do not rewrite their bytes or hashes. Reads use matching immutable (commit,partition,hash) bounds to skip impossible batches; general initialization baselines remain complete. Shared-commit checks with unknown record-window membership conservatively invalidate; no unsafe currentness claim. No schema migration, new batch store or implicit rolling/lookback clipping.
+Initialization is an unverified historical baseline. Strict reads exclude it
+until a retained natural-key visibility event establishes actual later timing.
+Never invent or backdate original publication. Preserve sparse membership, null
+and withdrawal events, complete compound keys, schema evolution, categories,
+nonfinite/signed floating values and deterministic version precedence.
 
-Frozen window pruning uses only bounds captured in that checksummed receipt or its exact full-commit seal. Legacy receipts keep their original broad batch read; never consult live batch summaries to alter their replay. Subsequent summary corruption cannot change either legacy or scoped frozen read while retained batch verification still passes. Scoped empty Item currentness ignores unrelated first physical schema publication only when no batch can be selected; retain captured schema bytes, typed declaration and empty dependency proof, and invalidate for relevant content/dependency changes.
+`input_read_boundary` captures one committed/check ceiling and may tighten only.
+`inputs.read_context` shares deeply immutable metadata in a same-thread finite
+SQLite view. Caller objects supply only ID/digest. Publication guards hold the
+writer fence only for finite metadata/reference CAS, never providers or kernels.
+No frame, proof-validity cache or authority survives the operation context.
 
-`inputs.verify` also accepts a nonempty finite sequence of original frozen
-receipts. Each root identity/digest and every dependency edge are checked;
-shared parents and original batches are checked once within this invocation.
-The multi-root report lists original root IDs/digests and aggregate counts.
-There is no new aggregate receipt or cross-call validity cache; a later call
-rechecks bytes. Currentness remains a separate check.
+## Inspection, audits and backups
 
-`inputs.read_context(receipt_or_sequence, verify=False, ...)` is finite and read-only.
-Resolve original registered metadata once per receipt, sharing a same-thread SQLite
-snapshot with matching Data readers. Exposed cached metadata is deeply immutable;
-supplied receipt objects provide only original ID/digest, never evidence authority.
-Check every supplied root digest when metadata is reused; explicit verify/currentness traverse required dependency edges. Default entry reads registered metadata (`verify=False`); `verify=True` explicitly
-audits every original byte and derived index, creating only finite audit proof authority. Release metadata/snapshot on failure/exit; no
-frames, validity proofs or cross-operation caches. No hardware discovery.
-Ordinary Raw/DataItem dataset snapshots reuse an ambient read transaction without
-nested BEGIN, COMMIT or ROLLBACK; standalone reads own their normal snapshot.
-Later verify calls within that same explicitly entered context may reuse successful
-original batch proof keys and immutable receipt graph summaries; every supplied
-root ID/digest is still checked, and all proof authority expires with the context.
-`inputs.read(start=..., end=...)` may tighten inclusive observation windows, never
-widen captured request/Raw observation bounds or change cutoff/commit/check/digest.
-Prune only with checksummed captured bounds; unknown/general/legacy reads stay
-conservative. Original-byte verification always retains all batches. Caller progress
-counts unique successful batches; caller cancellation exceptions propagate through
-receipt traversal, bounded decompression and IPC checks with temporary map/file and
-worker cleanup. Read contexts do not authorize publication or writes.
+Read-only opens never initialize or recover. Ordinary WAL coordination may touch
+SQLite sidecars. Default `DataLake.inspect` preserves originals/sidecars and
+includes committed WAL through a stable private metadata snapshot. Runtime
+inspection uses ordinary WAL coordination; do not ignore live WAL via immutable
+main-file reads. Active rollback journals are refused without recovery.
 
-`inputs.window_read_supported` is metadata-only and true only when every retained
-by-date batch has captured scoped or sealed observation bounds; general/unknown/
-legacy evidence remains conservative, with no live-summary lookup or validity claim.
+`inputs.verify` explicitly rechecks every original file byte and typed structure,
+including visibility events and all original dependency edges, with cancellation
+and one caller-bounded pool. Multiple roots deduplicate originals only within the
+invocation. Small range summaries are audited according to their proof kind;
+exact summaries compare consumed values, metadata summaries compare original
+registered headers whose files are separately audited.
 
-`integrity.snapshot` creates an independent task copy with `valid=None` and explicit
-unverified status; it does not replace strict backup/verify_backup. Copy stable
-main/WAL bytes, reject active rollback journals, and retry changing source signatures.
-Never open/checkpoint/write the original during copying. Recover WAL and relocate
-relative lake binding on the destination only, preserving lake identity and all
-historical SQLite evidence. Prefer independent filesystem clones with copy fallback;
-no shared writable inode, hard link or symlink. Copy current immutable generations.
-Reject existing/overlapping destinations, including original SQLite sidecars; failure
-cleanup is confined to the newly owned destinations. Required original receipts pass explicit verification when auditing backup integrity. Schema inspection uses the same
-efficient stable-copy primitive for committed live WAL and preserves original bytes.
+There is no second data copy for local corruption repair. Missing/damaged original
+segments or visibility files require checksum-verified backup restoration. Never
+refetch providers as historical evidence. Passive scans report facts, protect
+registered history, and never adopt or delete loose files. Explicit temporary
+cleanup freezes and revalidates known unpublished atomic temporary files only.
 
-Full-request identity uses `inputs.request_identity`: original alias request/cutoff/evidence metadata, excluding enclosing receipt ID/digest/global counters and optional derived indexes. Retain complete alias-local parent/PIT/empty/check evidence conservatively. Index availability must never change a full-request key; precise `selection_identity` separately proves selected-window reuse. Finite read contexts may memoize metadata hashes after validating each supplied root digest, clearing on exit.
+## Explicit Item evidence removal
+
+`integrity.item_removal_plan(names, discard_receipts=...)` previews an exact
+caller inventory using metadata and file attributes, without reading bodies.
+`integrity.remove_items(plan)` is explicit destructive maintenance, distinct
+from `items.remove` archival and temporary cleanup. Require no active Data
+writer/run/scope, including expired owners; process exit and external consumer
+reference release belong to the caller. Bind logical and physical lake identity,
+schema, exact scoped metadata, original file references and attributes. Verify
+original checksums before metadata detachment. Reject stale/foreign/forged plans,
+symbolic/shared links and unregistered target files rather than adopting them.
+
+Retained declarations, creator/check/build/native completion evidence, frozen
+requests and parent edges block removal. Discard only explicitly named whole
+receipts in the target Item dependency closure; never delete shared upstream
+sources or rewrite mixed immutable receipts. Core/BT/Workbench release their
+owned external references before apply; Data cannot discover those stores.
+
+Detach exact metadata atomically, keeping sequence/high-water state and every
+unrelated record unchanged. Persist the immutable removal inventory/status under
+a namespaced existing `data_meta_state` key, without schema migration. Then
+unlink only those exact old files under writer leases. Interrupted cleanup can
+repeat that receipt without recapturing a recreated name's generations. A forced
+process exit retains its ownership lease; only verified owner recovery releases
+it. Leave empty directories and retain shared optional selectors/upstream proofs.
+Removal receipts contain file/operation metadata only, never row proof arrays.
+
+Backups copy the metadata snapshot and all retained original content/visibility
+files. Total metadata loss requires restoration of that trusted backup. Unverified
+snapshot copies remain explicitly unverified; strict backup audits required
+original evidence. Preserve historical receipts, lake identity and declarations.

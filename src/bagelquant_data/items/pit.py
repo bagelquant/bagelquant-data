@@ -150,7 +150,18 @@ def general_input_snapshot(
 def _same_ordered_rows(left: pl.DataFrame, right: pl.DataFrame, fields: Sequence[str]) -> bool:
     """Prove exact ordered equality without allocating a hash-join working set."""
     lhs, rhs = left.select(fields), right.select(fields)
-    return lhs.schema == rhs.schema and lhs.equals(rhs, null_equal=True)
+    if lhs.schema != rhs.schema or not lhs.equals(rhs, null_equal=True):
+        return False
+    # Float equality merges signed zero. Round-trip scalar text preserves it
+    # while retaining canonical NaN/null semantics and avoiding rowwise hashes.
+    return all(lhs[name].cast(pl.String).equals(rhs[name].cast(pl.String))
+        for name, dtype in lhs.schema.items() if dtype in {pl.Float32, pl.Float64})
+
+
+def _comparison_frame(frame: pl.DataFrame, fields: Sequence[str]) -> pl.DataFrame:
+    """Typed comparison keys, including the sign of floating zero."""
+    return frame.select(pl.col(name).cast(pl.String) if frame.schema[name] in {pl.Float32, pl.Float64}
+        else pl.col(name) for name in fields)
 
 
 def iter_computed_versions(
@@ -206,7 +217,9 @@ def iter_computed_versions(
             if _same_ordered_rows(frame, previous, identity):
                 changed = frame.head(0)
             else:
-                changed = frame.join(previous.select(identity), on=identity, how="anti", nulls_equal=True)
+                changed_keys = _comparison_frame(frame, identity).join(_comparison_frame(previous, identity),
+                    on=identity, how="anti", nulls_equal=True).select("time", "asset_id")
+                changed = frame.join(changed_keys, on=["time", "asset_id"], how="semi")
                 removed = previous.join(frame.select("time", "asset_id"), on=["time", "asset_id"], how="anti")
                 if removed.height:
                     removed = removed.with_columns(pl.lit(None, dtype=previous.schema["value"]).alias("value"),

@@ -83,8 +83,12 @@ def test_repair_plan_requires_current_registered_evidence(tmp_path):
     current = lake.integrity.repair_plan('daily', source='custom')
     generation = lake.raw.manifest('daily', source='custom')[0]['generation_path']
     path = lake.lake_path / 'raw/custom/daily' / generation
+    backup = path.read_bytes()
     path.write_bytes(b'damaged')
     assert not lake.integrity.scan('daily', source='custom')['valid']
+    with pytest.raises(RuntimeError, match='trusted backup'):
+        lake.integrity.repair(current)
+    path.write_bytes(backup)
     assert lake.integrity.repair(current)[0]['content_changed'] is False
     assert lake.raw.read('daily', source='custom', view='latest').collect()['value'].to_list() == [2.0]
     foreign = DataLake.open(data_meta_path=tmp_path / 'other.sqlite', lake_path=tmp_path / 'other')

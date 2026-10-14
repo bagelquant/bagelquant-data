@@ -1,9 +1,24 @@
 # 计算记录
 
-普通读取信任已登记不可变元数据，并保留数值类型检查，不重新计算字节或内容哈希。显式审计检查原始完整性，并将当前版本派生索引与原始证据对照。新输出仍保留规范内容哈希。
+普通读取消费原始 Parquet 的 typed 数值。冻结、更新计划、完成检查和范围身份只读
+SQLite 小型元数据，不解码历史。`raw.completion_statuses` 和
+`items.completion_statuses` 在一个固定元数据视图批量读取节点 flag；定义、发布修订、
+连续覆盖、未完成更新和直接依赖状态共同决定是否完成。
 
-Owner 公共 API：`inputs.describe / request_identity / selection_identity / index_plan / build_index / verify`。索引维护由冻结计划显式执行，支持取消；普通打开不回填历史，也不改写旧 receipt 或 manifest。缺失、部分或版本不匹配的派生索引不提供 selection/interval 证明；可用的权威元数据精确命中和覆盖父记录快捷证明仍有效。资源预算不改变数值身份。
+`inputs.describe`、`request_identity`、`range_identity`、`selection_identity`
+和 `selection_descriptors` 均只读。支持的范围总能取得保守 token，显式维护不会
+改变普通 token。范围外追加及未消费字段变化不影响身份；稀疏坐标的矩形边界只提供
+保守判断，需要更精确相等证明时显式准备小型 selection 摘要。
 
-完整 `verify` 使用显式资源配置，未指定时继承当前读取上下文。选取摘要审计超出允许的缓冲预算时抛出 `MemoryError`，不会返回完整审计通过或自动扩大预算。原始字节传输可以落盘，但选取计算本身仍须满足工作集预算。
+`prepare_coordinate_selector` 仅保存调用方 Domain 坐标；`prepare_range_selections`
+登记小型元数据摘要并保留原 Source 引用。`index_selection(s)` 和
+`prepare_general_projections` 显式比较预算内的原始 typed 数据。坐标身份需要显式
+准备小型日期轴，缺失时返回 `None`。这些操作均不创建历史逐行索引。
 
-`inputs.request_identity(receipt, alias)` 对原始已登记 alias 请求、cutoff 和完整证据元数据计算身份，排除外层 receipt ID/digest、全局计数和可选索引。索引维护和无关 root alias 不改变该身份；alias 内检查与父引用保守保留。完整请求身份与精确选中窗口证明分别使用。
+`inputs.verify` 核验凭证绑定、数值和首次可见事件文件的完整原始字节、类型、边界及
+已有可选摘要。取消会关闭读取器并丢弃未完成的操作缓存。资源预算不影响数值身份；
+预算不足报 `MemoryError`。原始文件缺失或损坏需要可信备份。
+
+`items.completion_guard(names=...)` 在有限 Data 发布锁内返回同一批完成 flag。
+消费方可在固定视图内执行自己的引用 CAS；计算、Provider 调用及 Data 写入必须
+放在 guard 外。

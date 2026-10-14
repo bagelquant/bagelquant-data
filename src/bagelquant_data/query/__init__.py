@@ -131,7 +131,7 @@ class _RawReader:
         rows = self._raw.metadata._rows(
             "select b.commit_seq,b.partition_path,b.content_hash,b.row_count,"
             "b.min_available,b.max_available,b.min_observation,b.max_observation,c.mode,c.pit_date "
-            "from version_batches b join version_commits c on c.seq=b.commit_seq "
+            "from version_segments b join version_commits c on c.seq=b.commit_seq "
             "where "
             + " and ".join(conditions)
             + " order by b.commit_seq,b.partition_path",

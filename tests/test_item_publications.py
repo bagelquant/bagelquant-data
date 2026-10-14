@@ -1,3 +1,4 @@
+from storage_fixtures import damage_original_segments
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from dataclasses import replace
@@ -56,7 +57,7 @@ def test_multi_publication_preserves_versions_empty_certificates_and_rechecks(tm
     assert lake.inputs.read(old, "first", view="snapshot").collect()["value"].to_list() == [9.]
     assert lake.items.read("first", view="snapshot", as_of="2020-01-31").collect()["value"].to_list() == [None]
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
+        damage_original_segments(db, 'commit_seq=1', ())
     publish(lake, [publication(lake, "second", frame)], input_receipt=receipt)
     with pytest.raises(RuntimeError):
         lake.inputs.verify(receipt)
@@ -79,7 +80,8 @@ def test_multi_publication_validates_dependency_identity_and_definition_cas(tmp_
         publish(lake, [publication(lake, "first", frame), publication(lake, "second", frame)], input_receipt=receipt)
     assert not lake.items.builds("first")
     stale = publication(lake, "first", frame)
-    lake.items.register(DataItemSpec("first", (RawInput("custom", "source"),), description="changed"))
+    lake.items.register(DataItemSpec("first", (RawInput("custom", "source"),),
+        metadata={"numerical_revision": "changed"}))
     with pytest.raises(RuntimeError, match="definition changed"):
         publish(lake, [stale], input_receipt=receipt)
     assert not lake.items.builds("first") and not lake.integrity.active_update_leases()
@@ -120,7 +122,7 @@ def test_operation_verifies_once_across_groups_expires_and_rechecks_next_entry(t
         operation.publish([publication(lake, "first", frame.head(0))])
     assert lake.items.read("first", view="snapshot", as_of="2020-01-31").collect()["value"].to_list() == [9.]
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
+        damage_original_segments(db, 'commit_seq=1', ())
     with lake.items.publication(input_receipt=receipt):
         pass
     with pytest.raises(RuntimeError):
@@ -190,8 +192,7 @@ def test_forest_verifies_every_original_output_and_shared_parent_once(tmp_path, 
     assert lake.inputs.verify(roots) == report and batches
     output = roots[1].evidence["second"]["batches"][0]
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=? and partition_path=?",
-                   (output["commit_seq"], output["partition_path"]))
+        damage_original_segments(db, 'commit_seq=? and partition_path=?', (output['commit_seq'],output['partition_path']))
     with pytest.raises(RuntimeError):
         lake.inputs.verify(roots)
 

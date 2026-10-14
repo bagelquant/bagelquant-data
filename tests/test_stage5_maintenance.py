@@ -26,7 +26,9 @@ def test_usage_history_unknown_and_cleanup_idempotence(tmp_path):
     temporary = setup(lake)
     usage = lake.integrity.storage_usage()
     assert usage["raw_datasets"] == usage["available_raw_datasets"] == 1
-    assert usage["history_bytes"] > 0 and usage["current_bytes"] > 0
+    assert usage["history_bytes"] == 0 and usage["current_bytes"] > 0
+    # Both immutable content generations are registered originals; schema 8
+    # retains no separate redundant recovery body classified as history.
     assert usage["temporary_bytes"] == len(b"abandoned")
     assert usage["unknown_bytes"] == len(b"unknown")
     assert usage["bytes"] == usage["metadata_bytes"] + usage["lake_bytes"]

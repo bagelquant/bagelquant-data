@@ -123,7 +123,12 @@ def test_empty_baseline_without_content_commit_is_not_verified_absence(tmp_path,
         lake.items.ingest("count", _rows().with_columns(pl.lit(0.0).alias("value")),
                           available_date="2020-01-03", input_receipt=verified)
         assert lake.items.read("count", view="snapshot", as_of="2020-01-03", strict=True).collect()["value"].to_list() == [0.0]
-        lake.items.update("native_count", start="2020-01-01", end="2020-01-03")
+        with pytest.raises(RuntimeError, match="timing attestations"):
+            lake.items.update("native_count", start="2020-01-01", end="2020-01-03")
+        # Explicitly republish a known unchanged value with the new complete
+        # input timing proof; normal update must not replay an opaque producer.
+        lake.items.replace_range("native_count", _rows().with_columns(pl.lit(0.0).alias("value")),
+            start="2020-01-01", end="2020-01-03", available_date="2020-01-03", input_receipt=verified)
         assert lake.items.read("native_count", view="snapshot", as_of="2020-01-02", strict=True).collect().is_empty()
         assert lake.items.read("native_count", view="snapshot", as_of="2020-01-03", strict=True).collect()["value"].to_list() == [0.0]
         lake.items.replace_range("input", _rows().head(0), start="2020-01-01", end="2020-01-03", available_date="2020-01-04")

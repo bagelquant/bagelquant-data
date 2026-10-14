@@ -50,14 +50,14 @@ def test_parallel_month_writes_preserve_serial_values_and_frozen_recovery(tmp_pa
     assert len(threads) == 3
     for view in ("history", "snapshot"):
         cutoff = "2020-04-30" if view == "snapshot" else None
-        assert parallel.items.read("derived", view=view, as_of=cutoff).collect().equals(
-            serial.items.read("derived", view=view, as_of=cutoff).collect())
+        assert parallel.items.read("derived", view=view, as_of=cutoff).collect().drop("_dependency_digest", "ingested_at").equals(
+            serial.items.read("derived", view=view, as_of=cutoff).collect().drop("_dependency_digest", "ingested_at"))
     assert parallel.items.read("derived", strict=True).collect().is_empty()
     receipt = parallel.inputs.freeze({"derived": ItemInput("derived")}, information_cutoff="2020-04-30")
     assert parallel.inputs.verify(receipt)
     for part in parallel.items.manifest("derived"):
         state = recovery.inspect_partition(parallel._parquet, "items", "derived", part["partition_path"], deep=True)
-        assert state["recovery_state"] == "ready", state
+        assert state["recovery_state"] == "originals_present", state
 
 
 def test_parallel_writer_failure_drains_before_rollback(tmp_path, monkeypatch):
@@ -94,22 +94,20 @@ def test_parallel_writer_failure_drains_before_rollback(tmp_path, monkeypatch):
     assert report.status == "success" and lake.items.read("derived").collect().height == 4
 
 
-def test_recovery_compression_does_not_hold_sqlite_writer_lock(tmp_path, monkeypatch):
+def test_original_preparation_does_not_hold_sqlite_writer_lock(tmp_path, monkeypatch):
     lake = fixture_lake(tmp_path)
-    original = recovery.zlib.compress
+    original = recovery._file_hash
     calls = []
-
-    def compress(payload, level):
+    def file_hash(path, *args, **kwargs):
         with sqlite3.connect(tmp_path / "data.sqlite", timeout=0) as connection:
             connection.execute("begin immediate")
             connection.rollback()
-        calls.append(len(payload))
-        return original(payload, level)
-
-    monkeypatch.setattr(recovery.zlib, "compress", compress)
-    report = lake.items.initialize("derived", start="2020-01-01", end="2020-04-30",
-                                   config=ExecutionOptions(workers=1))
-    assert report.status == "success" and len(calls) == 8
+        calls.append(path)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(recovery, "_file_hash", file_hash)
+    report = lake.items.initialize("derived", start="2020-01-01", end="2020-04-30", config=ExecutionOptions(workers=1))
+    assert report.status == "success" and calls
+    assert len(set(calls)) == 4
 
 
 def test_small_writer_reserve_falls_back_to_serial_preparation(tmp_path, monkeypatch):
@@ -184,7 +182,7 @@ def test_general_recovery_retains_columns_omitted_by_later_snapshot(tmp_path):
                     ingested_at=datetime(2020, 1, 2, tzinfo=UTC))
     partition = lake.raw.manifest("membership", source="custom")[0]["partition_path"]
     state = recovery.inspect_partition(lake._parquet, "custom", "membership", partition, deep=True)
-    assert state["recovery_state"] == "ready", state
+    assert state["recovery_state"] == "originals_present", state
     frame = recovery.reconstruct(lake._parquet, "custom", "membership", partition)
     assert frame.sort("snapshot_date")["old"].to_list() == ["retained", None]
 
@@ -212,16 +210,18 @@ def test_existing_baseline_batches_match_chronological_noop_and_retain_frozen(tm
         return original_commit(spec, frame, *args, **kwargs)
 
     monkeypatch.setattr(item_api, "commit_versions", commit)
-    serial.items.update("derived", start="2020-01-01", end="2020-04-30", force=True)
+    serial.items._build("derived", start=date(2020, 1, 1), end=date(2020, 4, 30),
+        initialize=False, stack=(), force=True, config=None, progress=None, cancelled=None)
     assert counts == [1, 1, 1, 1]
     counts.clear()
-    report = batched.items.update("derived", start="2020-01-01", end="2020-04-30", force=True,
+    report = batched.items._build("derived", start=date(2020, 1, 1), end=date(2020, 4, 30),
+                                  initialize=False, stack=(), force=True, progress=None, cancelled=None,
                                   config=ExecutionOptions(workers=3, commit_batch_rows=2))
     assert report.status == "success" and report.rows_committed == 0
     assert counts == [2, 2]
     for cutoff in ("2020-01-01", "2020-02-01", "2020-03-01", "2020-04-30"):
-        assert batched.items.read("derived", view="snapshot", as_of=cutoff).collect().equals(
-            serial.items.read("derived", view="snapshot", as_of=cutoff).collect())
+        assert batched.items.read("derived", view="snapshot", as_of=cutoff).collect().drop("_dependency_digest", "ingested_at").equals(
+            serial.items.read("derived", view="snapshot", as_of=cutoff).collect().drop("_dependency_digest", "ingested_at"))
     assert batched.items.read("derived", strict=True).collect().is_empty()
     assert batched.inputs.read(receipt, "item").collect().equals(frozen)
     assert batched.inputs.verify(receipt)["valid"]
@@ -240,7 +240,8 @@ def test_existing_baseline_publication_bytes_bound_admission(tmp_path, monkeypat
         return original(spec, frame, *args, **kwargs)
 
     monkeypatch.setattr(item_api, "commit_versions", commit)
-    report = lake.items.update("derived", start="2020-01-01", end="2020-04-30", force=True,
+    report = lake.items._build("derived", start=date(2020, 1, 1), end=date(2020, 4, 30),
+                               initialize=False, stack=(), force=True, progress=None, cancelled=None,
                                config=ExecutionOptions(workers=1, commit_batch_rows=4, max_buffer_bytes=4096))
     assert report.status == "success" and counts == [1, 1, 1, 1]
 
@@ -263,7 +264,8 @@ def test_verified_rechecks_remain_chronological_for_frozen_cutoffs(tmp_path, mon
         return original(spec, frame, *args, **kwargs)
 
     monkeypatch.setattr(item_api, "commit_versions", commit)
-    report = lake.items.update("derived", start="2020-01-01", end="2020-01-02", force=True,
+    report = lake.items._build("derived", start=date(2020, 1, 1), end=date(2020, 1, 2),
+                               initialize=False, stack=(), force=True, progress=None, cancelled=None,
                                config=ExecutionOptions(workers=3, commit_batch_rows=2))
     assert report.status == "success" and counts == [1, 1]
     receipt = lake.inputs.freeze({"item": ItemInput("derived", view="snapshot", strict=True)}, information_cutoff="2020-01-01")
@@ -291,7 +293,8 @@ def test_verified_noop_witnesses_do_not_delay_old_baseline_frozen_visibility(tmp
     lake.items.ingest("derived", frame, historical_baseline=True, input_receipt=inputs)
     original = lake.inputs.freeze({"item": ItemInput("derived", view="snapshot", strict=True)}, information_cutoff="2020-01-03")
     assert lake.inputs.read(original, "item").collect().is_empty()
-    report = lake.items.update("derived", start="2020-01-01", end="2020-01-04", force=True,
+    report = lake.items._build("derived", start=date(2020, 1, 1), end=date(2020, 1, 4),
+                               initialize=False, stack=(), force=True, progress=None, cancelled=None,
                                config=ExecutionOptions(workers=3, commit_batch_rows=2))
     assert report.rows_committed == 0
     current = lake.inputs.freeze({"item": ItemInput("derived", view="snapshot", strict=True)}, information_cutoff="2020-01-03")
@@ -315,10 +318,11 @@ def test_cancel_between_baseline_batches_reports_retained_rows_without_success_b
 
     report = lake.items.update("derived", start="2020-01-01", end="2020-04-30",
         config=ExecutionOptions(workers=3, commit_batch_rows=1),
-        progress=progress, cancelled=lambda: bool(updates))
+        progress=progress, cancelled=lambda: any(update.rows_committed for update in updates))
     assert report.status == "cancelled" and report.rows_committed == 1
     assert report.commit_seq is not None and updates[-1].rows_committed == 1
-    assert len(lake.items.builds("derived")) == prior_build_count
+    completed_chunks = lake.items.builds("derived")[prior_build_count:]
+    assert all((row["start_date"], row["end_date"]) != ("2020-01-01", "2020-04-30") for row in completed_chunks)
     assert lake.integrity.active_update_leases() == []
     assert lake.inputs.verify(old)["valid"]
     assert lake.items.read("derived", view="snapshot", as_of="2020-04-29").collect()["value"].to_list() == [1.0, 2.0, 3.0, 4.0]

@@ -417,7 +417,7 @@ class StatusManager:
                 parquet, spec.source, spec.name, row["partition_path"], deep=deep
             )
             recovery.append(evidence)
-            if evidence["recovery_state"] != "ready":
+            if evidence["recovery_state"] != "originals_present":
                 damaged_partition = any(
                     issue.get("path") == row["partition_path"]
                     and issue.get("code")
@@ -444,7 +444,7 @@ class StatusManager:
                     ),
                     path=row["partition_path"],
                 )
-                recovery_issue["repairable"] = not damaged_partition
+                recovery_issue["repairable"] = False  # The sole original requires a trusted backup.
                 recovery_issue["recovery_state"] = evidence["recovery_state"]
                 issues.append(recovery_issue)
         repairable = sum(bool(issue["repairable"]) for issue in issues)
@@ -568,6 +568,14 @@ class StatusManager:
                 for path in sorted(manifested - actual)
             ]
             issues.extend(invalid_references)
+            missing_originals = {str(row["partition_path"]) for row in manifest_rows
+                if str(row["generation_path"]) not in actual and
+                (json.loads(row["partition_values"]) if isinstance(row["partition_values"],str) else row["partition_values"]).get("versioned")}
+            for partition in sorted(missing_originals):
+                issue = _health_issue("recovery_evidence","Original segment is missing; restore a trusted backup",path=partition)
+                issue["repairable"] = False
+                issue["recovery_state"] = "backup_required"
+                issues.append(issue)
             issues.extend(
                 _health_issue(
                     "orphan_file",

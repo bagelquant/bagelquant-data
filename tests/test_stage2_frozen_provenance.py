@@ -72,7 +72,8 @@ def test_one_external_batch_keeps_baseline_and_verified_versions_separate(tmp_pa
         _rows().with_columns(pl.lit(date(2020, 1, 3)).alias("version_available_date")),
     ])
     report = lake.items.ingest("item", output, input_receipt=receipt)
-    assert report.rows_committed == 1
+    # Both explicit version dates survive as distinct original publications.
+    assert report.rows_committed == 2
     assert lake.items.read("item", view="snapshot", as_of="2020-01-02", strict=True).collect().is_empty()
     assert lake.items.read("item", view="snapshot", as_of="2020-01-03", strict=True).collect()["value"].to_list() == [1.0]
     assert lake.items.read("item", view="versions").collect()["_baseline"].to_list() == [True, False]

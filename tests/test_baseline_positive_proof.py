@@ -1,4 +1,6 @@
 """Positive timing proof and conservative fallback in isolated fake lakes."""
+from storage_fixtures import damage_original_segments
+
 
 import copy
 from dataclasses import replace
@@ -81,7 +83,7 @@ def test_metadata_true_matches_uniform_commit_and_keeps_bytes(tmp_path, monkeypa
         import sqlite3
 
         with sqlite3.connect(data.data_meta_path) as db:
-            db.execute("update version_batches set payload=x'00'")
+            damage_original_segments(db, '', ())
         assert (
             proven(r, "raw", date(2020, 1, 5)) is True
         )  # metadata is not an integrity check
@@ -124,8 +126,10 @@ def test_full_commit_witness_eligibility_blocks(tmp_path, monkeypatch):
         )
         data.raw.ingest(spec(), frame, ingested_at=datetime(2020, 1, 20, tzinfo=UTC))
         monkeypatch.setattr(seals, "COMPACT_MIN_ROWS", 1)
+        assert not hasattr(data.inputs, "index_checks")
         r = scoped(data)
-        assert r.evidence["raw"]["full_commit_checks"]
+        assert r.evidence["raw"]["record_checks"]
+        assert not r.evidence["raw"].get("full_commit_checks")
         assert (
             proven(r, "raw", date(2020, 1, 10)) is True
             and data.inputs._baseline_at(r, "raw", date(2020, 1, 10)) is True
@@ -149,8 +153,8 @@ def test_mixed_flags_future_revision_and_commit_ceiling(tmp_path):
         )
         r = scoped(data)
         assert (
-            proven(r, "raw", date(2020, 1, 10)) is None
-        )  # conservatively includes invisible future nonbaseline batch
+            proven(r, "raw", date(2020, 1, 10)) is True
+        )  # registered availability excludes the future revision from this proof
         assert data.inputs._baseline_at(r, "raw", date(2020, 1, 10)) is True
         assert proven(r, "raw", date(2020, 1, 10), max_commit=1) is True
         assert data.inputs._baseline_at(r, "raw", date(2020, 1, 25)) is False
@@ -230,7 +234,7 @@ def test_history_strict_legacy_and_unknown_fallback(tmp_path):
                     )
 
 
-def test_general_and_empty_parent_no_local_positive_proof(tmp_path):
+def test_general_header_positive_proof_and_empty_parent_fallback(tmp_path):
     with lake(tmp_path) as data:
         data.raw.ingest(
             spec("general"),
@@ -243,7 +247,7 @@ def test_general_and_empty_parent_no_local_positive_proof(tmp_path):
         )
         r = data.inputs.freeze({"raw": raw}, information_cutoff="2020-01-31")
         assert (
-            proven(r, "raw", date(2020, 1, 5)) is None
+            proven(r, "raw", date(2020, 1, 5)) is True
             and data.inputs._baseline_at(r, "raw", date(2020, 1, 5)) is True
         )
         data.items.register(DataItemSpec("empty", (raw,)))
@@ -315,11 +319,79 @@ def test_publication_proves_timing_without_frames_but_rechecks_future_bytes(
             "_baseline"
         ].to_list() == [True]
         with sqlite3.connect(data.data_meta_path) as db:
-            db.execute(
-                "update version_batches set payload=x'00' where partition_path like '%month=02%'"
-            )
+            damage_original_segments(db, "partition_path like '%month=02%'", ())
         with data.items.publication(input_receipt=receipt) as operation:
             operation.publish([publication])
         with pytest.raises(RuntimeError):
             data.inputs.verify(receipt)
         assert not data.integrity.active_update_leases()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("empty_general", [False, True])
+def test_publication_checks_all_header_proofs_before_unknown_timing(tmp_path, monkeypatch, reverse, empty_general):
+    """One complete General baseline proves the OR, regardless of alias order."""
+    import sqlite3
+
+    data = lake(tmp_path)
+    daily = spec()
+    data.raw.ingest(daily, rows((1,), (1.0,)), mode="initialize",
+                    ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    data.raw.ingest(daily, rows((1,), (1.0,)),
+                    ingested_at=datetime(2020, 1, 5, tzinfo=UTC))
+    general = replace(spec("general"), name="calendar")
+    frame = rows((1,), (1.0,))
+    data.raw.ingest(general, frame.head(0) if empty_general else frame,
+                    mode="initialize", ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    requests = {"a": RawInput("custom", "calendar" if reverse else "raw", view="versions",
+                              include_historical_baseline=True),
+                "z": RawInput("custom", "raw" if reverse else "calendar", view="versions",
+                              include_historical_baseline=True)}
+    frozen = data.inputs.freeze(requests, information_cutoff="2020-01-31")
+    with sqlite3.connect(data.data_meta_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='input_batch_index'").fetchone() is None
+    data.items.register(DataItemSpec("output", tuple(requests.values())))
+    monkeypatch.setattr(data.inputs, "_baseline_at", lambda *a, **k: pytest.fail("known OR must not decode timing"))
+    output = rows((10, 20), (2., 3.)).with_columns(pl.col("time").alias("version_available_date"))
+    result = data.items.ingest("output", output, input_receipt=frozen)
+    assert result.status == "success"
+    assert data.items.read("output", strict=True, view="snapshot", as_of="2020-01-31").collect().is_empty()
+    assert data.inputs.get(frozen).digest == frozen.digest
+
+
+def test_general_positive_timing_preserves_attestation_cutoff_and_ceilings(tmp_path):
+    data = lake(tmp_path)
+    frame = rows((1,), (1.,))
+    data.raw.ingest(spec("general"), frame, mode="initialize",
+                    ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    data.raw.ingest(spec("general"), frame, ingested_at=datetime(2020, 1, 20, tzinfo=UTC))
+    frozen = data.inputs.freeze({"raw": RawInput("custom", "raw", view="versions",
+        include_historical_baseline=True)}, information_cutoff="2020-01-31")
+    assert proven(frozen, "raw", date(2020, 1, 10)) is True
+    assert proven(frozen, "raw", date(2020, 1, 25)) is None
+    assert proven(frozen, "raw", date(2020, 1, 25), max_check_id=0) is True
+    assert proven(frozen, "raw", date(2020, 1, 25), max_commit=0) is None
+    strict = replace(frozen, requests={"raw": replace(frozen.requests["raw"], strict=True)})
+    assert proven(strict, "raw", date(2020, 1, 10)) is None
+    assert data.inputs._baseline_at(frozen, "raw", date(2020, 1, 25)) is False
+
+
+def test_verified_general_cannot_hide_unknown_daily_timing(tmp_path):
+    import sqlite3
+
+    data = lake(tmp_path)
+    frame = rows((1,), (1.,))
+    data.raw.ingest(spec(), frame, mode="initialize", ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    data.raw.ingest(spec(), frame, ingested_at=datetime(2020, 1, 5, tzinfo=UTC))
+    general = replace(spec("general"), name="calendar")
+    data.raw.ingest(general, frame, ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    requests = {"daily": RawInput("custom", "raw", view="versions", include_historical_baseline=True),
+        "calendar": RawInput("custom", "calendar", view="versions", include_historical_baseline=True)}
+    frozen = data.inputs.freeze(requests, information_cutoff="2020-01-31")
+    with sqlite3.connect(data.data_meta_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='input_batch_index'").fetchone() is None
+    data.items.register(DataItemSpec("output", tuple(requests.values())))
+    # First visibility is retained as immutable Parquet event evidence.
+    data.items.ingest("output", rows((10,), (2.,)), available_date="2020-01-10", input_receipt=frozen)
+    assert data.items.read("output").collect()["value"].to_list() == [2.]
+    assert data.items.read("output", strict=True).collect()["value"].to_list() == [2.]

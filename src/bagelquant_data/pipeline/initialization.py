@@ -84,6 +84,7 @@ def reopen_initialization(metadata, spec, *, start, end, reason: str) -> dict:
             raise ConfigurationError("Reopening requires terminal historical daily scopes")
         now = datetime.now(UTC).isoformat()
         db.execute("update dataset_initializations set status='running' where source=? and dataset=?", key)
+        db.execute("update datasets set update_incomplete=1 where source=? and name=?",key)
         db.execute("update update_scopes set status='pending',checked_through=null,last_error=null,recheck_after=null,updated_at=? where source=? and dataset=? and spec_hash=? and scope_kind='date' and scope_key between ? and ?",
                    (now, *key, spec_hash, str(start), str(end)))
         return {"source": spec.source, "dataset": spec.name, "start": str(start), "end": str(end),

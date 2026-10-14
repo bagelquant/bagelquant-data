@@ -6,6 +6,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
+from bagelquant_data.storage.paths import LakePaths
 import polars as pl
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.core.exceptions import DatasetNotFoundError
@@ -37,7 +38,7 @@ class RawQueryService:
         frame = self._scan(dataset, source=source, snapshot=snapshot)
         frame = _attested_versions(frame, snapshot["checks"], snapshot["record_checks"],
                                    as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id,
-                                   full_commit_checks=snapshot.get("full_commit_checks", ()))
+                                   full_commit_checks=snapshot.get("full_commit_checks", ()), event_paths=self.parquet.paths)
         names = frame.collect_schema().names()
         if strict and "_baseline" in names:
             frame = frame.filter(~pl.col("_baseline"))
@@ -105,7 +106,8 @@ class RawQueryService:
         )
         frame = _attested_versions(frame, snapshot["checks"], snapshot["record_checks"],
                                    as_of_date=as_of_date, ingested_before=ingested_before, max_check_id=max_check_id,
-                                   full_commit_checks=snapshot.get("full_commit_checks", ()))
+                                   full_commit_checks=snapshot.get("full_commit_checks", ()), event_paths=self.parquet.paths,
+                                   observation_start=observation_start, observation_end=observation_end)
         names = frame.collect_schema().names()
         if strict and "_baseline" in names:
             frame = frame.filter(~pl.col("_baseline"))
@@ -135,6 +137,9 @@ class RawQueryService:
             frame = frame.filter(pl.col("time") >= _date_value(start))
         if end is not None:
             frame = frame.filter(pl.col("time") <= _date_value(end))
+        if view == "versions":
+            frame = frame.sort([field for field in ("time",observation,"asset_id","ingested_at","_commit_seq","_attestation_id")
+                if field in names])
         return (
             frame if fields is None else frame.select([f for f in fields if f in names])
         )
@@ -219,6 +224,20 @@ class RawQueryService:
             ]
         )
         aligned = [align_lazy_frame(f, schema, list(schema)) for f in frames]
+        if "source_time" in schema:
+            # Observation bounds commute with per-key version resolution and
+            # baseline visibility. Availability bounds deliberately stay later.
+            if observation_start is not None:
+                aligned = [f.filter(pl.col("source_time") >= _date_value(observation_start)) for f in aligned]
+            if observation_end is not None:
+                aligned = [f.filter(pl.col("source_time") <= _date_value(observation_end)) for f in aligned]
+            definition = self.metadata.get_dataset(source,dataset)
+            extra = () if definition is None else tuple(json.loads(definition["spec_json"]).get("primary_key_extra",()))
+            keys = ["source_time","asset_id",*extra]
+            from bagelquant_data.storage.recovery import with_record_key
+            keyed_schema = {**dict(schema),"_record_id":pl.String}
+            aligned = [f.map_batches(lambda frame:with_record_key(frame,keys=keys),schema=keyed_schema,
+                predicate_pushdown=False,projection_pushdown=False,slice_pushdown=False) for f in aligned]
         return pl.concat(aligned, how="vertical") if len(aligned) > 1 else aligned[0]
 
 
@@ -227,6 +246,9 @@ def _attested_versions(
     as_of_date: DateLike | None = None, ingested_before: datetime | None = None,
     max_check_id: int | None = None,
     full_commit_checks: Sequence[Mapping] = (),
+    event_paths: LakePaths | None = None,
+    observation_start: DateLike | None = None,
+    observation_end: DateLike | None = None,
 ) -> pl.LazyFrame:
     """Overlay exact unchanged-content witnesses without replacing stored history.
 
@@ -250,6 +272,14 @@ def _attested_versions(
     schema = {"_commit_seq": pl.Int64, "_attested_date": pl.Date,
               "_attested_ingested": pl.Datetime("us", "UTC"), "_attestation_id": pl.Int64}
     general = "_snapshot_id" in names
+    if not general and "_record_id" not in names:
+        # A bounded window can contain no original observations while retaining
+        # visibility events for other dates. Its canonical empty schema has no
+        # temporary natural-key identity, and those events cannot add rows.
+        # A nonempty unidentified frame is damaged input, never verified absence.
+        if frame.select(pl.len()).collect().item():
+            raise RuntimeError("Visibility overlay requires natural-key identities for nonempty observations")
+        return frame.with_columns(pl.lit(None, dtype=pl.Int64).alias("_attestation_id"))
     keys = ["_commit_seq"] if general else ["_commit_seq", "_record_id", "_payload_hash"]
     witnesses = []
     if general:
@@ -265,7 +295,7 @@ def _attested_versions(
              "_payload_hash": record["payload_hash"], "_attested_date": _date_value(record["available_date"]),
              "_attested_ingested": datetime.fromisoformat(str(eligible[int(record["check_id"])]["checked_at"])),
              "_attestation_id": int(record["check_id"])}
-            for record in record_checks if int(record["check_id"]) in eligible
+            for record in record_checks if not record.get("event") and int(record["check_id"]) in eligible
             and (cutoff is None or _date_value(record["available_date"]) <= cutoff)
         ]
     originals = frame.with_columns(pl.lit(None, dtype=pl.Int64).alias("_attestation_id"))
@@ -280,6 +310,45 @@ def _attested_versions(
             pl.max_horizontal(pl.col("time"), pl.lit(_date_value(seal["available_date"]))).alias("time"),
             pl.lit(datetime.fromisoformat(str(check["checked_at"])), dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
             pl.lit(False).alias("_baseline"), pl.lit(int(check["id"]), dtype=pl.Int64).alias("_attestation_id")))
+    for event in record_checks:
+        if not event.get("event") or int(event["check_id"]) not in eligible:
+            continue
+        if event_paths is None:
+            raise RuntimeError("Visibility events require their configured original lake")
+        check = eligible[int(event["check_id"])]
+        base = event_paths.dataset_root(str(event["source"]),str(event["dataset"]))
+        path = (base / str(event["generation_path"])).resolve()
+        if not path.is_relative_to(base) or path == base:
+            raise RuntimeError("Visibility event reference escapes its dataset")
+        event_frame = pl.scan_parquet(path,hive_partitioning=False).rename({"version_commit":"_commit_seq","available_date":"_attested_date"})
+        # Retain the full typed natural key while pruning unrelated observations
+        # before Python key encoding. Do not restrict first-known availability
+        # to the requested observation dates: genuinely late events remain late.
+        if observation_start is not None:
+            event_frame = event_frame.filter(pl.col("source_time") >= _date_value(observation_start))
+        if observation_end is not None:
+            event_frame = event_frame.filter(pl.col("source_time") <= _date_value(observation_end))
+        natural_keys = [name for name in event_frame.collect_schema().names() if name != "_attested_date"]
+        from bagelquant_data.storage.recovery import with_record_key
+        # SQL-style equality drops null keys and merges signed float zero.
+        # Match complete typed natural keys temporarily; originals store no hash.
+        observation_keys = [name for name in natural_keys if name != "_commit_seq"]
+        event_schema = {**dict(event_frame.collect_schema()),"_record_id":pl.String}
+        event_frame = event_frame.map_batches(lambda part, keys=observation_keys:with_record_key(part,keys=keys),
+            schema=event_schema,predicate_pushdown=False,projection_pushdown=False,slice_pushdown=False)
+        witnessed = frame.filter(pl.col("_baseline")).join(
+            event_frame.select("_commit_seq","_record_id","_attested_date"),
+            on=["_commit_seq","_record_id"],how="inner")
+        if cutoff is not None:
+            witnessed = witnessed.filter(pl.col("_attested_date") <= cutoff)
+        # An Item baseline's supplied version date is unknown history, not an
+        # observed publication floor. Its first verified result is constrained
+        # by the observation and declared availability, then this actual event.
+        availability_axes = (["source_time","available_date"] if "_item_definition_hash" in names else ["time"])
+        witnessed = witnessed.with_columns(pl.max_horizontal(*availability_axes,"_attested_date").alias("time"),
+            pl.lit(datetime.fromisoformat(str(check["checked_at"])),dtype=pl.Datetime("us","UTC")).alias("ingested_at"),
+            pl.lit(False).alias("_baseline"),pl.lit(int(event["check_id"]),dtype=pl.Int64).alias("_attestation_id"))
+        copies.append(witnessed.select(originals.collect_schema().names()))
     if not witnesses:
         return pl.concat([originals, *copies], how="vertical") if copies else originals
     witnessed = frame.filter(pl.col("_baseline")).join(pl.DataFrame(witnesses, schema=schema).lazy(), on=keys, how="inner")

@@ -46,6 +46,7 @@ class LedgerRequest:
     variant_hash: str | None = None
     range_backfill_eligible: bool = False
     request_date_field: str | None = None
+    require_nonempty_response: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +127,10 @@ def synchronize_requests(
     )
     variants = _parameter_variants(spec, raw, _base_variants(spec, params, discovered_param_sets), ids)
     if spec.update_type == "general":
-        requests = _general_requests(spec, metadata, final_day, variants)
+        requests = _general_requests(
+            spec, metadata, final_day, variants,
+            preserve_nonempty_history=_boolean_source_option(source_options, "preserve_nonempty_history"),
+        )
         assert requests is not None
         return requests
     spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
@@ -138,6 +142,50 @@ def synchronize_requests(
             refresh=bool(source_options and source_options.get("refresh")),
         )
     raise ConfigurationError(f"Unsupported update_type: {spec.update_type}")
+
+
+def general_snapshot_completed(
+    spec: DatasetSpec,
+    metadata: DataMetaStore,
+    *,
+    end: DateLike | None,
+    today: DateLike | None = None,
+    ids: Sequence[str] | None = None,
+    params: dict[str, object] | None = None,
+    source_options: Mapping[str, object] | None = None,
+) -> bool:
+    """Prove a default General inventory complete from atomic publication records.
+
+    Dynamic inventories are fixed by their successful discovery for this target;
+    a later target or explicit refresh discovers them again. Subset requests and
+    parameter-dataset inventories retain the ordinary scheduling path.
+    """
+    if (spec.update_type != "general" or ids is not None or params is not None
+            or spec.parameter_dataset or source_options and source_options.get("refresh")):
+        return False
+    target = _date_value(end or today or datetime.now(UTC).date()).isoformat()
+    rows = metadata.completion_statuses(source=spec.source,datasets=(spec.name,))
+    return bool(rows and rows[0]["definition_current"] and rows[0]["publication_current"]
+        and not (source_options and source_options.get("preserve_nonempty_history") and rows[0]["completion_empty_count"])
+        and rows[0]["checked_target"] == target)
+
+
+def _general_nonempty_variants(spec, metadata, spec_hash, target):
+    """Use retained canonical run evidence even after a same-target reset."""
+    return {str(row["variant_hash"]) for row in metadata._rows(
+        "select distinct s.variant_hash from api_calls a "
+        "cross join update_scopes s on s.id=a.scope_id "
+        "where a.source=? and a.dataset=? and a.status='success' and a.result_kind='nonempty' and a.row_count>0 "
+        "and s.source=a.source and s.dataset=a.dataset and s.scope_kind='general_snapshot' "
+        "and s.spec_hash=? and s.scope_key<=? and a.run_id in ("
+        "select run_id from version_commits where source=? and dataset=? "
+        "and status='committed' and spec_hash=? union "
+        "select c.run_id from version_checks c join version_commits v on v.seq=c.visible_commit "
+        "where c.source=? and c.dataset=? and v.source=c.source and v.dataset=c.dataset "
+        "and v.status='committed' and v.spec_hash=?)",
+        (spec.source, spec.name, spec_hash, target, spec.source, spec.name, spec_hash,
+         spec.source, spec.name, spec_hash),
+    )}
 
 
 def _parameter_variants(spec, raw, variants, ids=None):
@@ -171,7 +219,7 @@ def _parameter_variants(spec, raw, variants, ids=None):
     return variants
 
 
-def _general_requests(spec, metadata, final_day, variants):
+def _general_requests(spec, metadata, final_day, variants, *, preserve_nonempty_history=False):
     if spec.update_type == "general":
         target = final_day.isoformat()
         spec_hash = metadata.dataset_spec_hash(spec.source, spec.name)
@@ -202,6 +250,8 @@ def _general_requests(spec, metadata, final_day, variants):
             if str(row["scope_key"]) == target
             and str(row["variant_hash"]) in params_by_variant
         ]
+        previous_nonempty = (_general_nonempty_variants(spec, metadata, spec_hash, target)
+                             if preserve_nonempty_history else set())
         metadata.reset_update_scopes(
             [
                 int(row["id"])
@@ -222,6 +272,7 @@ def _general_requests(spec, metadata, final_day, variants):
                 ),
                 target_end=target,
                 variant_hash=str(row["variant_hash"]),
+                require_nonempty_response=preserve_nonempty_history and str(row["variant_hash"]) in previous_nonempty,
             )
             for row in rows
             if str(row["scope_key"]) == target

@@ -62,7 +62,7 @@ def test_large_first_panel_publishes_one_commit_across_months(tmp_path):
     assert result["value"].sum() == 48 * 210 * 211 / 2
 
 
-def test_baseline_bulk_does_not_coalesce_later_availability_attestations(tmp_path):
+def test_baseline_bulk_preserves_distinct_explicit_availability_publications(tmp_path):
     lake = _lake(tmp_path)
     lake.items.register(DataItemSpec("item"))
     days = [date(2020, 1, 1), date(2020, 1, 2)]
@@ -76,7 +76,9 @@ def test_baseline_bulk_does_not_coalesce_later_availability_attestations(tmp_pat
     lake.items.ingest("item", _frame(days, versions=[date(2020, 1, 3), date(2020, 1, 4)]))
     strict = lake.items.read("item", view="versions", strict=True).collect()
     assert strict["version_available_date"].to_list() == [date(2020, 1, 3), date(2020, 1, 4)]
-    assert strict["_attestation_id"].n_unique() == 2
+    # Explicit version dates are semantic publications, so these are retained
+    # original versions rather than equal-body first-visibility attestations.
+    assert not strict["_baseline"].any()
     assert lake.items.read("item", view="snapshot", as_of="2020-01-02", strict=True).collect().is_empty()
     assert lake.items.read("item", view="snapshot", as_of="2020-01-03", strict=True).collect().height == 1
     assert lake.inputs.read(receipt, "item").collect().is_empty()

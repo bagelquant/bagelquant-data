@@ -200,7 +200,7 @@ def test_backup_rejects_corrupt_frozen_evidence(tmp_path):
         lake.integrity.verify_backup()
 
 
-def test_mid_producer_definition_change_rejects_publication_and_force_recomputes(tmp_path):
+def test_mid_producer_definition_change_rejects_publication_and_force_does_not_replay(tmp_path):
     lake = opened(tmp_path)
     lake.raw.ingest(raw_spec(), panel(), ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
     request = RawInput("custom", "input")
@@ -221,5 +221,5 @@ def test_mid_producer_definition_change_rejects_publication_and_force_recomputes
     lake.items.update("derived", end="2020-01-01")
     assert lake.items.update("derived", end="2020-01-01").status == "unchanged"
     assert len(calls) == 1
-    lake.items.update("derived", end="2020-01-01", force=True)
-    assert len(calls) == 2
+    assert lake.items.update("derived", end="2020-01-01", force=True).status == "unchanged"
+    assert len(calls) == 1

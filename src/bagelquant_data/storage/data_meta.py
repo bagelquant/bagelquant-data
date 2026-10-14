@@ -23,6 +23,7 @@ from bagelquant_data.storage.snapshot import copy_database, file_signature
 
 
 _READ_VIEWS: ContextVar[tuple[tuple[Path, int, sqlite3.Connection], ...]] = ContextVar("data_read_views", default=())
+_UPDATE_OWNERS: ContextVar[tuple[tuple[Path, str], ...]] = ContextVar("data_update_owners", default=())
 
 
 def _probe_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -47,7 +48,7 @@ class DataMetaStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "7"
+    SCHEMA_VERSION = "8"
 
     def __init__(self, data_meta_path: str | Path, *, read_only: bool = False, runtime: bool = False) -> None:
         self.data_meta_path = Path(data_meta_path)
@@ -68,6 +69,29 @@ class DataMetaStore:
         """Reject mutations before any file or metadata write starts."""
         if self.read_only:
             raise PermissionError("Data lake is read-only")
+
+    @contextmanager
+    def update_owner(self, owner_id: str) -> Iterator[None]:
+        """Bind this execution context's publishers to one recoverable owner."""
+        self.ensure_writable()
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("Update owner must be a nonempty identity")
+        path = self.data_meta_path.resolve()
+        current = self._update_owner_id()
+        if current is not None and current != owner_id:
+            raise RuntimeError("Cannot replace an enclosing Data update owner")
+        token = _UPDATE_OWNERS.set((*_UPDATE_OWNERS.get(), (path, owner_id)))
+        try:
+            yield
+        finally:
+            _UPDATE_OWNERS.reset(token)
+
+    def _update_owner_id(self, explicit: str | None = None) -> str | None:
+        path = self.data_meta_path.resolve()
+        current = next((owner for root, owner in reversed(_UPDATE_OWNERS.get()) if root == path), None)
+        if current is not None and explicit is not None and current != explicit:
+            raise RuntimeError("Explicit Data update owner differs from enclosing owner")
+        return current if current is not None else explicit
 
     def bind_lake(self, lake_path: Path) -> None:
         """Validate that this metadata authority belongs to the selected lake."""
@@ -238,6 +262,19 @@ class DataMetaStore:
             connection.close()
 
     @contextmanager
+    def publication_read_view(self) -> Iterator[sqlite3.Connection]:
+        """Hold the writer fence while consumers bind a fixed metadata view."""
+        path = self.data_meta_path.resolve()
+        if any(view_path == path and thread == get_ident() for view_path, thread, _ in _READ_VIEWS.get()):
+            raise ConfigurationError("A publication guard cannot upgrade an existing read view")
+        with self.atomic_transaction() as connection:
+            token = _READ_VIEWS.set((*_READ_VIEWS.get(), (path, get_ident(), connection)))
+            try:
+                yield connection
+            finally:
+                _READ_VIEWS.reset(token)
+
+    @contextmanager
     def atomic_transaction(self) -> Iterator[sqlite3.Connection]:
         """Share one transaction across declaration helpers without nested commits."""
         self.ensure_writable()
@@ -354,8 +391,10 @@ class DataMetaStore:
 
     def _write_dataset(self, db: sqlite3.Connection, spec: DatasetSpec) -> None:
         now = _now()
-        payload = json.dumps(_spec_payload(spec), sort_keys=True, default=str)
-        spec_hash = hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+        declaration = _spec_payload(spec)
+        payload = json.dumps(declaration, sort_keys=True, default=str)
+        definition = {key: value for key, value in declaration.items() if key != "description"}
+        spec_hash = hashlib.blake2b(json.dumps(definition, sort_keys=True, default=str).encode("utf-8"), digest_size=16).hexdigest()
         db.execute(
             """
             insert into datasets(
@@ -489,18 +528,21 @@ class DataMetaStore:
 
         self.ensure_writable()
         with self.connect() as db:
-            db.execute(
-                """
-                insert into dataset_schemas(
-                    source,dataset,schema_ipc,schema_hash,updated_at
-                ) values (?, ?, ?, ?, ?)
-                on conflict(source,dataset) do update set
-                    schema_ipc=excluded.schema_ipc,
-                    schema_hash=excluded.schema_hash,
-                    updated_at=excluded.updated_at
-                """,
-                (source, dataset, schema_ipc, schema_hash, _now()),
-            )
+            self._write_dataset_schema(db, source, dataset, schema_ipc, schema_hash, _now())
+
+    @staticmethod
+    def _write_dataset_schema(db: sqlite3.Connection, source: str, dataset: str,
+                              schema_ipc: bytes, schema_hash: str, updated_at: str) -> None:
+        """Share the canonical schema publication with the caller's writer fence."""
+        previous = db.execute("select schema_hash from dataset_schemas where source=? and dataset=?",(source,dataset)).fetchone()
+        if previous is None or previous[0] != schema_hash:
+            db.execute("update datasets set publication_revision=publication_revision+1,update_incomplete=1 where source=? and name=?",(source,dataset))
+        db.execute(
+            "insert into dataset_schemas(source,dataset,schema_ipc,schema_hash,updated_at) values(?,?,?,?,?) "
+            "on conflict(source,dataset) do update set schema_ipc=excluded.schema_ipc,"
+            "schema_hash=excluded.schema_hash,updated_at=excluded.updated_at",
+            (source, dataset, schema_ipc, schema_hash, updated_at),
+        )
 
     def commit_dataset_metadata(
         self,
@@ -534,7 +576,7 @@ class DataMetaStore:
                 seq = int(version_commit["seq"])
                 for batch in version_commit["batches"]:
                     registered = db.execute(
-                        "select content_hash from version_batches where commit_seq=? and partition_path=?",
+                        "select content_hash from version_segments where commit_seq=? and partition_path=?",
                         (seq, batch["partition_path"]),
                     ).fetchone()
                     if registered is None or registered[0] != batch["content_hash"]:
@@ -549,6 +591,7 @@ class DataMetaStore:
                     raise RuntimeError(
                         "Version commit is not prepared for this dataset"
                     )
+                db.execute("update datasets set publication_revision=publication_revision+1,update_incomplete=1 where source=? and name=?", (source,dataset))
                 if version_commit.get("check"):
                     _insert_version_check(db, **version_commit["check"])
             if replace_manifests:
@@ -557,12 +600,7 @@ class DataMetaStore:
                     (source, dataset),
                 )
             self._write_manifests(db, rows, now)
-            db.execute(
-                "insert into dataset_schemas(source,dataset,schema_ipc,schema_hash,updated_at) values(?,?,?,?,?) "
-                "on conflict(source,dataset) do update set schema_ipc=excluded.schema_ipc,"
-                "schema_hash=excluded.schema_hash,updated_at=excluded.updated_at",
-                (source, dataset, schema_ipc, schema_hash, now),
-            )
+            self._write_dataset_schema(db, source, dataset, schema_ipc, schema_hash, now)
             if scope_transitions:
                 if run_id is None:
                     raise ValueError(
@@ -595,7 +633,7 @@ class DataMetaStore:
             db.execute(
                 "insert into partition_manifest(source,dataset,partition_path,generation_path,partition_values,"
                 "row_count,file_size_bytes,min_time,max_time,content_hash,schema_hash,updated_at) "
-                "values(?,?,?,?,?,?,?,?,?,?,?,?) on conflict(source,dataset,partition_path) do update set "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?) on conflict(source,dataset,generation_path) do update set "
                 "generation_path=excluded.generation_path,partition_values=excluded.partition_values,"
                 "row_count=excluded.row_count,file_size_bytes=excluded.file_size_bytes,min_time=excluded.min_time,"
                 "max_time=excluded.max_time,content_hash=excluded.content_hash,schema_hash=excluded.schema_hash,"
@@ -624,7 +662,7 @@ class DataMetaStore:
         run_id: str | None,
     ) -> None:
         current = {
-            row[0]: row[1]
+            row[1]: row[1]
             for row in db.execute(
                 "select partition_path,generation_path from partition_manifest where source=? and dataset=?",
                 (source, dataset),
@@ -664,7 +702,7 @@ class DataMetaStore:
                         source,
                         dataset,
                         run_id,
-                        run_id,
+                        self._update_owner_id() or run_id,
                         now.isoformat(),
                         (now + timedelta(seconds=300)).isoformat(),
                     ),
@@ -714,7 +752,7 @@ class DataMetaStore:
             commits = [
                 dict(row)
                 for row in db.execute(
-                    "select c.*,coalesce((select sum(b.row_count) from version_batches b where b.commit_seq=c.seq),0) as row_count "
+                    "select c.*,coalesce((select sum(b.row_count) from version_segments b where b.commit_seq=c.seq),0) as row_count "
                     "from version_commits c where source=? and dataset=? and status='committed' order by seq",
                     (source, dataset),
                 )
@@ -722,7 +760,7 @@ class DataMetaStore:
             batch_schemas = {
                 int(row["commit_seq"]): bytes(row["schema_ipc"])
                 for row in db.execute(
-                    "select b.commit_seq,b.schema_ipc from version_batches b join version_commits c on c.seq=b.commit_seq "
+                    "select b.commit_seq,b.schema_ipc from version_segments b join version_commits c on c.seq=b.commit_seq "
                     "where c.source=? and c.dataset=? and c.status='committed' order by b.commit_seq,b.partition_path",
                     (source, dataset),
                 )
@@ -734,22 +772,8 @@ class DataMetaStore:
                     (source, dataset),
                 )
             ]
-            from bagelquant_data.storage.full_commit_checks import full_commit_checks
-            seals = full_commit_checks(self, db, checks)
-            excluded = ",".join(str(int(seal["binding"]["check"]["id"])) for seal in seals) or "-1"
-            inline_count = db.execute(
-                "select count(*) from version_checks c cross join version_check_records r on c.id=r.check_id "
-                f"where c.source=? and c.dataset=? and c.id not in ({excluded})", (source, dataset)).fetchone()[0]
-            if inline_count > db.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) // 300:
-                raise MemoryError("Partial/mixed witnesses exceed the bounded metadata snapshot size limit")
-            record_checks = [
-                dict(row)
-                for row in db.execute(
-                    "select r.* from version_checks c cross join version_check_records r on c.id=r.check_id "
-                    f"where c.source=? and c.dataset=? and c.id not in ({excluded}) order by c.id,r.record_id",
-                    (source, dataset),
-                )
-            ]
+            record_checks = self.visibility_headers(db, source, dataset)
+            seals = []
         return {
             "manifests": manifests,
             "schema_ipc": None if schema is None else bytes(schema[0]),
@@ -759,6 +783,125 @@ class DataMetaStore:
             "record_checks": record_checks,
             "full_commit_checks": seals,
         }
+
+    @staticmethod
+    def visibility_headers(db: sqlite3.Connection, source: str, dataset: str,
+                           *, check_bound: int | None = None) -> list[dict[str, Any]]:
+        """Read compact first-visibility event bindings without loading event rows."""
+        rows = db.execute("select e.*,c.checked_at,c.pit_date from visibility_segments e "
+            "join version_checks c on c.id=e.check_id where c.source=? and c.dataset=? "
+            "and (? is null or e.check_id<=?) order by e.check_id",
+            (source, dataset, check_bound, check_bound))
+        return [{**dict(row), "event": True, "source": source, "dataset": dataset,
+            "version_commits": json.loads(row["commits_json"])} for row in rows]
+
+    def complete_node(self, *, node_key: str, definition_hash: str,
+                      completed_start: str | None, completed_end: str | None,
+                      checked_target: str, dependency_digest: str = "", result_ref: str) -> None:
+        """Advance one successful publication flag after all requested work commits."""
+        self.ensure_writable()
+        source, dataset = node_key.split("/", 1)
+        with self.connect() as db:
+            db.execute("begin immediate")
+            current = db.execute("select spec_hash from datasets where source=? and name=? and active=1",
+                (source, dataset)).fetchone()
+            if source == "items":
+                current = db.execute("select spec_hash from item_definitions where name=? and active=1", (dataset,)).fetchone()
+            if current is None or current[0] != definition_hash:
+                raise RuntimeError("Definition changed before node completion")
+            revision = db.execute("select publication_revision from datasets where source=? and name=?", (source,dataset)).fetchone()[0]
+            semantic = hashlib.sha256(f"{node_key}:{revision}".encode()).hexdigest()
+            self.write_completion(db, node_key=node_key, definition_hash=definition_hash,
+                completed_start=completed_start, completed_end=completed_end, checked_target=checked_target,
+                semantic_version=semantic, dependency_digest=dependency_digest, result_ref=result_ref)
+
+    @staticmethod
+    def write_completion(db: sqlite3.Connection, **value: Any) -> None:
+        previous = db.execute("select * from node_completions where node_key=?", (value["node_key"],)).fetchone()
+        source,dataset = value["node_key"].split("/",1)
+        dataset_state = db.execute("select publication_revision,update_incomplete from datasets where source=? and name=?", (source,dataset)).fetchone()
+        revision = dataset_state[0]
+        dependency_state = DataMetaStore.dependency_state(db,source,dataset)
+        if (previous is not None and previous["definition_hash"] == value["definition_hash"]
+                and not dataset_state[1] and previous["publication_revision"] == revision and previous["dependency_state_digest"] == dependency_state):
+            if previous["checked_target"] is not None and value["checked_target"] is not None:
+                if previous["checked_target"] > value["checked_target"]:
+                    db.execute("update datasets set update_incomplete=0 where source=? and name=?", (source,dataset))
+                    return  # An older unchanged branch cannot replace the latest flag.
+            # Union only overlapping/adjacent completed windows. A disjoint repair
+            # cannot turn the uncomputed hole between them into certified coverage.
+            from datetime import date
+            contiguous = (previous["completed_start"] is not None and previous["completed_end"] is not None
+                and value["completed_start"] is not None and value["completed_end"] is not None
+                and date.fromisoformat(value["completed_start"]) <= date.fromisoformat(previous["completed_end"])+timedelta(days=1)
+                and date.fromisoformat(previous["completed_start"]) <= date.fromisoformat(value["completed_end"])+timedelta(days=1))
+            if contiguous:
+                value["completed_start"] = min(previous["completed_start"],value["completed_start"])
+                value["completed_end"] = max(previous["completed_end"],value["completed_end"])
+        db.execute("insert into node_completions values(?,?,?,?,?,?,?,?,?,?,?) on conflict(node_key) "
+            "do update set definition_hash=excluded.definition_hash,completed_start=excluded.completed_start,"
+            "completed_end=excluded.completed_end,checked_target=excluded.checked_target,"
+            "semantic_version=excluded.semantic_version,dependency_digest=excluded.dependency_digest,"
+            "result_ref=excluded.result_ref,publication_revision=excluded.publication_revision,dependency_state_digest=excluded.dependency_state_digest,updated_at=excluded.updated_at", (*[value[key] for key in
+                ("node_key","definition_hash","completed_start","completed_end","checked_target", "semantic_version", "dependency_digest", "result_ref")], revision,dependency_state,_now()))
+        db.execute("update datasets set update_incomplete=0 where source=? and name=?", (source,dataset))
+
+    @staticmethod
+    def dependency_state(db: sqlite3.Connection, source: str, dataset: str) -> str:
+        if source != "items":
+            return ""
+        rows = [tuple(row) for row in db.execute("select p.kind,p.source,p.dataset,d.spec_hash,d.publication_revision,"
+            "d.update_incomplete,i.spec_hash from item_dependencies p left join datasets d "
+            "on d.source=case when p.kind='item' then 'items' else p.source end and d.name=p.dataset "
+            "left join item_definitions i on p.kind='item' and i.name=p.dataset "
+            "where p.item_name=? order by p.kind,p.source,p.dataset", (dataset,))]
+        return hashlib.sha256(json.dumps(rows,separators=(",", ":")).encode()).hexdigest()
+
+    def completion_statuses(self, *, source: str | None = None,
+                            datasets: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Read O(nodes + edges) small rows in one finite metadata snapshot."""
+        selected = None if datasets is None else tuple(dict.fromkeys(datasets))
+        if selected == ():
+            return []
+        clauses = ["d.active=1"]
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("d.source=?")
+            params.append(source)
+        if selected is not None:
+            clauses.append("d.name in (" + ",".join("?" for _ in selected) + ")")
+            params.extend(selected)
+        with self.connect() as db:
+            if not db.in_transaction:
+                db.execute("begin")
+            rows = [dict(row) for row in db.execute("select d.source,d.name as dataset,"
+                "d.spec_hash as declared_definition_hash,d.publication_revision as current_revision,"
+                "d.update_incomplete,f.*,r.empty_count as completion_empty_count from datasets d left join node_completions f "
+                "on f.node_key=d.source||'/'||d.name left join ingestion_runs r on r.run_id=f.result_ref where " + " and ".join(clauses) + " order by d.source,d.name",params)]
+            item_names = [row["dataset"] for row in rows if row["source"] == "items"]
+            definitions: dict[str,str] = {}
+            dependencies: dict[str,list[tuple[Any,...]]] = {}
+            if item_names:
+                placeholders = ",".join("?" for _ in item_names)
+                definitions = {row[0]:row[1] for row in db.execute("select name,spec_hash from item_definitions "
+                    "where active=1 and name in (" + placeholders + ")", item_names)}
+                edges = db.execute("select p.item_name,p.kind,p.source,p.dataset,d.spec_hash,d.publication_revision,"
+                    "d.update_incomplete,i.spec_hash from item_dependencies p left join datasets d "
+                    "on d.source=case when p.kind='item' then 'items' else p.source end and d.name=p.dataset "
+                    "left join item_definitions i on p.kind='item' and i.name=p.dataset "
+                    "where p.item_name in (" + placeholders + ") order by p.item_name,p.kind,p.source,p.dataset", item_names)
+                for edge in edges:
+                    dependencies.setdefault(edge[0],[]).append(tuple(edge)[1:])
+            for row in rows:
+                row["node_key"] = f"{row['source']}/{row['dataset']}"
+                dependency = ""
+                if row["source"] == "items":
+                    row["declared_definition_hash"] = definitions.get(row["dataset"])
+                    dependency = hashlib.sha256(json.dumps(dependencies.get(row["dataset"],[]),separators=(",", ":")).encode()).hexdigest()
+                row["definition_current"] = row["definition_hash"] == row["declared_definition_hash"]
+                row["publication_current"] = not row["update_incomplete"] and row["publication_revision"] == row["current_revision"]
+                row["dependency_current"] = row["dependency_state_digest"] == dependency
+        return rows
 
     def known_generations(self, source: str, dataset: str) -> set[str]:
         return {
@@ -844,8 +987,10 @@ class DataMetaStore:
         """Create an ingestion run before any scope is claimed."""
 
         self.ensure_writable()
+        owner_id = self._update_owner_id(owner_id)
         now = _now()
         with self.connect() as db:
+            db.execute("update datasets set update_incomplete=1 where source=? and name=?", (source,dataset))
             db.execute(
                 """
                 insert into ingestion_runs(
@@ -1434,6 +1579,8 @@ class DataMetaStore:
             return 0
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as db:
+            db.execute("update datasets set update_incomplete=1 where (source,name) in "
+                "(select source,dataset from update_scopes where id in (" + placeholders + "))", ids)
             checked_through = ",checked_through=null" if clear_watermark else ""
             if clear_watermark:
                 db.execute(
@@ -1461,6 +1608,7 @@ class DataMetaStore:
         rows = list(leases)
         if not rows:
             return
+        owner_id = self._update_owner_id(owner_id)
         now = datetime.now(UTC)
         expires = (now + timedelta(seconds=ttl_seconds)).isoformat()
         with self.connect() as db:
@@ -1567,10 +1715,19 @@ class DataMetaStore:
             )
 
     def active_update_leases(self) -> list[dict[str, Any]]:
-        return self._rows(
+        leases = self._rows(
             "select *,lease_expires_at<=? as heartbeat_expired from update_leases order by source,dataset",
             (_now(),),
         )
+        # Expose the original publisher's immutable metadata for explicit
+        # ownership recovery. Expiry alone never authorizes releasing a writer.
+        with self.connect() as db:
+            for lease in leases:
+                row = db.execute("select seq,ingested_at,pit_date,mode,input_receipt_id from version_commits "
+                    "where source=? and dataset=? and status='committed' and run_id=? "
+                    "order by seq desc limit 1", (lease["source"], lease["dataset"], lease["run_id"])).fetchone()
+                lease["latest_publication"] = None if row is None else dict(row)
+        return leases
 
     def dataset_spec_hash(self, source: str, dataset: str) -> str:
         rows = self._rows(
@@ -1640,10 +1797,10 @@ class DataMetaStore:
                     baseline integer not null default 0
                 );
                 create index if not exists version_commits_dataset on version_commits(source,dataset,status,seq);
-                create table if not exists version_batches (
+                create table if not exists version_segments (
                     commit_seq integer not null, partition_path text not null,
                     content_hash text not null, row_count integer not null,
-                    schema_ipc blob not null, payload blob not null,
+                    schema_ipc blob not null, generation_path text not null, file_size_bytes integer not null, bounds_json text not null, field_changes_json text not null, key_identity text not null,
                     min_available text, max_available text,
                     min_observation text, max_observation text,
                     primary key(commit_seq,partition_path)
@@ -1653,12 +1810,20 @@ class DataMetaStore:
                     source text not null, dataset text not null, run_id text not null,
                     checked_at text not null, pit_date text not null, baseline integer not null,
                     visible_commit integer,
-                    request_json text not null, row_count integer not null, input_receipt_id text
+                    request_json text not null, row_count integer not null, input_receipt_id text,
+                    content_scopes_json text not null default '[]'
                 );
-                create table if not exists version_check_records (
-                    check_id integer not null, record_id text not null, payload_hash text not null,
-                    version_commit integer not null, available_date text not null,
-                    primary key(check_id,record_id)
+                create table if not exists visibility_segments (
+                    check_id integer primary key, generation_path text not null,
+                    content_hash text not null, row_count integer not null,
+                    min_observation text, max_observation text,
+                    commits_json text not null
+                );
+                create table if not exists node_completions (
+                    node_key text primary key, definition_hash text not null,
+                    completed_start text, completed_end text, checked_target text not null,
+                    semantic_version text not null, dependency_digest text not null,
+                    result_ref text not null, publication_revision integer not null, dependency_state_digest text not null, updated_at text not null
                 );
                 create table if not exists dataset_initializations (
                     source text not null, dataset text not null, spec_hash text not null,
@@ -1682,6 +1847,8 @@ class DataMetaStore:
                     active integer not null default 1,
                     spec_hash text not null,
                     spec_json text not null,
+                    publication_revision integer not null default 0,
+                    update_incomplete integer not null default 0,
                     created_at text not null,
                     updated_at text not null,
                     primary key(source, name)
@@ -1794,7 +1961,7 @@ class DataMetaStore:
                     content_hash text not null,
                     schema_hash text not null,
                     updated_at text not null,
-                    primary key(source, dataset, partition_path)
+                    primary key(source, dataset, generation_path)
                 );
                 create table if not exists partition_generations (
                     source text not null, dataset text not null, partition_path text not null,
@@ -1833,21 +2000,6 @@ class DataMetaStore:
                         now,
                     ),
                 )
-            # Trailing metadata follows a potentially huge BLOB in the table.
-            # Keep a derived covering index so metadata reads need no overflow
-            # traversal. Index/statistics publication is atomic and idempotent.
-            if db.execute("select 1 from sqlite_master where type='index' and name='version_batches_metadata'").fetchone() is None:
-                if not db.in_transaction:
-                    db.execute("begin immediate")
-                # Another writable opener may have created it while we waited.
-                if db.execute("select 1 from sqlite_master where type='index' and name='version_batches_metadata'").fetchone() is None:
-                    db.execute(
-                        "create index if not exists version_batches_metadata on version_batches("
-                        "commit_seq,partition_path,content_hash,row_count,schema_ipc,"
-                        "min_available,max_available,min_observation,max_observation,length(payload))"
-                    )
-                    db.execute("analyze version_batches")
-
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -1866,11 +2018,13 @@ def _insert_version_check(
     row_count: int,
     records: Iterable[tuple[Any, ...]],
     input_receipt_id: str | None = None,
+    record_schema: bytes | None = None,
+    content_scopes_json: str = "[]",
 ) -> None:
     """Record immutable unchanged-content witnesses in the publication transaction."""
     check_id = db.execute(
-        "insert into version_checks(source,dataset,run_id,checked_at,pit_date,baseline,visible_commit,request_json,row_count,input_receipt_id) "
-        "values(?,?,?,?,?,?,(select max(seq) from version_commits where source=? and dataset=? and status='committed'),?,?,?)",
+        "insert into version_checks(source,dataset,run_id,checked_at,pit_date,baseline,visible_commit,request_json,row_count,input_receipt_id,content_scopes_json) "
+        "values(?,?,?,?,?,?,(select max(seq) from version_commits where source=? and dataset=? and status='committed'),?,?,?,?)",
         (
             source,
             dataset,
@@ -1883,23 +2037,41 @@ def _insert_version_check(
             request_json,
             row_count,
             input_receipt_id,
+            content_scopes_json,
         ),
     ).lastrowid
     if check_id is None:
         raise RuntimeError("Failed to allocate an unchanged-content witness")
-    db.executemany(
-        "insert into version_check_records(check_id,record_id,payload_hash,version_commit,available_date) values(?,?,?,?,?)",
-        (
-            (
-                check_id,
-                record_id,
-                payload_hash,
-                int(version_commit),
-                str(available_date),
-            )
-            for record_id, payload_hash, version_commit, available_date in records
-        ),
-    )
+    import polars as pl
+    from bagelquant_data.storage.atomic import atomic_write_parquet
+    from bagelquant_data.storage.recovery import _file_hash
+    from bagelquant_data.storage.paths import LakePaths
+    from uuid import uuid4
+    rows = list(records)
+    if not rows and not baseline:
+        visible = db.execute("select v.visible_commit,c.baseline,d.spec_json from version_checks v "
+            "left join version_commits c on c.seq=v.visible_commit join datasets d on d.source=v.source and d.name=v.dataset "
+            "where v.id=?",(check_id,)).fetchone()
+        if visible is not None and visible[1] and json.loads(visible[2])["update_type"] == "general":
+            known = db.execute("select 1 from version_checks where source=? and dataset=? and visible_commit=? "
+                "and baseline=0 and pit_date<=? and id<? limit 1",(source,dataset,visible[0],pit_date,check_id)).fetchone()
+            if known is None:
+                db.execute("update datasets set publication_revision=publication_revision+1,update_incomplete=1 where source=? and name=?",(source,dataset))
+    if rows and not baseline:
+        import pyarrow as pa
+        if record_schema is None:
+            raise RuntimeError("Natural visibility events require their exact typed schema")
+        schema = pl.Schema(pa.ipc.read_schema(pa.BufferReader(record_schema)))
+        frame = pl.DataFrame(rows,schema=schema,orient="row").rename({"_commit_seq":"version_commit","time":"available_date"})
+        location = db.execute("select value from data_meta_state where key='lake_location'").fetchone()
+        meta_path = Path(db.execute("pragma database_list").fetchone()[2])
+        paths = LakePaths.open(data_meta_path=meta_path, lake_path=meta_path.parent / location[0])
+        relative = f".visibility/{uuid4().hex}.parquet"
+        atomic_write_parquet(frame, paths.dataset_root(source, dataset) / relative)
+        db.execute("update datasets set publication_revision=publication_revision+1,update_incomplete=1 where source=? and name=?", (source,dataset))
+        db.execute("insert into visibility_segments values(?,?,?,?,?,?,?)", (check_id, relative,
+            _file_hash(paths.dataset_root(source, dataset) / relative), frame.height, str(frame["source_time"].min()), str(frame["source_time"].max()),
+            json.dumps(sorted(set(frame["version_commit"].to_list())))))
 
 
 def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:

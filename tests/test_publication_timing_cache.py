@@ -1,3 +1,4 @@
+from storage_fixtures import damage_original_segments
 from datetime import UTC, date, datetime
 
 import polars as pl
@@ -58,8 +59,7 @@ def test_later_attestation_reverses_timing_and_negative_memo_requires_all_aliase
         for day in (date(2020,1,10), date(2020,1,20)):
             operation.publish([output("first", rows, day)])
             operation.publish([output("second", rows, day)])
-    assert calls == [("one",date(2020,1,10),True), ("one",date(2020,1,20),False),
-                     ("two",date(2020,1,20),False)]
+    assert calls == [("one",date(2020,1,20),False), ("two",date(2020,1,20),False)]
     for name in ("first", "second"):
         versions = lake.items.read(name, view="versions").collect()
         assert versions["_baseline"].to_list() == [True, False]
@@ -69,12 +69,13 @@ def test_later_attestation_reverses_timing_and_negative_memo_requires_all_aliase
 
 def test_timing_memo_respects_explicit_small_entry_reserve_and_eviction(tmp_path, monkeypatch):
     lake, receipt, rows = setup(tmp_path)
-    original = lake.inputs._baseline_at
+    from bagelquant_data.inputs import InputsAPI
+    original = InputsAPI._proven_baseline_at
     calls = []
     def baseline(*args, **kwargs):
         calls.append(args[2])
         return original(*args, **kwargs)
-    monkeypatch.setattr(lake.inputs, "_baseline_at", baseline)
+    monkeypatch.setattr(InputsAPI, "_proven_baseline_at", staticmethod(baseline))
     # 8KiB /4 /1KiB admits only two timing entries.
     with lake.items.publication(input_receipt=receipt, config=ExecutionOptions(max_buffer_bytes=8192)) as operation:
         for day in (10,11,12,10):
@@ -84,12 +85,13 @@ def test_timing_memo_respects_explicit_small_entry_reserve_and_eviction(tmp_path
 
 def test_failed_group_clears_timing_memo_and_cannot_seed_next_operation(tmp_path, monkeypatch):
     lake, receipt, rows = setup(tmp_path)
-    original = lake.inputs._baseline_at
+    from bagelquant_data.inputs import InputsAPI
+    original = InputsAPI._proven_baseline_at
     calls = []
     def baseline(*args, **kwargs):
         calls.append(args[2])
         return original(*args, **kwargs)
-    monkeypatch.setattr(lake.inputs, "_baseline_at", baseline)
+    monkeypatch.setattr(InputsAPI, "_proven_baseline_at", staticmethod(baseline))
     with pytest.raises(RuntimeError, match="operation failed"):
         with lake.items.publication(input_receipt=receipt) as operation:
             operation.publish([output("first", rows, date(2020,1,10))])
@@ -119,7 +121,7 @@ def test_reused_build_rechecks_bytes_using_explicit_budget(tmp_path, monkeypatch
     assert calls == []
     import sqlite3
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
+        damage_original_segments(db, 'commit_seq=1', ())
     assert lake.items.update("copy", start="2020-01-01", end="2020-01-31", config=config).status == "unchanged"
     with pytest.raises(RuntimeError):
         lake.inputs.verify(lake.items.builds("copy")[-1]["frozen_receipt_id"], config=config)

@@ -16,10 +16,10 @@ from bagelquant_data.core.hashing import frame_content_hash
 from bagelquant_data.execution import ExecutionOptions
 from bagelquant_data.management import DataLake
 from bagelquant_data.management.lake import RawAPI
-from bagelquant_data.inputs import FrozenInputReceipt, input_read_boundary
+from bagelquant_data.inputs import FrozenInputReceipt, InputSelectionScope, input_read_boundary
 from bagelquant_data.items import (
     AvailabilityAlignment, AvailabilityPolicy, BuildContext, DataItemSpec,
-    ItemBuildReport, ItemInput, ItemPublication, ItemPublisher, RawInput, advance_available_date,
+    ItemBuildReport, ItemCompletionAttestation, ItemInput, ItemPublication, ItemPublisher, ProducerUpdatePolicy, RawInput, advance_available_date,
     advance_available_date_in_sessions, materialize_daily_pit,
 )
 from bagelquant_data.items.pit import (
@@ -45,7 +45,7 @@ __all__ = [
     "DatasetSpecError",
     "DuplicateResolutionError",
     "ConfigurationError", "ExecutionOptions", "DataItemSpec", "RawInput", "ItemInput", "ItemPublication",
-    "BuildContext", "ItemBuildReport", "ItemPublisher", "FrozenInputReceipt", "input_read_boundary",
+    "BuildContext", "ItemBuildReport", "ItemCompletionAttestation", "ItemPublisher", "ProducerUpdatePolicy", "FrozenInputReceipt", "InputSelectionScope", "input_read_boundary",
     "IngestionReport", "AvailabilityAlignment", "AvailabilityPolicy",
     "advance_available_date", "advance_available_date_in_sessions", "materialize_daily_pit",
     "frame_content_hash", "input_snapshot", "general_input_snapshot", "compute_versions",

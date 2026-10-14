@@ -65,7 +65,7 @@ def test_reopen_refuses_unsafe_history_and_does_not_change_completed_state(tmp_p
     elif failure == "reason":
         options["reason"] = " "
     elif failure == "definition":
-        lake.raw.register(replace(lake.raw.get("reports", source="fake"), description="changed"))
+        lake.raw.register(replace(lake.raw.get("reports", source="fake"), source_api="changed_provider_api"))
     elif failure.startswith("incremental"):
         if failure == "incremental_commit":
             source.frame = source.frame.with_columns(pl.lit(42.0).alias("value"))

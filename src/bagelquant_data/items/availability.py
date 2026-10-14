@@ -265,7 +265,10 @@ def _forward_fill_panel(
         )
         .sort("asset_id", "time")
     )
-    events = observations.with_columns(
+    # The output time is the calendar coordinate. Its source observation and
+    # publication dates already have explicit channels; do not leak a suffixed
+    # source time from the as-of join or collide with a caller's time_right.
+    events = observations.drop("time", strict=False).with_columns(
         pl.col("available_date")
         .replace_strict(indices)
         .cast(pl.Int64)

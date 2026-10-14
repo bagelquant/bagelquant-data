@@ -1,3 +1,4 @@
+from storage_fixtures import damage_original_segments
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -58,8 +59,8 @@ def test_later_context_rechecks_original_batch_bytes_and_failed_context_cleans_u
     with lake.inputs.read_context(frozen, verify=True):
         pass
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
-    with pytest.raises(RuntimeError, match="compression"):
+        damage_original_segments(db, 'commit_seq=1', ())
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
         with lake.inputs.read_context(frozen, verify=True):
             pass
     assert lake.inputs._read_context() is None
@@ -141,6 +142,8 @@ def test_legacy_window_remains_conservative(tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(lake.inputs, "_capture", legacy)
         frozen = lake.inputs.freeze({"raw": RawInput("custom", "values", view="snapshot")}, information_cutoff="2020-04-01")
+    with sqlite3.connect(lake.data_meta_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='input_batch_index'").fetchone() is None
     original_read = inputs.read_batch
     batches = []
     def tracked(*args, **kwargs):
@@ -148,8 +151,8 @@ def test_legacy_window_remains_conservative(tmp_path, monkeypatch):
         return original_read(*args, **kwargs)
     monkeypatch.setattr(inputs, "read_batch", tracked)
     assert lake.inputs.read(frozen, "raw", start="2020-02-01", end="2020-02-29").collect()["value"].to_list() == [2.]
-    assert len(batches) == 3
-    assert not lake.inputs.window_read_supported(frozen, "raw")
+    assert len(batches) == 1
+    assert lake.inputs.window_read_supported(frozen, "raw")
 
 
 @pytest.mark.parametrize("canceled_type", [RuntimeError, TypeError, ValueError])
@@ -159,7 +162,7 @@ def test_ipc_decode_cancellation_closes_mapping_and_allows_retry(tmp_path, monke
     lake, frozen = frozen_months(tmp_path)
     batch = frozen.evidence["raw"]["batches"][0]
     opened = False
-    original = recovery.pa.ipc.open_file
+    original = recovery.pq.ParquetFile
     def tracked(*args, **kwargs):
         nonlocal opened
         result = original(*args, **kwargs)
@@ -167,10 +170,10 @@ def test_ipc_decode_cancellation_closes_mapping_and_allows_retry(tmp_path, monke
         return result
     def cancel():
         if opened:
-            raise canceled_type("IPC canceled")
+            raise canceled_type("Parquet canceled")
     with monkeypatch.context() as patch:
-        patch.setattr(recovery.pa.ipc, "open_file", tracked)
-        with pytest.raises(canceled_type, match="IPC canceled"):
+        patch.setattr(recovery.pq, "ParquetFile", tracked)
+        with pytest.raises(canceled_type, match="Parquet canceled"):
             recovery.verify_batch(lake._data_meta, batch["partition_path"], batch["commit_seq"],
                                   batch["content_hash"], check_canceled=cancel, buffer_bytes=buffer_bytes)
     assert lake.inputs.verify(frozen)["valid"]
@@ -181,6 +184,7 @@ def test_read_context_keeps_full_commit_seals_and_shared_parent_graph_exact(tmp_
     from bagelquant_data.storage import full_commit_checks
     lake = prepared(tmp_path)
     monkeypatch.setattr(full_commit_checks, "COMPACT_MIN_ROWS", 1)
+    assert not hasattr(lake.inputs, "index_checks")
     frozen = lake.inputs.freeze(request(), information_cutoff="2020-02-03")
     expected = lake.inputs.read(frozen, "raw").collect()
     with lake.inputs.read_context(frozen) as reader:
@@ -196,10 +200,14 @@ def test_window_read_support_is_original_metadata_only_and_unknown_general_stay_
     with pytest.raises(KeyError):
         lake.inputs.window_read_supported(frozen, "missing")
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set min_observation=null,max_observation=null")
+        db.execute("update version_segments set min_observation=null,max_observation=null")
     assert lake.inputs.window_read_supported(frozen, "raw")
     unknown = lake.inputs.freeze(frozen.requests, information_cutoff="2020-04-01")
-    assert not lake.inputs.window_read_supported(unknown, "raw")
+    # Exact original index headers remain admissible after live headers change.
+    assert lake.inputs.window_read_supported(unknown, "raw")
+    with sqlite3.connect(lake.data_meta_path) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='input_batch_index'").fetchone() is None
+    assert lake.inputs.window_read_supported(unknown, "raw")
     lake.raw.ingest(DatasetSpec("general", "general", source="custom"),
                     pl.DataFrame({"asset_id": ["A"], "value": [1.]}),
                     ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
@@ -275,7 +283,7 @@ def test_currentness_reuses_completed_boolean_in_context_but_rechecks_after_exit
         assert not lake.inputs.is_current(frozen)
         assert not lake.inputs.is_current(frozen)
         assert len(captures) == 4
-    lake.raw.register(replace(spec, description="changed"))
+    lake.raw.register(replace(spec, source_api="changed_provider_api"))
     with lake.inputs.read_context(frozen, verify=False):
         assert not lake.inputs.is_current(frozen)
         assert len(captures) == 5

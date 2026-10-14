@@ -39,19 +39,25 @@ print(lake.items.read("close").collect())
 | `bagelquant_data.exploration` | Pure statistics and Polars result tables |
 
 Both paths are required. `data_meta_path` identifies the single Data SQLite file,
-including task state and compressed Arrow recovery evidence. Immutable Parquet
+including task state and compact immutable Parquet segment references. Immutable Parquet
 generations retain year/month partitions. Read-only queries never initialize or
 recover data; SQLite may create or update its WAL/SHM coordination sidecars.
 `DataLake.inspect(data_meta_path=..., lake_path=...)` checks schema and lake binding
 without changing any configured storage files or directories, including sidecars.
-Package 0.7 and metadata schema 7 are an incompatible fresh-database cut; old
+Package 0.7 and metadata schema 8 are an incompatible fresh-database cut; old
 databases are rejected. No aliases, migrations or automatic history cleanup exist.
+
+Explicit `integrity.item_removal_plan/remove_items` can discard an exact,
+unreferenced Item inventory after its external owners release the receipts.
+Planning reports blockers; application checks originals and retains a resumable
+operation receipt. Ordinary `items.remove` archives and preserves history.
 
 Historical daily reads are causal by default. Explicit `as_of` selects a fixed
 information cutoff; `view="versions"` exposes revisions. Initialization labels
 unverifiable original publication history as a baseline; `strict=True` excludes it.
-Later unchanged observations preserve new availability evidence without creating
-duplicate content versions. Frozen receipts pin both commit and check boundaries.
+First verification of an unknown baseline preserves an immutable availability
+event. Known identical rechecks preserve its original timing and create no file.
+Explicit typed Item timing changes remain real PIT data. Frozen receipts pin both commit and check boundaries.
 
 Read [overview](docs/en/1_overview.md), [quickstart](docs/en/2_quickstart.md),
 [datasets](docs/en/3_datasets.md), [sources](docs/en/4_sources.md),

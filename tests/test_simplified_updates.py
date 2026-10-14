@@ -306,7 +306,7 @@ def test_general_update_merges_dataset_and_runtime_params(tmp_path) -> None:
     assert source.requests[0] == {"exchange": "SZSE", "list_status": "P"}
 
 
-def test_each_explicit_general_update_commits_a_new_snapshot(
+def test_general_update_reuses_a_completed_target_and_refresh_remains_explicit(
     tmp_path,
 ) -> None:
     source = StaticSource({"stock_basic": pl.DataFrame({"code": ["A"]})})
@@ -320,12 +320,14 @@ def test_each_explicit_general_update_commits_a_new_snapshot(
     repeated = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-03"
     )
+    refreshed = lake.raw.refresh("stock_basic", source="custom", end="2025-01-03")
     advanced = lake.raw.update(
         "stock_basic", source="custom", end="2025-01-04"
     )
 
     assert first.request_count == 1
-    assert repeated.request_count == 1
+    assert repeated.request_count == 0
+    assert refreshed.request_count == 1
     assert advanced.request_count == 1
     assert len(source.requests) == 3
     scopes = lake.integrity.update_scopes(

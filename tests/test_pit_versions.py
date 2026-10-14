@@ -1,3 +1,4 @@
+from storage_fixtures import damage_original_segments
 from datetime import date, datetime
 from dataclasses import replace
 import sqlite3
@@ -149,12 +150,17 @@ def test_local_recovery_preserves_old_versions_and_metadata(tmp_path):
     partition = manifest[0]["partition_path"]
     expected = reconstruct(lake._parquet, "custom", "prices", partition)
     path = lake._paths.dataset_root("custom", "prices") / next(row["generation_path"] for row in lake.raw.manifest("prices", source="custom") if row["partition_path"] == partition)
+    backup = path.read_bytes()
     path.write_bytes(b"damaged")
+    with pytest.raises(RuntimeError, match="trusted backup"):
+        repair_partition(lake._parquet, "custom", "prices", partition)
+    path.write_bytes(backup)
     repair_partition(lake._parquet, "custom", "prices", partition)
-    assert pl.read_parquet(path, hive_partitioning=False).equals(expected)
+    from bagelquant_data.storage.recovery import with_record_key
+    assert with_record_key(pl.read_parquet(path, hive_partitioning=False)).equals(expected)
     assert lake._data_meta.manifest("custom", "prices") == manifest
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00'")
+        damage_original_segments(db, '', ())
     with pytest.raises(Exception):
         reconstruct(lake._parquet, "custom", "prices", partition)
 
@@ -248,7 +254,7 @@ def test_unchanged_general_snapshot_commits_new_definition_identity(tmp_path):
         "general",
         description="revised definition",
         availability_timezone="Asia/Shanghai",
-        availability_day_offset=-1,
+        availability_day_offset=-2,
         availability_cutoff_time="09:30:00",
     )
     frame = pl.DataFrame({"code": ["A"]})
@@ -647,28 +653,21 @@ def test_same_pit_day_versions_and_frozen_commit(tmp_path):
     assert lake.integrity.scan("prices", source="custom", deep=True)["valid"]
 
 
-def test_damaged_journal_can_only_be_restored_from_verified_parquet(tmp_path):
-    lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
+def test_original_loss_requires_trusted_backup_and_preserves_metadata(tmp_path):
+    lake = DataLake.open(data_meta_path=tmp_path / "data_meta.sqlite", lake_path=tmp_path / "lake")
     lake.raw.ingest(daily_spec(), price(), mode="initialize", ingested_at=instant("08-26"))
     row = lake._data_meta.manifest("custom", "prices")[0]
     partition = row["partition_path"]
-    path = lake._paths.dataset_root("custom", "prices") / next(row["generation_path"] for row in lake.raw.manifest("prices", source="custom") if row["partition_path"] == partition)
-    with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00'")
-    repair_partition(lake._parquet, "custom", "prices", partition)
-    assert reconstruct(lake._parquet, "custom", "prices", partition).height == 1
-    with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00'")
-    path.write_bytes(b"broken parquet")
-    with pytest.raises(Exception):
+    path = lake._paths.dataset_root("custom", "prices") / row["generation_path"]
+    trusted = path.read_bytes()
+    path.write_bytes(b"broken original")
+    with pytest.raises(RuntimeError, match="trusted backup"):
         repair_partition(lake._parquet, "custom", "prices", partition)
     assert lake._data_meta.manifest("custom", "prices")[0] == row
-    report = lake.integrity.scan("prices", source="custom", deep=True)
-    recovery_issue = next(
-        issue for issue in report["issues"] if issue["code"] == "recovery_evidence"
-    )
-    assert recovery_issue["repairable"] is False
-    assert "historical recovery is blocked" in recovery_issue["detail"]
+    assert not lake.integrity.scan("prices", source="custom", deep=True)["valid"]
+    path.write_bytes(trusted)
+    assert reconstruct(lake._parquet, "custom", "prices", partition).height == 1
+    assert lake.integrity.scan("prices", source="custom", deep=True)["valid"]
 
 
 def test_failed_manifest_commit_leaves_no_visible_new_versions(tmp_path, monkeypatch):
@@ -703,7 +702,7 @@ def test_general_failed_variant_preserves_previous_complete_snapshot(tmp_path):
     lake.raw.update("reference", source="custom", end="2026-09-10", max_retries=1)
     boundary = lake.inputs.max_commit()
     source.fail = True
-    result = lake.raw.update("reference", source="custom", end="2026-09-10", max_retries=1)
+    result = lake.raw.refresh("reference", source="custom", end="2026-09-10", max_retries=1)
     assert result.status == "failed"
     assert lake.inputs.max_commit() == boundary
     assert sorted(lake.raw.read("reference", source="custom", view="latest").collect()["code"]) == ["A", "B"]

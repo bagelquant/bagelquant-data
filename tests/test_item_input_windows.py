@@ -1,10 +1,11 @@
+from storage_fixtures import damage_original_segments
 from datetime import UTC, date, datetime
 import sqlite3
 
 import polars as pl
 import pytest
 
-from bagelquant_data import DataLake, DatasetSpec, DataItemSpec, RawInput
+from bagelquant_data import DataLake, DatasetSpec, DataItemSpec, RawInput, ProducerUpdatePolicy
 
 
 def fixture(tmp_path, *, declared_start=None):
@@ -40,6 +41,73 @@ def test_explicit_month_scope_is_frozen_without_changing_definition(tmp_path):
     assert second.rows_committed == 1
 
 
+def test_pointwise_widened_scope_reuses_completed_month_and_repairs_only_changed_day(tmp_path):
+    lake, spec, definition = fixture(tmp_path)
+    calls = []
+    def producer(context):
+        calls.append((context.start, context.end, context.frames["raw"]["source_time"].to_list()))
+        return context.frames["raw"].select(pl.col("source_time").alias("time"), "asset_id", "value")
+    lake.items.register_producer("pointwise", "1", producer, update_policy=ProducerUpdatePolicy("same_date"))
+    first = lake.items.update("derived", start="2020-02-01", end="2020-02-29",
+        input_windows={"raw": ("2020-02-01", "2020-02-29")})
+    calls.clear()
+    lake.raw.ingest(spec, pl.DataFrame({"time": [date(2020, 2, 1)], "asset_id": ["A"], "value": [9.]}),
+        ingested_at=datetime(2020, 3, 3, tzinfo=UTC))
+    lake.items.update("derived", start="2020-02-01", end="2020-03-31")
+    assert lake.items.get("derived") == definition
+    assert calls and all(start == date(2020, 2, 1) or start >= date(2020, 3, 1) for start, _, _ in calls)
+    assert all(date(2020, 1, 1) not in days for _, _, days in calls)
+    assert lake.items.read("derived", view="snapshot", as_of="2020-03-31").collect()["value"].to_list() == [9., 3.]
+    assert first.frozen_receipt_id is not None
+    assert lake.inputs.get(first.frozen_receipt_id).requests["raw"].start == "2020-02-01"
+
+
+def test_pointwise_scope_extension_cannot_certify_missing_old_input_range(tmp_path):
+    lake, _, _ = fixture(tmp_path)
+    lake.items.update("derived", start="2020-02-01", end="2020-03-31",
+        input_windows={"raw": ("2020-02-01", "2020-02-29")})
+    lake.items.register_producer("pointwise", "1", lambda context: context.frames["raw"].select(
+        pl.col("source_time").alias("time"), "asset_id", "value"), update_policy=ProducerUpdatePolicy("same_date"))
+    with pytest.raises(RuntimeError, match="input windows changed"):
+        lake.items.update("derived", start="2020-02-01", end="2020-03-31")
+
+
+@pytest.mark.parametrize("older_baseline", [False, True])
+def test_read_only_plan_and_update_share_whole_scope_timing_preflight(tmp_path, monkeypatch, older_baseline):
+    lake = DataLake.open(data_meta_path=tmp_path / "meta.sqlite", lake_path=tmp_path / "lake")
+    raw = DatasetSpec("daily", "by_date", date_kind="calendar",
+        field_mappings={"time": "time", "asset_id": "asset_id"})
+    def row(day, value):
+        return pl.DataFrame({"time": [day], "asset_id": ["A"], "value": [value]})
+    if older_baseline:
+        lake.raw.ingest(raw, row(date(2019, 12, 31), 1.), mode="initialize",
+            ingested_at=datetime(2019, 12, 31, tzinfo=UTC))
+    lake.raw.ingest(raw, row(date(2020, 1, 2), 2.),
+        mode="incremental" if older_baseline else "initialize",
+        ingested_at=datetime(2020, 1, 2, tzinfo=UTC))
+    calls = []
+    def producer(context):
+        calls.append(context.start)
+        return context.frames["raw"].select(pl.col("source_time").alias("time"), "asset_id", "value")
+    lake.items.register_producer("p", "1", producer, update_policy=ProducerUpdatePolicy("same_date"))
+    lake.items.register(DataItemSpec("derived", (RawInput("custom", "daily", alias="raw"),),
+        producer_key="p", producer_revision="1"))
+    windows = {"raw": ("2020-01-01", "2020-01-31")}
+    lake.items.update("derived", start="2020-01-01", end="2020-01-31", input_windows=windows)
+    original = lake.items.builds("derived")
+    calls.clear()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Planning/rejected update read values or created a frozen receipt")
+    monkeypatch.setattr(lake.inputs, "read", forbidden)
+    monkeypatch.setattr(lake.inputs, "freeze", forbidden)
+    assert lake.items.plan_update("derived", start="2020-01-01", end="2020-01-31", input_windows=windows) == []
+    plan = lake.items.plan_update("derived", start="2020-01-01", end="2020-01-31")
+    assert len(plan) == 1 and plan[0]["mode"] == "blocked" and "baseline timing" in plan[0]["reason"]
+    with pytest.raises(RuntimeError, match="baseline timing"):
+        lake.items.update("derived", start="2020-01-01", end="2020-01-31")
+    assert not calls and lake.items.builds("derived") == original
+
+
 @pytest.mark.parametrize("windows,error", [({"missing": ("2020-02-01", "2020-02-29")}, "Unknown"),
                                          ({"raw": ("2020-02-29", "2020-02-01")}, "precedes"),
                                          ({"raw": ("2019-01-01", "2020-02-29")}, "widen")])
@@ -60,7 +128,7 @@ def test_reuse_trusts_records_and_explicit_audit_verifies_original_bytes(tmp_pat
     reused = lake.items.update("derived", **options)
     assert reused.status == "unchanged" and reused.commit_seq == first.commit_seq
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
+        damage_original_segments(db, 'commit_seq=1', ())
     assert lake.items.update("derived", **options).status == "unchanged"
     with pytest.raises(RuntimeError):
         assert reused.frozen_receipt_id is not None
@@ -87,15 +155,15 @@ def test_month_pruning_keeps_later_revision_of_earlier_observation(tmp_path, mon
     assert lake.inputs.verify(receipt)["valid"]
 
 
-def test_unbounded_producer_retains_history_and_explicit_window_changes_dependency_identity(tmp_path):
+def test_unbounded_producer_retains_history_and_window_change_requires_impact_proof(tmp_path):
     lake, _, _ = fixture(tmp_path)
     old = lake.items.update("derived", start="2020-02-01", end="2020-02-29")
     assert old.frozen_receipt_id is not None
     receipt = lake.inputs.get(old.frozen_receipt_id)
     assert receipt.requests["raw"].start is None
     assert lake.inputs.read(receipt, "raw").collect()["value"].to_list() == [1., 2.]
-    scoped = lake.items.update("derived", start="2020-02-01", end="2020-02-29", input_windows={"raw": ("2020-02-01", "2020-02-29")})
-    assert old.dependency_digest != scoped.dependency_digest
+    with pytest.raises(RuntimeError, match="input windows changed"):
+        lake.items.update("derived", start="2020-02-01", end="2020-02-29", input_windows={"raw": ("2020-02-01", "2020-02-29")})
     assert lake.inputs.is_current(receipt)
 
 
@@ -164,7 +232,7 @@ def test_frozen_reads_ignore_later_mutation_of_live_batch_summaries(tmp_path, mo
         legacy = lake.inputs.freeze(requests, information_cutoff="2020-02-29")
     scoped = lake.inputs.freeze(requests, information_cutoff="2020-02-29")
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set min_observation='1899-01-01',max_observation='1899-01-02',min_available='2099-01-01'")
+        db.execute("update version_segments set min_observation='1899-01-01',max_observation='1899-01-02',min_available='2099-01-01'")
     for frozen in (legacy, scoped):
         assert lake.inputs.read(frozen, "raw").collect()["value"].to_list() == [2.]
         assert lake.inputs.verify(frozen)["valid"]

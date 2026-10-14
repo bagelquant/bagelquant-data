@@ -42,7 +42,8 @@ def test_immutable_generation_pins_lazy_reads(storage):
     first = data_meta.manifest(spec.source, spec.name)[0]
     lazy = RawQueryService(parquet, data_meta).query(spec.name, source=spec.source)
     commit(storage, 2.0, 3)
-    second = data_meta.manifest(spec.source, spec.name)[0]
+    manifests = data_meta.manifest(spec.source, spec.name)
+    second = next(row for row in manifests if row["generation_path"] != first["generation_path"])
     assert first["partition_path"] == second["partition_path"]
     assert first["generation_path"] != second["generation_path"]
     assert (paths.dataset_root(spec.source, spec.name) / first["generation_path"]).is_file()
@@ -72,8 +73,8 @@ def test_same_value_new_availability_is_new_evidence(storage):
     assert commit(storage, day=3).rows_committed == 0
     assert commit(storage, day=4).rows_committed == 0
     versions = RawQueryService(parquet, data_meta).query(spec.name, source=spec.source, view="versions").collect()
-    assert versions["time"].to_list() == [date(2025, 1, 2), date(2025, 1, 3), date(2025, 1, 4)]
-    assert versions["_baseline"].to_list() == [True, False, False]
+    assert versions["time"].to_list() == [date(2025, 1, 2), date(2025, 1, 3)]
+    assert versions["_baseline"].to_list() == [True, False]
     assert versions["_commit_seq"].n_unique() == 1
     assert len(data_meta.dataset_snapshot(spec.source, spec.name)["commits"]) == 1
 
@@ -83,8 +84,12 @@ def test_exact_local_repair_from_central_evidence(storage):
     commit(storage)
     row = data_meta.manifest(spec.source, spec.name)[0]
     path = paths.dataset_root(spec.source, spec.name) / row["generation_path"]
+    backup = path.read_bytes()
     path.write_bytes(b"corrupt parquet")
-    assert inspect_partition(parquet, spec.source, spec.name, row["partition_path"], deep=True)["recovery_state"] == "ready"
+    assert inspect_partition(parquet, spec.source, spec.name, row["partition_path"], deep=True)["recovery_state"] == "backup_required"
+    with pytest.raises(RuntimeError, match="trusted backup"):
+        repair_partition(parquet, spec.source, spec.name, row["partition_path"])
+    path.write_bytes(backup)
     result = repair_partition(parquet, spec.source, spec.name, row["partition_path"])
     assert result["content_changed"] is False
     assert data_meta.manifest(spec.source, spec.name)[0] == row
@@ -97,8 +102,6 @@ def test_inadequate_evidence_blocks_repair(storage):
     row = data_meta.manifest(spec.source, spec.name)[0]
     path = paths.dataset_root(spec.source, spec.name) / row["generation_path"]
     path.write_bytes(b"corrupt parquet")
-    with data_meta.connect() as db:
-        db.execute("update version_batches set payload=?", (b"corrupt batch",))
     with pytest.raises(Exception):
         repair_partition(parquet, spec.source, spec.name, row["partition_path"])
     assert path.read_bytes() == b"corrupt parquet"

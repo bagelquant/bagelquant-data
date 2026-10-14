@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -350,6 +351,11 @@ def _update_datasets(
                     request_index_offset=request_index_offset,
                 )
                 for state in states.values():
+                    # General is one complete inventory, including both retry
+                    # and forward cohorts. A phase-local snapshot would replace
+                    # the preceding cohort instead of completing it.
+                    if state.work.spec.update_type == "general":
+                        continue
                     _commit_state(
                         pipeline,
                         state,
@@ -471,6 +477,10 @@ def _run_fetches(
                 if partially_claimed:
                     raise RuntimeError(
                         "A physical request claimed only part of its logical scopes"
+                    )
+                if work.spec.update_type == "general":
+                    raise RuntimeError(
+                        "General snapshot could not claim its complete request inventory; retry after resolving scope ownership"
                     )
                 totals[work.spec.name] = max(
                     0, totals[work.spec.name] - _scope_count(request)
@@ -979,6 +989,19 @@ def _commit_state(
             for scope_frame, request in buffered
             if request.scope_id is not None
         ]
+        inventory_marker = (
+            {"general_default_inventory": "complete.v1"}
+            if state.work.spec.update_type == "general"
+            and state.work.context.options.get("params") is None
+            and state.work.context.options.get("ids") is None
+            and not state.work.spec.parameter_dataset
+            and len(buffered) == len(state.work.requests)
+            and {(request.scope_id, json.dumps(request.params, sort_keys=True, default=str))
+                 for _, request in buffered}
+            == {(request.scope_id, json.dumps(request.params, sort_keys=True, default=str))
+                for request in state.work.requests}
+            else {}
+        )
         commit = pipeline.commit_frame(
             state.work.spec,
             frame,
@@ -987,7 +1010,7 @@ def _commit_state(
             mode=str(state.work.context.options.get("mode", "incremental")),
             ingested_at=state.work.context.options.get("ingested_at"),
             requests=[
-                {"scope_id": r.scope_id, "params": r.params} for _, r in buffered
+                {"scope_id": r.scope_id, "params": r.params, **inventory_marker} for _, r in buffered
             ],
             scope_transitions=transitions,
             partition_workers=int(state.work.context.options.get("workers", 1)),
@@ -1220,6 +1243,15 @@ def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionRep
         error_message=error,
         metrics=_run_metrics(state),
     )
+    if (status in {"success","no_data"} and remaining == 0
+            and not (state.work.spec.update_type == "general" and state.work.context.options.get("mode") == "initialize")
+            and state.work.context.options.get("params") is None and state.work.context.options.get("ids") is None):
+        context = state.work.context
+        if context.end is not None:
+            pipeline.metadata.complete_node(node_key=f"{state.work.spec.source}/{state.work.spec.name}",
+                definition_hash=pipeline.metadata.dataset_spec_hash(state.work.spec.source,state.work.spec.name),
+                completed_start=None if context.start is None else str(context.start), completed_end=str(context.end),
+                checked_target=str(context.end),result_ref=state.work.run_id)
     return IngestionReport(
         run_id=state.work.run_id,
         source=state.work.spec.source,
@@ -1388,6 +1420,8 @@ def _fetch_and_prepare_request(
     request = ledger_request.params
     started = time.perf_counter()
     request_options = {**spec.request_options, **request_options}
+    if spec.update_type == "general" and ledger_request.require_nonempty_response:
+        request_options["_require_nonempty_response"] = True
     if ledger_request.request_kind != "initial_full_scan" and len(ledger_request.daily_scopes) == 1:
         required, _ = _classify_empty_daily_scopes(request_options, ledger_request.daily_scopes)
         request_options["_require_nonempty_response"] = bool(required)
@@ -1829,7 +1863,11 @@ def _fetch_one(
                 raise TypeError("source adapter must return a Polars DataFrame")
             if require_nonempty and frame.is_empty():
                 empty_response = True
-                raise ValueError("provider response omitted a required dense trading-date scope")
+                raise ValueError(
+                    "provider response omitted a required previously nonempty General scope; verify the withdrawal explicitly"
+                    if spec.update_type == "general" else
+                    "provider response omitted a required dense trading-date scope"
+                )
         except Exception as exc:  # noqa: BLE001
             provider_seconds += time.perf_counter() - started
             last_error = exc

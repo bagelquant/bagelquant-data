@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 
 import polars as pl
+import pytest
 
 from bagelquant_data import DataItemSpec, DataLake, DatasetSpec, RawInput, input_read_boundary
 
@@ -103,7 +104,14 @@ def test_empty_general_baseline_and_later_attestation_keep_check_boundary(tmp_pa
     assert captured.items.read("count", view="snapshot", as_of="2020-01-04", strict=True).collect().is_empty()
     statuses.clear()
     lake.items.register_producer("empty", "1", empty_count)
-    lake.items.update("count", start="2020-01-01", end="2020-01-04")
-    assert statuses == [(date(2020, 1, 2), True), (date(2020, 1, 4), False)]
+    with pytest.raises(RuntimeError, match="timing attestations"):
+        lake.items.update("count", start="2020-01-01", end="2020-01-04")
+    assert statuses == []
+    known = lake.items.read("count", view="snapshot", as_of="2020-01-04").collect().select(
+        "time", "asset_id", "value", "observation_date", "available_date")
+    verified = lake.inputs.freeze({"members": RawInput("custom", "members", alias="members",
+        view="versions", include_historical_baseline=True)}, information_cutoff="2020-01-04")
+    lake.items.replace_range("count", known, start="2020-01-01", end="2020-01-04",
+        available_date="2020-01-03", input_receipt=verified)
     assert lake.items.read("count", view="snapshot", as_of="2020-01-02", strict=True).collect().is_empty()
     assert lake.items.read("count", view="snapshot", as_of="2020-01-03", strict=True).collect()["value"].to_list() == [0]

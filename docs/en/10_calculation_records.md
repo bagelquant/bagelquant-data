@@ -1,9 +1,31 @@
 # Calculation records
 
-Ordinary reads trust registered immutable metadata and consume typed values without byte/content rehashing. Explicit audits retain original integrity checks and compare present current-version derived indexes to original evidence. New outputs retain canonical hashes.
+Ordinary reads consume typed original Parquet values. Freeze, plans, completion
+checks and range identities use compact SQLite metadata without decoding history.
+`raw.completion_statuses` and `items.completion_statuses` batch node flags in one
+finite metadata view. Definitions, publication revisions, contiguous coverage,
+unfinished updates and direct dependency state decide readiness.
 
-Public owner APIs: `inputs.describe / request_identity / selection_identity / index_plan / build_index / verify`. Index maintenance is explicit, frozen-plan based and cancelable; normal opens never backfill or rewrite historical receipts/manifests. Missing/partial/version-mismatched derived indexes provide no selection/interval proof. Supported authoritative metadata exact hits and covering-parent shortcuts remain valid. Admission limits do not change numerical identity.
+`inputs.describe`, `request_identity`, `range_identity`, `selection_identity`
+and `selection_descriptors` are read-only. Ordinary range tokens are always
+available for supported typed selections and remain stable across optional
+maintenance. New segments outside a consumed window and changes to unconsumed
+fields preserve identity. Compact date/asset bounds are conservative for sparse
+coordinate intersections; exact equality may require explicit selected summaries.
 
-Full `verify` uses its explicit resource options, or inherits the active read context. If selection-summary auditing cannot fit the admitted buffer, it raises `MemoryError` rather than reporting a complete audit or increasing the budget. Original-byte transport can spill independently of this selection working-set requirement.
+`prepare_coordinate_selector` retains only caller-supplied Domain coordinates;
+`prepare_range_selections` registers small metadata summaries and preserves their
+original Source reference. `index_selection(s)` and `prepare_general_projections`
+explicitly compare admitted original typed selections. Coordinate identities
+require an explicitly prepared small date axis; missing axes return `None`.
+These operations never create historical row indexes.
 
-`inputs.request_identity(receipt, alias)` hashes original registered alias request, cutoff and complete evidence metadata. It excludes enclosing receipt IDs/digests/global counters and optional indexes. It is stable across index maintenance and unrelated root aliases; alias-local checks and parent links conservatively invalidate. This full-request token is separate from exact selected-window proof.
+`inputs.verify` checks immutable receipt bindings, exact original value and
+visibility file bytes, typed schemas and bounds, and registered optional summaries.
+Cancellation closes readers and discards partial operation caches. Resource limits
+do not change numerical identity; insufficient admission raises `MemoryError`.
+Missing or damaged originals require a trusted backup.
+
+`items.completion_guard(names=...)` yields the same batch flags under a finite
+Data publication fence. Consumers can publish their own guarded reference CAS
+inside that view. Kernels, providers and Data writes belong outside the guard.

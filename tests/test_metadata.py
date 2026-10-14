@@ -201,6 +201,7 @@ def test_upsert_manifests_inserts_and_updates_batch(tmp_path) -> None:
     assert [
         (row["partition_path"], row["row_count"], row["content_hash"]) for row in rows
     ] == [
+        ("year=2024/month=01/data.parquet", 10, "hash-1"),
         ("year=2024/month=01/data.parquet", 11, "hash-1b"),
         ("year=2024/month=02/data.parquet", 20, "hash-2"),
     ]

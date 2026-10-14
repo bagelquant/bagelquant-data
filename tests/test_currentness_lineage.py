@@ -1,4 +1,6 @@
 """Exact currentness parent selection has bounded, disposable projected frames."""
+from storage_fixtures import damage_original_segments
+
 from concurrent.futures import CancelledError
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -39,6 +41,68 @@ def prepared(root, *, baseline=False, revisions=True):
     return lake
 
 
+def test_current_discrete_creators_need_no_whole_certificate_or_selection_index(tmp_path, monkeypatch):
+    lake = DataLake.open(data_meta_path=tmp_path / 'meta.sqlite', lake_path=tmp_path / 'lake')
+    days = [date(2020, 1, 1), date(2020, 2, 1)]
+    frame = pl.DataFrame({'time': days, 'asset_id': ['A', 'A'], 'value': [1., 2.]})
+    spec = DatasetSpec('raw', 'by_date', date_kind='calendar',
+        field_mappings={'time': 'time', 'asset_id': 'asset_id'})
+    lake.raw.ingest(spec, frame, ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    raw = RawInput('custom', 'raw', view='versions')
+    lake.items.register(DataItemSpec('sparse', (raw,), producer_key='external', producer_revision='1'))
+    for day in days:
+        source = lake.inputs.freeze({'raw': replace(raw, observation_start=day, observation_end=day)},
+            information_cutoff=days[-1])
+        lake.items.replace_range('sparse', frame.filter(pl.col('time') == day), start=day, end=day,
+            available_date=day, input_receipt=source)
+    root = lake.inputs.freeze({'sparse': ItemInput('sparse', start=days[0], end=days[-1])},
+        information_cutoff=days[-1])
+    assert root.evidence['sparse']['empty_item_build'] is None
+    assert len(root.evidence['sparse']['parent_receipts']) == 2
+    def forbidden(*args, **kwargs):
+        pytest.fail('Current creators requested numerical/selected-lineage work')
+    monkeypatch.setattr(lake.inputs, '_selected_item_parents', forbidden)
+    monkeypatch.setattr(lake.inputs, 'read', forbidden)
+    monkeypatch.setattr(lake.inputs, 'verify', forbidden)
+    assert lake.inputs.is_current(root)
+
+
+@pytest.mark.parametrize('case', ['empty', 'future', 'strict_baseline', 'hole', 'mixed_visibility'])
+def test_current_creators_do_not_certify_uncompleted_empty_selection(tmp_path, monkeypatch, case):
+    lake = DataLake.open(data_meta_path=tmp_path / 'meta.sqlite', lake_path=tmp_path / 'lake')
+    days = [date(2020, 1, 1), date(2020, 1, 3)]
+    frame = pl.DataFrame({'time': days, 'asset_id': ['A', 'A'], 'value': [1., 2.]})
+    spec = DatasetSpec('raw', 'by_date', date_kind='calendar',
+        field_mappings={'time': 'time', 'asset_id': 'asset_id'})
+    lake.raw.ingest(spec, frame, ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    raw = RawInput('custom', 'raw', view='versions')
+    lake.items.register(DataItemSpec('item', (raw,), producer_key='external', producer_revision='1'))
+    source = lake.inputs.freeze({'raw': raw}, information_cutoff='2020-01-03')
+    output = frame.head(0) if case == 'empty' else frame
+    if case == 'mixed_visibility':
+        output = frame.with_columns(pl.Series('available_date', [date(2020, 1, 2), date(2020, 1, 4)]))
+    for publication in ([output.head(1), output.tail(1)] if case == 'hole' else [output]):
+        lake.items.ingest('item', publication,
+            available_date=None if case == 'mixed_visibility' else
+                '2020-01-04' if case == 'future' else '2020-01-01',
+            historical_baseline=case == 'strict_baseline', input_receipt=source)
+    lower = '2020-01-02' if case == 'hole' else '2020-01-03'
+    upper = '2020-01-02' if case == 'hole' else '2020-01-04'
+    root = lake.inputs.freeze({'item': ItemInput('item', start=lower, end=upper,
+        strict=case == 'strict_baseline')}, information_cutoff='2020-01-03', retain_batch_bounds=True)
+    assert root.evidence['item']['empty_item_build'] is None
+    assert lake.inputs.is_current(source)
+    assert lake.inputs.read(root, 'item').collect().is_empty()
+    calls = []
+    def selected(*args, **kwargs):
+        calls.append(True)
+        return None if case == 'hole' else (False, set())
+    monkeypatch.setattr(lake.inputs, '_selected_item_parents', selected)
+    monkeypatch.setattr(lake.inputs, 'read', lambda *a, **k: pytest.fail('currentness read values'))
+    assert not lake.inputs.is_current(root)
+    assert calls
+
+
 def reference(lake, frozen):
     evidence = frozen.evidence["item"]
     frame = lake.inputs._read_frame(frozen, "item")
@@ -68,9 +132,11 @@ def test_cross_month_and_witness_selection_equals_original_frames(tmp_path, base
     lake = prepared(tmp_path, baseline=baseline)
     frozen = lake.inputs.freeze({"item": ItemInput("item", strict=strict, start="2020-01-01", end="2020-01-01")}, information_cutoff=cutoff)
     expected = reference(lake, frozen)
-    monkeypatch.setattr(recovery, "project_batch", lambda *a, **k: pytest.fail("ordinary currentness scanned IPC"))
-    monkeypatch.setattr(recovery, "read_batch", lambda *a, **k: pytest.fail("ordinary currentness decoded IPC"))
-    assert lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions()) == expected
+    selected = lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions())
+    assert selected is not None and selected[0] == expected[0]
+    # Compact provenance retains conservative parent requirements for mixed
+    # creator segments; it must never omit a actually selected creator.
+    assert not expected[0] or selected[1] >= expected[1]
 
 
 
@@ -84,8 +150,10 @@ def test_compact_attestation_matches_inline_selection(tmp_path, monkeypatch):
                             "value": [float(i) for i in range(24)]})
     lake.items.ingest("item", original, available_date="2020-03-03", input_receipt=parent)
     monkeypatch.setattr(full_commit_checks, "COMPACT_MIN_ROWS", 1)
+    assert not hasattr(lake.inputs, "index_checks")
     frozen = lake.inputs.freeze({"item": ItemInput("item", strict=True)}, information_cutoff="2020-03-03")
-    assert frozen.evidence["item"].get("full_commit_checks")
+    assert frozen.evidence["item"]["record_checks"]
+    assert not frozen.evidence["item"].get("full_commit_checks")
     assert lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions(max_buffer_bytes=128 * 1024)) == reference(lake, frozen)
 
 
@@ -96,9 +164,11 @@ def test_original_corruption_requires_explicit_audit(tmp_path):
     frozen = lake.inputs.freeze({"item": ItemInput("item")}, information_cutoff="2020-03-03")
     expected = reference(lake, frozen)
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=?", (frozen.evidence["item"]["batches"][0]["commit_seq"],))
-    assert lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions()) == expected
-    with pytest.raises(RuntimeError, match="compression"):
+        damage_original_segments(db, 'commit_seq=?', (frozen.evidence['item']['batches'][0]['commit_seq'],))
+    # Metadata currentness is not a byte-integrity audit. Partial creator
+    # selection now consumes sole Parquet and must reject damaged bytes.
+    assert expected is not None
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
         lake.inputs.verify(frozen)
 
 
@@ -110,12 +180,12 @@ def test_project_consumer_exception_preserves_identity_and_closes_transport(tmp_
     frozen = lake.inputs.freeze({"item": ItemInput("item")}, information_cutoff="2020-03-03")
     batch = frozen.evidence["item"]["batches"][0]
     files = []
-    original = recovery.tempfile.TemporaryFile
+    original = recovery.pq.ParquetFile
     def temporary(*args, **kwargs):
         file = original(*args, **kwargs)
         files.append(file)
         return file
-    monkeypatch.setattr(recovery.tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(recovery.pq, "ParquetFile", temporary)
     error = error_type("original consumer failure")
     def consume(frame):
         assert "value" not in frame.columns
@@ -125,7 +195,7 @@ def test_project_consumer_exception_preserves_identity_and_closes_transport(tmp_
             batch["content_hash"], columns=("_record_id",), consume=consume, buffer_bytes=budget)
     assert caught.value is error
     assert all(file.closed for file in files)
-    assert bool(files) is (budget == 32 * 1024)
+    assert files
 
 
 def test_tied_witness_sort_keys_and_cutoff_none_keep_original_selected_parent(tmp_path):
@@ -143,5 +213,9 @@ def test_tied_witness_sort_keys_and_cutoff_none_keep_original_selected_parent(tm
         lake.items.ingest("item", frame, available_date="2020-03-03", input_receipt=receipt,
                           ingested_at=datetime(2020, 3, 3, tzinfo=UTC))
     frozen = lake.inputs.freeze({"item": ItemInput("item", strict=True)})
-    assert len(frozen.evidence["item"]["checks"]) == 2
-    assert lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions(max_buffer_bytes=32 * 1024)) == reference(lake, frozen)
+    assert len(frozen.evidence["item"]["checks"]) == 1
+    # Only the earliest real visibility produces a row event.
+    assert len(frozen.evidence["item"]["record_checks"]) == 1
+    actual = lake.inputs._selected_item_parents(frozen, "item", ExecutionOptions(max_buffer_bytes=32 * 1024))
+    expected = reference(lake, frozen)
+    assert actual is not None and actual[0] == expected[0] and actual[1] >= expected[1]

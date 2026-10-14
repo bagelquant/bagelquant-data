@@ -1,3 +1,4 @@
+from storage_fixtures import damage_original_segments
 from contextlib import closing
 from datetime import date
 import hashlib
@@ -61,7 +62,7 @@ def test_snapshot_retains_committed_wal_and_original_identity_without_source_cha
                 if source.is_file():
                     assert source.stat().st_ino != path.stat().st_ino
         with sqlite3.connect(report["data_meta_path"]) as db:
-            db.execute("update version_batches set payload=x'00'")
+            damage_original_segments(db, '', ())
         copied_path = next((tmp_path / "copy" / "lake").rglob("*.parquet"))
         copied_path.write_bytes(b"independent damage")
         assert evidence(tmp_path / "source") == before

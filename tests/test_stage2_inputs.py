@@ -19,8 +19,15 @@ def test_frozen_bytes_survive_revisions_archival_and_missing_parquet(tmp_path):
     frozen = lake.inputs.freeze({"raw": RawInput("custom", "prices", view="snapshot")}, information_cutoff="2020-01-01")
     lake.raw.ingest(spec, first.with_columns(pl.lit(9.0).alias("close")), ingested_at=datetime(2020, 1, 2, tzinfo=UTC))
     lake.raw.remove("prices", source="custom")
-    for file in (tmp_path / "lake").rglob("*.parquet"):
+    trusted = {file: file.read_bytes() for file in (tmp_path / "lake").rglob("*.parquet")}
+    for file in trusted:
         file.unlink()
+    with pytest.raises(FileNotFoundError):
+        lake.inputs.read(frozen, "raw").collect()
+    with pytest.raises(FileNotFoundError):
+        lake.inputs.verify(frozen)
+    for file, contents in trusted.items():
+        file.write_bytes(contents)
     assert lake.inputs.read(frozen, "raw").collect()["close"].to_list() == [1.0]
     assert lake.inputs.verify(frozen)["valid"] is True
     reopened = lake_at(tmp_path, read_only=True)
@@ -66,7 +73,7 @@ def test_frozen_corrupt_receipt_and_payload_fail_closed(tmp_path):
     lake.items.ingest("item", pl.DataFrame({"time": [date(2020, 1, 1)], "asset_id": ["A"], "value": [1.0]}))
     frozen = lake.inputs.freeze({"item": ItemInput("item")})
     with lake._data_meta.connect() as db:
-        db.execute("update version_batches set content_hash='wrong'")
+        db.execute("update version_segments set content_hash='wrong'")
     with pytest.raises(RuntimeError, match="checksum"):
         lake.inputs.verify(frozen)
     with lake._data_meta.connect() as db:

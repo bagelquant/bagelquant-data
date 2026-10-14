@@ -19,7 +19,6 @@ from polars.datatypes import DataTypeClass
 from bagelquant_data.core.dataset import DatasetSpec, record_key
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.core.schema import (
-    concat_compatible_frames,
     align_frame,
     compatible_schema,
 )
@@ -28,7 +27,7 @@ from bagelquant_data.storage.parquet import (
     rollback_partition_writes,
     partition_write_context,
 )
-from bagelquant_data.storage.recovery import append_batch, sort_versions
+from bagelquant_data.storage.recovery import sort_versions
 from bagelquant_data.storage.data_meta import _insert_version_check
 
 
@@ -176,6 +175,7 @@ def commit_versions(
     writer_executor: ThreadPoolExecutor | None = None,
     available_date: DateLike | None = None,
     preserve_available: bool = False,
+    preserve_semantic_timing: bool = False,
     historical_baseline: bool | None = None,
     scope_transitions: list[dict] | None = None,
     partition_workers: int = 1,
@@ -211,7 +211,7 @@ def commit_versions(
     baseline = mode == "initialize" if historical_baseline is None else historical_baseline
     root = parquet.paths.dataset_root(spec.source, spec.name)
     manifests = parquet.metadata.manifest(spec.source, spec.name)
-    parent = {str(row["partition_path"]): str(row["generation_path"]) for row in manifests}
+    parent = {str(row["generation_path"]): str(row["generation_path"]) for row in manifests}
     definition_hash = parquet.metadata.dataset_spec_hash(spec.source, spec.name)
     if mode == "initialize":
         initialization = parquet.metadata._rows(
@@ -241,11 +241,15 @@ def commit_versions(
         else frozenset()
     )
     attestations = pl.DataFrame()
+    content_scopes = []
     checked_rows = frame.height
+    changed_fields = None
     if spec.update_type == "by_date":
         keys = list(record_key(spec))
-        frame = frame.with_columns(_payload_hashes(frame, keys).rename("_record_id"))
-        payload = sorted(set(frame.columns) - {"time", "year", "month", "_record_id"})
+        frame = frame.with_columns(_payload_hashes(frame,keys).rename("_record_id"))
+        payload = sorted(set(frame.columns) - {"time", "year", "month", "_record_id", "_dependency_digest"})
+        if preserve_semantic_timing:
+            payload.append("time")
         frame = frame.with_columns(_payload_hashes(frame, payload))
         conflicts = (
             frame.group_by("_record_id")
@@ -288,22 +292,73 @@ def commit_versions(
                     source=spec.source,
                     observation_start=observation_start,
                     observation_end=observation_end,
-                    fields=["_record_id", "_payload_hash", "_commit_seq"],
+                    fields=None,
                 )
                 .collect()
             )
             if old.height:
+                old = old.drop("_payload_hash") if "_payload_hash" in old.columns else old
+                common_schema = compatible_schema([frame.select(payload).schema,
+                    old.select([field for field in payload if field in old.columns]).schema])
+                old = old.with_columns((pl.col(field).cast(common_schema[field]) if field in old.columns
+                    else pl.lit(None,dtype=common_schema[field])).alias(field) for field in payload)
+                frame = frame.with_columns(pl.col(field).cast(common_schema[field]) for field in payload)
+                frame = frame.with_columns(_payload_hashes(frame,payload))
+                old = old.with_columns(_payload_hashes(old,payload))
+                if spec.source == "items" and input_receipt_id is not None:
+                    from bagelquant_data.core.hashing import frame_content_hash
+                    matched = frame.join(old.select("_record_id","_payload_hash",pl.col("_commit_seq").alias("_checked_commit")),
+                        on=["_record_id","_payload_hash"],how="inner")
+                    for (checked_commit,),checked in matched.partition_by("_checked_commit",as_dict=True).items():
+                        content_scopes.append({"commit_seq":checked_commit,"key_identity":frame_content_hash(checked.select(keys)),"row_count":checked.height})
+                changed_fields = {}
+                joined = frame.join(old.select("_record_id", pl.col("time").alias("_previous_availability"), *[pl.col(name).alias("_old_"+name) for name in payload]).with_columns(pl.lit(True).alias("_old_exists")),
+                    on="_record_id",how="left")
+                timing_changed = joined.filter(pl.col("_old_exists").is_null() | ~pl.col("time").eq_missing(pl.col("_previous_availability")))
+                for field in payload:
+                    equal = pl.col(field).eq_missing(pl.col("_old_"+field))
+                    if common_schema[field].is_float():
+                        equal = equal & pl.col(field).cast(pl.String).eq_missing(pl.col("_old_"+field).cast(pl.String))
+                    changed = joined.filter(pl.col("_old_exists").is_null() | ~equal)
+                    if changed.height or timing_changed.height:
+                        changed_fields[field] = {"value":None if not changed.height else
+                            (str(changed["source_time"].min()),str(changed["source_time"].max())),
+                            "timing":None if not timing_changed.height else
+                            (str(timing_changed["source_time"].min()),str(timing_changed["source_time"].max()))}
+                if joined["_old_exists"].null_count() == joined.height:
+                    changed_fields = None  # Shared initial/all-new coordinate evidence.
                 # Unchanged values retain their content version. An immutable
                 # check witnesses that exact version at this collection date.
-                attestations = frame.join(old, on=["_record_id", "_payload_hash"], how="inner").select(
-                    "_record_id", "_payload_hash", "_commit_seq", "time"
+                # Match only typed identities to the original creator. Joining
+                # the full old schema invents suffixed coordinate/payload fields
+                # and collides with legitimate channels such as time_right.
+                attestation_fields = list(dict.fromkeys(["_record_id", "_payload_hash", "time", *keys]))
+                attestations = (
+                    frame.select(attestation_fields)
+                    .join(
+                        old.filter(pl.col("_baseline")).select("_record_id", "_payload_hash", "_commit_seq"),
+                        on=["_record_id", "_payload_hash"], how="inner",
+                    )
+                    .select("_commit_seq", "time", *keys)
                 )
                 frame = frame.join(old.select("_record_id", "_payload_hash"), on=["_record_id", "_payload_hash"], how="anti")
         if frame.is_empty():
+            # Schema-only acquisitions and typed empty acquisitions retain the
+            # declared channels without duplicating identical historical rows.
+            typed = frame.drop([name for name in ("_record_id","_payload_hash") if name in frame.columns]).with_columns(
+                pl.lit(now, dtype=pl.Datetime("us", "UTC")).alias("ingested_at"),
+                pl.lit(None, dtype=pl.Int64).alias("_commit_seq"),
+                pl.lit(baseline).alias("_baseline"),
+            )
+            stored_schema = parquet.canonical_schema(spec.source, spec.name)
+            canonical = compatible_schema([*([stored_schema] if stored_schema is not None else []), typed.schema])
+            empty_schema = partition_write_context(canonical)
             with parquet.metadata.connect() as db:
                 db.execute("begin immediate")
                 parquet.metadata.assert_dataset_parent(db, spec.source, spec.name, parent, definition_hash, run_id)
-                _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id)
+                _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id,content_scopes=content_scopes)
+                parquet.metadata._write_dataset_schema(db, spec.source, spec.name,
+                    empty_schema.schema_ipc, empty_schema.schema_hash, now.isoformat())
                 if scope_transitions:
                     parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
             return CommitResult(0, 0, len({value[:7] for value in source_times}), 0, present_times=source_times)
@@ -390,7 +445,7 @@ def commit_versions(
     writes = []
     batches = []
     stored_schema = parquet.canonical_schema(spec.source, spec.name)
-    schemas = [frame.schema, *([stored_schema] if stored_schema is not None else [])]
+    schemas = [frame.drop([name for name in ("_record_id","_payload_hash") if name in frame.columns]).schema, *([stored_schema] if stored_schema is not None else [])]
     if spec.update_type == "by_date":
         frame = align_frame(frame, compatible_schema(schemas))
         groups = frame.with_columns(pl.col(partition_field).dt.strftime("%Y-%m").alias("_partition")).partition_by(
@@ -413,7 +468,7 @@ def commit_versions(
                     (month,), group = item
                     partition = f"year={month[:4]}/month={month[5:]}/data.parquet"
                     args = (spec, group.drop("_partition"), parquet, root, partition,
-                            int(seq), manifest_by_partition.get(partition))
+                            int(seq), manifest_by_partition.get(partition),changed_fields)
                     tasks.append(
                         writer_executor.submit(_write_version_partition, *args)
                         if writer_executor else _write_version_partition(*args)
@@ -449,8 +504,8 @@ def commit_versions(
             version_commit={
                 "seq": seq, "batches": batches,
                 "parent": parent, "definition_hash": definition_hash,
-                "check": _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id)
-                if attestations.height else None,
+                "check": _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id,content_scopes=content_scopes)
+                if attestations.height or content_scopes else None,
             },
             scope_transitions=scope_transitions,
             run_id=run_id,
@@ -470,58 +525,37 @@ def commit_versions(
     )
 
 
-def _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, records, *, input_receipt_id=None):
+def _check_evidence(spec, run_id, now, available, baseline, requests, checked_rows, records, *, input_receipt_id=None,content_scopes=()):
     return {
         "source": spec.source, "dataset": spec.name, "run_id": run_id,
         "checked_at": now.isoformat(), "pit_date": available.isoformat(), "baseline": baseline,
         "request_json": json.dumps(requests or [], sort_keys=True, default=str),
         "row_count": checked_rows,
-        "records": records.select("_record_id", "_payload_hash", "_commit_seq", "time").iter_rows()
+        "records": records.select("_commit_seq", "time", *record_key(spec)).iter_rows()
         if records.height else iter(()),
+        "record_schema": records.select("_commit_seq", "time", *record_key(spec)).to_arrow().schema.serialize().to_pybytes() if records.height else None,
         "input_receipt_id": input_receipt_id,
+        "content_scopes_json":json.dumps(content_scopes,sort_keys=True),
     }
 
 
-def _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, records=None, *, input_receipt_id=None):
+def _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, records=None, *, input_receipt_id=None,content_scopes=()):
     _insert_version_check(db, **_check_evidence(
         spec, run_id, now, available, baseline, requests, checked_rows,
         pl.DataFrame() if records is None else records,
-        input_receipt_id=input_receipt_id,
+        input_receipt_id=input_receipt_id,content_scopes=content_scopes,
     ))
 
 
-def _write_version_partition(spec, delta, parquet, root, partition, seq, manifest):
-    """Prepare one independent partition without publishing committed visibility."""
-    from bagelquant_data.core.hashing import frame_content_hash
-    from bagelquant_data.storage.atomic import _filesystem_path
-
-    path = Path(_filesystem_path(parquet.paths.generation_path(spec.source, spec.name, partition, manifest["generation_path"]) if manifest is not None else root / partition))
-    if manifest is not None and not path.is_file():
-        raise RuntimeError(
-            "Committed partition is missing; restore ingestion evidence before updating"
-        )
-    bytes_read = 0
-    if manifest is not None:
-        bytes_read = path.stat().st_size
-        old = pl.read_parquet(path, hive_partitioning=False)
-        if frame_content_hash(old) != manifest["content_hash"]:
-            raise RuntimeError("Committed partition is damaged; repair it before updating")
-        merged = concat_compatible_frames([old, delta])
-    else:
-        merged = delta
-    merged = sort_versions(merged)
-    if spec.update_type != "general":
-        delta = align_frame(delta, merged.schema)
-    batch = append_batch(parquet.metadata, partition, seq, delta)
+def _write_version_partition(spec, delta, parquet, root, partition, seq, manifest, changed_fields):
+    """Write only this immutable delta; original segments are never read or copied."""
+    from bagelquant_data.storage.recovery import register_segment
+    delta = sort_versions(delta.drop([name for name in ("_record_id","_payload_hash") if name in delta.columns]))
     month = partition.split("/")
     values = {"year": int(month[0][5:]), "month": int(month[1][6:]), "versioned": True}
-    if "source_time" in merged.columns and merged.height:
-        values.update(
-            min_source_time=str(merged["source_time"].min()),
-            max_source_time=str(merged["source_time"].max()),
-        )
-    write = parquet.write_partition_file_result(
-        spec, merged, Path(partition), values, existing_manifest=manifest,
-        write_context=partition_write_context(merged.schema),
-    )
-    return write, batch, merged.schema, bytes_read
+    if "source_time" in delta.columns and delta.height:
+        values.update(min_source_time=str(delta["source_time"].min()), max_source_time=str(delta["source_time"].max()))
+    write = parquet.write_partition_file_result(spec, delta, Path(partition), values,
+        existing_manifest=None, write_context=partition_write_context(delta.schema))
+    batch = register_segment(parquet.metadata, partition, seq, delta, write.path, write.manifest,changed_fields=changed_fields)
+    return write, batch, delta.schema, 0

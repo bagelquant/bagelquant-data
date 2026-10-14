@@ -1,6 +1,9 @@
 """Finite original roots share currentness work only within one read view."""
+from storage_fixtures import damage_original_segments
+
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime
 import sqlite3
@@ -142,7 +145,7 @@ def test_fresh_integrity_check_still_rejects_corrupt_unselected_original_bytes(f
     assert lake.inputs.is_current(roots)
     assert lake.inputs.verify(roots)["valid"]
     with sqlite3.connect(lake.data_meta_path) as db:
-        db.execute("update version_batches set payload=x'00' where commit_seq=1")
+        damage_original_segments(db, 'commit_seq=1', ())
     assert lake.inputs.is_current(roots)
     with pytest.raises(RuntimeError, match="compression|checksum"):
         lake.inputs.verify(roots)
@@ -158,10 +161,12 @@ def test_all_roots_use_one_read_view_during_a_new_commit(forest, monkeypatch):
         result = original(db, requests, **kwargs)
         if "child0" in requests and not inserted:
             inserted = True
-            lake.raw.ingest(
-                spec, frame.with_columns(pl.lit(3.0).alias("value")),
-                ingested_at=datetime(2020, 1, 3, tzinfo=UTC),
-            )
+            # A competing writer commits in its own WAL connection. A reader's
+            # same-thread read view cannot be upgraded to a write transaction.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(lake.raw.ingest,
+                    spec, frame.with_columns(pl.lit(3.0).alias("value")),
+                    ingested_at=datetime(2020, 1, 3, tzinfo=UTC)).result()
         return result
 
     monkeypatch.setattr(lake.inputs, "_capture", capture)

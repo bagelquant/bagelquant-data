@@ -1,4 +1,6 @@
 """Timing prefix equivalence and original integrity in isolated fake lakes."""
+from storage_fixtures import damage_original_segments
+
 
 import copy
 from dataclasses import replace
@@ -152,11 +154,16 @@ def test_legacy_and_unknown_bounds_broad(tmp_path, monkeypatch):
             {"raw": RawInput("custom", "raw", start="2020-01-01", end="2020-03-31")},
             information_cutoff="2020-03-31",
         )
+        with lake._data_meta.connect() as db:
+            assert db.execute("SELECT 1 FROM sqlite_master WHERE name='input_batch_index'").fetchone() is None
         seen = calls(monkeypatch)
         for legacy in [True, False]:
             ev = {key: dict(copy.deepcopy(value)) for key, value in receipt.evidence.items()}
             if legacy:
                 ev["raw"].pop("scoped_batches")
+                ev["raw"]["retained_batch_bounds"] = False
+                for b in ev["raw"]["batches"]:
+                    b["min_available"] = None
             else:
                 for b in ev["raw"]["batches"]:
                     b["min_available"] = None
@@ -170,7 +177,7 @@ def test_legacy_and_unknown_bounds_broad(tmp_path, monkeypatch):
             prefix = READ(
                 lake.inputs, synthetic, "raw", timing_cutoff=date(2020, 1, 10)
             )
-            assert len(seen) - before == n
+            assert len(seen) - before == (1 if legacy else n)
             assert BASE(
                 lake.inputs, synthetic, "raw", date(2020, 1, 10), frame=full
             ) == BASE(lake.inputs, synthetic, "raw", date(2020, 1, 10), frame=prefix)
@@ -222,6 +229,7 @@ def test_full_commit_seal_stays_complete_and_integrity_checks_future_batches(
         )
         lake.raw.ingest(spec(), frame, ingested_at=datetime(2020, 3, 15, tzinfo=UTC))
         monkeypatch.setattr(proofs, "COMPACT_MIN_ROWS", 1)
+        assert not hasattr(lake.inputs, "index_checks")
         receipt = lake.inputs.freeze(
             {
                 "raw": RawInput(
@@ -234,7 +242,8 @@ def test_full_commit_seal_stays_complete_and_integrity_checks_future_batches(
             },
             information_cutoff="2020-03-31",
         )
-        assert len(receipt.evidence["raw"]["full_commit_checks"]) == 1
+        assert len(receipt.evidence["raw"]["record_checks"]) == 1
+        assert not receipt.evidence["raw"].get("full_commit_checks")
         retained = copy.deepcopy(receipt.evidence)
         seen = calls(monkeypatch)
         full = READ(lake.inputs, receipt, "raw")
@@ -250,8 +259,6 @@ def test_full_commit_seal_stays_complete_and_integrity_checks_future_batches(
         import sqlite3
 
         with sqlite3.connect(lake.data_meta_path) as db:
-            db.execute(
-                "update version_batches set payload=x'00' where partition_path like '%month=03%'"
-            )
+            damage_original_segments(db, "partition_path like '%month=03%'", ())
         with pytest.raises(RuntimeError):
             lake.inputs.verify(receipt)

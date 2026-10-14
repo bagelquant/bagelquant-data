@@ -7,23 +7,31 @@ results = lake.integrity.repair(plan)
 ```
 
 扫描只报告 manifest/schema/键/哈希/分区/恢复事实，不修改状态，不接管孤立文件，不调用
-Provider。浅扫描比较登记文件，深扫描校验内容及 Arrow 恢复证据。修复计划固定 lake 身份
+Provider。浅扫描比较登记文件，深扫描校验原始 Parquet 字节和类型证据。修复计划固定 lake 身份
 和 manifest；过期或不同 lake 的计划失败，执行期间持有数据集更新 lease。
 
-唯一 Data SQLite 决定提交可见性。先准备其中的压缩 Arrow 批次及不可变 Parquet 文件，
-再通过 SQLite 事务一起发布 manifest、schema、commit 和 coverage。未登记文件不可见，
-旧的已登记 generation 作为历史证据保留。
+唯一 Data SQLite 决定提交可见性。先准备唯一的不可变 Parquet segment 与小型
+文件、schema、字段变化元数据，再原子发布 manifest、commit 和 coverage。
+未登记文件不可见；全部已登记 segment 保留为历史权威。SQLite 不保存 Arrow
+正文副本，也不保存历史逐行完整性索引。
 
-本地修复必须重现原始哈希、schema、可用日期和身份。完整恢复批次可以恢复损坏 Parquet；
-完整已校验 Parquet 只有能重现每个原始批次时才可恢复其 payload。证据不足明确失败。
-全部元数据库丢失必须恢复备份，不能从散落文件或当前 Provider 响应推造历史。
-没有自动历史清理、quarantine、孤立 manifest 接管或旧 schema 迁移。
+修复核验已有原始文件。原始文件缺失或损坏必须恢复可信备份，不能从散落文件或
+当前 Provider 响应推造历史。没有自动历史清理、孤立文件接管或旧 schema 迁移。
 
 `integrity` 提供运行、失败、scope、coverage、lease 状态；`raw.status/status_many` 与
 `items.status` 提供对象概况。重置 scope、放弃失效 owner 都是显式操作，与扫描分开。
 所有验收使用临时根和假 Provider，不访问真实工作区数据。
 心跳过期只报告事实，不自动释放写入所有权。调用者确认 owner 已终止后才应显式调用
 `abandon_update_owner`。发布事务同时校验 run 所有权、父 generation 和当前定义。
+
+工作流写入应包在 `with lake.integrity.update_owner(workflow_id):` 中，使 Raw
+和原生 Item 使用同一可恢复 owner；同一元数据路径的不同 lake 实例共享该绑定。
+绑定仅属于当前执行上下文，独立调用线程必须显式进入或复制上下文；内部发布线程
+保留外层数据集 lease。同一 owner 可嵌套，冲突 owner 会失败。协调层确认该 owner
+的所有发布进程已经退出后，才调用 `integrity.abandon_update_owner`；成功 scope、
+完成 flag、不可变原始文件和 frozen receipt 均保留。上下文不自动抢占或清除 lease，
+心跳过期也不能证明进程退出。旧独立 lease 必须根据公开状态中的精确 owner 和
+外部进程证据恢复，不能只凭日期判断。
 
 ## 存储用量与临时清理
 
@@ -36,6 +44,34 @@ result = lake.integrity.cleanup_temporary(plan)
 用量统计实际 lake 普通文件、Data 元数据库及 SQLite sidecar，硬链接仅计一次；区分当前与历史 generations、元数据/恢复、拒绝证据、已知临时文件和未知文件。`temporary_bytes` 包含受保护的活动临时文件，`reclaimable_temporary_bytes` 仅统计可清理候选。已注册与可用 Raw/DataItem 数量分开，可用指有非空已提交 manifest，不据此推断研究 Available Date。
 
 清理计划固定 lake 身份、哈希、相对路径及文件内容身份。只有已注册月度目录中明确属于 Data 原子写入的临时名称可能入选；活动 writer、历史/已提交 generations、元数据与恢复证据、未知文件、符号链接及共享硬链接受保护。执行先取得数据集 writer leases，再完整复验全部候选；变更后拒绝旧计划。重复执行仅报告已不存在的候选，不扩大范围。读取用量和计划不删除文件、不释放 writer。
+
+## 显式删除 Item 证据
+
+```python
+preview = lake.integrity.item_removal_plan(["obsolete.model.exposures", "obsolete.model.carry"])
+# 调用者先通过各自的存储 owner 释放这些 receipt 的全部外部引用。
+plan = lake.integrity.item_removal_plan(
+    preview["names"], discard_receipts=preview["required_receipts"],
+)
+if not plan["blockers"]:
+    result = lake.integrity.remove_items(plan)
+```
+
+此操作永久删除精确指定 Item 的声明、已提交正文/可见事件、完成 flag/build 与明确丢弃的
+完整 frozen receipt。`items.remove` 仍只归档并保留历史。计划只读元数据与文件属性；
+执行校验原始文件哈希，并固定逻辑/物理 lake、schema、目标元数据和文件清单。
+过期/异地计划、活动 Data owner（含过期 lease）、保留依赖、creator/build/output receipt
+引用、父 receipt，以及未知文件、符号链接、共享硬链接均阻止删除。只能传精确名称，
+不能按通配符或整个数据根删除。
+
+`required_receipts` 包含目标 Item 的冻结选择及其下游 receipt。共享上游 Raw/Item source
+不能删除。混合 receipt 必须明确整体丢弃，否则保留它会阻止删除；不会修改任何保留的
+不可变 receipt。Data 无法发现 Core、BT 或应用存储的外部引用，各自 owner 必须先释放。
+
+元数据先原子脱离，再清理旧文件。现有元数据状态保存小型操作凭据和精确旧清单，
+同一计划可以恢复中断的文件清理，不会删除同名重新创建的数据。普通异常释放操作 lease；
+强制进程退出后，协调者必须先确认 publisher 已退出，再恢复精确 owner。
+无关行/原始文件、共享 selector/summary 和全局序号均保持不变；空目录保留，未知文件作为 blocker 报告。
 
 ## 可携带声明批次
 
@@ -65,7 +101,7 @@ if plan["valid"]:
 导出到新的调用者路径，并返回校验后的文件哈希。`integrity.verify_backup()` 校验备份。
 `DataLake.restore(backup_data_meta_path=..., backup_lake_path=...,
 data_meta_path=..., lake_path=...)` 将同 schema 备份恢复到新路径；已有目标会被拒绝。
-完整历史和冻结输入保留在单个元数据库中，旧物理文件可按登记 Arrow 批次重现。
+冻结凭证保留在 SQLite；全部历史数值和首次可见事件以原始文件完整备份。
 
 `integrity.snapshot(data_meta_path=..., lake_path=...)` 为隔离计算创建一致、独立的
 副本，不扫描全部历史证明。报告明确为 `valid=None`、`verification="unverified"`，
@@ -75,6 +111,6 @@ data_meta_path=..., lake_path=...)` 将同 schema 备份恢复到新路径；已
 复制前后检查原始 SQLite main/WAL/journal 签名，拒绝活动回滚日志。包含已提交
 WAL，但不打开、checkpoint 或写入原始元数据；恢复 WAL 和修改相对 lake 绑定
 仅发生在目标，保留 lake 身份及完整历史。macOS 优先独立的文件系统写时复制，
-其他平台/不支持的文件系统使用独立文件复制。当前不可变 generation 随副本复制，
+其他平台/不支持的文件系统使用独立文件复制。全部已提交数值和可见事件 segment 随副本复制，
 不建立符号链接或硬链接。拒绝已有目标和原始 metadata/sidecar/lake 重叠；失败仅
 清理此次新建的目标。原 `backup` / `verify_backup` 仍完整校验全部保留证明。

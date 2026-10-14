@@ -57,7 +57,7 @@ def test_ordered_equality_requires_schema_and_does_not_join(monkeypatch):
     assert outputs[0].height == 6 and outputs[1].is_empty()
 
 
-def test_public_build_checks_only_keys_and_preserves_true_withdrawals(tmp_path, monkeypatch):
+def test_public_build_preserves_true_withdrawals_with_original_evidence(tmp_path, monkeypatch):
     with DataLake.open(data_meta_path=tmp_path/'meta.sqlite', lake_path=tmp_path/'lake') as lake:
         spec = DatasetSpec("seed", "by_date", date_kind="calendar", field_mappings={"time":"time", "asset_id":"asset_id"})
         frame = pl.DataFrame({"time":[date(2020,1,1)]*2,"asset_id":["A","B"],"value":[1.,2.],"diagnostic":["first","second"]})
@@ -79,10 +79,15 @@ def test_public_build_checks_only_keys_and_preserves_true_withdrawals(tmp_path, 
         monkeypatch.setattr(pl.LazyFrame, "collect", observe)
         lake.items.initialize("derived",start="2020-01-01",end="2020-01-04",progress=progress)
         assert ["time", "asset_id"] in schemas
-        assert not any("_producer_key" in schema and "value" in schema for schema in schemas)
+        # Immutable Parquet content deduplication may consume bounded original
+        # value chunks; it no longer has a separate persisted row-hash index.
+        assert original("derived", view="snapshot", as_of="2020-01-04").collect()["value"].to_list() == [1., 2.]
         armed = False
         frozen = lake.inputs.freeze({"item":ItemInput("derived")},information_cutoff="2020-01-02")
         selected[0] = frame.filter(pl.col("asset_id")=="A")
+        lake.items.register_producer("fixture", "2", lambda context: selected[0])
+        lake.items.register(DataItemSpec("derived", (RawInput("custom", "seed"),),
+            producer_key="fixture", producer_revision="2"))
         report = lake.items.update("derived",start="2020-01-01",end="2020-01-04",force=True)
         assert report.status=="success"
         assert original("derived",view="snapshot",as_of="2020-01-04").collect().filter(pl.col("asset_id")=="B")["value"][0] is None

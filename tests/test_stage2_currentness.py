@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from dataclasses import replace
 import sqlite3
 
 import polars as pl
@@ -50,7 +51,7 @@ def test_currentness_rejects_changed_definition_archival_and_corrupt_receipt(tmp
     lake.raw.ingest(_spec(), _frame(), ingested_at=_received(1))
     request = {"raw": RawInput("custom", "raw", view="snapshot")}
     first = lake.inputs.freeze(request, information_cutoff="2020-01-03")
-    lake.raw.register(_spec(description="Changed declaration"))
+    lake.raw.register(replace(_spec(), source_api="changed_provider_api"))
     assert not lake.inputs.is_current(first)
     current = lake.inputs.freeze(request, information_cutoff="2020-01-03")
     assert lake.inputs.is_current(current)
@@ -95,7 +96,7 @@ def test_item_receipt_currentness_uses_declared_item_definition_and_content(tmp_
     receipt = lake.inputs.freeze({"item": ItemInput("item", view="snapshot")}, information_cutoff="2020-01-03")
     reader = _lake(tmp_path, read_only=True)
     assert reader.inputs.is_current(receipt)
-    lake.items.register(DataItemSpec("item", description="New declaration"))
+    lake.items.register(DataItemSpec("item", metadata={"numerical_revision": "changed"}))
     assert not reader.inputs.is_current(receipt)
 
 

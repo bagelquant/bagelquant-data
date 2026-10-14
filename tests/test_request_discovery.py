@@ -74,7 +74,7 @@ def test_general_discovery_fans_out_declared_provider_api_and_records_provenance
     ]
 
 
-def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(tmp_path) -> None:
+def test_explicit_general_refresh_discovers_and_commits_a_complete_snapshot(tmp_path) -> None:
     source = DiscoverySource()
     lake = DataLake.open(data_meta_path=(tmp_path) / "data_meta.sqlite", lake_path=(tmp_path) / "lake")
     lake.catalog.sources.register(source)
@@ -92,7 +92,7 @@ def test_each_explicit_general_update_discovers_and_commits_a_complete_snapshot(
         "logical_membership", source="custom", end="2025-01-03"
     )
     call_count = len(source.calls)
-    report = lake.raw.update(
+    report = lake.raw.refresh(
         "logical_membership", source="custom", end="2025-01-03"
     )
 

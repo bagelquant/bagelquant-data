@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from bagelquant_data.pipeline.ingest import IngestionPipeline, IngestionReport
 from bagelquant_data.pipeline.scopes import (
     compact_daily_range_backfill,
     discover_request_param_sets,
+    general_snapshot_completed,
     synchronize_requests,
 )
 from bagelquant_data.pipeline.update import (
@@ -82,6 +84,9 @@ class DataLake:
 
         self.inputs = InputsAPI(self)
         self.items = ItemAPI(self)
+        if not read_only and self.inputs._boundary is None and self.inputs._read_context() is None:
+            from bagelquant_data.storage.record_lookups import initialize_empty_record_lookups
+            initialize_empty_record_lookups(self._data_meta)
 
     @classmethod
     def open(
@@ -266,6 +271,12 @@ class RawAPI:
             spec, frame, mode=mode, ingested_at=ingested_at
         )
 
+    def completion_statuses(self, *, source: str | None = None,
+                            datasets: Sequence[str] | None = None) -> list[dict[str,Any]]:
+        """Read compact publication flags for Raw prerequisites in one query."""
+        return [row for row in self._lake._data_meta.completion_statuses(source=source,datasets=datasets)
+            if row["source"] != "items"]
+
     def plan_updates(
         self, datasets: Sequence[str], *, source: str, start: DateLike = "2000-01-01",
         end: DateLike, source_options: Mapping[str, Mapping[str, object]] | None = None,
@@ -280,7 +291,16 @@ class RawAPI:
         visited: set[str] = set()
         actions_by_name = {}
         store = self._lake._data_meta
+        flags = {row["dataset"]: row for row in self.completion_statuses(source=source,datasets=tuple(specs))}
         for name in specs:
+            flag = flags[name]
+            if (flag["definition_current"] and flag["publication_current"] and flag["checked_target"] is not None
+                    and flag["completed_start"] is not None and flag["completed_end"] is not None
+                    and _date_value(flag["completed_start"]) <= _date_value(start)
+                    and _date_value(flag["completed_end"]) >= _date_value(end)
+                    and _date_value(flag["checked_target"]) >= _date_value(end)):
+                actions_by_name[name] = []
+                continue
             rows = store._rows("select * from dataset_initializations where source=? and dataset=?", (source, name))
             row = rows[0] if rows else None
             initialization = None if row is None else {"status": row["status"],
@@ -289,6 +309,10 @@ class RawAPI:
             actions_by_name[name] = initialization_actions(start=_date_value(start), end=_date_value(end),
                 definition_hash=self.definition_hash(name, source=source), initialization=initialization,
                 has_history=history)
+            if general_snapshot_completed(specs[name], store, end=end, source_options=(source_options or {}).get(name)):
+                actions_by_name[name] = [
+                    action for action in actions_by_name[name] if action["mode"] != "incremental"
+                ]
 
         def visit(name: str) -> None:
             if name in visiting:
@@ -466,6 +490,22 @@ class IntegrityAPI:
         """Freeze only known, unreferenced and inactive atomic temporary files."""
         from bagelquant_data.management.maintenance import cleanup_plan
         return cleanup_plan(self._lake)
+
+    def item_removal_plan(self, names: Sequence[str], *,
+                          discard_receipts: Sequence[str] = ()) -> dict[str, Any]:
+        """Preview exact Item history/files and retained-reference blockers.
+
+        Unlike item archival, explicit removal discards original evidence.
+        External receipt owners must release their references before apply.
+        Shared upstream receipts are never implicitly discarded.
+        """
+        from bagelquant_data.management.item_removal import item_removal_plan
+        return item_removal_plan(self._lake, names, discard_receipts=discard_receipts)
+
+    def remove_items(self, plan: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply a frozen unreferenced Item inventory; resume interrupted cleanup."""
+        from bagelquant_data.management.item_removal import remove_items
+        return remove_items(self._lake, plan)
 
     def cleanup_temporary(self, plan: Mapping[str, Any]) -> dict[str, Any]:
         """Delete exact frozen temporary files after owner and identity checks."""
@@ -669,6 +709,17 @@ class IntegrityAPI:
     def active_update_leases(self) -> list[dict[str, Any]]:
         return self._lake._data_meta.active_update_leases()
 
+    @contextmanager
+    def update_owner(self, owner_id: str) -> Iterator[None]:
+        """Bind Raw and Item publishers in this context to one workflow owner.
+
+        Separate lake instances for the same metadata path share the binding.
+        Recovery remains explicit: prove that all owner publishers exited before
+        calling abandon_update_owner. Expired heartbeats do not grant permission.
+        """
+        with self._lake._data_meta.update_owner(owner_id):
+            yield
+
     def abandon_update_owner(self, owner_id: str, *, reason: str) -> dict[str, int]:
         self._lake._data_meta.ensure_writable()
         return self._lake._data_meta.abandon_update_owner(owner_id, reason=reason)
@@ -743,14 +794,20 @@ class _RawUpdater:
                 progress_callback(
                     UpdateProgress(dataset, "discovery", 0, 0, 0, 0, 0, "running")
                 )
-            discovered_param_sets, discovery_call = discover_request_param_sets(
-                spec, adapter
-            )
             raw_source_options = {
                 **spec.request_options,
                 **dict(context.options.get("source_options") or {}),
             }
             raw_source_options["refresh"] = context.options.get("mode") == "refresh"
+            completed_general = context.options["mode"] == "incremental" and general_snapshot_completed(
+                spec, self.lake._data_meta, end=context.end,
+                today=context.options.get("today"), ids=context.options.get("ids"),
+                params=context.options.get("params"),
+                source_options=raw_source_options,
+            )
+            discovered_param_sets, discovery_call = (
+                ((), None) if completed_general else discover_request_param_sets(spec, adapter)
+            )
             scan = raw_source_options.get("initialization_scan")
             if scan is not None:
                 if context.options["mode"] != "initialize" or not isinstance(scan, Mapping):
@@ -772,7 +829,7 @@ class _RawUpdater:
                 raw_source_options, Mapping
             ):
                 raise ConfigurationError("source_options must be a mapping")
-            requests = synchronize_requests(
+            requests = () if completed_general else synchronize_requests(
                 spec=spec,
                 raw=raw,
                 metadata=self.lake._data_meta,
@@ -850,7 +907,7 @@ class _RawUpdater:
         for row in self.lake._data_meta._rows(
             "select c.dataset,c.run_id,b.partition_path,"
             "b.min_available,b.max_available,b.min_observation,b.max_observation,c.pit_date "
-            "from version_batches b join version_commits c on c.seq=b.commit_seq "
+            "from version_segments b join version_commits c on c.seq=b.commit_seq "
             "where c.source=? and c.status='committed'",
             (source,),
         ):

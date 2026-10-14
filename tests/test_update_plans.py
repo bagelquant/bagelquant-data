@@ -4,7 +4,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-from bagelquant_data import DataItemSpec, RawInput
+from bagelquant_data import DataItemSpec, ProducerUpdatePolicy, RawInput
 from test_ledger_updates import LedgerSource, _daily_lake
 
 
@@ -31,7 +31,7 @@ def test_cancelled_raw_initialization_resumes_frozen_end_before_extension(tmp_pa
         lake.raw.update("daily", source="custom", mode=action["mode"],
                         start=action["start"], end=action["end"])
     assert lake.raw.plan_updates(["daily"], source="custom", start="2025-01-02",
-                                 end="2025-01-03")[0]["mode"] == "incremental"
+                                 end="2025-01-03") == []
     assert lake.raw.status("daily", source="custom")["row_count"] == 2
 
 
@@ -40,7 +40,7 @@ def test_completed_empty_raw_initialization_uses_incremental(tmp_path):
     lake.raw.initialize("daily", source="custom", start="2025-01-02", end="2025-01-03")
     assert lake.raw.status("daily", source="custom")["row_count"] == 0
     assert lake.raw.plan_updates(["daily"], source="custom", start="2025-01-02",
-                                 end="2025-01-03")[0]["mode"] == "incremental"
+                                 end="2025-01-03") == []
 
 
 def test_unfinished_raw_initialization_rejects_changed_bounds_and_definition(tmp_path):
@@ -52,7 +52,7 @@ def test_unfinished_raw_initialization_rejects_changed_bounds_and_definition(tmp
     with pytest.raises(ValueError, match="frozen"):
         lake.raw.plan_updates(["daily"], source="custom", start="2025-01-02", end="2025-01-02")
     from dataclasses import replace
-    lake.raw.register(replace(lake.raw.get("daily", source="custom"), description="changed"))
+    lake.raw.register(replace(lake.raw.get("daily", source="custom"), source_api="changed_provider_api"))
     with pytest.raises(ValueError, match="original"):
         lake.raw.plan_updates(["daily"], source="custom", start="2025-01-02", end="2025-01-03")
 
@@ -66,7 +66,7 @@ def test_item_plan_resumes_initialization_and_handles_empty_builds(tmp_path, emp
     def producer(context):
         frame = pl.DataFrame({"time": [date(2025, 1, 2)], "asset_id": ["A"], "value": [10.0]})
         return frame.head(0) if empty else frame
-    lake.items.register_producer("fixture", "1", producer)
+    lake.items.register_producer("fixture", "1", producer, update_policy=ProducerUpdatePolicy("same_date"))
     assert lake.items.plan_update("close", start="2025-01-02", end="2025-01-02")[0]["mode"] == "initialize"
     lake.items.initialize("close", start="2025-01-02", end="2025-01-02", cancelled=lambda: True)
     plan = lake.items.plan_update("close", start="2025-01-02", end="2025-01-03")
@@ -75,4 +75,4 @@ def test_item_plan_resumes_initialization_and_handles_empty_builds(tmp_path, emp
     for action in plan:
         api = lake.items.initialize if action["mode"] == "initialize" else lake.items.update
         api("close", start=action["start"], end=action["end"])
-    assert lake.items.plan_update("close", start="2025-01-02", end="2025-01-03")[0]["mode"] == "incremental"
+    assert lake.items.plan_update("close", start="2025-01-02", end="2025-01-03") == []
