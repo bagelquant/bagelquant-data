@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import sys
 
 from bagelquant_data.core.exceptions import ConfigurationError
 from bagelquant_data.storage.atomic import _filesystem_path
@@ -23,8 +22,6 @@ def file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
 
 
 def _clone_file(source: Path, destination: Path) -> bool:
-    if sys.platform != "darwin":
-        return False
     libc = ctypes.CDLL(None, use_errno=True)
     clone = getattr(libc, "clonefile", None)
     if clone is None:

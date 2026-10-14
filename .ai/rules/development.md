@@ -5,10 +5,9 @@
 - Inspect `git status --short --branch` including untracked changes before editing;
   read README, manifest and affected docs. Work in the owning repository and preserve
   unrelated user edits. Never remove Git metadata, merge histories or absorb repos.
-- Supported platforms are macOS and Linux; Windows support is retired.
-- Use Python 3.13 and `uv`. Choose cross-platform paths/APIs; account for separators,
-  casing, line endings, permissions, shell syntax and environment conventions on
-  macOS/Linux. Use `pathlib`; never persist developer-specific absolute paths.
+- The supported platform is macOS. Run validation locally; GitHub Actions is disabled.
+- Use Python 3.13 and `uv`. Account for macOS path casing, line endings, permissions,
+  shell syntax and environment conventions. Use `pathlib`; never persist developer-specific absolute paths.
 - Data has no BagelQuant package dependency. Keep provider adapters at the
   integration edge; storage/query/ledger are provider-neutral. Declare any
   necessary dependency in the owning manifest.
