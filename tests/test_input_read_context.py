@@ -319,7 +319,9 @@ def test_currentness_context_memo_distinguishes_every_reader_boundary(tmp_path, 
 
 def test_currentness_context_does_not_cache_failed_capture_or_partial_roots(tmp_path, monkeypatch):
     lake, frozen = frozen_months(tmp_path)
-    second = lake.inputs.freeze(frozen.requests, information_cutoff="2020-04-01")
+    # Identical Sources now reuse their immutable receipt ID. Use a distinct
+    # cutoff so this still checks two roots and a failure partway through them.
+    second = lake.inputs.freeze(frozen.requests, information_cutoff="2020-04-02")
     original = lake.inputs._capture
     captures = 0
     # Exercise the conservative path when compact completion authority cannot

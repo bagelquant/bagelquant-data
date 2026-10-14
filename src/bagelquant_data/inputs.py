@@ -2351,7 +2351,9 @@ class InputsAPI:
             first, last = [header["min_observation"]], [header["max_observation"]]
             if header["source"] == "items":
                 request = payload["requests"][name]
-                empty = db.execute("SELECT min(b.start_date),max(b.end_date) FROM item_builds b JOIN frozen_inputs f ON f.receipt_id=b.frozen_receipt_id WHERE b.name=? AND b.status='success' AND b.definition_hash=? AND b.result_commit IS NULL AND b.input_commit<=? AND cast(json_extract(f.payload_json,'$.max_check_id') AS integer)<=? AND (? IS NULL OR b.end_date>=?) AND (? IS NULL OR b.start_date<=?)", (header["dataset"], header["definition_hash"], payload["max_commit"], payload["max_check_id"], request.get("start"), request.get("start"), request.get("end"), request.get("end"))).fetchone()
+                start = str(request["start"]) if request.get("start") is not None else None
+                end = str(request["end"]) if request.get("end") is not None else None
+                empty = db.execute("SELECT min(b.start_date),max(b.end_date) FROM item_builds b JOIN frozen_inputs f ON f.receipt_id=b.frozen_receipt_id WHERE b.name=? AND b.status='success' AND b.definition_hash=? AND b.result_commit IS NULL AND b.input_commit<=? AND cast(json_extract(f.payload_json,'$.max_check_id') AS integer)<=? AND (? IS NULL OR b.end_date>=?) AND (? IS NULL OR b.start_date<=?)", (header["dataset"], header["definition_hash"], payload["max_commit"], payload["max_check_id"], start, start, end, end)).fetchone()
                 first.append(empty[0])
                 last.append(empty[1])
             header["required_start"] = min((day for day in first if day is not None), default=None)
