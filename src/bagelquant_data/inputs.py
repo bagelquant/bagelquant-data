@@ -564,7 +564,9 @@ class InputsAPI:
 
     def describe(self, receipt: FrozenInputReceipt | str) -> dict[str, Any]:
         """Describe registered identity without loading the recursive evidence tree."""
-        key = receipt.receipt_id if isinstance(receipt, FrozenInputReceipt) else receipt
+        # The small root is immutable evidence too. Verify its registered digest
+        # before admitting its alias headers; descendants remain untouched.
+        key = self.get(receipt).receipt_id
         rows = self._store._rows("SELECT receipt_id,digest,created_at,"
             "json_extract(payload_json,'$.max_commit') AS max_commit,"
             "json_extract(payload_json,'$.max_check_id') AS max_check_id,"
