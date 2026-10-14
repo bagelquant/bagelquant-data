@@ -33,7 +33,8 @@ if TYPE_CHECKING:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    from bagelquant_data.storage.immutable_metadata import canonical
+    return canonical(value)
 
 
 def _definition_hash(spec: DataItemSpec) -> str:

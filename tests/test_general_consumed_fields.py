@@ -196,9 +196,11 @@ def test_general_unknown_captured_schema_is_unsupported_before_cached_proof(tmp_
     # Isolated legacy metadata fixture: an original future atomic header was
     # retained without schema authority, rather than fabricated on a receipt.
     with lake._data_meta.connect() as db:
-        db.execute("update version_segments set schema_ipc=x'' where commit_seq in "
+        from bagelquant_data.storage.immutable_metadata import save_schema
+        empty = save_schema(db, b"")
+        db.execute("update version_segments set schema_ref=? where commit_seq in "
             "(select seq from version_commits where source='custom' and dataset='metadata' and seq>?)",
-            (old.max_commit,))
+            (empty, old.max_commit))
     current = freeze(lake, old, 3)
     ban_originals(monkeypatch, lake)
     assert lake.inputs.index_selection(old, "metadata", view="snapshot", fields=FIELDS) == first

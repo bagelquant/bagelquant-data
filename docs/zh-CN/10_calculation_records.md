@@ -5,6 +5,20 @@ SQLite 小型元数据，不解码历史。`raw.completion_statuses` 和
 `items.completion_statuses` 在一个固定元数据视图批量读取节点 flag；定义、发布修订、
 连续覆盖、未完成更新和直接依赖状态共同决定是否完成。
 
+Schema 9 将 Arrow schema 按 digest 只保存一次。冻结输入保存薄 header 和 alias 到
+不可变 Source 的引用；共享块在收据之间共用原始 segment/check header 快照，当前可变
+索引投影不能替代它。
+`inputs.get` 返回显式 lazy `evidence` Mapping，访问字段才解引用；`describe` 返回每个
+alias 的定义/schema 身份、范围、行数和 Source 引用。普通未变化检查使用登记的本地
+发布修订和完整生产者完成证明；未知、未完成或变化证据仍走保守元数据比较。
+
+`register_selection_set(receipt, descriptors)` 验证完整 Data 描述符后返回
+`{id, digest, source, count}`。`describe_selection_set` 只验证薄 set header 和原始
+Source；`read_selection_set(reference, keys=[...])` 只读取指定描述符，省略 keys 明确
+表示准备或审计中的全量读取。key 为 UTF-8 JSON 的 SHA-256：排序字段、紧凑分隔符、
+`ensure_ascii=False`、`default=str`。`inputs.verify` 检查所有共享后代、selection set
+完整成员和 proof，以及原始不可变文件字节。
+
 `inputs.describe`、`request_identity`、`range_identity`、`selection_identity`
 和 `selection_descriptors` 均只读。支持的范围总能取得保守 token，显式维护不会
 改变普通 token。范围外追加及未消费字段变化不影响身份；稀疏坐标的矩形边界只提供

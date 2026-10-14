@@ -28,6 +28,7 @@ from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_fr
 from bagelquant_data.query.raw import _date_value
 from bagelquant_data.storage.recovery import read_batch, verify_batch
 from bagelquant_data.execution import ExecutionOptions
+from bagelquant_data.storage import immutable_metadata
 
 if TYPE_CHECKING:
     from bagelquant_data.management.lake import DataLake
@@ -119,7 +120,8 @@ def current_input_check_boundary(data_meta_path: str | Path) -> int | None:
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      default=lambda value: dict(value) if isinstance(value, Mapping) else str(value))
+                      default=lambda value: dict(value) if isinstance(value, Mapping) else
+                      list(value) if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) else str(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +182,10 @@ def _selection_batches(frozen, alias, request, cutoff, *, fields=None):
     if isinstance(request, RawInput):
         lower = max((_date_value(item) for item in (lower, request.observation_start) if item is not None), default=None)
         upper = min((_date_value(item) for item in (upper, request.observation_end) if item is not None), default=None)
-    return [batch for batch in evidence["batches"] if not (
+    batches = evidence["batches"]
+    if isinstance(batches, immutable_metadata.LazyMetadataSequence) and (evidence.get("scoped_batches") or evidence.get("retained_batch_bounds")):
+        return list(batches.selected(lower, upper, cutoff))
+    return [batch for batch in batches if not (
         (evidence.get("scoped_batches") or evidence.get("retained_batch_bounds")) and (
             lower is not None and batch["max_observation"] is not None and _date_value(batch["max_observation"]) < lower
             or upper is not None and batch["min_observation"] is not None and _date_value(batch["min_observation"]) > upper
@@ -447,7 +452,7 @@ class InputsAPI:
         self._shared_context: _ReadContext | None = None
         if not self._store.read_only:
             with self._store.connect() as db:
-                db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null,created_at text not null)")
+                db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null unique,created_at text not null)")
 
     def _read_context(self) -> _ReadContext | None:
         path = self._store.data_meta_path.resolve()
@@ -571,6 +576,8 @@ class InputsAPI:
         value = dict(rows[0])
         if isinstance(receipt, FrozenInputReceipt) and receipt.digest != value["digest"]:
             raise RuntimeError("Frozen input receipt checksum mismatch")
+        with self._store.connect() as db:
+            value["aliases"] = json.loads(db.execute("SELECT json_extract(payload_json,'$.aliases') FROM frozen_inputs WHERE receipt_id=?", (key,)).fetchone()[0])
         return value
 
     def request_identity(self, receipt: FrozenInputReceipt | str, alias: str) -> str:
@@ -584,6 +591,11 @@ class InputsAPI:
         frozen = self.get(receipt)
         if alias not in frozen.requests:
             raise KeyError(f"Unknown frozen input alias: {alias}")
+        if frozen.receipt_id != "current":
+            with self._store.connect() as db:
+                row = db.execute("SELECT value FROM frozen_inputs,json_each(payload_json,'$.request_identities') WHERE receipt_id=? AND key=?", (frozen.receipt_id, alias)).fetchone()
+            if row is not None:
+                return row[0]
         context = self._read_context()
         key = (frozen.digest, alias)
         if context is not None and context.memo_available and key in context.request_identities:
@@ -596,6 +608,120 @@ class InputsAPI:
         if context is not None and context.memo_available:
             context.request_identities[key] = identity
         return identity
+
+    @staticmethod
+    def selection_descriptor_identity(descriptor: Mapping[str, Any]) -> str:
+        """UTF-8 canonical JSON identity for a public selection descriptor."""
+        return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, default=str).encode()).hexdigest()
+
+    def register_selection_set(self, receipt: FrozenInputReceipt | str,
+            descriptors: Sequence[Mapping[str, Any]], *, config: ExecutionOptions | None = None,
+            check_canceled: Callable[[], None] = lambda: None) -> dict[str, Any]:
+        """Register immutable owner-validated selection references, without values.
+
+        Complete descriptor validation happens here once. Ordinary consumers use
+        describe_selection_set; this is a Source-bound publication, not a cache
+        claiming that a current mutable Source or original bytes were audited.
+        """
+        self._store.ensure_writable()
+        if not descriptors or isinstance(descriptors, (str, bytes)):
+            raise ValueError("Selection sets require complete known descriptors")
+        frozen = self.get(receipt)
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for descriptor in descriptors:
+            check_canceled()
+            grouped.setdefault(str(descriptor["alias"]), []).append(descriptor)
+        for values in grouped.values():
+            for first in range(0, len(values), 16):
+                group = values[first:first + 16]
+                resolved = self.resolve_selection_descriptors(frozen, group,
+                    config=config, check_canceled=check_canceled)
+                if list(resolved) != list(group):
+                    raise ValueError("Selection set descriptor differs from its registered Source")
+        keys = [self.selection_descriptor_identity(value) for value in descriptors]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Selection set descriptor identities must be unique")
+        source = {"id": frozen.receipt_id, "digest": frozen.digest}
+        with self._store.connect() as db:
+            db.execute("begin immediate")
+            self.get(frozen)
+            members = []
+            for key, descriptor in zip(keys, descriptors):
+                check_canceled()
+                # Source binding is shared by the set. Its immutable descriptor
+                # contents can therefore survive a later equivalent Source.
+                base = {name: value for name, value in descriptor.items() if name != "source"}
+                members.append({"key": key, "reference": immutable_metadata.save(db, base)})
+            root = immutable_metadata.save(db, members)
+            body = {"source": source, "count": len(members), "root_ref": root["ref"]}
+            digest = hashlib.sha256(_json(body).encode()).hexdigest()
+            db.execute("INSERT OR IGNORE INTO input_selection_sets VALUES(?,?,?,?,?,?)",
+                (digest, digest, frozen.receipt_id, frozen.digest, root["ref"], len(members)))
+            db.executemany("INSERT OR IGNORE INTO input_selection_set_entries VALUES(?,?,?,?)",
+                ((digest, member["key"], index, _json(member["reference"]))
+                 for index, member in enumerate(members)))
+        return {"id": digest, "digest": digest, "source": source, "count": len(members)}
+
+    def describe_selection_set(self, reference: Mapping[str, Any], *,
+            receipt: FrozenInputReceipt | str | None = None, config: ExecutionOptions | None = None,
+            check_canceled: Callable[[], None] = lambda: None) -> dict[str, Any]:
+        """Validate a registered set header and original Source without descendants."""
+        check_canceled()
+        with self._store.connect() as db:
+            row = db.execute("SELECT * FROM input_selection_sets WHERE id=?", (reference["id"],)).fetchone()
+        if row is None:
+            raise KeyError("Unknown registered selection set")
+        source = {"id": row["source_id"], "digest": row["source_digest"]}
+        body = {"source": source, "count": row["item_count"], "root_ref": row["root_ref"]}
+        result = {"id": row["id"], "digest": row["digest"], "source": source, "count": row["item_count"]}
+        if (hashlib.sha256(_json(body).encode()).hexdigest() != row["digest"]
+                or any(reference.get(key) != value for key, value in result.items())):
+            raise RuntimeError("Selection set identity or original Source changed")
+        if config is not None and len(_json(body).encode()) * 8 > config.max_buffer_bytes // 4:
+            raise MemoryError("Selection set header exceeds max_buffer_bytes")
+        frozen = self.describe(source["id"] if receipt is None else receipt)
+        if frozen["receipt_id"] != source["id"] or frozen["digest"] != source["digest"]:
+            raise RuntimeError("Selection set names a different original Source")
+        return result
+
+    def read_selection_set(self, reference: Mapping[str, Any], *, keys: Sequence[str] | None = None,
+            config: ExecutionOptions | None = None,
+            check_canceled: Callable[[], None] = lambda: None) -> tuple[dict[str, Any], ...]:
+        """Read selected descriptor keys; all-key reads are explicit preparation/audit."""
+        header = self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
+        if isinstance(keys, (str, bytes)):
+            raise ValueError("Selection set keys require a finite sequence")
+        with self._store.connect() as db:
+            if keys is None:
+                rows = db.execute("SELECT descriptor_key,ordinal,reference_json FROM input_selection_set_entries WHERE set_id=? ORDER BY ordinal", (header["id"],)).fetchall()
+            else:
+                rows = db.execute("SELECT descriptor_key,ordinal,reference_json FROM input_selection_set_entries WHERE set_id=? AND descriptor_key IN(SELECT value FROM json_each(?)) ORDER BY ordinal", (header["id"], _json(list(keys)))).fetchall()
+                if len(rows) != len(set(keys)):
+                    raise KeyError("Selection set descriptor key is unknown")
+            root = db.execute("SELECT s.root_ref,m.kind,m.item_count FROM input_selection_sets s JOIN immutable_metadata m ON m.digest=s.root_ref WHERE s.id=?", (header["id"],)).fetchone()
+        if root is None or root["item_count"] != header["count"]:
+            raise RuntimeError("Registered selection membership is missing")
+        reader = immutable_metadata.MetadataReader(self._store)
+        members = reader.value({"ref": root["root_ref"], "kind": root["kind"], "count": root["item_count"]})
+        result, charge = [], 0
+        options = config or ExecutionOptions()
+        for row in rows:
+            check_canceled()
+            member = members[row["ordinal"]]
+            if member["key"] != row["descriptor_key"] or member["reference"] != json.loads(row["reference_json"]):
+                raise RuntimeError("Registered selection membership differs from its immutable root")
+            value = {**reader.value(json.loads(row["reference_json"])), "source": header["source"]}
+            # Descriptor dictionaries contain bounded nested public JSON, not
+            # lazy source-history views, so the public wire shape stays ordinary.
+            value = json.loads(_json(value))
+            charge += len(_json(value).encode()) * 8
+            if charge > options.max_buffer_bytes // 4:
+                raise MemoryError("Selected descriptors exceed max_buffer_bytes")
+            if self.selection_descriptor_identity(value) != row["descriptor_key"]:
+                raise RuntimeError("Registered selection descriptor checksum mismatch")
+            result.append(value)
+        return tuple(result)
 
     def range_identity(self, receipt: FrozenInputReceipt | str, alias: str, *,
                        start: DateLike | None = None, end: DateLike | None = None,
@@ -2207,18 +2333,124 @@ class InputsAPI:
             payload = self._capture(db, requests, cutoff=cutoff, max_commit=max_commit, persist_checks=True,
                 retained_bounds_aliases=set(requests) if retain_batch_bounds else set())
             registered = self._register_capture(db, payload)
-            receipt_id, digest = registered.receipt_id, registered.digest
-        return self._receipt(receipt_id, payload, digest)
+        return registered
 
     def _register_capture(self, db, payload):
         """Publish one captured metadata body through the sole Source writer."""
-        serialized = _json(payload)
+        references = {name: immutable_metadata.save(db, value) for name, value in payload["evidence"].items()}
+        aliases = {name: {"source": value["source"], "dataset": value["dataset"],
+            "definition_hash": value["definition_hash"], "schema_hash": value["schema_hash"],
+            "update_type": value["definition"].get("update_type", "by_date"), "source_ref": references[name]["ref"],
+            "row_count": sum(batch["row_count"] for batch in value["batches"]),
+            "batch_count": len(value["batches"]),
+            "min_observation": min((batch["min_observation"] for batch in value["batches"] if batch["min_observation"] is not None), default=None),
+            "max_observation": max((batch["max_observation"] for batch in value["batches"] if batch["max_observation"] is not None), default=None),
+            "state": self._registered_source_state(db, value["source"], value["dataset"])}
+            for name, value in payload["evidence"].items()}
+        for name, header in aliases.items():
+            first, last = [header["min_observation"]], [header["max_observation"]]
+            if header["source"] == "items":
+                request = payload["requests"][name]
+                empty = db.execute("SELECT min(b.start_date),max(b.end_date) FROM item_builds b JOIN frozen_inputs f ON f.receipt_id=b.frozen_receipt_id WHERE b.name=? AND b.status='success' AND b.definition_hash=? AND b.result_commit IS NULL AND b.input_commit<=? AND cast(json_extract(f.payload_json,'$.max_check_id') AS integer)<=? AND (? IS NULL OR b.end_date>=?) AND (? IS NULL OR b.start_date<=?)", (header["dataset"], header["definition_hash"], payload["max_commit"], payload["max_check_id"], request.get("start"), request.get("start"), request.get("end"), request.get("end"))).fetchone()
+                first.append(empty[0])
+                last.append(empty[1])
+            header["required_start"] = min((day for day in first if day is not None), default=None)
+            header["required_end"] = max((day for day in last if day is not None), default=None)
+        identities = {name: hashlib.sha256(_json({"version": "frozen_request.v1",
+            "request": payload["requests"][name], "information_cutoff": payload["information_cutoff"],
+            "evidence": _identity_evidence(value)}).encode()).hexdigest()
+            for name, value in payload["evidence"].items()}
+        header = {**payload, "format": 9, "evidence": references, "aliases": aliases,
+            "request_identities": identities}
+        serialized = _json(header)
         if len(serialized.encode()) > db.getlimit(sqlite3.SQLITE_LIMIT_LENGTH):
             raise MemoryError("Frozen input evidence exceeds SQLite's single-value size limit")
         digest = hashlib.sha256(serialized.encode()).hexdigest()
+        existing = db.execute("SELECT receipt_id FROM frozen_inputs WHERE digest=?", (digest,)).fetchone()
+        if existing is not None:
+            return self.get(existing[0])
         receipt_id = uuid4().hex
         db.execute("insert into frozen_inputs values(?,?,?,?)", (receipt_id, serialized, digest, datetime.now(UTC).isoformat()))
-        return self._receipt(receipt_id, payload, digest)
+        return self._receipt(receipt_id, header, digest)
+
+    @staticmethod
+    def _registered_source_state(db, source, dataset):
+        """Small published state bound to a Source, independent of global counters."""
+        row = db.execute("SELECT spec_hash,publication_revision,active FROM datasets WHERE source=? AND name=?", (source, dataset)).fetchone()
+        if row is None:
+            return None
+        definition = row["spec_hash"]
+        if source == "items":
+            item = db.execute("SELECT spec_hash,active FROM item_definitions WHERE name=?", (dataset,)).fetchone()
+            if item is None or not item["active"]:
+                return None
+            definition = item["spec_hash"]
+        return {"definition_hash": definition, "publication_revision": row["publication_revision"],
+            "active": bool(row["active"]),
+            "commit": db.execute("SELECT coalesce(max(seq),0) FROM version_commits WHERE source=? AND dataset=? AND status='committed'", (source, dataset)).fetchone()[0],
+            "check": db.execute("SELECT coalesce(max(id),0) FROM version_checks WHERE source=? AND dataset=?", (source, dataset)).fetchone()[0]}
+
+    def _completed_source_current(self, db, frozen):
+        """Admit unchanged Source headers under existing whole-range authorities.
+
+        Raw has no producer dependency. Items additionally require current
+        completed flags through the live declaration closure; unknown/partial
+        authorities take the existing conservative record comparison path.
+        """
+        if frozen.receipt_id == "current" or self._boundary is not None:
+            return None
+        aliases = self.describe(frozen)["aliases"]
+        checked, visiting = set(), set()
+
+        def completed(name):
+            if name in visiting:
+                raise RuntimeError("DataItem declaration dependency cycle")
+            if name in checked:
+                return True
+            visiting.add(name)
+            row = db.execute("SELECT f.*,d.update_incomplete,d.publication_revision AS active_revision,i.spec_hash AS active_definition,i.active FROM node_completions f JOIN datasets d ON d.source='items' AND d.name=? JOIN item_definitions i ON i.name=d.name WHERE f.node_key=?", (name, "items/" + name)).fetchone()
+            if (row is None or not row["active"] or row["update_incomplete"]
+                    or row["definition_hash"] != row["active_definition"]
+                    or row["publication_revision"] != row["active_revision"]
+                    or row["dependency_state_digest"] != self._store.dependency_state(db, "items", name)):
+                return False
+            from .items.completion import pending_dates, verified_completion_digest
+            try:
+                build_id = int(row["result_ref"])
+            except (TypeError, ValueError):
+                return False
+            verified_completion_digest(db, build_id)
+            if any(frozen.information_cutoff is None or _date_value(available) <= frozen.information_cutoff
+                    for _, available in pending_dates(db, build_id)):
+                return False
+            for parent in db.execute("SELECT kind,source,dataset FROM item_dependencies WHERE item_name=?", (name,)):
+                if parent["kind"] == "item" and not completed(parent["dataset"]):
+                    return False
+                if parent["kind"] != "item" and db.execute("SELECT 1 FROM datasets WHERE source=? AND name=? AND active=1", (parent["source"], parent["dataset"])).fetchone() is None:
+                    return False
+            visiting.remove(name)
+            checked.add(name)
+            return True
+
+        for alias, request in frozen.requests.items():
+            header = aliases[alias]
+            state = header["state"]
+            if (state is None or not state["active"] or state["commit"] > frozen.max_commit
+                    or state["check"] > frozen.max_check_id
+                    or state != self._registered_source_state(db, header["source"], header["dataset"])):
+                return None
+            if isinstance(request, ItemInput):
+                if frozen.information_cutoff is None or not completed(request.name):
+                    return None
+                flag = db.execute("SELECT completed_start,completed_end,checked_target FROM node_completions WHERE node_key=?", ("items/" + request.name,)).fetchone()
+                lower = str(request.start) if request.start is not None else header["required_start"]
+                upper = str(request.end) if request.end is not None else header["required_end"]
+                if (flag["checked_target"] < str(frozen.information_cutoff)
+                        or lower is None or upper is None or flag["completed_start"] is None
+                        or flag["completed_end"] is None or flag["completed_start"] > lower
+                        or flag["completed_end"] < upper):
+                    return None
+        return True
 
     def _capture_batch_headers(self, db, source, dataset, boundary, *, max_buffer_bytes=None):
         """Reuse immutable headers only inside the same admitted SQLite view."""
@@ -2324,7 +2556,7 @@ class InputsAPI:
             item_definition = db.execute("select spec_json,spec_hash,active from item_definitions where name=?", (dataset,)).fetchone() if isinstance(request, ItemInput) else None
             if isinstance(request, ItemInput) and (item_definition is None or not item_definition["active"]):
                 raise KeyError(f"Unknown active input: {dataset}")
-            schema = db.execute("select schema_ipc,schema_hash from dataset_schemas where source=? and dataset=?", (source, dataset)).fetchone()
+            schema = db.execute("select s.schema_ipc,d.schema_hash from dataset_schemas d join immutable_schemas s on s.digest=d.schema_ref where source=? and dataset=?", (source, dataset)).fetchone()
             batches = self._capture_batch_headers(db, source, dataset, boundary,
                 max_buffer_bytes=max_buffer_bytes)
             general = json.loads(definition["spec_json"])["update_type"] == "general"
@@ -2400,8 +2632,8 @@ class InputsAPI:
                 general_snapshots = [dict(value) for value in db.execute(
                     "select c.seq,c.pit_date,c.ingested_at,c.mode,c.spec_hash,c.baseline,"
                     "coalesce(sum(b.row_count),0) as row_count,"
-                    "(select hex(schema_ipc) from version_segments where commit_seq=c.seq "
-                    "order by partition_path limit 1) as schema_ipc "
+                    "(select hex(s.schema_ipc) from version_segments v join immutable_schemas s on s.digest=v.schema_ref where v.commit_seq=c.seq "
+                    "order by v.partition_path limit 1) as schema_ipc "
                     "from version_commits c left join version_segments b on b.commit_seq=c.seq "
                     "where c.source=? and c.dataset=? and c.status='committed' and c.seq<=? "
                     "group by c.seq order by c.seq", (source, dataset, boundary),
@@ -2556,6 +2788,15 @@ class InputsAPI:
                     checked[value.receipt_id] = context.currentness[memo_key]
                     return checked[value.receipt_id]
                 visiting.add(value.receipt_id)
+                if self._completed_source_current(db, value) is True:
+                    checked[value.receipt_id] = True
+                    visiting.remove(value.receipt_id)
+                    if progress is not None:
+                        for alias, request in value.requests.items():
+                            progress({"phase": "currentness_completed_source", "receipt_id": value.receipt_id,
+                                "alias": alias, "current": True, "completion_metadata_equal": True,
+                                "item_versions_metadata_equal": isinstance(request, ItemInput)})
+                    return True
                 # Check size/count alone cannot establish changed selection:
                 # even a large new attestation can be outside this fixed cutoff.
                 # Reuse registered proofs and admit any inline representation
@@ -3006,9 +3247,12 @@ class InputsAPI:
         digest = hashlib.sha256(serialized.encode()).hexdigest()
         if digest != rows[0]["digest"] or isinstance(receipt, FrozenInputReceipt) and digest != receipt.digest:
             raise RuntimeError("Frozen input receipt checksum mismatch")
-        result = self._receipt(key, json.loads(serialized), digest)
+        payload = json.loads(serialized)
+        if payload.get("format") != 9:
+            raise RuntimeError("Incompatible frozen input metadata format; rebuild the lake explicitly")
+        result = self._receipt(key, payload, digest)
         if context is not None and context.memo_available:
-            result = replace(result, requests=_readonly(result.requests), evidence=_readonly(result.evidence))
+            result = replace(result, requests=_readonly(result.requests))
             context.receipts[key] = result
         return result
 
@@ -3406,7 +3650,7 @@ class InputsAPI:
                 return True
             return (request.start is None or _date_value(bound["observation_max"]) >= _date_value(request.start)) and (request.end is None or _date_value(bound["observation_min"]) <= _date_value(request.end))
         with self._store.connect() as db:
-            selected = [value for value in evidence["batches"] if needed(db, value)]
+            selected = [value for value in _selection_batches(frozen, alias, request, effective_cutoff) if needed(db, value)]
         context = self._read_context()
         if restored and (request.start is not None or request.end is not None):
             options = context.options if context is not None else ExecutionOptions()
@@ -3449,6 +3693,7 @@ class InputsAPI:
         retained_receipts = {value.receipt_id: value for value in roots}
         batch_count = 0
         verified: set[str] = set()
+        metadata_verified: set[str] = set()
         verified_batches: set[tuple[int, str, str]] = set()
         batches_to_verify: list[tuple[int, str, str]] = []
         visiting: set[str] = set()
@@ -3460,6 +3705,14 @@ class InputsAPI:
                 check_canceled()
             if value.receipt_id in visiting:
                 raise RuntimeError("Frozen input receipt dependency cycle")
+            with self._store.connect() as db:
+                registered = db.execute("SELECT payload_json FROM frozen_inputs WHERE receipt_id=?", (value.receipt_id,)).fetchone()
+                if registered is not None:
+                    reader = immutable_metadata.MetadataReader(database=db)
+                    for reference in json.loads(registered["payload_json"])["evidence"].values():
+                        if check_canceled is not None:
+                            check_canceled()
+                        reader.audit(reference, metadata_verified)
             if value.receipt_id in verified:
                 return
             visiting.add(value.receipt_id)
@@ -3585,6 +3838,33 @@ class InputsAPI:
                                     for dependency in references(self, proof):
                                         retained_receipts[dependency.receipt_id] = dependency
                                         verify_retained(dependency)
+        with self._store.connect() as db:
+            sets = db.execute("SELECT * FROM input_selection_sets WHERE source_id IN(SELECT value FROM json_each(?))", (_json(list(retained_receipts)),)).fetchall()
+            for saved in sets:
+                reference = {"id": saved["id"], "digest": saved["digest"],
+                    "source": {"id": saved["source_id"], "digest": saved["source_digest"]},
+                    "count": saved["item_count"]}
+                root = db.execute("SELECT kind,item_count FROM immutable_metadata WHERE digest=?", (saved["root_ref"],)).fetchone()
+                if root is None:
+                    raise RuntimeError("Registered selection set membership is missing")
+                immutable_metadata.MetadataReader(database=db).audit(
+                    {"ref": saved["root_ref"], "kind": root["kind"], "count": root["item_count"]}, metadata_verified)
+                cursor = db.execute("SELECT descriptor_key FROM input_selection_set_entries WHERE set_id=? ORDER BY ordinal", (saved["id"],))
+                count = 0
+                while group := cursor.fetchmany(16):
+                    descriptors = self.read_selection_set(reference, keys=[row[0] for row in group],
+                        config=options, check_canceled=check_canceled or (lambda: None))
+                    grouped = {}
+                    for descriptor in descriptors:
+                        grouped.setdefault(descriptor["alias"], []).append(descriptor)
+                    for values in grouped.values():
+                        resolved = self.resolve_selection_descriptors(saved["source_id"], values,
+                            config=options, check_canceled=check_canceled or (lambda: None))
+                        if list(resolved) != values:
+                            raise RuntimeError("Registered selection set proof changed")
+                    count += len(descriptors)
+                if count != saved["item_count"]:
+                    raise RuntimeError("Registered selection set membership is incomplete")
         completed = 0
         def report() -> None:
             if progress is not None:
@@ -3747,9 +4027,12 @@ class InputsAPI:
                 "valid": True, "batch_count": batch_count,
                 "upstream_receipt_count": len(verified) - len({value.receipt_id for value in roots})}
 
-    @staticmethod
-    def _receipt(key: str, payload: Mapping[str, Any], digest: str) -> FrozenInputReceipt:
-        return FrozenInputReceipt(key, int(payload["max_commit"]), int(payload["max_check_id"]), None if payload["information_cutoff"] is None else _date_value(payload["information_cutoff"]), {name: input_from_payload(value) for name, value in payload["requests"].items()}, payload["evidence"], digest, payload["dependency_digest"])
+    def _receipt(self, key: str, payload: Mapping[str, Any], digest: str) -> FrozenInputReceipt:
+        evidence = payload["evidence"]
+        if payload.get("format") == 9:
+            reader = immutable_metadata.MetadataReader(self._store)
+            evidence = immutable_metadata.FrozenEvidenceMapping(reader, evidence)
+        return FrozenInputReceipt(key, int(payload["max_commit"]), int(payload["max_check_id"]), None if payload["information_cutoff"] is None else _date_value(payload["information_cutoff"]), {name: input_from_payload(value) for name, value in payload["requests"].items()}, evidence, digest, payload["dependency_digest"])
 
     @staticmethod
     def _select(frame: pl.DataFrame, request: DataInput, cutoff: date | None,

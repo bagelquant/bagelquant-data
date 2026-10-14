@@ -7,10 +7,36 @@ inputs. Data imports no other BagelQuant package. Workbench supplies market
 semantics, authored definitions and orchestration through public APIs; Core and
 BT own their numerical and financial artifacts.
 
-Schema 8 requires a fresh lake. Reject other schemas before writes; do not add
+Schema 9 requires a fresh lake. Reject other schemas before writes; do not add
 migration readers, aliases, orphan adoption or provider-backed recovery.
 `data_meta_path` is the sole Data SQLite metadata authority. `lake_path` contains
 the sole original immutable Parquet evidence, partitioned by year/month.
+
+Schema 9 stores Arrow IPC schemas once by digest. Frozen receipts keep small
+headers, requests, alias summaries and immutable Source references. Shared
+definitions, General headers, original segment/check snapshots and sequence
+blocks are content addressed and shared across receipts. Live ledger projections
+never replace a frozen original header after indexing or metadata changes. Provider
+commit request batches share templates and per-scope deltas. No schema 8 reader
+or automatic migration exists.
+An identical thin receipt digest reuses its original receipt ID. Different
+cutoffs, declarations or retained boundaries remain distinct immutable evidence;
+only selected semantic identities govern numerical reuse.
+
+`inputs.get/describe/request_identity` do not expand historical evidence. The
+public `FrozenInputReceipt.evidence` is an explicit lazy Mapping: field/sequence
+access consumes only the corresponding registered metadata. Ordinary unchanged
+Source checks use alias-local publication evidence and, for Items, current
+whole-range completion flags and the live declaration dependency closure.
+Unknown, partial or changed authority takes the conservative metadata path.
+
+`register_selection_set` validates owner descriptors once and publishes immutable
+Source-bound shared references. `describe_selection_set` validates only the set
+header and original Source; it does not claim currentness or byte integrity.
+`read_selection_set(keys=...)` resolves exact descriptor identities with bounded
+membership paths. An all-key read is explicit preparation/audit. `inputs.verify`
+audits Source blocks, selection membership/proofs and original bytes. Consumers
+retain set references rather than another copy of its descriptor bodies.
 
 Each actual content delta is one immutable Parquet segment. Never rewrite/copy
 an entire historical month for an append. SQLite stores file references, exact

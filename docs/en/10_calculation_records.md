@@ -6,6 +6,24 @@ checks and range identities use compact SQLite metadata without decoding history
 finite metadata view. Definitions, publication revisions, contiguous coverage,
 unfinished updates and direct dependency state decide readiness.
 
+Schema 9 stores each immutable Arrow schema once. Frozen inputs contain thin
+headers and alias-to-Source references; shared metadata blocks retain one frozen
+original segment/check snapshot across receipts. Live projections cannot replace it.
+`inputs.get` returns an explicit lazy `evidence` Mapping. `describe` includes
+small per-alias definition/schema identities, row/batch counts, bounds and Source
+references. Neither operation expands historical metadata. Unchanged currentness
+uses recorded alias-local revisions and complete producer authorities; unknown
+or changed evidence keeps the conservative metadata comparison.
+
+`register_selection_set(receipt, descriptors)` validates complete public
+descriptors and returns `{id, digest, source, count}`. `describe_selection_set`
+checks that header and original Source without resolving historical descriptors.
+`read_selection_set(reference, keys=[...])` reads only selected descriptor keys;
+omitting keys explicitly reads the whole set for preparation or audit. Keys are
+SHA-256 of UTF-8 JSON with sorted keys, compact separators, `ensure_ascii=False`
+and `default=str`. `inputs.verify` checks shared descendants, complete set
+membership and proofs, together with retained original byte evidence.
+
 `inputs.describe`, `request_identity`, `range_identity`, `selection_identity`
 and `selection_descriptors` are read-only. Ordinary range tokens are always
 available for supported typed selections and remain stable across optional

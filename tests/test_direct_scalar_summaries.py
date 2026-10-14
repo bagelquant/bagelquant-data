@@ -605,26 +605,27 @@ def test_source_json_header_admitted_before_first_or_saved_source_decode(
     options = ExecutionOptions(max_buffer_bytes=512 * 1024)
     if path != "first":
         assert lake.inputs.index_selection(wide, "x") is not None
-    old_get = lake.inputs._get
-
-    def get(receipt):
-        key = getattr(receipt, "receipt_id", receipt)
-        if key == wide.receipt_id:
-            pytest.fail("Wide original Source JSON fetched before budget admission")
-        return old_get(receipt)
-
-    monkeypatch.setattr(lake.inputs, "_get", get)
+    from bagelquant_data.storage.immutable_metadata import MetadataReader
+    with lake._data_meta.connect() as db:
+        unused = db.execute("SELECT digest FROM immutable_metadata WHERE kind='text' AND length(payload_json)=65538").fetchone()[0]
+    old_block = MetadataReader.block
+    def block(reader, reference):
+        if reference["ref"] == unused:
+            pytest.fail("Selected Source operation expanded unrelated wide metadata")
+        return old_block(reader, reference)
+    monkeypatch.setattr(MetadataReader, "block", block)
     if path == "saved_normal":
         # Ordinary range identity never borrows optional exact summary Sources.
         expected = lake.inputs.selection_identity(original, "x", values_only=True)
         with lake.inputs.read_context(original, config=options):
             assert lake.inputs.selection_identity(original, "x", values_only=True) == expected
         return
-    with pytest.raises(MemoryError, match="source metadata"):
-        if path == "first":
-            lake.inputs.index_selection(wide, "x", config=options)
-        elif path == "saved_explicit":
-            lake.inputs.index_selection(original, "x", config=options)
+    # Schema-nine Source headers are thin; admission of the selected alias must
+    # not charge or decode an unrelated historical definition body.
+    if path == "first":
+        assert lake.inputs.index_selection(wide, "x", config=options) is not None
+    elif path == "saved_explicit":
+        assert lake.inputs.index_selection(original, "x", config=options) is not None
 
 
 @pytest.mark.parametrize('damage', ['empty_asset', 'outside_window'])

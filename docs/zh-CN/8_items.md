@@ -26,7 +26,7 @@ expected_definition_hash=captured_current_hash)`。Data 在该 Item 的 writer l
 
 基线时间判定发现肯定证据后停止读取后续输入。已核验的发布上下文仅按精确有效截止日期缓存最终布尔值；后续核验可能改变判定，不能假设日期单调。否定判定必须检查全部输入。缓存不保留 frame，按每项 1 KiB 保守预留至多四分之一显式 buffer，最多 1024 项，满时淘汰最早项，失败或退出时清空。已完成构建的复用校验也传入调用方资源限制；单独使用仍默认串行。
 
-可写打开湖时，原有初始化路径原子创建派生元数据覆盖索引并进行一次统计分析；持有 writer 锁后再次确认索引不存在，后续打开不重建统计。没有此索引的 schema-eight 湖仍可只读打开。恢复 payload、冻结收据、哈希、历史时点和原始证据不变。
+可写打开湖时，原有初始化路径原子创建派生元数据覆盖索引并进行一次统计分析；持有 writer 锁后再次确认索引不存在，后续打开不重建统计。没有此索引的 schema-nine 湖仍可只读打开。恢复 payload、冻结收据、哈希、历史时点和原始证据不变。
 
 DataItem 的 `(time, asset_id)` 唯一且排序确定，value 声明 float/integer/boolean/string/
 date/datetime/categorical 标量类型。定义、依赖和 producer revision 保存在 Data SQLite。
@@ -308,7 +308,7 @@ authority、pending 证明和原检查边界，不改原记录或数值历史；
 
 ## 小型存储与完成检查
 
-Schema 8 将全部历史数值和首次可见事件仅保存在原始不可变 Parquet。SQLite 保存
+Schema 9 将全部历史数值和首次可见事件仅保存在原始不可变 Parquet。SQLite 保存
 声明、小型文件/变化元数据、节点完成 flag 和冻结引用。`range_identity` 与普通
 `selection_identity` 只读元数据，无需原始读取或准备索引。可选精确
 `index_selection(s)` 和小型坐标轴需要显式准备，普通身份不因维护变化。

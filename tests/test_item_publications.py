@@ -212,9 +212,14 @@ def test_forest_checks_every_shared_parent_edge_digest(tmp_path):
     roots = [lake.inputs.freeze({name: ItemInput(name)}, information_cutoff="2020-01-31")
              for name in ("first", "second")]
     with sqlite3.connect(lake.data_meta_path) as db:
+        from copy import deepcopy
+        from bagelquant_data.storage.immutable_metadata import MetadataReader, save
         payload = json.loads(db.execute("select payload_json from frozen_inputs where receipt_id=?",
                                         (roots[1].receipt_id,)).fetchone()[0])
-        payload["evidence"]["second"]["parent_receipts"][receipt.receipt_id] = "0" * 64
+        evidence = deepcopy(MetadataReader(database=db).value(payload["evidence"]["second"]))
+        evidence["parent_receipts"][receipt.receipt_id] = "0" * 64
+        payload["evidence"]["second"] = save(db, evidence)
+        payload["aliases"]["second"]["source_ref"] = payload["evidence"]["second"]["ref"]
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         db.execute("update frozen_inputs set payload_json=?,digest=? where receipt_id=?",
                    (serialized, hashlib.sha256(serialized.encode()).hexdigest(), roots[1].receipt_id))

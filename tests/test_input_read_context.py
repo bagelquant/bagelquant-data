@@ -265,28 +265,28 @@ def test_currentness_reuses_completed_boolean_in_context_but_rechecks_after_exit
     with lake.inputs.read_context(frozen, verify=False):
         assert lake.inputs.is_current(frozen)
         assert lake.inputs.is_current([frozen, frozen])
-        assert len(captures) == 1
+        assert len(captures) == 0
         nested = DataLake.open(data_meta_path=lake.data_meta_path, lake_path=lake.lake_path, read_only=True, runtime=True)
         with monkeypatch.context() as patch:
             patch.setattr(nested.inputs, "_capture", lambda *args, **kwargs: pytest.fail("compatible reader recaptured currentness"))
             assert nested.inputs.is_current(frozen)
         with pytest.raises(RuntimeError, match="checksum"):
             lake.inputs.is_current(replace(frozen, digest="forged"))
-        assert len(captures) == 1
+        assert len(captures) == 0
     spec = lake.raw.get("values", source="custom")
     lake.raw.ingest(spec, pl.DataFrame({"time": [date(2020, 1, 1)], "asset_id": ["A"], "value": [9.]}),
                     ingested_at=datetime(2020, 4, 1, tzinfo=UTC))
     assert not lake.inputs.is_current(frozen)
     assert not lake.inputs.is_current(frozen)
-    assert len(captures) == 3
+    assert len(captures) == 2
     with lake.inputs.read_context(frozen, verify=False):
         assert not lake.inputs.is_current(frozen)
         assert not lake.inputs.is_current(frozen)
-        assert len(captures) == 4
+    assert len(captures) == 3
     lake.raw.register(replace(spec, source_api="changed_provider_api"))
     with lake.inputs.read_context(frozen, verify=False):
         assert not lake.inputs.is_current(frozen)
-        assert len(captures) == 5
+        assert len(captures) == 4
 
 
 def test_currentness_context_memo_distinguishes_every_reader_boundary(tmp_path, monkeypatch):
@@ -322,6 +322,9 @@ def test_currentness_context_does_not_cache_failed_capture_or_partial_roots(tmp_
     second = lake.inputs.freeze(frozen.requests, information_cutoff="2020-04-01")
     original = lake.inputs._capture
     captures = 0
+    # Exercise the conservative path when compact completion authority cannot
+    # establish currentness; unchanged schema-nine Sources need no capture.
+    monkeypatch.setattr(lake.inputs, "_completed_source_current", lambda *_: None)
     def fail_second(*args, **kwargs):
         nonlocal captures
         captures += 1

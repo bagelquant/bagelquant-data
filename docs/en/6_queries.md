@@ -208,7 +208,7 @@ historical field summaries across newer receipts without original-byte reads.
 
 ## Compact storage and readiness
 
-Schema 8 stores every historical value and first-visibility event once in original
+Schema 9 stores every historical value and first-visibility event once in original
 immutable Parquet. SQLite holds declarations, compact file/change metadata, node
 completion flags and frozen references. `range_identity` and ordinary
 `selection_identity` use metadata without original reads or index preparation.

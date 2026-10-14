@@ -2,7 +2,7 @@
 
 `batch_size` 的单位是逻辑 scope，`commit_batch_rows` 的单位是行；已完成的
 Raw 缓冲还会每 `commit_interval_seconds`（默认30秒）提交。完整 general
-快照及未完成的初始化全量清单不会提前发布。schema 8 保存 Provider 请求、
+快照及未完成的初始化全量清单不会提前发布。schema 9 保存 Provider 请求、
 限流/重试等待、准备、scope 领取、提交、丢弃行数及内存/分区峰值等指标。
 
 逻辑覆盖仍然逐日。`daily_range_backfill.window="calendar_month"` 只在同月

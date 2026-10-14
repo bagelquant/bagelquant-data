@@ -6,7 +6,8 @@ import json
 
 
 def _json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    from bagelquant_data.storage.immutable_metadata import canonical
+    return canonical(value)
 
 
 def output_check_bound(db, build_id, authority=None) -> int | None:

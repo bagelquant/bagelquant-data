@@ -42,9 +42,13 @@ Both paths are required. `data_meta_path` identifies the single Data SQLite file
 including task state and compact immutable Parquet segment references. Immutable Parquet
 generations retain year/month partitions. Read-only queries never initialize or
 recover data; SQLite may create or update its WAL/SHM coordination sidecars.
+Schema 9 shares immutable schemas and metadata blocks. Frozen receipts are thin;
+`inputs.get/describe` do not decode historical evidence. The receipt's explicit
+lazy `evidence` Mapping resolves fields on access. Source-bound selection sets
+provide header-only validation and exact keyed reads for downstream Snapshots.
 `DataLake.inspect(data_meta_path=..., lake_path=...)` checks schema and lake binding
 without changing any configured storage files or directories, including sidecars.
-Package 0.7 and metadata schema 8 are an incompatible fresh-database cut; old
+Package 0.7 and metadata schema 9 are an incompatible fresh-database cut; old
 databases are rejected. No aliases, migrations or automatic history cleanup exist.
 
 Explicit `integrity.item_removal_plan/remove_items` can discard an exact,

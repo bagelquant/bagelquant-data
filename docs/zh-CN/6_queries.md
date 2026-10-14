@@ -157,7 +157,7 @@ view="snapshot", fields=(...), as_of=...)`；同日中间状态先以提示的�
 
 ## 小型存储与完成检查
 
-Schema 8 将全部历史数值和首次可见事件仅保存在原始不可变 Parquet。SQLite 保存
+Schema 9 将全部历史数值和首次可见事件仅保存在原始不可变 Parquet。SQLite 保存
 声明、小型文件/变化元数据、节点完成 flag 和冻结引用。`range_identity` 与普通
 `selection_identity` 只读元数据，无需原始读取或准备索引。可选精确
 `index_selection(s)` 和小型坐标轴需要显式准备，普通身份不因维护变化。

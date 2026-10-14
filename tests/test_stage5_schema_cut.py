@@ -109,7 +109,7 @@ def test_probe_retries_if_source_changes_during_snapshot(tmp_path, monkeypatch):
         writer.execute("PRAGMA wal_autocheckpoint=0")
         writer.execute("UPDATE data_meta_state SET value='5' WHERE key='schema_version'")
         writer.commit()
-        writer.execute("UPDATE data_meta_state SET value='8' WHERE key='schema_version'")
+        writer.execute("UPDATE data_meta_state SET value=? WHERE key='schema_version'", (DataMetaStore.SCHEMA_VERSION,))
         writer.commit()
         import bagelquant_data.storage.snapshot as module
         original = module.copy_file
@@ -173,7 +173,7 @@ def test_probe_refuses_uncommitted_rollback_pages_without_recovery(tmp_path):
         writer.execute("PRAGMA cache_size=1")
         writer.execute("PRAGMA cache_spill=ON")
         writer.execute("BEGIN IMMEDIATE")
-        writer.execute("UPDATE data_meta_state SET value='8' WHERE key='schema_version'")
+        writer.execute("UPDATE data_meta_state SET value=? WHERE key='schema_version'", (DataMetaStore.SCHEMA_VERSION,))
         writer.executemany("INSERT INTO padding(value) VALUES(?)", [(b"x" * 65536,) for _ in range(40)])
         journal = metadata.with_name(metadata.name + "-journal")
         assert journal.stat().st_size > 0 and any(journal.read_bytes()[:8])

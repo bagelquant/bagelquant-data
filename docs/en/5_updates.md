@@ -66,7 +66,7 @@ change content identity. Workbench supplies local ceilings and native thread pol
 
 `batch_size` counts logical scopes, while `commit_batch_rows` counts rows.
 Completed publication buffers also flush every `commit_interval_seconds`
-(default 30); an incomplete general snapshot never flushes early. Schema 8
+(default 30); an incomplete general snapshot never flushes early. Schema 9
 stores run/API-call metrics, separating provider calls, limiter/backoff waits,
 preparation, scope claims, commits and discarded parent rows.
 

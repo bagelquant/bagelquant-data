@@ -79,7 +79,9 @@ def register_segment(data_meta: DataMetaStore, partition: str, seq: int, frame: 
         commit = db.execute("select status from version_commits where seq=?", (seq,)).fetchone()
         if commit is None or commit[0] != "prepared":
             raise RuntimeError("Segment evidence requires a prepared commit")
-        fields = ("partition_path","content_hash","row_count","schema_ipc","generation_path", "file_size_bytes", "bounds_json", "field_changes_json", "key_identity",
+        from .immutable_metadata import save_schema
+        batch["schema_ref"] = save_schema(db, batch["schema_ipc"])
+        fields = ("partition_path","content_hash","row_count","schema_ref","generation_path", "file_size_bytes", "bounds_json", "field_changes_json", "key_identity",
                   "min_available","max_available","min_observation","max_observation")
         db.execute("insert into version_segments(commit_seq," + ",".join(fields) + ") values(" + ",".join("?" for _ in range(14)) + ")",
             (seq, *(batch[field] for field in fields)))

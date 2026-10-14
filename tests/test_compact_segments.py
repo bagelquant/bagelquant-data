@@ -177,7 +177,7 @@ def test_wide_initial_batch_uses_shared_field_change_evidence(tmp_path,count):
         **{f'field_{index:03}':[float(index)]*count for index in range(200)}})
     lake.raw.ingest(spec(),frame,mode='initialize',ingested_at=datetime(2020,1,1,tzinfo=UTC))
     with lake._data_meta.connect() as db:
-        row = db.execute('select field_changes_json,schema_ipc,bounds_json from version_segments').fetchone()
+        row = db.execute('select field_changes_json,s.schema_ipc,bounds_json from version_segments b join immutable_schemas s on s.digest=b.schema_ref').fetchone()
         changes = json.loads(row[0])
         assert set(changes) == {'$initial'}
         assert len([name for name in changes['$initial']['fields'] if name.startswith('field_')]) == 200

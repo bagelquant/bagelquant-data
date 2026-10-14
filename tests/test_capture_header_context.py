@@ -27,6 +27,11 @@ def statements_for_batch_headers(statements):
 
 def test_distinct_windows_share_headers_only_in_one_view(lake_roots):
     lake, roots = lake_roots
+    # New future publication changes the live revision and forces conservative
+    # comparison, while both original fixed-cutoff windows remain unchanged.
+    lake.raw.ingest(lake.raw.get("raw", source="custom"),
+        pl.DataFrame({"time": [date(2024, 3, 3)], "asset_id": ["A"], "value": [3.]}),
+        ingested_at=datetime(2024, 3, 10, tzinfo=UTC))
     statements = []
     with lake.inputs.read_context(roots):
         with lake.inputs._store.connect() as db:

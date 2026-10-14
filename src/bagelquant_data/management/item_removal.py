@@ -78,6 +78,8 @@ def _scopes(names: tuple[str, ...], receipts: tuple[str, ...]) -> dict[str, tupl
     result["input_selection_index"] = ("receipt_digest in(" + digests + ")", (discarded,))
     result["input_coordinate_index"] = ("receipt_digest in(" + digests + ")", (discarded,))
     result["input_projection_index"] = ("source_receipt_id in(select value from json_each(?))", (discarded,))
+    result["input_selection_set_entries"] = ("set_id in(select id from input_selection_sets where source_id in(select value from json_each(?)))", (discarded,))
+    result["input_selection_sets"] = ("source_id in(select value from json_each(?))", (discarded,))
     result["frozen_inputs"] = ("receipt_id in(select value from json_each(?))", (discarded,))
     return result
 
@@ -110,7 +112,9 @@ def _references(db: sqlite3.Connection, names: tuple[str, ...], discarded: tuple
                 continue
             try:
                 body = json.loads(serialized)
-                evidence = body["evidence"]
+                from bagelquant_data.storage.immutable_metadata import MetadataReader
+                reader = MetadataReader(database=db)
+                evidence = {alias: reader.value(reference) for alias, reference in body["evidence"].items()}
                 direct = any(value.get("kind") == "ItemInput" and value.get("name") in targets
                              for value in body["requests"].values())
                 direct |= any(value.get("source") == "items" and value.get("dataset") in targets

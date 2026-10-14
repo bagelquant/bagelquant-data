@@ -10,7 +10,10 @@ Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint
 Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
 DataItem updates accept caller-declared input windows pinned in frozen receipts; new scoped freezes preserve late revisions and legacy receipt identity.
 `items.completed_builds` exposes whole-range authorities; `inputs.publication_guard` fences Data writers through consumer CAS without audit/maintenance.
-Schema 8 retains one immutable Parquet body and compact segment/change headers.
+Schema 9 retains one immutable Parquet body and shared segment/check/schema headers.
+Frozen receipts are thin references; their public evidence Mapping is explicitly
+lazy. get/describe/request_identity never expand history. Registered selection
+sets expose header-only validation and keyed reads; audits traverse all originals.
 Node completion rows prove successful contiguous coverage, definitions and direct
 dependency revisions; failed/partial updates cannot advance success flags.
 `integrity.update_owner` binds Raw/native writers to one workflow owner; explicit
@@ -25,7 +28,7 @@ Domain selectors are small explicit summaries, never historical row indexes.
 `index_selection(s)` and `prepare_general_projections` explicitly admit exact typed
 comparisons where conservative range evidence cannot prove equality.
 `inputs.verify` audits exact original Parquet bytes, schema, bounds and saved
-summaries. Missing/damaged originals require a trusted backup. Schema 7 databases
+summaries. Missing/damaged originals require a trusted backup. Schema 8 databases
 are rejected; there is no compatibility reader, Arrow body replica or row-proof
 backfill. `index_record_lookups` adds metadata access indexes only.
 
@@ -41,7 +44,7 @@ Keep this entry short; detailed owner contracts live under `.ai/rules/`.
 - Do not commit, push, create PRs, merge, release, deploy, install services,
   call providers, update real data or change governance unless explicitly requested.
 - Coverage is commit-backed truth; queries never submit updates or call providers.
-- Schema 8 is a fresh-lake hard cut; do not add migration/compatibility readers,
+- Schema 9 is a fresh-lake hard cut; do not add migration/compatibility readers,
   adopt orphan files or substitute current provider bytes for historical evidence.
 - Default `DataLake.inspect` checks committed schema/lake binding without changing
   original files or SQLite sidecars. Ordinary read-only queries use normal WAL
@@ -71,7 +74,7 @@ Plan/read-only mode never writes task records or implementation files.
 
 Validate with `uv run pytest`, `uv run pyright` and `uv run ruff check .`; report actual results and unrun checks.
 
-Schema-eight completion flags and range identities use metadata only. Read the
+Schema-nine completion flags and range identities use metadata only. Read the
 storage rule for exact single-body Parquet, visibility, frozen/PIT, optional
 compact summary and backup-required recovery contracts. Retired per-row indexes
 and Arrow-body backup APIs must not be reintroduced.

@@ -48,7 +48,9 @@ class DataMetaStore:
     """SQLite metadata store using WAL mode."""
 
     _BUSY_TIMEOUT_MS = 30_000
-    SCHEMA_VERSION = "8"
+    SCHEMA_VERSION = "9"
+    SCHEMA_TABLES = {"declaration_batch_receipts", "immutable_metadata", "immutable_schemas",
+        "input_selection_sets", "input_selection_set_entries"}
 
     def __init__(self, data_meta_path: str | Path, *, read_only: bool = False, runtime: bool = False) -> None:
         self.data_meta_path = Path(data_meta_path)
@@ -178,7 +180,7 @@ class DataMetaStore:
         tables, state = cls._runtime_schema(data_meta_path) if runtime else cls._inspect_schema(data_meta_path)
         if tables and (
             state.get("schema_version") != cls.SCHEMA_VERSION
-            or "declaration_batch_receipts" not in tables
+            or not cls.SCHEMA_TABLES.issubset(tables)
         ):
             raise ConfigurationError(
                 "Incompatible data-lake metadata schema; back up and rebuild the lake explicitly. Automatic migration is disabled."
@@ -208,7 +210,7 @@ class DataMetaStore:
         except (OSError, sqlite3.Error, ConfigurationError):
             return {"status": "incompatible", "reason": "metadata_unreadable", "schema_version": None}
         version = state.get("schema_version")
-        if version != cls.SCHEMA_VERSION or "declaration_batch_receipts" not in tables:
+        if version != cls.SCHEMA_VERSION or not cls.SCHEMA_TABLES.issubset(tables):
             return {"status": "incompatible", "reason": "metadata_schema_incompatible", "schema_version": version}
         location = state.get("lake_location")
         if (
@@ -456,7 +458,7 @@ class DataMetaStore:
         """Return the serialized canonical Arrow schema for a dataset."""
 
         rows = self._rows(
-            "select schema_ipc from dataset_schemas where source=? and dataset=?",
+            "select s.schema_ipc from dataset_schemas d join immutable_schemas s on s.digest=d.schema_ref where source=? and dataset=?",
             (source, dataset),
         )
         if not rows:
@@ -537,11 +539,13 @@ class DataMetaStore:
         previous = db.execute("select schema_hash from dataset_schemas where source=? and dataset=?",(source,dataset)).fetchone()
         if previous is None or previous[0] != schema_hash:
             db.execute("update datasets set publication_revision=publication_revision+1,update_incomplete=1 where source=? and name=?",(source,dataset))
+        from .immutable_metadata import save_schema
+        reference = save_schema(db, schema_ipc)
         db.execute(
-            "insert into dataset_schemas(source,dataset,schema_ipc,schema_hash,updated_at) values(?,?,?,?,?) "
-            "on conflict(source,dataset) do update set schema_ipc=excluded.schema_ipc,"
+            "insert into dataset_schemas(source,dataset,schema_ref,schema_hash,updated_at) values(?,?,?,?,?) "
+            "on conflict(source,dataset) do update set schema_ref=excluded.schema_ref,"
             "schema_hash=excluded.schema_hash,updated_at=excluded.updated_at",
-            (source, dataset, schema_ipc, schema_hash, updated_at),
+            (source, dataset, reference, schema_hash, updated_at),
         )
 
     def commit_dataset_metadata(
@@ -746,7 +750,7 @@ class DataMetaStore:
                 )
             ]
             schema = db.execute(
-                "select schema_ipc from dataset_schemas where source=? and dataset=?",
+                "select s.schema_ipc from dataset_schemas d join immutable_schemas s on s.digest=d.schema_ref where source=? and dataset=?",
                 (source, dataset),
             ).fetchone()
             commits = [
@@ -760,7 +764,7 @@ class DataMetaStore:
             batch_schemas = {
                 int(row["commit_seq"]): bytes(row["schema_ipc"])
                 for row in db.execute(
-                    "select b.commit_seq,b.schema_ipc from version_segments b join version_commits c on c.seq=b.commit_seq "
+                    "select b.commit_seq,s.schema_ipc from version_segments b join immutable_schemas s on s.digest=b.schema_ref join version_commits c on c.seq=b.commit_seq "
                     "where c.source=? and c.dataset=? and c.status='committed' order by b.commit_seq,b.partition_path",
                     (source, dataset),
                 )
@@ -1756,6 +1760,13 @@ class DataMetaStore:
         with self.connect() as db:
             rows = [dict(row) for row in db.execute(sql, tuple(params)).fetchall()]
         for row in rows:
+            if "schema_ref" in row:
+                from .immutable_metadata import schema_bytes
+                with self.connect() as db:
+                    row["schema_ipc"] = schema_bytes(db, row["schema_ref"])
+            if "request_json" in row and str(row["request_json"]).startswith('{"request_ref":'):
+                from .immutable_metadata import decode_requests
+                row["request_json"] = decode_requests(self, row["request_json"])
             request_params = row.get("request_params")
             if "metrics_json" in row:
                 row["metrics"] = json.loads(row.pop("metrics_json"))
@@ -1779,7 +1790,7 @@ class DataMetaStore:
                         "select value from data_meta_state where key='schema_version'"
                     ).fetchone()
                     schema_version = None if row is None else str(row["value"])
-                if schema_version != self.SCHEMA_VERSION:
+                if schema_version != self.SCHEMA_VERSION or not self.SCHEMA_TABLES.issubset(existing_tables):
                     raise ConfigurationError(
                         "Incompatible data-lake metadata schema "
                         f"({schema_version or 'unversioned'}). Preserve the existing "
@@ -1800,7 +1811,7 @@ class DataMetaStore:
                 create table if not exists version_segments (
                     commit_seq integer not null, partition_path text not null,
                     content_hash text not null, row_count integer not null,
-                    schema_ipc blob not null, generation_path text not null, file_size_bytes integer not null, bounds_json text not null, field_changes_json text not null, key_identity text not null,
+                    schema_ref text not null, generation_path text not null, file_size_bytes integer not null, bounds_json text not null, field_changes_json text not null, key_identity text not null,
                     min_available text, max_available text,
                     min_observation text, max_observation text,
                     primary key(commit_seq,partition_path)
@@ -1971,7 +1982,7 @@ class DataMetaStore:
                 create table if not exists dataset_schemas (
                     source text not null,
                     dataset text not null,
-                    schema_ipc blob not null,
+                    schema_ref text not null,
                     schema_hash text not null,
                     updated_at text not null,
                     primary key(source,dataset)
@@ -1986,7 +1997,10 @@ class DataMetaStore:
                 );
                 """
             )
+            from .immutable_metadata import SCHEMA
+            db.executescript(SCHEMA)
             if not existing_tables:
+                db.execute("CREATE INDEX version_checks_record_lookup on version_checks(source,dataset,id)")
                 from bagelquant_data import input_index
                 input_index.initialize(db)
                 now = _now()

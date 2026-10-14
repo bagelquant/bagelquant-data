@@ -24,7 +24,8 @@ _BATCH_COLUMNS = "commit_seq,partition_path,content_hash,row_count,min_available
 
 
 def _json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    from bagelquant_data.storage.immutable_metadata import canonical
+    return canonical(value)
 
 
 def _own_checks(db, name, max_check=None):
@@ -119,7 +120,7 @@ def index_output_reuse(owner: ItemAPI, name, *, end, config, check_canceled, pro
     report = {"name": name, "build_id": previous["id"], "batches": len(later), "completed": 0,
         "unchanged_batches": 0, "affected_dates": [], "producer_calls": 0}
     def project(value, consume):
-        schema = owner._store._rows("select schema_ipc from version_segments where commit_seq=? and partition_path=?",
+        schema = owner._store._rows("select s.schema_ipc from version_segments b join immutable_schemas s on s.digest=b.schema_ref where commit_seq=? and partition_path=?",
             (value["commit_seq"], value["partition_path"]))[0]["schema_ipc"]
         columns = (tuple(field for field in pa.ipc.read_schema(pa.BufferReader(schema)).names if field not in _PROVENANCE)
             if consume is not None else ("time", "source_time"))

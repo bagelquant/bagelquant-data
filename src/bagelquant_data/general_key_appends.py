@@ -16,7 +16,8 @@ VERSION = "general_asset_append.v1"
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    from bagelquant_data.storage.immutable_metadata import canonical
+    return canonical(value)
 
 
 def _anchor_namespace(inputs, current, anchors, first, last, cutoff):

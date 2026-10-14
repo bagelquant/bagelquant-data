@@ -408,6 +408,8 @@ def commit_versions(
                 return CommitResult(0, 0, 1, 0)
         frame = frame.with_columns(pl.lit(available).alias("snapshot_date"))
     with parquet.metadata.connect() as db:
+        from bagelquant_data.storage.immutable_metadata import encode_requests
+        request_record = encode_requests(db, requests or [])
         seq = db.execute(
             "insert into version_commits(source,dataset,run_id,ingested_at,pit_date,mode,status,spec_hash,request_json,input_receipt_id,baseline) values(?,?,?,?,?,?,'prepared',?,?,?,?)",
             (
@@ -418,7 +420,7 @@ def commit_versions(
                 available.isoformat(),
                 mode,
                 parquet.metadata.dataset_spec_hash(spec.source, spec.name),
-                json.dumps(requests or [], sort_keys=True, default=str),
+                request_record,
                 input_receipt_id,
                 int(baseline),
             ),

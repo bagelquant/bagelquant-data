@@ -141,7 +141,7 @@ overrides a supplied frame, or replaces complete original byte verification.
 Writable lake initialization creates a derived covering metadata index and
 analyzes the batch table once, atomically. This avoids traversing recovery payload
 overflow pages just to read metadata. Subsequent opens retain statistics; existing
-schema-eight read-only lakes work without this index. Original recovery payloads,
+schema-nine read-only lakes work without this index. Original recovery payloads,
 frozen receipts, hashes and historical timing remain unchanged.
 
 A first direct panel publication with unique coordinates and uniform timing
@@ -492,7 +492,7 @@ A group of empty sparse continuations with one frozen Source and disjoint output
 
 ## Compact storage and readiness
 
-Schema 8 stores every historical value and first-visibility event once in original
+Schema 9 stores every historical value and first-visibility event once in original
 immutable Parquet. SQLite holds declarations, compact file/change metadata, node
 completion flags and frozen references. `range_identity` and ordinary
 `selection_identity` use metadata without original reads or index preparation.

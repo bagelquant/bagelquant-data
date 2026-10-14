@@ -99,7 +99,7 @@ history. Monthly transport also groups historical rechecks during initialization
 - `batch_size` counts scopes, `commit_batch_rows` counts rows. Completed Raw
   publication batches also flush at commit_interval_seconds (default 30);
   complete general snapshots and unfinished full inventories remain atomic.
-  Schema 8 persists provider/limiter/retry/prepare/claim/commit timings, physical
+  Schema 9 persists provider/limiter/retry/prepare/claim/commit timings, physical
   attempts, discarded rows and buffer/partition metrics in run/API-call evidence.
 - Planning/activity/heartbeat and completed counts are separate; pulses never
   advance completed scope/row counts. Cancellation preserves committed work;

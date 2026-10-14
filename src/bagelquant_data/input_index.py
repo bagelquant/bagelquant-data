@@ -187,7 +187,7 @@ def project_original(store, batch, *, max_bytes, check_canceled=None, values=Fal
         return pl.concat([pl.read_ipc(io.BytesIO(chunk)) for chunk in chunks], how="diagonal_relaxed")
     # Empty IPC contains no chunks, but its typed schema is still evidence.
     import pyarrow as pa
-    rows = store._rows("SELECT schema_ipc FROM version_segments WHERE commit_seq=? AND partition_path=?",
+    rows = store._rows("SELECT s.schema_ipc FROM version_segments b JOIN immutable_schemas s ON s.digest=b.schema_ref WHERE commit_seq=? AND partition_path=?",
                        (batch["commit_seq"], batch["partition_path"]))
     schema = pa.ipc.read_schema(pa.BufferReader(rows[0]["schema_ipc"]))
     typed = pl.Schema(schema)
