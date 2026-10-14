@@ -19,9 +19,16 @@ or changed evidence keeps the conservative metadata comparison.
 descriptors and returns `{id, digest, source, count}`. `describe_selection_set`
 checks that header and original Source without resolving historical descriptors.
 `read_selection_set(reference, keys=[...])` reads only selected descriptor keys;
-omitting keys explicitly reads the whole set for preparation or audit. Keys are
-SHA-256 of UTF-8 JSON with sorted keys, compact separators, `ensure_ascii=False`
-and `default=str`. `inputs.verify` checks shared descendants, complete set
+omitting keys explicitly reads the whole set for preparation or audit. Obtain
+keys only from `inputs.selection_descriptor_identity`: its `selection.handle.v1`
+hash binds every scope/proof field except enclosing `source` and
+`requested_cutoff`. Bodies omit those same two fields; the original set Source
+and retained explicit `as_of` reconstruct the exact requested boundary. Canonical
+cutoff, original `proof_source`, strictness and selected evidence stay bound.
+Different explicit `as_of` values remain distinct. Complete 64-member chunks
+share their indexes across Sources, so a cutoff/append does not copy historical
+descriptor bodies or index rows. Earlier selection-set formats require a fresh
+registry; there is no automatic conversion. `inputs.verify` checks shared descendants, complete set
 membership and proofs, together with retained original byte evidence.
 
 `inputs.describe`, `request_identity`, `range_identity`, `selection_identity`

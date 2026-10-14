@@ -88,3 +88,15 @@
 - Report behavior/why, repository-specific checks/results, unrun checks and reasons,
   and contract/version/data/operational caveats. Distinguish existing failures from
   introduced failures; never claim a check passed unless run.
+
+## English documentation and private wiki
+
+Active UI/documentation and new task text use English; preserve historical
+evidence, imported source documents, market identifiers and Unicode tests.
+Changes to public behavior, formulas, metrics, PIT/data contracts or workflows
+update owning documentation and relevant private wiki pages in the same task.
+Record affected page UUIDs and checks, or a justified no-impact assessment.
+In an integrated checkout, read workspace `.ai/rules/wiki.md`; required missing
+wiki access blocks task completion. Keep package docs and generated references
+here, and reference them from wiki knowledge/workflows without duplicating API
+authority. Record actual authors when maintaining wiki content.

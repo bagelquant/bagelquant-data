@@ -50,7 +50,7 @@ class DataMetaStore:
     _BUSY_TIMEOUT_MS = 30_000
     SCHEMA_VERSION = "9"
     SCHEMA_TABLES = {"declaration_batch_receipts", "immutable_metadata", "immutable_schemas",
-        "input_selection_sets", "input_selection_set_entries"}
+        "input_selection_sets", "input_selection_chunk_entries"}
 
     def __init__(self, data_meta_path: str | Path, *, read_only: bool = False, runtime: bool = False) -> None:
         self.data_meta_path = Path(data_meta_path)

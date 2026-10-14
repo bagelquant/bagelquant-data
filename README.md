@@ -67,7 +67,7 @@ Read [overview](docs/en/1_overview.md), [quickstart](docs/en/2_quickstart.md),
 [datasets](docs/en/3_datasets.md), [sources](docs/en/4_sources.md),
 [updates](docs/en/5_updates.md), [queries](docs/en/6_queries.md),
 [operations](docs/en/7_operations.md), [DataItems](docs/en/8_items.md) and
-[exploration](docs/en/9_exploration.md). [中文文档](docs/zh-CN/1_overview.md).
+[exploration](docs/en/9_exploration.md).
 AI contributors start with [AGENTS.md](AGENTS.md) and [.ai/README.md](.ai/README.md).
 
 ```bash
@@ -78,4 +78,4 @@ uv run ruff check .
 
 Supported platforms: macOS and Linux. Windows support is retired.
 
-[Calculation records](docs/en/10_calculation_records.md) · [计算记录](docs/zh-CN/10_calculation_records.md)
+[Calculation records](docs/en/10_calculation_records.md)

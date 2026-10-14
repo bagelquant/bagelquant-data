@@ -23,9 +23,9 @@ CREATE TABLE IF NOT EXISTS immutable_schemas(
 CREATE TABLE IF NOT EXISTS input_selection_sets(
  id TEXT PRIMARY KEY,digest TEXT NOT NULL,source_id TEXT NOT NULL,
  source_digest TEXT NOT NULL,root_ref TEXT NOT NULL,item_count INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS input_selection_set_entries(
- set_id TEXT NOT NULL,descriptor_key TEXT NOT NULL,ordinal INTEGER NOT NULL,
- reference_json TEXT NOT NULL,PRIMARY KEY(set_id,descriptor_key));
+CREATE TABLE IF NOT EXISTS input_selection_chunk_entries(
+ block_ref TEXT NOT NULL,descriptor_key TEXT NOT NULL,ordinal INTEGER NOT NULL,
+ reference_json TEXT NOT NULL,PRIMARY KEY(block_ref,descriptor_key));
 """
 
 
@@ -79,18 +79,53 @@ def save(db, value: Any) -> Any:
                 for key in ("min_observation", "max_observation", "min_available")})
         return reference
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        leaves = [_save(db, "sequence", [save(db, item) for item in value[first:first + BLOCK_SIZE]],
-            len(value[first:first + BLOCK_SIZE])) for first in range(0, len(value), BLOCK_SIZE)]
-        if not leaves:
-            return _save(db, "sequence", [], 0)
-        while len(leaves) > 1:
-            leaves = [_save(db, "branches", leaves[first:first + BLOCK_SIZE],
-                sum(item["count"] for item in leaves[first:first + BLOCK_SIZE]))
-                for first in range(0, len(leaves), BLOCK_SIZE)]
-        return leaves[0]
+        return _save_sequence(db, value)
     if isinstance(value, str) and len(value) > 256:
         return _save(db, "text", value, 1)
     return value
+
+
+def _save_sequence(db, values, *, run_ends=None):
+    """Chunk neutral contiguous runs without shifting later runs' leaf blocks."""
+    leaves, start = [], 0
+    for end in (run_ends if run_ends is not None else (len(values),)):
+        if type(end) is not int or not start < end <= len(values):
+            if not values and end == 0:
+                continue
+            raise ValueError("Immutable sequence run bounds are invalid")
+        for first in range(start, end, BLOCK_SIZE):
+            chunk = values[first:min(end, first + BLOCK_SIZE)]
+            leaves.append(_save(db, "sequence", [save(db, item) for item in chunk], len(chunk)))
+        start = end
+    if start != len(values):
+        raise ValueError("Immutable sequence run bounds are incomplete")
+    if not leaves:
+        return _save(db, "sequence", [], 0)
+    while len(leaves) > 1:
+        leaves = [_save(db, "branches", leaves[first:first + BLOCK_SIZE],
+            sum(item["count"] for item in leaves[first:first + BLOCK_SIZE]))
+            for first in range(0, len(leaves), BLOCK_SIZE)]
+    return leaves[0]
+
+
+def save_selection_membership(db, members: Sequence[Mapping[str, Any]], *, run_ends=None):
+    """Share immutable member chunks and their bounded indexed manifest."""
+    sequence = _save_sequence(db, members, run_ends=run_ends)
+    reader = MetadataReader(database=db)
+    blocks = []
+
+    def visit(reference, start):
+        if reference["kind"] == "sequence":
+            blocks.append({"ref": reference["ref"], "start": start, "count": reference["count"]})
+            return
+        for child in reader.block(reference):
+            visit(child, start)
+            start += child["count"]
+
+    visit(sequence, 0)
+    return _save(db, "selection_membership", {"schema": "selection.membership.v1",
+        "members": sequence, "blocks": save(db, [{"ref": block["ref"], "count": block["count"]}
+            for block in blocks])}, len(members)), blocks
 
 
 class MetadataReader:

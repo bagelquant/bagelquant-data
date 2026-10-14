@@ -613,8 +613,14 @@ class InputsAPI:
 
     @staticmethod
     def selection_descriptor_identity(descriptor: Mapping[str, Any]) -> str:
-        """UTF-8 canonical JSON identity for a public selection descriptor."""
-        return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":"),
+        """Stable immutable selection identity, separate from Source binding.
+
+        Only the enclosing Source and its requested cutoff are omitted. Exact
+        scope, explicit as_of, canonical cutoff and original proof remain bound.
+        This identity alone claims neither currentness nor Source admission.
+        """
+        body = {key: value for key, value in descriptor.items() if key not in {"source", "requested_cutoff"}}
+        return hashlib.sha256(json.dumps({"schema": "selection.handle.v1", "selection": body}, sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, default=str).encode()).hexdigest()
 
     def register_selection_set(self, receipt: FrozenInputReceipt | str,
@@ -648,21 +654,30 @@ class InputsAPI:
         with self._store.connect() as db:
             db.execute("begin immediate")
             self.get(frozen)
-            members = []
+            members, run_ends, previous_scope = [], [], None
             for key, descriptor in zip(keys, descriptors):
                 check_canceled()
-                # Source binding is shared by the set. Its immutable descriptor
-                # contents can therefore survive a later equivalent Source.
-                base = {name: value for name, value in descriptor.items() if name != "source"}
+                # The immutable Source plus explicit as_of reconstructs the
+                # requested boundary exactly. Keep canonical/PIT proof fields.
+                base = {name: value for name, value in descriptor.items()
+                    if name not in {"source", "requested_cutoff"}}
+                scope = _json({"alias": base["alias"], "fields": base["fields"], "as_of": base["as_of"],
+                    "request": {name: value for name, value in base["request"].items() if name not in {"start", "end"}},
+                    "coordinates": base["coordinate_identity"] is not None})
+                if previous_scope is not None and scope != previous_scope:
+                    run_ends.append(len(members))
+                previous_scope = scope
                 members.append({"key": key, "reference": immutable_metadata.save(db, base)})
-            root = immutable_metadata.save(db, members)
-            body = {"source": source, "count": len(members), "root_ref": root["ref"]}
+            run_ends.append(len(members))
+            root, blocks = immutable_metadata.save_selection_membership(db, members, run_ends=run_ends)
+            body = {"schema": "selection.set.v2", "source": source, "count": len(members), "root_ref": root["ref"]}
             digest = hashlib.sha256(_json(body).encode()).hexdigest()
             db.execute("INSERT OR IGNORE INTO input_selection_sets VALUES(?,?,?,?,?,?)",
                 (digest, digest, frozen.receipt_id, frozen.digest, root["ref"], len(members)))
-            db.executemany("INSERT OR IGNORE INTO input_selection_set_entries VALUES(?,?,?,?)",
-                ((digest, member["key"], index, _json(member["reference"]))
-                 for index, member in enumerate(members)))
+            for block in blocks:
+                db.executemany("INSERT OR IGNORE INTO input_selection_chunk_entries VALUES(?,?,?,?)",
+                    ((block["ref"], member["key"], index, _json(member["reference"]))
+                     for index, member in enumerate(members[block["start"]:block["start"] + block["count"]])))
         return {"id": digest, "digest": digest, "source": source, "count": len(members)}
 
     def describe_selection_set(self, reference: Mapping[str, Any], *,
@@ -675,7 +690,7 @@ class InputsAPI:
         if row is None:
             raise KeyError("Unknown registered selection set")
         source = {"id": row["source_id"], "digest": row["source_digest"]}
-        body = {"source": source, "count": row["item_count"], "root_ref": row["root_ref"]}
+        body = {"schema": "selection.set.v2", "source": source, "count": row["item_count"], "root_ref": row["root_ref"]}
         result = {"id": row["id"], "digest": row["digest"], "source": source, "count": row["item_count"]}
         if (hashlib.sha256(_json(body).encode()).hexdigest() != row["digest"]
                 or any(reference.get(key) != value for key, value in result.items())):
@@ -687,6 +702,36 @@ class InputsAPI:
             raise RuntimeError("Selection set names a different original Source")
         return result
 
+    def _selection_membership(self, reference, *, config=None, check_canceled=lambda: None):
+        """Read the shared member-tree and small chunk index, without bodies."""
+        header = self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
+        with self._store.connect() as db:
+            root = db.execute("SELECT s.root_ref,m.kind,m.item_count FROM input_selection_sets s "
+                "JOIN immutable_metadata m ON m.digest=s.root_ref WHERE s.id=?", (header["id"],)).fetchone()
+        if root is None or root["kind"] != "selection_membership" or root["item_count"] != header["count"]:
+            raise RuntimeError("Registered selection membership is missing or unsupported")
+        reader = immutable_metadata.MetadataReader(self._store)
+        body = reader.block({"ref": root["root_ref"], "kind": root["kind"], "count": root["item_count"]})
+        if body.get("schema") != "selection.membership.v1" or body["members"]["count"] != header["count"]:
+            raise RuntimeError("Registered selection membership inventory changed")
+        blocks = []
+        start = 0
+        for block in reader.value(body["blocks"]):
+            check_canceled()
+            block = dict(block)
+            if (set(block) != {"ref", "count"} or type(block["count"]) is not int
+                    or not 1 <= block["count"] <= immutable_metadata.BLOCK_SIZE):
+                raise RuntimeError("Registered selection chunk inventory changed")
+            block["start"] = start
+            start += block["count"]
+            blocks.append(block)
+        if start != header["count"] or len({block["ref"] for block in blocks}) != len(blocks):
+            raise RuntimeError("Registered selection chunk inventory changed")
+        options = config or ExecutionOptions()
+        if len(_json(blocks).encode()) * 8 > options.max_buffer_bytes // 4:
+            raise MemoryError("Selection chunk inventory exceeds max_buffer_bytes")
+        return header, reader, reader.value(body["members"]), blocks
+
     def read_selection_set(self, reference: Mapping[str, Any], *, keys: Sequence[str] | None = None,
             config: ExecutionOptions | None = None,
             check_canceled: Callable[[], None] = lambda: None) -> tuple[dict[str, Any], ...]:
@@ -694,26 +739,41 @@ class InputsAPI:
         header = self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
         if isinstance(keys, (str, bytes)):
             raise ValueError("Selection set keys require a finite sequence")
+        if keys is not None and not keys:
+            return ()
+        header, reader, members, blocks = self._selection_membership(reference, config=config,
+            check_canceled=check_canceled)
         with self._store.connect() as db:
+            query = "SELECT e.descriptor_key,e.ordinal,e.reference_json,e.block_ref," \
+                "json_extract(b.value,'$.start') AS start,json_extract(b.value,'$.count') AS block_count " \
+                "FROM input_selection_chunk_entries e JOIN json_each(?) b " \
+                "ON e.block_ref=json_extract(b.value,'$.ref')"
             if keys is None:
-                rows = db.execute("SELECT descriptor_key,ordinal,reference_json FROM input_selection_set_entries WHERE set_id=? ORDER BY ordinal", (header["id"],)).fetchall()
+                rows = db.execute(query + " ORDER BY start,e.ordinal", (_json(blocks),)).fetchall()
+                if len(rows) != header["count"]:
+                    raise RuntimeError("Registered selection chunk entries are incomplete")
             else:
-                rows = db.execute("SELECT descriptor_key,ordinal,reference_json FROM input_selection_set_entries WHERE set_id=? AND descriptor_key IN(SELECT value FROM json_each(?)) ORDER BY ordinal", (header["id"], _json(list(keys)))).fetchall()
+                rows = db.execute(query + " WHERE e.descriptor_key IN(SELECT value FROM json_each(?)) ORDER BY start,e.ordinal",
+                    (_json(blocks), _json(list(keys)))).fetchall()
                 if len(rows) != len(set(keys)):
                     raise KeyError("Selection set descriptor key is unknown")
-            root = db.execute("SELECT s.root_ref,m.kind,m.item_count FROM input_selection_sets s JOIN immutable_metadata m ON m.digest=s.root_ref WHERE s.id=?", (header["id"],)).fetchone()
-        if root is None or root["item_count"] != header["count"]:
-            raise RuntimeError("Registered selection membership is missing")
-        reader = immutable_metadata.MetadataReader(self._store)
-        members = reader.value({"ref": root["root_ref"], "kind": root["kind"], "count": root["item_count"]})
+        source = self.get(header["source"]["id"])
         result, charge = [], 0
         options = config or ExecutionOptions()
         for row in rows:
             check_canceled()
-            member = members[row["ordinal"]]
+            if not 0 <= row["ordinal"] < row["block_count"]:
+                raise RuntimeError("Registered selection chunk ordinal changed")
+            member = members[row["start"] + row["ordinal"]]
             if member["key"] != row["descriptor_key"] or member["reference"] != json.loads(row["reference_json"]):
                 raise RuntimeError("Registered selection membership differs from its immutable root")
-            value = {**reader.value(json.loads(row["reference_json"])), "source": header["source"]}
+            value = json.loads(_json(reader.value(json.loads(row["reference_json"]))))
+            request = input_from_payload(value["request"])
+            effective, cutoff = self._selection_scope(source, value["alias"], start=request.start, end=request.end,
+                as_of=value["as_of"], view=request.view, strict=request.strict)
+            if _json(input_payload(effective)) != _json(value["request"]):
+                raise RuntimeError("Registered selection differs from its original Source request")
+            value.update(source=header["source"], requested_cutoff=None if cutoff is None else str(cutoff))
             # Descriptor dictionaries contain bounded nested public JSON, not
             # lazy source-history views, so the public wire shape stays ordinary.
             value = json.loads(_json(value))
@@ -3853,9 +3913,14 @@ class InputsAPI:
                     raise RuntimeError("Registered selection set membership is missing")
                 immutable_metadata.MetadataReader(database=db).audit(
                     {"ref": saved["root_ref"], "kind": root["kind"], "count": root["item_count"]}, metadata_verified)
-                cursor = db.execute("SELECT descriptor_key FROM input_selection_set_entries WHERE set_id=? ORDER BY ordinal", (saved["id"],))
+                _, reader, _, blocks = self._selection_membership(reference, config=options)
+                cursor = db.execute("SELECT e.descriptor_key,e.reference_json FROM input_selection_chunk_entries e "
+                    "JOIN json_each(?) b ON e.block_ref=json_extract(b.value,'$.ref') "
+                    "ORDER BY json_extract(b.value,'$.start'),e.ordinal", (_json(blocks),))
                 count = 0
                 while group := cursor.fetchmany(16):
+                    for row in group:
+                        reader.audit(json.loads(row["reference_json"]), metadata_verified)
                     descriptors = self.read_selection_set(reference, keys=[row[0] for row in group],
                         config=options, check_canceled=check_canceled or (lambda: None))
                     grouped = {}

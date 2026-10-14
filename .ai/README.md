@@ -36,6 +36,11 @@ Integration discovery and standalone fallback are in [AGENTS.md](../AGENTS.md).
 After verifying an integration root, read its
 `.ai/rules/contracts/package-boundaries.md` for cross-package work and use its
 `.ai/workflow.md` and root task CLI;
-the bilingual usage guide is `docs/ai-workflow.md` / `docs/zh-CN/ai-workflow.md`
+the English usage guide is `docs/ai-workflow.md`
 in that verified root. Rules/templates are versioned; actual task records are
 local, ignored, and owned only by the workspace root. A clone does not restore them.
+
+Active authored documentation and new AI records use English. Public behavior,
+formula, metric, PIT/data or workflow changes update relevant owner docs and
+private wiki pages in the same task; integrated tasks record wiki impact, page
+UUIDs and verification. Read the verified workspace `.ai/rules/wiki.md`.

@@ -78,7 +78,8 @@ def _scopes(names: tuple[str, ...], receipts: tuple[str, ...]) -> dict[str, tupl
     result["input_selection_index"] = ("receipt_digest in(" + digests + ")", (discarded,))
     result["input_coordinate_index"] = ("receipt_digest in(" + digests + ")", (discarded,))
     result["input_projection_index"] = ("source_receipt_id in(select value from json_each(?))", (discarded,))
-    result["input_selection_set_entries"] = ("set_id in(select id from input_selection_sets where source_id in(select value from json_each(?)))", (discarded,))
+    # Shared member indexes, like immutable metadata blocks, can be retained by
+    # other Sources. Deleting a Source never deletes a shared chunk's entries.
     result["input_selection_sets"] = ("source_id in(select value from json_each(?))", (discarded,))
     result["frozen_inputs"] = ("receipt_id in(select value from json_each(?))", (discarded,))
     return result

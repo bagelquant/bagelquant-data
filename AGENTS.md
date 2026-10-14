@@ -10,7 +10,7 @@ Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint
 Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
 DataItem updates accept caller-declared input windows pinned in frozen receipts; new scoped freezes preserve late revisions and legacy receipt identity.
 `items.completed_builds` exposes whole-range authorities; `inputs.publication_guard` fences Data writers through consumer CAS without audit/maintenance.
-Schema 9 retains one immutable Parquet body and shared segment/check/schema headers.
+Schema 9 retains one immutable Parquet body and shared segment/check/schema headers; selection handles bind immutable scope/PIT proof, with Source/requested cutoff in set bindings and shared chunk indexes across append.
 Frozen receipts are thin references; their public evidence Mapping is explicitly
 lazy. get/describe/request_identity never expand history. Registered selection
 sets expose header-only validation and keyed reads; audits traverse all originals.

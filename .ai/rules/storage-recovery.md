@@ -37,6 +37,16 @@ header and original Source; it does not claim currentness or byte integrity.
 membership paths. An all-key read is explicit preparation/audit. `inputs.verify`
 audits Source blocks, selection membership/proofs and original bytes. Consumers
 retain set references rather than another copy of its descriptor bodies.
+`inputs.selection_descriptor_identity` is the sole stable key: it binds all
+original proof/scope fields under `selection.handle.v1`, omitting only the
+enclosing `source` and `requested_cutoff`. Shared bodies omit those same fields;
+the immutable set Source and retained explicit `as_of` reconstruct the exact
+requested boundary through the existing request contract. Canonical cutoff,
+original `proof_source`, fields, coordinates, strictness and evidence remain
+bound. Different explicit `as_of` values retain distinct keys. Member indexes
+belong to immutable 64-member chunks, not to Source-bound set IDs. Source removal
+retains shared indexes like other shared metadata; it never deletes another
+Source's evidence. Earlier set formats are not read or automatically migrated.
 
 Each actual content delta is one immutable Parquet segment. Never rewrite/copy
 an entire historical month for an append. SQLite stores file references, exact
