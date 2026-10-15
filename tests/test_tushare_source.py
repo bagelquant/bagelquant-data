@@ -1,7 +1,6 @@
 import pandas as pd
 import pytest
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 
 from bagelquant_data.sources.tushare.client import build_client
 from bagelquant_data.sources.tushare.source import TushareSource, _to_tushare_params
@@ -96,21 +95,45 @@ def test_tushare_builds_one_client_per_worker_thread(monkeypatch) -> None:
 
 
 def test_tushare_client_passes_token_without_writing_user_home(monkeypatch) -> None:
-    calls: list[str] = []
-    expected = object()
-    module = SimpleNamespace(
-        pro_api=lambda token: calls.append(token) or expected,
-        set_token=lambda _token: (_ for _ in ()).throw(
-            AssertionError("set_token must not persist credentials")
-        ),
-    )
-    monkeypatch.setattr(
-        "bagelquant_data.sources.tushare.client.importlib.import_module",
-        lambda _name: module,
-    )
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"code": 0, "data": {"fields": ["close"], "items": [[1.5]]}}
+    class Session:
+        calls = []
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return Response()
+        def close(self):
+            pass
+    session = Session()
+    monkeypatch.setattr("requests.Session", lambda: session)
+    client = build_client("secret")
+    assert client.daily(trade_date="20240102", fields="close")["close"].tolist() == [1.5]
+    assert client.daily(trade_date="20240103", fields="close")["close"].tolist() == [1.5]
+    assert len(session.calls) == 2
+    assert session.calls[0] == ("http://api.tushare.pro", {"json": {
+        "api_name": "daily", "token": "secret", "params": {"trade_date": "20240102"}, "fields": "close"}, "timeout": 30})
+    assert "secret" not in repr(client)
 
-    assert build_client("secret") is expected
-    assert calls == ["secret"]
+
+@pytest.mark.parametrize("response", [{"code": 2002, "msg": "permission denied"}, {},
+                                      {"code": 0, "data": None}])
+def test_persistent_transport_rejects_provider_errors_and_malformed_envelopes(response):
+    from bagelquant_data.core.exceptions import DataSourceError
+    from bagelquant_data.sources.tushare.client import TushareClient
+    class Session:
+        def post(self, *args, **kwargs):
+            return self
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return response
+        def close(self):
+            pass
+    with pytest.raises(DataSourceError):
+        TushareClient("secret", Session()).query("daily")
 
 
 def test_provider_admission_is_cancelable_without_calling_provider(monkeypatch) -> None:

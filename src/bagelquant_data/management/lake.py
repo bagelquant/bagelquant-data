@@ -966,6 +966,7 @@ def _request_context(
     params = kwargs.pop("params", None)
     owner_id = kwargs.pop("owner_id", None)
     cancel_requested = kwargs.pop("cancel_requested", None)
+    native_admission = kwargs.pop("native_admission", None)
     if kwargs:
         keys = ", ".join(sorted(kwargs))
         raise ConfigurationError(f"Unsupported update option(s): {keys}")
@@ -982,6 +983,10 @@ def _request_context(
         ):
             raise ConfigurationError(f"{name} must be a positive integer")
     options: dict[str, Any] = {"mode": mode}
+    if native_admission is not None:
+        if not callable(native_admission):
+            raise ConfigurationError("native_admission must be callable")
+        options["native_admission"] = native_admission
     import math
     if (isinstance(commit_interval_seconds, bool)
             or not isinstance(commit_interval_seconds, (int, float))

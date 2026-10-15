@@ -26,7 +26,8 @@ def fixture_lake(root):
 def test_parallel_month_writes_preserve_serial_values_and_frozen_recovery(tmp_path, monkeypatch):
     serial = fixture_lake(tmp_path / "serial")
     parallel = fixture_lake(tmp_path / "parallel")
-    serial.items.initialize("derived", start="2020-01-01", end="2020-04-30")
+    serial.items.initialize("derived", start="2020-01-01", end="2020-04-30",
+                            config=ExecutionOptions(observation_window_days=None))
     original = versions._write_version_partition
     gate = Barrier(3, timeout=10)
     lock = Lock()
@@ -45,7 +46,7 @@ def test_parallel_month_writes_preserve_serial_values_and_frozen_recovery(tmp_pa
 
     monkeypatch.setattr(versions, "_write_version_partition", write)
     report = parallel.items.initialize("derived", start="2020-01-01", end="2020-04-30",
-                                       config=ExecutionOptions(workers=3, max_in_flight=3))
+                                       config=ExecutionOptions(workers=3, max_in_flight=3, observation_window_days=None))
     assert report.status == "success" and report.rows_committed == 4
     assert len(threads) == 3
     for view in ("history", "snapshot"):
@@ -83,7 +84,7 @@ def test_parallel_writer_failure_drains_before_rollback(tmp_path, monkeypatch):
     monkeypatch.setattr(versions, "_write_version_partition", write)
     with pytest.raises(RuntimeError, match="fixture writer failure"):
         lake.items.initialize("derived", start="2020-01-01", end="2020-04-30",
-                              config=ExecutionOptions(workers=3))
+                              config=ExecutionOptions(workers=3, observation_window_days=None))
     assert len(settled) == 3
     assert lake.items.manifest("derived") == []
     assert lake.integrity.active_update_leases() == []
@@ -198,7 +199,7 @@ def test_existing_baseline_batches_match_chronological_noop_and_retain_frozen(tm
     original_publish = serial.items._publish_proven
 
     def chronological(*args, **kwargs):
-        kwargs["commit_batch_rows"] = None
+        kwargs["commit_batch_rows"] = 1
         return original_publish(*args, **kwargs)
 
     monkeypatch.setattr(serial.items, "_publish_proven", chronological)

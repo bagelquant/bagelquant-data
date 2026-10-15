@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, cast, overload
 from threading import Lock, get_ident
 from uuid import uuid4
+from time import perf_counter
 
 import polars as pl
 
@@ -68,7 +69,11 @@ def _pointwise_scope_extension(previous, requests, *, policy, completed_start, c
 
 
 def _baseline_publication_groups(frame: pl.DataFrame, rows: int, byte_limit: int):
-    """Keep independent baseline coordinates in causal, bounded batches."""
+    """Group admitted baseline coordinates causally toward a byte target.
+
+    One indivisible row can exceed this partition-copy target; the enclosing
+    numerical unit still has its ordinary working-buffer admission.
+    """
     for group in frame.sort("version_available_date", "time", "asset_id").iter_slices(rows):
         pending = [group]
         while pending:
@@ -368,6 +373,7 @@ class ItemAPI:
         self._max_commit, self._as_of = current_input_boundary(self._store.data_meta_path)
         self._max_check_id = current_input_check_boundary(self._store.data_meta_path)
         self._producers: dict[tuple[str, str], Producer] = {}
+        self._producer_native_kinds: dict[tuple[str, str], str] = {}
         self._update_policies: dict[tuple[str, str], ProducerUpdatePolicy] = {}
         if not self._store.read_only:
             with self._store.connect() as db:
@@ -457,16 +463,20 @@ class ItemAPI:
             self._lake.catalog.item_categories.assign(spec.name, category_id)
 
     def register_producer(self, key: str, revision: str, producer: Producer, *,
-                          update_policy: ProducerUpdatePolicy | None = None) -> None:
+                          update_policy: ProducerUpdatePolicy | None = None,
+                          native_kind: str = "mixed") -> None:
         """Register runtime code matching an explicit immutable declaration."""
         self._store.ensure_writable()
         if not key or not revision or not callable(producer):
             raise ValueError("producer requires a non-empty key/revision and a callable")
         if update_policy is not None and not isinstance(update_policy, ProducerUpdatePolicy):
             raise TypeError("update_policy must be a ProducerUpdatePolicy")
+        if native_kind not in {"columnar", "mixed"}:
+            raise ValueError("native_kind must be columnar or mixed")
         if (key, revision) in self._update_policies and self._update_policies[(key, revision)] != update_policy:
             raise ValueError("Update policy conflicts with the registered immutable producer revision")
         self._producers[(key, revision)] = producer
+        self._producer_native_kinds[(key, revision)] = native_kind
         if update_policy is not None:
             self._update_policies[(key, revision)] = update_policy
         else:
@@ -637,6 +647,29 @@ class ItemAPI:
         if _json({key: input_payload(value) for key, value in old_requests.items()}) == _json(
                 {key: input_payload(value) for key, value in requests.items()}):
             return None
+        # Earlier native captures omitted the already-declared field selection.
+        # Narrow only that physical overcapture under the unchanged numerical
+        # declaration. Original receipts remain immutable; no values are read.
+        declared = {value.key: value for value in self.get(previous["name"]).inputs}
+        projection_only = set(old_requests) == set(requests)
+        for alias, old in old_requests.items():
+            new = requests.get(alias)
+            declaration = declared.get(alias)
+            if new is None:
+                projection_only = False
+                break
+            before, after = input_payload(old), input_payload(new)
+            if before == after:
+                continue
+            if (not isinstance(old, RawInput) or not isinstance(new, RawInput)
+                    or old.fields or not new.fields or not isinstance(declaration, RawInput)
+                    or declaration.fields != new.fields
+                    or {key: value for key, value in before.items() if key != "fields"}
+                    != {key: value for key, value in after.items() if key != "fields"}):
+                projection_only = False
+                break
+        if projection_only:
+            return None
         if not _pointwise_scope_extension(old_requests, requests, policy=policy,
                 completed_start=_date_value(previous["start_date"]),
                 completed_end=_date_value(previous["end_date"]), requested_start=first, requested_end=last):
@@ -693,31 +726,22 @@ class ItemAPI:
 
     def initialize(self, name: str, *, end: DateLike, start: DateLike = "2000-01-01", config: ExecutionOptions | None = None,
                    progress: Callable[[ItemBuildReport], None] | None = None, cancelled: Callable[[], bool] | None = None) -> ItemBuildReport:
-        self._store.ensure_writable()
-        first, last = _date_value(start), _date_value(end)
-        if last < first:
-            raise ValueError("end precedes start")
-        spec = self.get(name)
-        self._validate_output_anchors(spec, self._policy(spec))
-        definition_hash = _definition_hash(spec)
-        with self._store.connect() as db:
-            row = db.execute("select * from item_initializations where name=?", (name,)).fetchone()
-            if row and (row["definition_hash"] != definition_hash or row["start_date"] != first.isoformat() or row["end_date"] != last.isoformat()):
-                raise ValueError("Initialization range and definition are fixed; use update after completion")
-            if row is None:
-                if db.execute("select 1 from version_commits where source='items' and dataset=? and status='committed' limit 1", (name,)).fetchone():
-                    raise ValueError("Historical initialization requires a new DataItem")
-                db.execute("insert into item_initializations values(?,?,?,?,'running')", (name, definition_hash, first.isoformat(), last.isoformat()))
-            elif row["status"] == "complete":
-                previous = db.execute("select * from item_builds where name=? and definition_hash=? and start_date=? and end_date=? and status='success' order by id desc limit 1", (name, definition_hash, first.isoformat(), last.isoformat())).fetchone()
-                if previous is None:
-                    raise RuntimeError("Completed initialization has no committed build evidence")
-                return ItemBuildReport(name, "unchanged", 0, previous["result_commit"], previous["input_commit"], first, last, previous["dependency_digest"], previous["frozen_receipt_id"])
-        report = self._build(name, start=first, end=last, initialize=True, config=config, stack=(), progress=progress, cancelled=cancelled)
-        if report.status in {"success", "unchanged"}:
-            with self._store.connect() as db:
-                db.execute("update item_initializations set status='complete' where name=?", (name,))
-        return report
+        return self.initialize_many((name,), start=start, end=end, config=config,
+            progress=progress, cancelled=cancelled)[name]
+
+    def initialize_many(self, names: Sequence[str], *, end: DateLike,
+                        start: DateLike = "2000-01-01", config: ExecutionOptions | None = None,
+                        progress: Callable[[ItemBuildReport], None] | None = None,
+                        cancelled: Callable[[], bool] | None = None) -> dict[str, ItemBuildReport]:
+        """Initialize independent ready Items with bounded, shared input preparation.
+
+        Each Item retains its own frozen inputs, causal versions and completion.
+        Successful units survive cancellation; only the final whole-range
+        certificate advances completion. Resource settings do not bind identity.
+        """
+        from .initialization import initialize_many
+        return initialize_many(self, names, start=start, end=end, config=config,
+            progress=progress, cancelled=cancelled)
 
     def update(self, name: str, *, end: DateLike, start: DateLike | None = None, config: ExecutionOptions | None = None,
                progress: Callable[[ItemBuildReport], None] | None = None, cancelled: Callable[[], bool] | None = None,
@@ -738,6 +762,34 @@ class ItemAPI:
                 config=config, progress=progress, cancelled=cancelled, force=force, input_windows=input_windows)
         except CancelledError:
             return ItemBuildReport(name, "cancelled", 0, None, 0, _date_value(first), _date_value(end), "")
+
+    def update_many(self, names: Sequence[str], *, end: DateLike,
+                    start: DateLike | None = None, config: ExecutionOptions | None = None,
+                    progress: Callable[[ItemBuildReport], None] | None = None,
+                    cancelled: Callable[[], bool] | None = None) -> dict[str, ItemBuildReport]:
+        """Share bounded preparation for independent ready append/repair updates.
+
+        Each update uses its existing causal plan, Source and publication fences.
+        The disposable cache may reuse only exact immutable selection headers;
+        changed fields, timing or windows cannot borrow another update's proof.
+        """
+        from dataclasses import replace
+        from .preparation import prepared_window
+        if isinstance(names, str) or not names or len(set(names)) != len(names):
+            raise ValueError("names must be a nonempty sequence of unique DataItem names")
+        if not self._independent_group(names):
+            raise ValueError("Update independent ready Items together; complete their declared Item dependencies first")
+        options = config or ExecutionOptions()
+        result = {}
+        with self._store.writer_session(), prepared_window(self._store.data_meta_path, options.max_buffer_bytes // 4) as prepared:
+            for name in sorted(names):
+                result[name] = self.update(name, start=start, end=end,
+                    config=replace(options, max_buffer_bytes=max(1, options.max_buffer_bytes * 3 // 4)),
+                    progress=progress, cancelled=cancelled)
+            work = {"prepared_hits": prepared.hits, "prepared_misses": prepared.misses,
+                "source_rows_read": prepared.source_rows, "key_rows_prepared": prepared.key_rows,
+                "prepared_peak_bytes": prepared.peak_bytes}
+            return {name: replace(report, work={**report.work, **work}) for name, report in result.items()}
 
     def _incremental_update(self, name: str, *, first: date, last: date,
                             config: ExecutionOptions | None,
@@ -931,7 +983,9 @@ class ItemAPI:
                     pending.extend(pending_dates(db, unit[0]))
             _save_completion(db, cursor.lastrowid, pending=pending)
         return ItemBuildReport(name, "success", sum(value.rows_committed for value in reports), result_commit,
-            receipt.max_commit, reports[0].start, reports[-1].end, receipt.dependency_digest, receipt.receipt_id)
+            receipt.max_commit, reports[0].start, reports[-1].end, receipt.dependency_digest, receipt.receipt_id,
+            {metric: sum(value.work.get(metric, 0) for value in reports)
+                for metric in {metric for value in reports for metric in value.work}})
 
     def ingest(
         self, name: str, frame: pl.DataFrame, *, available_date: DateLike | None = None,
@@ -1076,7 +1130,7 @@ class ItemAPI:
         # baseline checks cannot promote strict visibility. Verified no-op
         # witnesses retain date-by-date checks (their check date is causal).
         resume_bulk = (frame.height > 0 and has_committed and _baseline_proven and historical_baseline
-                       and commit_batch_rows is not None and commit_batch_bytes is not None
+                       and commit_batch_bytes is not None
                        and len(set(baseline_by_date.values())) == 1
                        and not frame.select("time", "asset_id").is_duplicated().any())
         # Only first-publication deltas have bounded old-partition memory (zero).
@@ -1089,7 +1143,7 @@ class ItemAPI:
             admitted_writers = max(1, min(partition_workers, len(parts), writer_buffer_bytes // max(1, 6 * largest)))
             del parts
         rows_committed = 0
-        groups = _baseline_publication_groups(frame, cast(int, commit_batch_rows), cast(int, commit_batch_bytes)) if resume_bulk else (
+        groups = _baseline_publication_groups(frame, commit_batch_rows or frame.height, cast(int, commit_batch_bytes)) if resume_bulk else (
                       (day, frame if initial_bulk else frame.filter(pl.col("version_available_date") == day))
                       for day in publication_dates)
         for publication_date, group in groups:
@@ -1137,9 +1191,10 @@ class ItemAPI:
                         on_commit: Callable[[int, int | None], None] | None = None,
                         on_unchanged_check: Callable[[sqlite3.Connection, int], None] | None = None,
                         available_date: date | None = None,
-                        check_requests: list[dict] | None = None) -> ItemBuildReport:
+                        check_requests: list[dict] | None = None,
+                        writer_run_id: str | None = None) -> ItemBuildReport:
         """Publish causal output; generated acquisition dates are not value deltas."""
-        run_id = uuid4().hex
+        run_id = writer_run_id or uuid4().hex
         with self._store.dataset_writer("items", name, run_id):
             return self._ingest(name, frame, available_date=available_date,
                 historical_baseline=historical_baseline, ingested_at=None,
@@ -1704,6 +1759,15 @@ class ItemAPI:
         seen.add(first)
         return any(self._reaches(str(row["dataset"]), target, seen) for row in self._store._rows("select dataset from item_dependencies where item_name=? and kind='item'", (first,)))
 
+    def _independent_group(self, names: Sequence[str]) -> bool:
+        """Check all selected dependency closures in one finite metadata query."""
+        return not self._store._rows("with recursive selected(name) as (select value from json_each(?)), "
+            "descendants(origin,name) as (select item_name,dataset from item_dependencies "
+            "where kind='item' and item_name in (select name from selected) union "
+            "select d.origin,i.dataset from descendants d join item_dependencies i on i.item_name=d.name "
+            "where i.kind='item') select 1 from descendants where origin<>name "
+            "and name in (select name from selected) limit 1", (_json(list(names)),))
+
     @staticmethod
     def _physical_spec(spec: DataItemSpec) -> DatasetSpec:
         return DatasetSpec(spec.name, "by_date", source="items", description=spec.description,
@@ -1743,7 +1807,9 @@ class ItemAPI:
                frozen_receipt: FrozenInputReceipt | None = None,
                completed_through: date | None = None, frozen_spec: DataItemSpec | None = None,
                pinned_producer: Producer | None = None,
-               pinned_policy: ProducerUpdatePolicy | None = None) -> ItemBuildReport:
+               pinned_policy: ProducerUpdatePolicy | None = None,
+               publish_completion: bool = True,
+               writer_run_id: str | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
         if end < start:
             raise ValueError("end precedes start")
@@ -1786,6 +1852,9 @@ class ItemAPI:
         if prior and not force:
             return ItemBuildReport(name, "unchanged", 0, prior[0]["result_commit"], max_commit, start, end, dependency_digest, receipt.receipt_id)
         options = config or ExecutionOptions()
+        work: dict[str, int | float] = {"input_seconds": 0.0, "producer_seconds": 0.0,
+            "publication_seconds": 0.0, "producer_calls": 0, "input_rows": 0}
+        work_lock = Lock()
         policy = pinned_policy if frozen_spec is not None else self._policy(spec)
         frames: dict[str, pl.DataFrame] = {}
         buffered = 0
@@ -1805,8 +1874,13 @@ class ItemAPI:
                           if isinstance(request, RawInput) else None)
             windowed = bounded_history and (isinstance(request, ItemInput)
                 or definition is not None and json.loads(definition["spec_json"])["update_type"] == "by_date")
-            frame = self._lake.inputs.read(receipt, key,
-                start=read_start if windowed else None, end=end if windowed else None).collect()
+            input_started = perf_counter()
+            with options.admission(), self._lake.inputs.read_context(receipt,
+                    config=replace(options, max_buffer_bytes=max(1, options.max_buffer_bytes // 2 - buffered))):
+                frame = self._lake.inputs.read(receipt, key, fields=(),
+                    start=read_start if windowed else None, end=end if windowed else None).collect()
+            work["input_seconds"] += perf_counter() - input_started
+            work["input_rows"] += frame.height
             buffered += frame.estimated_size()
             if buffered > options.max_buffer_bytes // 2:
                 raise MemoryError("Frozen DataItem inputs exceed max_buffer_bytes; use smaller declared input windows")
@@ -1871,7 +1945,7 @@ class ItemAPI:
         pending_output: list[tuple[str, str]] = []
         final_baseline = False
 
-        def evaluate(raw_snapshots: dict, item_snapshots: dict, cutoff: date) -> pl.DataFrame:
+        def evaluate_admitted(raw_snapshots: dict, item_snapshots: dict, cutoff: date) -> pl.DataFrame:
             nonlocal final_baseline
             snapshots = {key: value.collect() for key, value in {**raw_snapshots, **item_snapshots}.items()}
             baseline = any("_baseline" in frame.columns and frame["_baseline"].fill_null(False).any() for frame in snapshots.values())
@@ -1897,12 +1971,20 @@ class ItemAPI:
                                        max_buffer_bytes=int(options.max_buffer_bytes - buffered))
                                        for key in snapshots if snapshots[key].is_empty()
                                        and self._lake.inputs._could_have_baseline(receipt, key))
-            context = BuildContext(snapshots, start, end, cutoff, max_commit, baseline, completed_through)
+            producer_snapshots = {}
+            channels = {"time", "source_time", "asset_id", "snapshot_date", "_snapshot_id",
+                "ingested_at", "_commit_seq", "_record_id", "_payload_hash", "_baseline", "_attestation_id"}
+            for alias, selected in snapshots.items():
+                request = requests[alias]
+                producer_snapshots[alias] = (selected.select([field for field in selected.columns
+                    if field in channels or field in request.fields])
+                    if isinstance(request, RawInput) and request.fields else selected)
+            context = BuildContext(producer_snapshots, start, end, cutoff, max_commit, baseline, completed_through)
             if producer:
                 result = producer(context)
                 frame = result.collect() if isinstance(result, pl.LazyFrame) else result
             else:
-                frame = apply_transforms(snapshots[spec.inputs[0].key], spec.transforms, snapshots)
+                frame = apply_transforms(producer_snapshots[spec.inputs[0].key], spec.transforms, producer_snapshots)
             frame = self._normalize(spec, frame).filter(pl.col("time").is_between(start, end))
             if policy is not None and policy.output_anchors:
                 parts = []
@@ -1931,6 +2013,19 @@ class ItemAPI:
                 final_baseline = baseline
             return frame.with_columns(pl.lit(baseline).alias("_build_baseline"))
 
+        native_kind = (self._producer_native_kinds.get((cast(str, spec.producer_key), str(spec.producer_revision)), "mixed")
+                       if producer is not None else "columnar")
+
+        def evaluate(raw_snapshots: dict, item_snapshots: dict, cutoff: date) -> pl.DataFrame:
+            started = perf_counter()
+            try:
+                with options.admission(native_kind):
+                    return evaluate_admitted(raw_snapshots, item_snapshots, cutoff)
+            finally:
+                with work_lock:
+                    work["producer_seconds"] += perf_counter() - started
+                    work["producer_calls"] += 1
+
         committed_rows = 0
         result_commit: int | None = None
 
@@ -1944,17 +2039,25 @@ class ItemAPI:
                 if progress:
                     progress(ItemBuildReport(name, "running", committed_rows, result_commit, max_commit,
                         start, end, dependency_digest, receipt.receipt_id))
-            return self._publish_proven(name, frame, historical_baseline=baseline,
-                input_receipt=receipt, expected_definition_hash=definition_hash,
-                writer_executor=executor, partition_workers=partition_workers,
-                writer_buffer_bytes=writer_buffer, commit_batch_rows=options.commit_batch_rows,
-                commit_batch_bytes=publication_bytes, cancelled=cancelled, on_commit=published)
+            started = perf_counter()
+            try:
+                with options.admission():
+                    return self._publish_proven(name, frame, historical_baseline=baseline,
+                        input_receipt=receipt, expected_definition_hash=definition_hash,
+                        writer_executor=executor, partition_workers=partition_workers,
+                        writer_buffer_bytes=writer_buffer, commit_batch_rows=options.commit_batch_rows,
+                        commit_batch_bytes=publication_bytes, cancelled=cancelled, on_commit=published,
+                        writer_run_id=writer_run_id)
+            finally:
+                work["publication_seconds"] += perf_counter() - started
 
         partition_workers = min(options.workers, options.max_in_flight or options.workers,
                                 options.batch_size or options.workers)
         with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="data-item") as executor:
             try:
                 output_options = replace(options, max_buffer_bytes=options.max_buffer_bytes - buffered)
+                if options.native_admission is not None and native_kind == "mixed":
+                    output_options = replace(output_options, workers=1, max_in_flight=1)
                 writer_buffer = output_options.max_buffer_bytes // (options.workers + 1)
                 publication_bytes = max(1, writer_buffer // 6)
                 with closing(iter_computed_versions(raw=raw, items=items, start=start, end=through, evaluate=lambda raw, items: evaluate(raw, items, through), evaluate_at=evaluate, raw_resolvers=resolvers, extra_boundaries=sorted(general_boundaries), config=output_options, cancelled=cancelled, executor=executor)) as outputs:
@@ -1974,52 +2077,53 @@ class ItemAPI:
                         writer_buffer = 0
             except CancelledError:
                 return ItemBuildReport(name, "cancelled", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id)
-            if "frame" in final_output and self._store.manifest("items", name):
-                existing = self.read(name, start=start, end=end, view="snapshot", as_of=through)
-                keys = ["time", "asset_id"]
-                # A later externally published version can dominate the causal
-                # revisions just rebuilt above. Repair the latest affected view
-                # at this frozen boundary, retaining the old historical version.
-                expected = final_output["frame"].with_columns(pl.lit(final_baseline).alias("_baseline"))
-                identity = [key for key in ("time", "asset_id", "value", "observation_date", "available_date", "_baseline")
-                    if key in expected.columns]
-                selected = existing.select(identity).collect().sort(keys)
-                target = expected.select(identity).sort(keys)
-                changed = (target.head(0) if _same_ordered_rows(target, selected, identity)
-                    else _comparison_frame(target, identity).join(_comparison_frame(selected, identity),
-                        on=identity, how="anti", nulls_equal=True))
-                if changed.height:
-                    repair = expected.join(changed.select(keys), on=keys, how="semi").drop("_baseline").with_columns(
-                        pl.max_horizontal("time", pl.lit(through)).alias("version_available_date"))
-                    try:
-                        publish_group(repair, final_baseline, executor=executor)
-                    except CancelledError:
-                        return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
-                            max_commit, start, end, dependency_digest, receipt.receipt_id)
-                existing_keys = existing.select(keys).collect()
-                current_keys = final_output["frame"].select(keys)
-                removed_keys = (existing_keys.head(0) if _same_ordered_rows(existing_keys, current_keys, keys)
-                                else existing_keys.join(current_keys, on=keys, how="anti"))
-                if removed_keys.height:
-                    # Only actual withdrawals need the old values/extra columns.
-                    removed = existing.join(removed_keys.lazy(), on=keys, how="inner",
-                                            maintain_order="left").collect()
-                    removed = removed.with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"), pl.max_horizontal("time", pl.lit(through)).alias("version_available_date"))
-                    try:
-                        publish_group(removed, final_baseline, executor=executor)
-                    except CancelledError:
-                        return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
-                            max_commit, start, end, dependency_digest, receipt.receipt_id)
+            with options.admission():
+                if "frame" in final_output and self._store.manifest("items", name):
+                    existing = self.read(name, start=start, end=end, view="snapshot", as_of=through)
+                    keys = ["time", "asset_id"]
+                    # A later externally published version can dominate the causal
+                    # revisions just rebuilt above. Repair the latest affected view
+                    # at this frozen boundary, retaining the old historical version.
+                    expected = final_output["frame"].with_columns(pl.lit(final_baseline).alias("_baseline"))
+                    identity = [key for key in ("time", "asset_id", "value", "observation_date", "available_date", "_baseline")
+                        if key in expected.columns]
+                    selected = existing.select(identity).collect().sort(keys)
+                    target = expected.select(identity).sort(keys)
+                    changed = (target.head(0) if _same_ordered_rows(target, selected, identity)
+                        else _comparison_frame(target, identity).join(_comparison_frame(selected, identity),
+                            on=identity, how="anti", nulls_equal=True))
+                    if changed.height:
+                        repair = expected.join(changed.select(keys), on=keys, how="semi").drop("_baseline").with_columns(
+                            pl.max_horizontal("time", pl.lit(through)).alias("version_available_date"))
+                        try:
+                            publish_group(repair, final_baseline, executor=executor)
+                        except CancelledError:
+                            return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
+                                max_commit, start, end, dependency_digest, receipt.receipt_id)
+                    existing_keys = existing.select(keys).collect()
+                    current_keys = final_output["frame"].select(keys)
+                    removed_keys = (existing_keys.head(0) if _same_ordered_rows(existing_keys, current_keys, keys)
+                                    else existing_keys.join(current_keys, on=keys, how="anti"))
+                    if removed_keys.height:
+                        # Only actual withdrawals need the old values/extra columns.
+                        removed = existing.join(removed_keys.lazy(), on=keys, how="inner",
+                                                maintain_order="left").collect()
+                        removed = removed.with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"), pl.max_horizontal("time", pl.lit(through)).alias("version_available_date"))
+                        try:
+                            publish_group(removed, final_baseline, executor=executor)
+                        except CancelledError:
+                            return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
+                                max_commit, start, end, dependency_digest, receipt.receipt_id)
         with self._store.connect() as db:
             db.execute("begin immediate")
-            cursor = db.execute("insert into item_builds(name,definition_hash,dependency_digest,start_date,end_date,input_commit,result_commit,status,created_at,frozen_receipt_id) values(?,?,?,?,?,?,?,'success',?,?)", (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat(), max_commit, result_commit, datetime.now(UTC).isoformat(), receipt.receipt_id))
-            _save_completion(db, cursor.lastrowid, pending=pending_output)
-        return ItemBuildReport(name, "success", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id)
+            cursor = db.execute("insert into item_builds(name,definition_hash,dependency_digest,start_date,end_date,input_commit,result_commit,status,created_at,frozen_receipt_id) values(?,?,?,?,?,?,?,?,?,?)", (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat(), max_commit, result_commit, "success" if publish_completion else "unit_success", datetime.now(UTC).isoformat(), receipt.receipt_id))
+            _save_completion(db, cursor.lastrowid, pending=pending_output, publish_node=publish_completion)
+        return ItemBuildReport(name, "success", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id, work)
 
     def _input_requests(self, spec: DataItemSpec,
                         input_windows: Mapping[str, tuple[DateLike, DateLike]] | None):
         from dataclasses import replace
-        requests = {value.key: replace(value, view="versions", fields=(), include_historical_baseline=True)
+        requests = {value.key: replace(value, view="versions", include_historical_baseline=True)
                     if isinstance(value, RawInput) else replace(value, view="versions") for value in spec.inputs}
         for key, window in (input_windows or {}).items():
             if key not in requests:

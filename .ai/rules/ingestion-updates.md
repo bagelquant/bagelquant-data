@@ -86,6 +86,12 @@ history. Monthly transport also groups historical rechecks during initialization
   pool; no additional writer pool. Central SQLite metadata/coverage publication
   stays serialized. Join admitted writers before rollback so late writes cannot
   undo it. Share one total thread/memory budget with native libraries.
+  Commit waits can refill a bounded response queue on the coordinator. Reserve
+  a partition worker slot; if all fetch slots are occupied, prepare partitions
+  inline instead of waiting under a shared native permit. Network/limiter waits
+  hold no native permit. Public native_admission is execution-only and callable;
+  response conversion/validation and publication preparation use columnar permits.
+  Cancellation releases this run's unfinished claims before dropping its lease.
 - Workbench owns global scheduler, hardware detection, runtime policy, task
   admission and native thread budgets. Data defaults to one worker and enforces
   caller-supplied worker/in-flight/batch/buffer limits, never probes machine RAM.

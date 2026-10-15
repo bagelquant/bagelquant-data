@@ -231,11 +231,16 @@ class DataMetaStore:
                 return
         active = getattr(self._thread_state, "writer_connection", None)
         if isinstance(active, sqlite3.Connection):
-            if getattr(self._thread_state, "atomic_transaction", False):
+            depth = getattr(self._thread_state, "connection_depth", 0)
+            if getattr(self._thread_state, "atomic_transaction", False) or depth:
                 yield active
                 return
-            with active as connection:
-                yield connection
+            self._thread_state.connection_depth = depth + 1
+            try:
+                with active as connection:
+                    yield connection
+            finally:
+                self._thread_state.connection_depth = depth
             return
         connection = self._new_connection()
         try:
@@ -280,19 +285,28 @@ class DataMetaStore:
     def atomic_transaction(self) -> Iterator[sqlite3.Connection]:
         """Share one transaction across declaration helpers without nested commits."""
         self.ensure_writable()
-        if getattr(self._thread_state, "writer_connection", None) is not None:
+        path = self.data_meta_path.resolve()
+        if any(view_path == path and thread == get_ident() for view_path, thread, _ in _READ_VIEWS.get()):
+            raise ConfigurationError("An atomic transaction cannot upgrade an existing read view")
+        active = getattr(self._thread_state, "writer_connection", None)
+        if (getattr(self._thread_state, "atomic_transaction", False)
+                or getattr(self._thread_state, "connection_depth", 0)
+                or active is not None and active.in_transaction):
             raise ConfigurationError("An atomic declaration transaction cannot be nested")
-        connection = self._new_connection()
-        self._thread_state.writer_connection = connection
+        borrowed = active is not None
+        connection = active if borrowed else self._new_connection()
+        if not borrowed:
+            self._thread_state.writer_connection = connection
         self._thread_state.atomic_transaction = True
         try:
             with connection:
                 connection.execute("begin immediate")
                 yield connection
         finally:
-            del self._thread_state.writer_connection
             del self._thread_state.atomic_transaction
-            connection.close()
+            if not borrowed:
+                del self._thread_state.writer_connection
+                connection.close()
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = (

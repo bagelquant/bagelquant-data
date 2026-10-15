@@ -201,15 +201,15 @@ def test_project_consumer_exception_preserves_identity_and_closes_transport(tmp_
 def test_tied_witness_sort_keys_and_cutoff_none_keep_original_selected_parent(tmp_path):
     lake = prepared(tmp_path, baseline=True, revisions=False)
     first = lake.inputs.get(lake.items.builds("item")[0]["frozen_receipt_id"])
-    # Two original IDs bind identical dependencies and exact witness sort keys.
-    with sqlite3.connect(lake.data_meta_path) as db:
-        payload, digest, created = db.execute("select payload_json,digest,created_at from frozen_inputs where receipt_id=?",
-                                            (first.receipt_id,)).fetchone()
-        db.execute("insert into frozen_inputs values('second-original',?,?,?)", (payload, digest, created))
+    # Distinct valid Source headers retain the same original dependency bytes.
+    # Their different cutoffs cannot alter the tied output witness sort keys.
+    second = lake.inputs.freeze(first.requests, max_commit=first.max_commit,
+        information_cutoff="2020-03-06")
+    assert first.receipt_id != second.receipt_id and first.digest != second.digest
     frame = pl.DataFrame({"time": [date(2020, 1, 1)] * 24,
                           "asset_id": [f"asset-{i}" for i in range(24)],
                           "value": [float(i) for i in range(24)]})
-    for receipt in (first, lake.inputs.get("second-original")):
+    for receipt in (first, second):
         lake.items.ingest("item", frame, available_date="2020-03-03", input_receipt=receipt,
                           ingested_at=datetime(2020, 3, 3, tzinfo=UTC))
     frozen = lake.inputs.freeze({"item": ItemInput("item", strict=True)})

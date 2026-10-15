@@ -9,8 +9,11 @@ topic rules; rules are authoritative instructions and linked docs explain use.
 | Raw/DataItems, classification, Parquet/SQLite commit, frozen/PIT inputs, schema, recovery and integrity | [Storage and recovery](rules/storage-recovery.md) | [Queries](../docs/en/6_queries.md), [Operations](../docs/en/7_operations.md), [DataItems](../docs/en/8_items.md), [Exploration](../docs/en/9_exploration.md) |
 | Public facade or data-boundary change | Both owner rules and [development](rules/development.md) | [Overview](../docs/en/1_overview.md), [Quickstart](../docs/en/2_quickstart.md) |
 
-Data is independently versioned and imports no BagelQuant package. Its target
-owns Raw and neutral DataItems, categories, storage/query/versions/PIT, frozen
+Data is independently versioned and imports no BagelQuant package. It implements
+bounded same-date Item initialization and shared preparation for independent
+ready initialize/update groups; see DataItems for frozen retry, completion,
+field selection and execution-only admission contracts. Its target owns Raw
+and neutral DataItems, categories, storage/query/versions/PIT, frozen
 input receipts and recovery. Version 0.7 implements the stage-2 public facades
 with explicit data_meta_path/lake_path and one Data SQLite (schema 9). Data's
 guides describe this implemented contract; real database/service cutover remains

@@ -14,7 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 tushare = [
     "pandas>=3.0.0",
-    "tushare>=1.4.21",
+    "requests>=2.32,<3",
 ]
 
 [dependency-groups]

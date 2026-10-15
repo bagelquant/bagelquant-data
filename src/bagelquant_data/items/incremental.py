@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import date, timedelta
 from bisect import bisect_right
 from typing import TYPE_CHECKING, cast
+import json
 
 
 from bagelquant_data import input_index
@@ -333,6 +334,7 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                     *([{"mode": "incremental", "start": (through + timedelta(days=1)).isoformat(),
                         "end": end.isoformat()}] if end > through else [])]
         calendar: list[date] | None = None
+        declared_inputs = {value.key: value for value in owner.get(previous["name"]).inputs}
         for alias, request in receipt.requests.items():
             evidence = receipt.evidence[alias]
             captured_future_timing = []
@@ -376,7 +378,7 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                         break
                 captured_future_timing = [check for check in evidence["checks"] if not check["baseline"]
                     and receipt.information_cutoff < _date_value(check["pit_date"]) <= end]
-            batches = db.execute("select " + batch_columns + ",c.source,c.dataset,c.pit_date from version_segments b "
+            batches = db.execute("select " + batch_columns + ",b.field_changes_json,c.source,c.dataset,c.pit_date,c.baseline from version_segments b "
                 "join version_commits c on c.seq=b.commit_seq "
                 "where c.source=? and c.dataset=? and c.status='committed' and b.commit_seq<=? "
                 "and (b.commit_seq>? or b.max_available is null or b.max_available>?) "
@@ -388,6 +390,14 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
             for batch in (() if evidence["general_snapshots"] else batches):
                 if batch["min_available"] is not None and _date_value(batch["min_available"]) > end:
                     continue
+                declared = declared_inputs.get(alias)
+                fields = declared.fields if isinstance(declared, RawInput) else ()
+                if (fields and not set(fields).intersection({"time", "snapshot_date", "ingested_at", "_baseline", "_commit_seq"})
+                        and batch["commit_seq"] > receipt.max_commit
+                        and not batch["baseline"] and all(not original["baseline"] for original in evidence["batches"])):
+                    changes = json.loads(batch["field_changes_json"])
+                    if "$initial" not in changes and not set(fields).intersection(changes):
+                        continue
                 lower, upper = batch["min_observation"], batch["max_observation"]
                 if batch["commit_seq"] <= receipt.max_commit:
                     # Compact observation/availability bounds conservatively repair

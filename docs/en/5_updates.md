@@ -59,6 +59,23 @@ checks and pagination; discarded parent calls never advance coverage. A single
 day or complete general snapshot that still exceeds the budget fails explicitly.
 Provider/native-library internal allocations require the caller's separate budget.
 
+While partition preparation is pending, the coordinator can admit more fetches
+and retain a bounded response queue. The same executor serves fetches and writes;
+the commit phase reserves one writer slot, or prepares partitions inline when
+all fetch slots are occupied. This also avoids waiting on a native-gated response
+while holding the commit permit. Only the coordinator publishes metadata and
+coverage. Queue bytes, unfinished responses and in-flight reservations share the
+response half of the buffer; publication batches use the other half. Oversized
+responses fail explicitly. Callback failure settles every partition writer before
+rollback. Cancellation stops admission, drains admitted work and releases claimed
+unfinished scopes into the normal retry inventory. Persisted run metrics include
+`prefetched_during_commit` and `peak_prefetched_bytes`.
+
+Callers may supply `native_admission(kind)` returning a context manager. Data
+requests `columnar` admission for response conversion/validation and commit
+preparation; network and quota waits hold no native permit. Data does not choose
+machine policy or resize process-wide native pools.
+
 Use `progress_callback` and `cancel_check` for orchestration. Cancellation retains
 committed work and leaves unfinished scopes resumable. Reports expose actual
 counts, timings, bytes and in-flight peaks; those operational counters do not

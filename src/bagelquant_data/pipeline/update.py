@@ -29,6 +29,7 @@ from bagelquant_data.pipeline.scopes import (
     DiscoveryCall,
     LedgerRequest,
 )
+from bagelquant_data.pipeline.native import response_admission, response_admission_scope
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,8 @@ class _RunState:
     peak_buffer_bytes: int = 0
     observed_requests: int = 0
     observed_rows: int = 0
+    prefetched_during_commit: int = 0
+    peak_prefetched_bytes: int = 0
 
 
 type UpdateTask = tuple[DatasetUpdateWork, LedgerRequest]
@@ -426,6 +429,12 @@ def _run_fetches(
     next_split_index = request_index_offset + len(tasks)
     ready: deque[tuple[int, UpdateTask]] = deque()
     futures: dict[Future[PreparedFetch], tuple[float, UpdateTask]] = {}
+    prefetched: deque[tuple[float, UpdateTask, PreparedFetch]] = deque()
+    prefetched_bytes = 0
+    processing_bytes = 0
+    response_budget = max(1, min(_buffer_limit(state.work.context) for state in states.values()) // 2)
+    reservation = max(1, response_budget // max_in_flight)
+    response_count_limit = 2 * max_in_flight
     stop_submission = False
     next_heartbeat = time.monotonic() + 30.0
     next_activity = time.monotonic()
@@ -489,7 +498,15 @@ def _run_fetches(
             ready.append(candidate)
         return bool(ready)
 
-    def submit_next() -> bool:
+    def submit_next(*, committing: bool = False) -> bool:
+        # Completed responses and in-flight reservations share one half-buffer.
+        # Reserve a worker slot for queued partition preparation during commit.
+        capacity = max_in_flight
+        if committing:
+            capacity = min(capacity, max(0, int(tasks[0][0].context.options.get("workers", 1)) - 1))
+        if (len(futures) >= capacity or len(prefetched) >= response_count_limit
+                or prefetched_bytes + processing_bytes + (len(futures) + 1) * reservation > response_budget):
+            return False
         if not ready and not fill_ready(max_in_flight - len(futures)):
             return False
         index, task = ready.popleft()
@@ -517,6 +534,7 @@ def _run_fetches(
                 ),
                 "_page_callback": lambda page, name=work.spec.name: page_activity.put(
                     (name, page.request_attempts, page.row_count if page.status == "success" else 0)),
+                "_native_admission": work.context.options.get("native_admission"),
             },
             max_retries=max(1, int(work.context.options.get("max_retries", 3))),
             retry_backoff_seconds=float(
@@ -530,9 +548,44 @@ def _run_fetches(
         )
         return True
 
+    def refill_during_commit() -> None:
+        """Pump only transport results; publication/coverage stays on this thread."""
+        nonlocal prefetched_bytes, stop_submission
+        if cancellation_requested():
+            stop_submission = True
+            mark_cancelled()
+        for future in tuple(futures):
+            if not future.done() or len(prefetched) >= response_count_limit:
+                continue
+            submitted, task = futures.pop(future)
+            prepared = future.result()
+            size = 0 if prepared.frame is None else int(prepared.frame.estimated_size())
+            if prefetched_bytes + processing_bytes + size > response_budget:
+                raise MemoryError("Completed Raw responses exceed the admitted prefetch buffer")
+            prefetched.append((submitted, task, prepared))
+            prefetched_bytes += size
+            state = states[task[0].spec.name]
+            state.prefetched_during_commit += 1
+            state.peak_prefetched_bytes = max(state.peak_prefetched_bytes, prefetched_bytes)
+        if not stop_submission:
+            while submit_next(committing=True):
+                pass
+
+    def commit_buffer(state, callback, count, total):
+        # A writer-preferring native gate may park response conversions behind
+        # a mixed Item. Do not queue partition work behind an occupied fetch
+        # pool while holding the commit's shared native permit. Queued fetches
+        # count too; if no slot is guaranteed, prepare partitions inline.
+        workers = int(state.work.context.options.get("workers", 1))
+        partition_executor = (writer_executor
+                              if sum(not future.done() for future in futures) < workers
+                              else None)
+        _commit_state(pipeline, state, callback, count, total, partition_executor,
+                      on_wait=refill_during_commit)
+
     while len(futures) < max_in_flight and submit_next():
         pass
-    while futures:
+    while futures or prefetched:
         while True:
             try:
                 name, calls, rows = page_activity.get_nowait()
@@ -576,22 +629,29 @@ def _run_fetches(
         if cancellation_requested():
             stop_submission = True
             mark_cancelled()
-        done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+        done, _ = wait(futures, timeout=0 if prefetched else 0.25, return_when=FIRST_COMPLETED)
         for state in states.values():
             if (state.work.spec.update_type != "general" and state.buffered_since is not None
                     and time.monotonic() - state.buffered_since >= float(
                         state.work.context.options.get("commit_interval_seconds", 30.0))):
-                _commit_state(pipeline, state, callbacks[state.work.spec.name],
-                              completed[state.work.spec.name], totals[state.work.spec.name], writer_executor)
-        if not done:
+                commit_buffer(state, callbacks[state.work.spec.name],
+                              completed[state.work.spec.name], totals[state.work.spec.name])
+        # A commit may already have moved a completed future into the bounded
+        # response queue. Never consume it twice from the earlier wait result.
+        done = done.intersection(futures)
+        pending_results = deque(prefetched)
+        prefetched.clear()
+        prefetched_bytes = 0
+        pending_results.extend((*futures.pop(future), future.result()) for future in done)
+        processing_bytes = sum(0 if item[2].frame is None else int(item[2].frame.estimated_size()) for item in pending_results)
+        if not pending_results:
             continue
-        for future in done:
-            submitted_at, (work, request) = futures.pop(future)
+        while pending_results:
+            submitted_at, (work, request), prepared = pending_results.popleft()
             state = states[work.spec.name]
             state.in_flight = len(futures)
             state.wait_reason = ""
             state.wait_seconds = 0.0
-            prepared = future.result()
             state.fetch_seconds += time.perf_counter() - submitted_at
             state.prepare_seconds += prepared.prepare_seconds
             state.provider_seconds += sum(page.provider_seconds for page in prepared.pages)
@@ -618,6 +678,7 @@ def _run_fetches(
                     children.append((next_split_index, (work, child)))
                     next_split_index += 1
                 ready.extendleft(reversed(children))
+                processing_bytes -= 0 if prepared.frame is None else int(prepared.frame.estimated_size())
                 continue
             incoming_bytes = (
                 int(prepared.frame.estimated_size())
@@ -630,16 +691,10 @@ def _run_fetches(
                     raise ValueError(
                         "Complete general snapshot exceeds max_buffer_bytes; increase the explicit buffer limit"
                     )
-                _commit_state(
-                    pipeline,
-                    state,
-                    callbacks[work.spec.name],
-                    completed[work.spec.name],
-                    totals[work.spec.name],
-                    writer_executor,
-                )
+                commit_buffer(state, callbacks[work.spec.name], completed[work.spec.name], totals[work.spec.name])
             started = time.perf_counter()
             _harvest_request(pipeline, state, request, prepared)
+            processing_bytes -= incoming_bytes
             state.peak_buffer_bytes = max(state.peak_buffer_bytes, state.buffered_bytes)
             state.metadata_seconds += time.perf_counter() - started
             completed[work.spec.name] += _scope_count(request)
@@ -661,14 +716,7 @@ def _run_fetches(
                 or (commit_batch_rows is not None and state.buffered_rows >= int(commit_batch_rows))
                 or state.buffered_bytes >= max_bytes
             ):
-                _commit_state(
-                    pipeline,
-                    state,
-                    callbacks[work.spec.name],
-                    completed[work.spec.name],
-                    totals[work.spec.name],
-                    writer_executor,
-                )
+                commit_buffer(state, callbacks[work.spec.name], completed[work.spec.name], totals[work.spec.name])
         if not stop_submission:
             while len(futures) < max_in_flight and submit_next():
                 pass
@@ -958,8 +1006,15 @@ def _commit_state(
     callback: UpdateProgressCallback | None,
     completed: int,
     total: int,
-    writer_executor: ThreadPoolExecutor,
+    writer_executor: ThreadPoolExecutor | None,
+    *, on_wait: Callable[[], None] | None = None,
 ) -> None:
+    admission = state.work.context.options.get("native_admission")
+    with nullcontext() if admission is None else admission("columnar"):
+        _commit_admitted(pipeline, state, callback, completed, total, writer_executor, on_wait=on_wait)
+
+
+def _commit_admitted(pipeline, state, callback, completed, total, writer_executor, *, on_wait):
     if not state.buffered:
         return
     if state.work.spec.update_type == "general" and (
@@ -1002,19 +1057,22 @@ def _commit_state(
                 for request in state.work.requests}
             else {}
         )
-        commit = pipeline.commit_frame(
-            state.work.spec,
-            frame,
-            run_id=state.work.run_id,
-            writer_executor=writer_executor,
-            mode=str(state.work.context.options.get("mode", "incremental")),
-            ingested_at=state.work.context.options.get("ingested_at"),
-            requests=[
-                {"scope_id": r.scope_id, "params": r.params, **inventory_marker} for _, r in buffered
-            ],
-            scope_transitions=transitions,
-            partition_workers=int(state.work.context.options.get("workers", 1)),
-        )
+        admission = state.work.context.options.get("native_admission")
+        with nullcontext() if admission is None else admission("columnar"):
+            commit = pipeline.commit_frame(
+                state.work.spec,
+                frame,
+                run_id=state.work.run_id,
+                writer_executor=writer_executor,
+                mode=str(state.work.context.options.get("mode", "incremental")),
+                ingested_at=state.work.context.options.get("ingested_at"),
+                requests=[
+                    {"scope_id": r.scope_id, "params": r.params, **inventory_marker} for _, r in buffered
+                ],
+                scope_transitions=transitions,
+                partition_workers=int(state.work.context.options.get("workers", 1)),
+                on_wait=on_wait,
+            )
         state.commit_seconds += time.perf_counter() - started
         state.rows_committed += commit.rows_committed
         state.commit_count += 1
@@ -1174,6 +1232,7 @@ def _fail_running(pipeline: IngestionPipeline, state: _RunState, message: str) -
         (
             {"scope_id": row["id"], "status": "failed", "last_error": message}
             for row in rows
+            if row["active_run_id"] == state.work.run_id
         ),
         run_id=state.work.run_id,
     )
@@ -1201,6 +1260,8 @@ def _run_metrics(state: _RunState) -> dict[str, int | float]:
         "discarded_rows", "peak_buffer_bytes", "commit_count", "partitions_rewritten",
         "partitions_skipped", "bytes_written", "bytes_read", "peak_in_flight",
         "peak_partition_in_flight", "request_count", "rows_downloaded", "rows_committed")}
+    metrics.update(prefetched_during_commit=state.prefetched_during_commit,
+                   peak_prefetched_bytes=state.peak_prefetched_bytes)
     metrics["elapsed_seconds"] = time.perf_counter() - state.started_at
     metrics["request_count"] = max(state.request_count, state.observed_requests)
     metrics["rows_downloaded"] = max(state.rows_downloaded, state.observed_rows)
@@ -1209,6 +1270,11 @@ def _run_metrics(state: _RunState) -> dict[str, int | float]:
 
 def _finish_state(pipeline: IngestionPipeline, state: _RunState) -> IngestionReport:
     _flush_api_calls(pipeline, state)
+    if state.cancelled:
+        # Prefetch claims can include scopes that have not reached transport.
+        # Release them into the ordinary retry inventory before dropping the
+        # run lease; otherwise a clean cancellation strands "running" scopes.
+        _fail_running(pipeline, state, "update cancelled by workflow owner")
     remaining = _remaining_scope_count(pipeline, state)
     error = state.fatal_error or ("; ".join(state.errors[:5]) if state.errors else None)
     if state.cancelled and error is None:
@@ -1417,6 +1483,15 @@ def _fetch_and_prepare_request(
 ) -> PreparedFetch:
     """Fetch, combine, and validate one logical request in its fetch worker."""
 
+    with response_admission_scope(request_options.get("_native_admission")):
+        return _fetch_and_prepare_response(spec=spec, source_adapter=source_adapter,
+            ledger_request=ledger_request, request_index=request_index, request_options=request_options,
+            max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds, cancel_requested=cancel_requested)
+
+
+def _fetch_and_prepare_response(*, spec, source_adapter, ledger_request, request_index,
+                              request_options, max_retries, retry_backoff_seconds, cancel_requested):
+
     request = ledger_request.params
     started = time.perf_counter()
     request_options = {**spec.request_options, **request_options}
@@ -1439,50 +1514,51 @@ def _fetch_and_prepare_request(
         retry_backoff_seconds=retry_backoff_seconds,
         cancel_requested=cancel_requested,
     )
-    if not _bound_pages(pages, request_options, request_index, request) or any(
-        page.status != "success" for page in pages
-    ):
+    with response_admission():
+        if not _bound_pages(pages, request_options, request_index, request) or any(
+            page.status != "success" for page in pages
+        ):
+            return PreparedFetch(
+                tuple(pages),
+                None,
+                buffer_limit_exceeded=any(page.buffer_limit_exceeded for page in pages),
+                prepare_seconds=max(0.0, time.perf_counter() - started - sum(
+                    page.provider_seconds + page.limiter_wait_seconds + page.retry_wait_seconds for page in pages)),
+            )
+        frames = [
+            page.frame for page in pages if page.frame is not None and page.frame.height
+        ]
+        frame = (
+            pl.DataFrame()
+            if not frames
+            else frames[0]
+            if len(frames) == 1
+            else concat_compatible_frames(frames)
+        )
+        if ledger_request.request_kind == "initial_full_scan":
+            policy = request_options["initialization_scan"]
+            if frame.is_empty() and policy.get("require_nonempty", False):
+                return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
+                                     "initialization_scan returned no data for the complete parameter inventory")
+            if frame.height:
+                time_column = _source_column(spec, "time")
+                if time_column not in frame.columns:
+                    return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
+                                         f"response missing source date column: {time_column}")
+                selected_dates = [_date_value(scope.scope_key) for scope in ledger_request.daily_scopes]
+                frame = frame.filter(_date_expr(time_column).is_in(selected_dates))
+        allow_all_null_payload = request_options.get("allow_all_null_payload", False)
+        if not isinstance(allow_all_null_payload, bool):
+            raise ValueError("source_options.allow_all_null_payload must be boolean")
+        validation_error = _validate_response(spec, ledger_request, frame,
+                                              allow_all_null_payload=allow_all_null_payload)
         return PreparedFetch(
-            tuple(pages),
-            None,
-            buffer_limit_exceeded=any(page.buffer_limit_exceeded for page in pages),
+            tuple(replace(page, frame=None) for page in pages),
+            frame,
+            validation_error,
             prepare_seconds=max(0.0, time.perf_counter() - started - sum(
                 page.provider_seconds + page.limiter_wait_seconds + page.retry_wait_seconds for page in pages)),
         )
-    frames = [
-        page.frame for page in pages if page.frame is not None and page.frame.height
-    ]
-    frame = (
-        pl.DataFrame()
-        if not frames
-        else frames[0]
-        if len(frames) == 1
-        else concat_compatible_frames(frames)
-    )
-    if ledger_request.request_kind == "initial_full_scan":
-        policy = request_options["initialization_scan"]
-        if frame.is_empty() and policy.get("require_nonempty", False):
-            return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
-                                 "initialization_scan returned no data for the complete parameter inventory")
-        if frame.height:
-            time_column = _source_column(spec, "time")
-            if time_column not in frame.columns:
-                return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
-                                     f"response missing source date column: {time_column}")
-            selected_dates = [_date_value(scope.scope_key) for scope in ledger_request.daily_scopes]
-            frame = frame.filter(_date_expr(time_column).is_in(selected_dates))
-    allow_all_null_payload = request_options.get("allow_all_null_payload", False)
-    if not isinstance(allow_all_null_payload, bool):
-        raise ValueError("source_options.allow_all_null_payload must be boolean")
-    validation_error = _validate_response(spec, ledger_request, frame,
-                                          allow_all_null_payload=allow_all_null_payload)
-    return PreparedFetch(
-        tuple(replace(page, frame=None) for page in pages),
-        frame,
-        validation_error,
-        prepare_seconds=max(0.0, time.perf_counter() - started - sum(
-            page.provider_seconds + page.limiter_wait_seconds + page.retry_wait_seconds for page in pages)),
-    )
 
 
 def _notify_page(options: dict[str, Any], page: FetchPage) -> None:
@@ -1638,7 +1714,8 @@ def _fetch_offset_pages(
         if page.frame is not None and page.row_count:
             from bagelquant_data.core.hashing import frame_content_hash
 
-            digest = frame_content_hash(page.frame)
+            with response_admission():
+                digest = frame_content_hash(page.frame)
             if digest in seen_pages:
                 pages.append(
                     _invalid_pagination_page(

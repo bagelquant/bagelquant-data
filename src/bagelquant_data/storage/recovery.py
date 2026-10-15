@@ -101,7 +101,8 @@ def _registered(data_meta: DataMetaStore, partition: str, seq: int, digest: str)
 
 def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
                check_canceled: Callable[[], None] | None = None, verify: bool = False,
-               observation_start: date | None = None, observation_end: date | None = None) -> pl.DataFrame:
+               observation_start: date | None = None, observation_end: date | None = None,
+               max_buffer_bytes: int | None = None) -> pl.DataFrame:
     """Consume exact original Parquet; explicit audit verifies every original byte."""
     row,path = _registered(data_meta,partition,seq,digest)
     if check_canceled is not None:
@@ -110,7 +111,7 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
         raise RuntimeError(f"Original Parquet segment {seq} checksum mismatch; restore a trusted backup")
     schema = pl.Schema(pa.ipc.read_schema(pa.BufferReader(row["schema_ipc"])))
     bounded = "source_time" in schema and (observation_start is not None or observation_end is not None)
-    if bounded:
+    if bounded or max_buffer_bytes is not None:
         # Validate the complete original's physical authority before selecting
         # observations. Its footer row count is not the selected row count.
         with pq.ParquetFile(path) as reader:
@@ -121,7 +122,16 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
             scan = scan.filter(pl.col("source_time") >= observation_start)
         if observation_end is not None:
             scan = scan.filter(pl.col("source_time") <= observation_end)
+        if max_buffer_bytes is not None:
+            # Bound allocation before collection. Variable-width values are
+            # checked again below; this reserve includes temporary key strings.
+            row_reserve = 96 + sum(16 if dtype.is_numeric() or dtype.is_temporal() or dtype == pl.Boolean
+                else 128 if dtype == pl.String else 256 for dtype in schema.values())
+            row_limit = max(1, max_buffer_bytes // row_reserve)
+            scan = scan.limit(row_limit + 1)
         frame = scan.collect()
+        if max_buffer_bytes is not None and (frame.height > row_limit or frame.estimated_size() > max_buffer_bytes):
+            raise MemoryError("Original input state exceeds max_buffer_bytes; use a smaller observation window or larger explicit budget")
     else:
         frame = pl.read_parquet(path, hive_partitioning=False)
     if frame.schema != schema or not bounded and frame.height != row["row_count"]:

@@ -178,6 +178,60 @@ availability boundary, not the earlier observation date. Unknown or full-history
 Completed-range authority and pending visibility publish with the success flag;
 row-only ingestion cannot create a complete-range certificate.
 
+Same-date initialization uses the existing Item initialization/build ledger with
+one pinned original Source, definition and immutable runtime causal policy.
+Private unit certificates use `unit_success` and never publish a node flag or
+appear as a public whole-range completion. Only the final successful whole
+request publishes that authority; cancelled/failed runs retain their committed
+units and original Source. Resume subtracts completed observation ranges before
+choosing future windows, so different resource/window settings do not rerun
+certified history. Reuse checks later same-Item commits, visibility events and
+verified empty-range checks against the unit's original output bounds. Unknown
+or overlapping output authority requeues the range; disjoint units remain reusable.
+Repeat that metadata check at final publication under the writer/transaction
+fence. A Source changed during the operation or pause retains its
+historical result but cannot publish a current-input flag. No new storage schema
+or Workbench lifecycle is introduced.
+
+`items.initialize_many` interleaves independent ready Items by bounded observation
+window; `initialize` delegates. Same-date/no-positive-history producers and native
+pointwise transforms are eligible. Default units stop at month boundaries;
+metadata-admitted tiny whole ranges can coalesce without bypassing numerical
+byte checks. Explicit smaller windows stay bounded, and oversized units may split
+further under caller admission. Proven baseline publication uses its byte target
+without requiring an optional row-count cap; retain individual row timing and
+chronological verified rechecks. Unsupported producers retain their whole input
+contract and must fit the explicit buffer. Windowing keeps the original
+information cutoff, all causal revision boundaries, withdrawals and pending
+visibility. Item dependencies must complete before a ready group is admitted.
+`items.update_many` uses the same ordinary causal per-Item update path with shared
+bounded preparation, never a second incremental planner or completion authority.
+One coordinator metadata connection can serve the ready update group without
+retaining a transaction or snapshot across Items. Only the outermost `connect`
+owns commit/rollback; nested helpers cannot commit an enclosing transaction.
+An atomic publication fence may borrow an idle session connection, while active
+transaction nesting and read-view upgrades remain rejected. Release every
+transaction promptly so later reads observe other writers' committed changes.
+
+Logical Raw field selections remain in each original Source. Original aliases
+with identical immutable header, physical request/window and cutoff can share
+temporary keys/visibility frames in a disposable byte-bounded preparation context;
+no persistent body, row index, proof authority or global cache is created. The
+cache is charged inside the caller buffer and expires after its admitted window
+(or bounded update operation). Unrelated global counters cannot alter that bound
+alias authority. Declared payload projections occur only after complete General
+snapshot resolution. Original overcaptured native requests may narrow to their
+unchanged declared fields without rewriting receipts or running history; ordinary
+timing/baseline/change proofs remain required. Selected-field skip authority
+requires registered unchanged value/timing and known nonbaseline evidence.
+
+Read admission uses original footer/schema metadata and a pre-collection row cap
+with post-collection byte validation. It must not collect unsupported full history
+and only then reject the caller budget. Native admission is an execution-only
+caller context-manager callback; external producers default to mixed/exclusive
+work. With that callback, mixed revision evaluations remain serial to avoid
+cross-thread nested exclusive acquisition. Data never derives hardware policy.
+
 ## PIT and typed consumption
 
 Observation date, availability date, ingestion/version identity, content commit

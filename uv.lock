@@ -20,7 +20,7 @@ dependencies = [
 [package.optional-dependencies]
 tushare = [
     { name = "pandas" },
-    { name = "tushare" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -37,7 +37,7 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'tushare'", specifier = ">=3.0.0" },
     { name = "polars", specifier = ">=1.35.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },
-    { name = "tushare", marker = "extra == 'tushare'", specifier = ">=1.4.21" },
+    { name = "requests", marker = "extra == 'tushare'", specifier = ">=2.32,<3" },
 ]
 provides-extras = ["tushare"]
 
@@ -48,31 +48,6 @@ dev = [
     { name = "pyright", specifier = ">=1.1.410" },
     { name = "pytest", specifier = ">=9.0.0" },
     { name = "ruff", specifier = ">=0.14.0" },
-]
-
-[[package]]
-name = "beautifulsoup4"
-version = "4.14.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "soupsieve" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c3/b0/1c6a16426d389813b48d95e26898aff79abbde42ad353958ad95cc8c9b21/beautifulsoup4-4.14.3.tar.gz", hash = "sha256:6292b1c5186d356bba669ef9f7f051757099565ad9ada5dd630bd9de5fa7fb86", size = 627737, upload-time = "2025-11-30T15:08:26.084Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1a/39/47f9197bdd44df24d67ac8893641e16f386c984a0619ef2ee4c51fbbc019/beautifulsoup4-4.14.3-py3-none-any.whl", hash = "sha256:0918bfe44902e6ad8d57732ba310582e98da931428d231a5ecb9e7c703a735bb", size = 107721, upload-time = "2025-11-30T15:08:24.087Z" },
-]
-
-[[package]]
-name = "bs4"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "beautifulsoup4" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/aa/4acaf814ff901145da37332e05bb510452ebed97bc9602695059dd46ef39/bs4-0.0.2.tar.gz", hash = "sha256:a48685c58f50fe127722417bae83fe6badf500d54b55f7e39ffe43b798653925", size = 698, upload-time = "2024-01-17T18:15:47.371Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/bb/bf7aab772a159614954d84aa832c129624ba6c32faa559dfb200a534e50b/bs4-0.0.2-py2.py3-none-any.whl", hash = "sha256:abf8742c0805ef7f662dce4b51cca104cffe52b835238afc169142ab9b3fbccc", size = 1189, upload-time = "2024-01-17T18:15:48.613Z" },
 ]
 
 [[package]]
@@ -146,16 +121,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
-]
-
-[[package]]
-name = "lxml"
-version = "6.1.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/05/3b/aab6728cae887456f409b4d75e8a01856e4f04bd510de38052a47768b680/lxml-6.1.1.tar.gz", hash = "sha256:ba96ae44888e0185281e937633a743ea90d5a196c6000f82565ebb0580012d40", size = 4197430, upload-time = "2026-05-18T19:19:06.424Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a5/eb/7e6f37c5584ccbb2ff267f56fd0339016938c1c8684cfefab9b33ffc2f36/lxml-6.1.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:68a9198d0fc122d14bb76837de9aa80cf84caed990b5b237f532ed87d3706736", size = 8559780, upload-time = "2026-05-18T19:17:57.661Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/36/587c2521cf23a2cd6c9c22108aa7528f683a1f195ed7ccd23a4b1786ad36/lxml-6.1.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:7d47866cb32fb503450b6edc9df355d10dc49836af2e89901bd6ac6b0896d9d9", size = 4618006, upload-time = "2026-05-18T19:18:04.452Z" },
 ]
 
 [[package]]
@@ -373,60 +338,12 @@ wheels = [
 ]
 
 [[package]]
-name = "simplejson"
-version = "4.1.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/0e/2a/54837395a3487c725669428d513293612a48d82b95a0642c936932e5d898/simplejson-4.1.1.tar.gz", hash = "sha256:c08eb9f7a90f77ae470e19a07472e9a79ebc0d1c2315d86a72767665bd5ba79f", size = 118860, upload-time = "2026-04-24T19:24:59.819Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/37/a9/47b445eeb559c9593453a0648e0fd6d08e8adff64dd5e5ced66726da8a09/simplejson-4.1.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:dff52fc7af272e84fc21cc5a06c927c823ca6ae00af14f3b0d7707b42775ed98", size = 113160, upload-time = "2026-04-24T19:23:26.033Z" },
-    { url = "https://files.pythonhosted.org/packages/4c/65/cb72db31523c164dea5dc55b02dad065a40c478856bc7534b279d2b51906/simplejson-4.1.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:971aed0647ad6e840a3943bec812fcda5f2d26a5497a4981d1fb49aa4f9a396c", size = 91521, upload-time = "2026-04-24T19:23:27.572Z" },
-    { url = "https://files.pythonhosted.org/packages/9a/e5/54cb7c50ad5fdc1e0a86b7df4b135c2cbd5c4623605aa94466659098e8da/simplejson-4.1.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:249e2e220aa6d9b9d936bde84eb7bf79d5b6c5a8273c6e411f8b1635a9073f2d", size = 91407, upload-time = "2026-04-24T19:23:28.991Z" },
-    { url = "https://files.pythonhosted.org/packages/ce/6a/8b74c52ffd33dbbde00fe7251fee6a0acdc8cea33f7a43805aed258fb79b/simplejson-4.1.1-py3-none-any.whl", hash = "sha256:2ce92b3748f02423e26d2bfb636fb9d7a8f67c8f5854dcae69d350d123b2eee2", size = 69195, upload-time = "2026-04-24T19:24:57.962Z" },
-]
-
-[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
-]
-
-[[package]]
-name = "soupsieve"
-version = "2.8.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/47/2c/0a5f6f8ee0d5589e48c7640213ed5175d52cf540a06725b628cc1a45d6ce/soupsieve-2.8.4.tar.gz", hash = "sha256:e121fd02e975c695e4e9e8774a5ee35d74714b59307868dcc5319ad2d9e3328e", size = 121110, upload-time = "2026-05-24T13:55:57.154Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/f5/0c41cb68dcae6b7de4fac4188a3a9589e21fb31df21ea3a2e888db95e6c9/soupsieve-2.8.4-py3-none-any.whl", hash = "sha256:e7e6b0769c8f51ed59acab6e994b00621096cfb1c640a7509295987388fbaf65", size = 37304, upload-time = "2026-05-24T13:55:55.406Z" },
-]
-
-[[package]]
-name = "tqdm"
-version = "4.67.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
-]
-
-[[package]]
-name = "tushare"
-version = "1.4.29"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "bs4" },
-    { name = "lxml" },
-    { name = "pandas" },
-    { name = "requests" },
-    { name = "simplejson" },
-    { name = "tqdm" },
-    { name = "websocket-client" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/91/a4/5ce99585209410463e4b203d13c73d356c6ac92daea48af182932af7cb61/tushare-1.4.29.tar.gz", hash = "sha256:f578fb778868c0b744ac9173a837b695fd82e8d1b1e0d39c1f882b0e4fef7ecb", size = 128623, upload-time = "2026-03-25T06:33:44.722Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/3e/d426a56e5feac9b0aaada1c6b0745ed03422d4a713295e0bbb44c8ea86fe/tushare-1.4.29-py3-none-any.whl", hash = "sha256:82554af953ea5ac3d8771d42330493181031c7e68dccce03a491c7356e9ba4b2", size = 142920, upload-time = "2026-03-25T06:33:43.111Z" },
 ]
 
 [[package]]
@@ -460,13 +377,4 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e1/0d/4e93c8e6d1001a75763f87d8f5ecda8ebc7f4aa2153dddfaf4ae8892821a/virtualenv-21.4.2.tar.gz", hash = "sha256:38e6ee0a555615c0ea9da2ac7e9998fe8dc3b911dd33ad8eaad2020957653b0c", size = 7613326, upload-time = "2026-05-31T17:01:22.827Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bf/c4/557dc082be035381b85fdb2b74e21d3d21b57750b74f2b47a32f3a639ff9/virtualenv-21.4.2-py3-none-any.whl", hash = "sha256:854210ca524a1a4d0d744734f4acbc721c3ffe163b85bbf5d56d14d5ae2f0fae", size = 7594079, upload-time = "2026-05-31T17:01:20.735Z" },
-]
-
-[[package]]
-name = "websocket-client"
-version = "1.9.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz", hash = "sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98", size = 70576, upload-time = "2025-10-07T21:16:36.495Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl", hash = "sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef", size = 82616, upload-time = "2025-10-07T21:16:34.951Z" },
 ]

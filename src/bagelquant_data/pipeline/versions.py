@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -181,6 +181,7 @@ def commit_versions(
     partition_workers: int = 1,
     input_receipt_id: str | None = None,
     _on_unchanged_check: Callable | None = None,
+    _on_wait: Callable[[], None] | None = None,
 ):
     from bagelquant_data.pipeline.commit import CommitResult
 
@@ -471,6 +472,7 @@ def commit_versions(
     pending = iter(groups.items())
     bytes_read = 0
     peak_partition_in_flight = 0
+    callback_failure = None
     try:
         while True:
             # Bound both queued tasks and concurrent old+delta partition frames.
@@ -500,6 +502,16 @@ def commit_versions(
             # must never republish a partition after its rollback.
             for task in tasks:
                 try:
+                    if writer_executor and _on_wait is not None:
+                        while not task.done():
+                            if callback_failure is None:
+                                try:
+                                    _on_wait()
+                                except BaseException as error:
+                                    # Drain and retain every successful writer
+                                    # before rolling the publication back.
+                                    callback_failure = error
+                            wait((task,), timeout=0.05)
                     write, batch, schema, read_bytes = (
                         task.result() if writer_executor else task
                     )
@@ -510,6 +522,8 @@ def commit_versions(
                 except BaseException as error:
                     if failure is None:
                         failure = error
+            if failure is None and callback_failure is not None:
+                failure = callback_failure
             if failure is not None:
                 raise failure
         canonical = compatible_schema(schemas)

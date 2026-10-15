@@ -132,8 +132,8 @@ class TushareSource:
             return self._provided_client
         client = getattr(self._clients, "client", None)
         if client is None:
-            # Tushare configures its token through module-global state while a
-            # client is created, so serialize initialization but not requests.
+            # Token replacement and thread-local Session construction share a
+            # short fence; requests retain independent thread-owned sessions.
             with self._client_lock:
                 client = build_client(self._token)
                 self._clients.client = client
@@ -171,4 +171,6 @@ def _from_pandas(value: Any) -> pl.DataFrame:
         raise DataSourceError(
             f"Tushare returned {type(value)!r}, expected pandas.DataFrame"
         )
-    return pl.from_pandas(value)
+    from bagelquant_data.pipeline.native import response_admission
+    with response_admission():
+        return pl.from_pandas(value)

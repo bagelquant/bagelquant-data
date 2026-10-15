@@ -3670,6 +3670,18 @@ class InputsAPI:
             raise KeyError(f"Unknown frozen input alias: {alias}")
         request = frozen.requests[alias] if request is None else request
         evidence = frozen.evidence[alias]
+        # Only exact immutable alias headers can share numerical preparation.
+        # The enclosing receipt/alias name is deliberately not a cache key;
+        # request, checks, schema and original Source are bound by the header.
+        from bagelquant_data.items.preparation import current_preparation
+        prepared = current_preparation(self._store.data_meta_path)
+        preparation_key = None
+        if prepared is not None and isinstance(evidence, immutable_metadata.LazyMetadataMapping):
+            preparation_key = (evidence.reference["ref"], _json(input_payload(request)),
+                frozen.information_cutoff, timing_cutoff)
+            cached = prepared.get(preparation_key)
+            if cached is not None:
+                return cached
         observation_lower = [request.start]
         observation_upper = [request.end]
         if isinstance(request, RawInput):
@@ -3720,10 +3732,17 @@ class InputsAPI:
             options = context.options if context is not None else ExecutionOptions()
             if sum(value["row_count"] for value in selected) * 256 > options.max_buffer_bytes:
                 raise MemoryError("Original indexed window exceeds max_buffer_bytes; use a larger explicit read allocation or a smaller window")
-        pieces = [read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"],
-                            check_canceled=None if context is None else context.check_canceled,
-                            observation_start=observation_start, observation_end=observation_end)
-                  for value in selected]
+        pieces = []
+        retained_bytes = 0
+        for value in selected:
+            piece = read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"],
+                check_canceled=None if context is None else context.check_canceled,
+                observation_start=observation_start, observation_end=observation_end,
+                max_buffer_bytes=None if context is None else max(1, context.options.max_buffer_bytes - retained_bytes))
+            retained_bytes += int(piece.estimated_size())
+            if context is not None and retained_bytes > context.options.max_buffer_bytes:
+                raise MemoryError("Frozen DataItem inputs exceed max_buffer_bytes; use smaller declared input windows")
+            pieces.append(piece)
         if pieces:
             frame = concat_compatible_frames(pieces)
         elif evidence["schema_ipc"]:
@@ -3740,6 +3759,10 @@ class InputsAPI:
                                    max_check_id=frozen.max_check_id,
                                    full_commit_checks=evidence.get("full_commit_checks", ()),event_paths=self._lake._paths,
                                    observation_start=observation_start, observation_end=observation_end).collect()
+        if prepared is not None and preparation_key is not None:
+            prepared.source_rows += sum(piece.height for piece in pieces)
+            prepared.key_rows += sum(piece.height for piece in pieces if "source_time" in piece.columns)
+            prepared.put(preparation_key, frame)
         return frame
 
     def verify(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,

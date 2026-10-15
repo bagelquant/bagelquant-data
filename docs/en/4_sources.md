@@ -20,3 +20,11 @@ Sources support `list/get/register/configure/enable/disable/remove/test`. Removi
 a source with active datasets or categories fails. Registering an adapter is
 local; `test()` and update APIs perform explicit external calls. Tests use fake
 providers and temporary lakes.
+
+Tushare transport uses one thread-owned persistent `requests.Session` per fetch
+thread and the provider's [documented JSON HTTP protocol](https://tushare.pro/document/2?doc_id=40).
+Install `--extra tushare` for pandas and requests. Transport performs no automatic
+retries: Raw owns pacing, attempts, cancellation, pagination and completeness.
+HTTP or invalid-envelope failures cannot certify empty coverage. Injected fake
+clients remain supported for isolated tests. This change has fake-transport
+validation; no live provider validation or measured network speedup is implied.

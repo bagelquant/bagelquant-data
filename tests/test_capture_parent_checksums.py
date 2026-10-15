@@ -37,14 +37,17 @@ def test_guard_own_write_invalidates_parent_checksum(lake_roots, change):
 
 def test_missing_parent_is_not_cached_and_can_become_available(lake_roots):
     lake, roots = lake_roots
+    restored = lake.inputs.freeze(roots[0].requests, information_cutoff="2024-03-02")
+    with lake.inputs._store.connect() as db:
+        original = tuple(db.execute("select * from frozen_inputs where receipt_id=?", (restored.receipt_id,)).fetchone())
+        db.execute("delete from frozen_inputs where receipt_id=?", (restored.receipt_id,))
     with lake.inputs.publication_guard(roots):
         with lake.inputs._store.connect() as db:
             with pytest.raises(RuntimeError, match='missing'):
-                lake.inputs._capture_parent_digest(db, 'new-parent')
+                lake.inputs._capture_parent_digest(db, restored.receipt_id)
             assert not lake.inputs._read_context().capture_parents
-            db.execute('insert into frozen_inputs select ?,payload_json,digest,created_at from frozen_inputs where receipt_id=?',
-                ('new-parent', roots[0].receipt_id))
-            assert lake.inputs._capture_parent_digest(db, 'new-parent') == roots[0].digest
+            db.execute('insert into frozen_inputs values(?,?,?,?)', original)
+            assert lake.inputs._capture_parent_digest(db, restored.receipt_id) == restored.digest
 
 
 def test_changed_budget_does_not_borrow_checksum_memo(lake_roots):

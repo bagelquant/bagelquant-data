@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
@@ -137,6 +138,7 @@ class IngestionPipeline:
         requests: list[dict] | None = None,
         scope_transitions: list[dict] | None = None,
         partition_workers: int = 1,
+        on_wait: Callable[[], None] | None = None,
     ) -> CommitResult:
         """Commit a frame as part of an existing logical run."""
 
@@ -176,4 +178,5 @@ class IngestionPipeline:
             scope_transitions=scope_transitions,
             writer_executor=writer_executor,
             partition_workers=partition_workers,
+            _on_wait=on_wait,
         )

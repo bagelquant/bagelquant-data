@@ -206,6 +206,7 @@ class ItemBuildReport:
     end: date
     dependency_digest: str
     frozen_receipt_id: str | None = None
+    work: Mapping[str, int | float] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

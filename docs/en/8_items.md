@@ -44,6 +44,84 @@ lake.items.initialize("close", end="2020-12-31")
 lake.items.update("close", end="2021-01-15")
 ```
 
+`items.initialize_many(names, start=..., end=..., config=...)` initializes an
+independent ready group, interleaving compatible Items over bounded observation
+windows. `initialize` uses this same coordinator. `ExecutionOptions` defaults to
+31 natural days and stops each fallback unit at a calendar-month boundary.
+When original row counts admit a tiny whole range with a broad reserve, this
+default coalesces it into one unit; ordinary read/output byte checks still apply.
+Smaller `observation_window_days` request explicit windows and can reduce the
+working set. Units that exceed their
+explicit buffer admission split further, down to one date. All assets for a
+date remain together. `observation_window_days=None` requests one admitted range.
+
+Unverified baseline units with independent coordinates are grouped toward a byte
+target even when no row-count cap is supplied. An indivisible row may exceed
+that target inside the enclosing working buffer. Groups retain each row's original
+availability and baseline marker; verified rechecks still publish chronologically.
+
+Windowing applies to a producer declaring `same_date` without positive history,
+or to native pointwise `Select`/`Filter`/`MapValues`/`Cast` transformations.
+Other producers retain their declared whole-range read requirements and must fit
+the caller's buffer budget. A finite-history or as-of producer is never treated
+as same-date merely to reduce memory. Parquet reads apply observation predicates
+and an admission row limit before collection, then check actual frame bytes;
+oversized inputs fail with an actionable `MemoryError` before full-history
+key preparation. These are working-buffer limits, not a process-memory hard cap.
+
+Every Item retains its own field declarations and frozen Source. Compatible
+physical reads share temporary original keys and visibility preparation in an
+operation-local cache, charged at most one quarter of `max_buffer_bytes`. The
+cache binds the immutable alias header, physical scope and information cutoff;
+it is cleared at the end of each window and never becomes stored history or
+proof authority. Producers receive declared payload fields plus causal coordinate
+and version channels. A shared read cannot widen an Item's logical dependency.
+
+The initialization ledger pins its original Source, definition, causal producer
+policy and whole requested bounds. Each window uses that original information
+cutoff and preserves all causal revisions, removals and pending visibility.
+Committed units survive cancellation; resume reuses their exact certificates,
+including when resource settings choose different future window sizes. Unit
+reuse also checks later output commits and visibility evidence: an overlapping
+write at the pinned cutoff requeues the affected range, while disjoint units
+remain reusable. Final publication repeats this check under the writer fence.
+Unit certificates cannot replace a whole-range completion. Only after every unit
+succeeds does one final whole-range record advance completion. A later source
+change does not replace the pinned Source during resume; its historical result
+remains available and receives no current-input flag until an ordinary update
+proves the new input impact. Currentness and original-byte integrity are separate.
+
+`items.update_many(names, end=..., start=..., config=...)` applies the existing
+causal append/repair path to independent ready Items with shared bounded input
+preparation. Complete declared Item dependencies before admitting either batch
+API; an interdependent group is rejected. Completion and failure remain per Item.
+The coordinator reuses one metadata connection across updates; every capture,
+read snapshot and publication transaction retains its own finite fence. Reuse
+holds no operation-long transaction or old metadata snapshot.
+Unchanged initialized calls read metadata only and create no workers or input
+frames. Earlier native receipts that physically overcaptured fields remain
+immutable; an unchanged declaration can narrow that overcapture without numerical
+replay. Registered selected-field value, timing and known-baseline evidence must
+prove an unrelated-column change; unknown timing still follows ordinary planning.
+
+`ItemBuildReport.work` contains execution diagnostics outside numerical identity.
+`windows_built`, `windows_reused`, optional `windows_split`, `build_seconds`,
+`input_seconds`, `producer_seconds`, `publication_seconds`, `producer_calls` and
+`input_rows` describe one Item. Phase times include permit waits and may overlap;
+do not sum them into a critical path. Cache `prepared_hits`, `prepared_misses`,
+`source_rows_read`, `key_rows_prepared` and `prepared_peak_bytes` are totals for
+the entire batch, repeated in each report: do not sum sibling reports. Key rows
+count original by-date rows, excluding separate visibility-event key work.
+
+`ExecutionOptions.native_admission` accepts a caller-owned context-manager
+factory for `columnar` or `mixed` work. It is execution-only, omitted from repr
+and comparison, and never changes definitions or receipts. Data does not choose
+machine-wide limits. External producers default to `native_kind="mixed"` in
+`register_producer`; explicit `native_kind="columnar"` is a caller promise about
+the implementation, separate from its causal policy. Mixed revision evaluations
+are serial when admission is supplied, so an exclusive outer numerical permit
+cannot deadlock waiting for worker-thread reacquisition.
+
 Built-in `Select`, `Filter`, `MapValues`, `Cast`, explicit-key `Join`, and `Align`
 operate on neutral frames. Duplicate output keys fail. Alignment uses caller
 coordinates; missing values stay null. Forward filling requires a finite
