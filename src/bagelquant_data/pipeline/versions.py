@@ -180,6 +180,7 @@ def commit_versions(
     scope_transitions: list[dict] | None = None,
     partition_workers: int = 1,
     input_receipt_id: str | None = None,
+    _on_unchanged_check: Callable | None = None,
 ):
     from bagelquant_data.pipeline.commit import CommitResult
 
@@ -353,14 +354,25 @@ def commit_versions(
             stored_schema = parquet.canonical_schema(spec.source, spec.name)
             canonical = compatible_schema([*([stored_schema] if stored_schema is not None else []), typed.schema])
             empty_schema = partition_write_context(canonical)
-            with parquet.metadata.connect() as db:
-                db.execute("begin immediate")
-                parquet.metadata.assert_dataset_parent(db, spec.source, spec.name, parent, definition_hash, run_id)
-                _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id,content_scopes=content_scopes)
-                parquet.metadata._write_dataset_schema(db, spec.source, spec.name,
-                    empty_schema.schema_ipc, empty_schema.schema_hash, now.isoformat())
-                if scope_transitions:
-                    parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
+            visibility_path = None
+            try:
+                with parquet.metadata.connect() as db:
+                    db.execute("begin immediate")
+                    parquet.metadata.assert_dataset_parent(db, spec.source, spec.name, parent, definition_hash, run_id)
+                    check_id = _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, attestations, input_receipt_id=input_receipt_id,content_scopes=content_scopes)
+                    event = db.execute("select generation_path from visibility_segments where check_id=?", (check_id,)).fetchone()
+                    if event is not None:
+                        visibility_path = root / event[0]
+                    parquet.metadata._write_dataset_schema(db, spec.source, spec.name,
+                        empty_schema.schema_ipc, empty_schema.schema_hash, now.isoformat())
+                    if scope_transitions:
+                        parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
+                    if _on_unchanged_check is not None:
+                        _on_unchanged_check(db, check_id)
+            except BaseException:
+                if visibility_path is not None:
+                    visibility_path.unlink(missing_ok=True)
+                raise
             return CommitResult(0, 0, len({value[:7] for value in source_times}), 0, present_times=source_times)
     else:
         frame = frame.unique(maintain_order=True)
@@ -407,6 +419,8 @@ def commit_versions(
                         parquet.metadata._transition_scopes(db, scope_transitions, run_id=run_id)
                 return CommitResult(0, 0, 1, 0)
         frame = frame.with_columns(pl.lit(available).alias("snapshot_date"))
+    if _on_unchanged_check is not None:
+        raise RuntimeError("Timing attestation cannot publish changed numerical content")
     with parquet.metadata.connect() as db:
         from bagelquant_data.storage.immutable_metadata import encode_requests
         request_record = encode_requests(db, requests or [])
@@ -542,7 +556,7 @@ def _check_evidence(spec, run_id, now, available, baseline, requests, checked_ro
 
 
 def _record_check(db, spec, run_id, now, available, baseline, requests, checked_rows, records=None, *, input_receipt_id=None,content_scopes=()):
-    _insert_version_check(db, **_check_evidence(
+    return _insert_version_check(db, **_check_evidence(
         spec, run_id, now, available, baseline, requests, checked_rows,
         pl.DataFrame() if records is None else records,
         input_receipt_id=input_receipt_id,content_scopes=content_scopes,

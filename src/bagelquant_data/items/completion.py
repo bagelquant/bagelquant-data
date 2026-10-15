@@ -87,6 +87,9 @@ def verified_completion_digest(db, build_id) -> str:
             raise ValueError("unknown completion authority")
         else:
             output_check_bound(db, build_id, authority)
+        if "timing" in authority:
+            from .timing import verify_authority
+            verify_authority(db, original, authority["timing"])
         if "reuse" in authority:
             reuse = authority["reuse"]
             parent = db.execute("select * from item_builds where id=?", (reuse["completed_build"],)).fetchone()
@@ -133,7 +136,8 @@ def pending_dates(db, build_id) -> list[tuple[str, str]]:
     return [tuple(value) for value in payload["coordinates"]]
 
 
-def save_completion(db, build_id, *, pending=(), authority=None, checked_target=None) -> None:
+def save_completion(db, build_id, *, pending=(), authority=None, checked_target=None,
+                    publish_node=True) -> None:
     """Publish original range authority atomically with its pending coordinates."""
     db.execute("create table if not exists item_completion_proofs(build_id integer primary key, digest text not null)")
     original = db.execute("select * from item_builds where id=?", (build_id,)).fetchone()
@@ -157,6 +161,8 @@ def save_completion(db, build_id, *, pending=(), authority=None, checked_target=
     payload = pending_payload
     db.execute("insert into item_pending_outputs values(?,?,?)", (build_id, payload,
         hashlib.sha256(payload.encode()).hexdigest()))
+    if not publish_node:
+        return
     from bagelquant_data.storage.data_meta import DataMetaStore
     # The flag publishes in the same transaction as complete-range authority.
     revision = db.execute("select publication_revision from datasets where source='items' and name=?", (original["name"],)).fetchone()[0]

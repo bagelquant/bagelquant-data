@@ -880,10 +880,16 @@ class ItemAPI:
             "order by end_date desc,id desc limit 1", (name, definition_hash, first.isoformat()))
         completed_through = _date_value(prior_completion[0]["end_date"]) if prior_completion else None
         for action in actions:
-            report = self._build(name, start=_date_value(action["start"]), end=_date_value(action["end"]),
-                initialize=False, config=config, stack=(), progress=progress, cancelled=cancelled,
-                force=force, frozen_receipt=receipt, completed_through=completed_through,
-                frozen_spec=spec, pinned_producer=pinned_producer, pinned_policy=pinned_policy)
+            if action["mode"] == "attest":
+                from .timing import execute
+                previous = prior_completion[0]
+                report = execute(self, previous, self._lake.inputs.get(previous["frozen_receipt_id"]),
+                    receipt, action, policy=pinned_policy, config=config, cancelled=cancelled, progress=progress)
+            else:
+                report = self._build(name, start=_date_value(action["start"]), end=_date_value(action["end"]),
+                    initialize=False, config=config, stack=(), progress=progress, cancelled=cancelled,
+                    force=force, frozen_receipt=receipt, completed_through=completed_through,
+                    frozen_spec=spec, pinned_producer=pinned_producer, pinned_policy=pinned_policy)
             reports.append(report)
             if report.status == "cancelled":
                 return ItemBuildReport(name, "cancelled", sum(value.rows_committed for value in reports),
@@ -955,6 +961,8 @@ class ItemAPI:
                 commit_batch_bytes: int | None = None,
                 cancelled: Callable[[], bool] | None = None,
                 on_commit: Callable[[int, int | None], None] | None = None,
+                on_unchanged_check: Callable[[sqlite3.Connection, int], None] | None = None,
+                check_requests: list[dict] | None = None,
                 _verification: _PublicationVerification | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
         semantic_timing = "version_available_date" in frame.columns if _semantic_timing is None else _semantic_timing
@@ -1095,7 +1103,9 @@ class ItemAPI:
                 preserve_semantic_timing=semantic_timing,
                 historical_baseline=baseline_by_date[publication_date],
                 input_receipt_id=None if receipt is None else receipt.receipt_id,
-                requests=None if _declared_range is None else [{"item_range": {"start": first.isoformat(), "end": last.isoformat()}}],
+                _on_unchanged_check=on_unchanged_check,
+                requests=check_requests if check_requests is not None else
+                    None if _declared_range is None else [{"item_range": {"start": first.isoformat(), "end": last.isoformat()}}],
                 writer_executor=writer_executor if admitted_writers > 1 else None,
                 partition_workers=admitted_writers,
             )
@@ -1124,18 +1134,22 @@ class ItemAPI:
                         commit_batch_rows: int | None = None,
                         commit_batch_bytes: int | None = None,
                         cancelled: Callable[[], bool] | None = None,
-                        on_commit: Callable[[int, int | None], None] | None = None) -> ItemBuildReport:
+                        on_commit: Callable[[int, int | None], None] | None = None,
+                        on_unchanged_check: Callable[[sqlite3.Connection, int], None] | None = None,
+                        available_date: date | None = None,
+                        check_requests: list[dict] | None = None) -> ItemBuildReport:
         """Publish causal output; generated acquisition dates are not value deltas."""
         run_id = uuid4().hex
         with self._store.dataset_writer("items", name, run_id):
-            return self._ingest(name, frame, available_date=None,
+            return self._ingest(name, frame, available_date=available_date,
                 historical_baseline=historical_baseline, ingested_at=None,
                 input_receipt=input_receipt, expected_definition_hash=expected_definition_hash,
                 run_id=run_id, _baseline_proven=True,
                 _semantic_timing=False,
                 writer_executor=writer_executor, partition_workers=partition_workers,
                 writer_buffer_bytes=writer_buffer_bytes, commit_batch_rows=commit_batch_rows,
-                commit_batch_bytes=commit_batch_bytes, cancelled=cancelled, on_commit=on_commit)
+                commit_batch_bytes=commit_batch_bytes, cancelled=cancelled, on_commit=on_commit,
+                on_unchanged_check=on_unchanged_check, check_requests=check_requests)
 
     def replace_range(self, name: str, frame: pl.DataFrame, *, start: DateLike, end: DateLike,
                       available_date: DateLike, input_receipt: FrozenInputReceipt | str | None = None,

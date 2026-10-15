@@ -2034,7 +2034,7 @@ def _insert_version_check(
     input_receipt_id: str | None = None,
     record_schema: bytes | None = None,
     content_scopes_json: str = "[]",
-) -> None:
+) -> int:
     """Record immutable unchanged-content witnesses in the publication transaction."""
     check_id = db.execute(
         "insert into version_checks(source,dataset,run_id,checked_at,pit_date,baseline,visible_commit,request_json,row_count,input_receipt_id,content_scopes_json) "
@@ -2086,6 +2086,7 @@ def _insert_version_check(
         db.execute("insert into visibility_segments values(?,?,?,?,?,?,?)", (check_id, relative,
             _file_hash(paths.dataset_root(source, dataset) / relative), frame.height, str(frame["source_time"].min()), str(frame["source_time"].max()),
             json.dumps(sorted(set(frame["version_commit"].to_list())))))
+    return check_id
 
 
 def _spec_payload(spec: DatasetSpec) -> dict[str, Any]:

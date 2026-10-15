@@ -323,6 +323,15 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                 and not (policy is not None and policy.general_fields)
                 and owner._lake.inputs.is_current(receipt)):
             return []
+        if not windows:
+            from .timing import proof
+            timing = proof(owner, db, previous, receipt, policy=policy, start=start, end=end,
+                commit_bound=commit_bound, check_bound=check_bound)
+            if timing is not None:
+                return [{"mode": "attest", "start": start.isoformat(), "end": through.isoformat(),
+                    "available_date": timing["available_date"]},
+                    *([{"mode": "incremental", "start": (through + timedelta(days=1)).isoformat(),
+                        "end": end.isoformat()}] if end > through else [])]
         calendar: list[date] | None = None
         for alias, request in receipt.requests.items():
             evidence = receipt.evidence[alias]

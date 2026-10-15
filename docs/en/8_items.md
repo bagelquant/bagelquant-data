@@ -357,10 +357,35 @@ also covers repeats within the saved cutoff when they preserve the original firs
 known date; an earlier first-known date remains a historical timing change.
 It is local to that alias; other dependency revisions are planned separately, and
 unrelated missing indexes do not invalidate the calendar proof. First promotion
-still requires current past input evidence, uniform output baseline commits and
-a visible baseline surviving each new timing boundary. Otherwise timing changes
-remain blocked pending an explicit proven refresh. New General contents require
+normally requires current past input evidence, uniform output baseline commits and
+a visible baseline surviving each new timing boundary. When that last baseline
+becomes verified, the narrow saved-value path below handles the timing change.
+Other unproved timing changes remain blocked. New General contents require
 selected-row impact proof when historical output coordinates exist.
+
+For completed native producers whose whole General Raw inputs all declare
+timing neutrality, unchanged selected snapshots and schemas can prove the first
+aggregate baseline-to-verified boundary. With no pending outputs or numerical
+repair, `plan_update` returns an `attest` action with `start`, `end` and
+`available_date`, followed by ordinary append actions. Planning reads metadata
+only, including checks already captured beyond the old information cutoff.
+
+`items.update` reads saved outputs at their original commit/check boundaries in
+monthly units and uses the existing unchanged-content publisher to retain the
+values while recording actual later verification. It does not call the producer
+for historical dates or rewrite numerical bodies. Earlier snapshots and causal
+history retain their original baseline evidence; strict later snapshots can use
+the newly verified values. Each timing check and unit certificate commits in one
+transaction. Retry skips completed units. The prefix is certified only after all
+units succeed; the extended range is certified after its numerical append.
+`recertify` rejects this work because it changes timing and consumes saved values.
+
+Saved-output admission uses original row/schema/file metadata and Parquet footer
+sizes before collection, then checks the collected working set. These are soft
+allocation estimates, including variable-width channels, rather than hard RSS
+bounds. Oversized units fail explicitly without replaying producers; callers may
+retry with a larger admitted buffer. Changed content, undeclared timing effects,
+pending outputs, mixed input kinds and damaged proof remain blocked.
 
 A producer that consumes only specified General columns can declare the
 immutable runtime policy below, without changing its numerical DataItemSpec:

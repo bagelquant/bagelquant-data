@@ -257,6 +257,20 @@ check-scope authorities can rebind equal Item outputs to a new producer Source
 only for complete matching original natural-key sets, without value copies or
 whole-range completion claims.
 
+An unchanged native producer with only whole General Raw inputs, every alias
+timing-neutral, no pending coordinates and no numerical prefix repair may plan
+`attest` at a proven later aggregate baseline-to-verified boundary. Metadata-only
+planning binds the original selected snapshots/schemas and every timing state.
+Execution reuses saved outputs pinned to original output commit/check ceilings;
+historical producers never run. Existing unchanged-check publication atomically
+saves each bounded unit's distinct timing authority, without whole-node flags.
+Validate predecessor, policy, original/current Sources, scope, actual date and
+exact check/range bindings. Certify the full prefix only after all units complete,
+then compute append and certify extended coverage. Retain earlier PIT/strict
+views and all original receipts; reject timing work in record-only recertify.
+Admit saved/comparison buffers from metadata/footer estimates before collection;
+these remain soft allocation estimates. Unsupported impact stays blocked.
+
 Impact queries select compact segment/change metadata explicitly and never read original Parquet values.
 Explicit `items.index_output_reuse` audits later output versions against original
 completed channels and records batch-bound affected dates. Creator-only duplicate
