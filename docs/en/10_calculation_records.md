@@ -6,6 +6,13 @@ checks and range identities use compact SQLite metadata without decoding history
 finite metadata view. Definitions, publication revisions, contiguous coverage,
 unfinished updates and direct dependency state decide readiness.
 
+`items.completion_read_context(names=...)` yields completion flags and keeps
+subsequent metadata reads, including `completed_builds` and nested
+`inputs.read_context(..., verify=False)`, in the same SQLite snapshot. It works
+on a read-only lake and does not block competing Data writers. Later contexts
+observe later commits. Use it for metadata-only readiness planning; consumer
+reference publication uses the writable publication guards described below.
+
 Schema 9 stores each immutable Arrow schema once. Frozen inputs contain thin
 headers and alias-to-Source references; shared metadata blocks retain one frozen
 original segment/check snapshot across receipts. Live projections cannot replace it.
@@ -52,5 +59,7 @@ do not change numerical identity; insufficient admission raises `MemoryError`.
 Missing or damaged originals require a trusted backup.
 
 `items.completion_guard(names=...)` yields the same batch flags under a finite
-Data publication fence. Consumers can publish their own guarded reference CAS
-inside that view. Kernels, providers and Data writes belong outside the guard.
+Data publication fence and requires a writable lake. Consumers can publish
+their own guarded reference CAS inside that view. Kernels, providers and Data
+writes belong outside the guard. `inputs.publication_guard(receipts)` likewise
+requires writable admission and fences Data writers through the consumer CAS.

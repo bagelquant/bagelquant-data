@@ -81,9 +81,16 @@ immutable and retained for frozen replay; queries never adopt loose files.
 
 `raw.completion_statuses` and `items.completion_statuses` batch-read small node
 flags and their dependency metadata in one finite SQLite snapshot.
+`items.completion_read_context(names=...)` shares those flags and subsequent
+metadata reads in one operation-local read-only snapshot. Nested frozen input
+read contexts share it, while competing Data writers may commit. Use this for
+readiness planning; a later context observes later publication. It admits no
+Data writes and does not fence consumer reference publication.
 `items.completion_guard(names=...)` holds the Data publication fence through a
 consumer’s finite reference CAS using those batch flags. It reads no input
 values, freezes no Source and permits no kernels, providers or Data writes.
+This guard requires writable admission; never substitute the read context for
+an actual consumer publication fence.
 The number of queries is fixed; work is proportional to nodes and declared edges, never data
 rows. Each success flag binds definition, covered interval, checked target,
 publication revision, input state, semantic version and result reference.

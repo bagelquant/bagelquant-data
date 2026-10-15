@@ -1636,6 +1636,17 @@ class ItemAPI:
         return self._store.completion_statuses(source="items",datasets=names)
 
     @contextmanager
+    def completion_read_context(self, *, names: tuple[str,...] | list[str] | None = None) -> Iterator[list[dict[str,Any]]]:
+        """Share completion flags and subsequent reads in one metadata snapshot.
+
+        Read-only lakes are supported and competing writers may commit. Nested
+        metadata readers share this view; the next context sees later commits.
+        Consumer reference publication requires the writable completion_guard.
+        """
+        with self._store.read_view():
+            yield self.completion_statuses(names=names)
+
+    @contextmanager
     def completion_guard(self, *, names: tuple[str,...] | list[str] | None = None) -> Iterator[list[dict[str,Any]]]:
         """Fence metadata flags through a finite consumer reference publication.
 
