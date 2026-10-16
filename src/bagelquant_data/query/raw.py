@@ -298,6 +298,13 @@ def _attested_versions(
             for record in record_checks if not record.get("event") and int(record["check_id"]) in eligible
             and (cutoff is None or _date_value(record["available_date"]) <= cutoff)
         ]
+    # The original and witnessed branches consume the same typed natural-key
+    # projection. Share it for this collection so each selected original row is
+    # encoded once, even when many retained witnesses reference the baseline.
+    # Observation predicates were applied before the projection by the caller;
+    # no values or authority survive the LazyFrame collection.
+    if not general and (witnesses or full_commit_checks or any(record.get("event") for record in record_checks)):
+        frame = frame.cache()
     originals = frame.with_columns(pl.lit(None, dtype=pl.Int64).alias("_attestation_id"))
     copies = []
     from bagelquant_data.storage.full_commit_checks import validate_seal
@@ -312,6 +319,15 @@ def _attested_versions(
             pl.lit(False).alias("_baseline"), pl.lit(int(check["id"]), dtype=pl.Int64).alias("_attestation_id")))
     for event in record_checks:
         if not event.get("event") or int(event["check_id"]) not in eligible:
+            continue
+        # A visibility witness can only add copies of observations in its saved
+        # range. Exclude disjoint events before constructing another scan/join
+        # of the selected baseline; monthly timing updates retain many of them.
+        # Unknown bounds still take the complete typed-key consumption path.
+        if (observation_start is not None and event.get("max_observation") is not None
+                and _date_value(event["max_observation"]) < _date_value(observation_start)
+                or observation_end is not None and event.get("min_observation") is not None
+                and _date_value(event["min_observation"]) > _date_value(observation_end)):
             continue
         if event_paths is None:
             raise RuntimeError("Visibility events require their configured original lake")

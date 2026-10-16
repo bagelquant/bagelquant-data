@@ -123,6 +123,12 @@ releasing only that owner's unfinished runs/scopes/leases. Legacy standalone
 leases expose their exact `owner_id` through `active_update_leases`; recovery
 requires external owner/process evidence, not date or heartbeat inference.
 
+Native initialization, bounded units and combined incremental ranges check
+cancellation inside their completion transaction before and after certificate
+publication. Cancellation rolls that transaction back while preserving earlier
+committed rows and completed units; it never reports initialization success or
+certifies an interrupted enclosing range.
+
 Covered ranges must contain the requested start/end. Union overlapping or
 adjacent successful windows only when the earlier publication revision and
 direct dependency state remain current and no unfinished update exists. Changed
@@ -146,6 +152,17 @@ nonempty inventory reopens a latest response that contained empty variants.
 Explicit freshness does not certify original-byte integrity.
 
 ## Range identities and incremental calculation
+
+`items.resume_update(name, build_id=..., start=..., end=...)` is explicit
+original-bound recovery for an interrupted first build of the current numerical
+definition. Bind the original partial publication, frozen Source requests and
+cutoff, and caller-confirmed original bounds. Refuse any completed current
+definition, an unproved success record spanning the whole requested range,
+different partial Sources/bounds, stale inputs or initialization authority.
+Run the existing producer/publication path without certifying partial rows;
+retain all originals. Whole-range completion uses one finite Data writer
+transaction with fresh definition/Source/original-build checks, output/check
+CAS and cancellation checks. Never hold that fence during numerical work.
 
 Frozen receipts pin declarations, typed schema, original segment/visibility
 headers, cutoff, committed/check ceilings and dependency edges. Receipt IDs,
@@ -242,6 +259,8 @@ complete selected event, including a genuinely empty event, not a daily grid.
 Bounded observation reads apply `source_time` predicates to original Parquet
 scans before computing temporary typed natural-key identities. Retained visibility
 events receive the same observation predicates before key encoding and joining.
+Exclude events with registered disjoint observation bounds before constructing
+their scans/joins; missing bounds retain the complete typed consumption path.
 Validate the whole original's physical schema and row count from its Parquet
 footer before bounded consumption; selected row counts are not whole-file counts.
 Keep availability lower bounds after latest-version resolution, preserve the

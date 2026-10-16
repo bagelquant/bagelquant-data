@@ -791,6 +791,95 @@ class ItemAPI:
                 "prepared_peak_bytes": prepared.peak_bytes}
             return {name: replace(report, work={**report.work, **work}) for name, report in result.items()}
 
+    def resume_update(self, name: str, *, build_id: int, start: DateLike, end: DateLike,
+                      config: ExecutionOptions | None = None,
+                      progress: Callable[[ItemBuildReport], None] | None = None,
+                      cancelled: Callable[[], bool] | None = None) -> ItemBuildReport:
+        """Explicitly resume an uncertified first build from its original Source.
+
+        ``build_id`` identifies a retained partial publication, not a completed
+        range. The caller supplies the interrupted request's original bounds;
+        its end must equal the saved immutable Source cutoff. Completed current
+        definitions and ambiguous missing completion authority require ordinary
+        update or explicit completion maintenance instead of historical replay.
+        """
+        self._store.ensure_writable()
+        from bagelquant_data.inputs import current_input_boundary, current_input_check_boundary
+        if (self._lake.inputs._read_context() is not None or self._max_commit is not None
+                or current_input_boundary(self._store.data_meta_path) != (None, None)
+                or current_input_check_boundary(self._store.data_meta_path) is not None):
+            raise ValueError("resume_update requires an unrestricted writer outside an input read context")
+        if isinstance(build_id, bool) or not isinstance(build_id, int) or build_id < 1:
+            raise ValueError("resume_update requires a positive original build_id")
+        first, last = _date_value(start), _date_value(end)
+        if last < first:
+            raise ValueError("end precedes start")
+        spec = self.get(name)
+        definition_hash = _definition_hash(spec)
+        policy = self._policy(spec)
+        self._validate_output_anchors(spec, policy)
+        rows = self._store._rows("select * from item_builds where id=?", (build_id,))
+        if not rows or rows[0]["name"] != name or rows[0]["status"] != "success":
+            raise ValueError("resume_update requires an original partial build of this DataItem")
+        original = rows[0]
+        if original["definition_hash"] != definition_hash:
+            raise ValueError("resume_update cannot cross a numerical definition change")
+        if self._completed_rows("name=? and definition_hash=? and status='success'", (name, definition_hash)):
+            raise ValueError("resume_update cannot replay a completed current definition; use update")
+        partials = self._store._rows("select * from item_builds where name=? and definition_hash=? "
+            "and status='success'", (name, definition_hash))
+        if any(row["start_date"] <= str(first) and row["end_date"] >= str(last) for row in partials):
+            raise ValueError("resume_update cannot resolve missing whole-range completion authority; "
+                "use explicit completion maintenance")
+        if any(row["frozen_receipt_id"] != original["frozen_receipt_id"]
+                or not str(first) <= row["start_date"] <= row["end_date"] <= str(last)
+                for row in partials):
+            raise ValueError("resume_update partial publications differ from the original Source or bounds")
+        initialization = self._store._rows("select * from item_initializations where name=?", (name,))
+        if initialization and (initialization[0]["status"] == "running"
+                or initialization[0]["definition_hash"] == definition_hash):
+            raise ValueError("resume_update cannot replace initialization authority; resume initialize instead")
+        receipt = self._lake.inputs.get(original["frozen_receipt_id"])
+        if (receipt.information_cutoff != last or receipt.max_commit != original["input_commit"]
+                or receipt.dependency_digest != original["dependency_digest"]
+                or dict(receipt.requests) != self._input_requests(spec, None)):
+            raise ValueError("resume_update original frozen Source or cutoff differs from the request")
+        if not self._lake.inputs.is_current(receipt):
+            raise ValueError("resume_update original frozen Source is stale; resolve changed inputs explicitly")
+        producer = self._producers.get((spec.producer_key, str(spec.producer_revision))) if spec.producer_key else None
+        if spec.producer_key and producer is None:
+            raise ValueError(f"Producer is not registered: {spec.producer_key}@{spec.producer_revision}")
+        recovery_id = uuid4().hex
+        def completion_check(db):
+            if self.get(name) != spec:
+                raise RuntimeError("DataItem definition changed during original-bound recovery")
+            selected = db.execute("select * from item_builds where id=?", (build_id,)).fetchone()
+            if selected is None or dict(selected) != original:
+                raise RuntimeError("Original partial build changed during recovery")
+            if self._completed_rows("name=? and definition_hash=? and status='success'", (name, definition_hash)):
+                raise RuntimeError("Current definition completed during recovery; retry ordinary update")
+            for row in db.execute("select * from item_builds where name=? and definition_hash=? "
+                    "and status='success'", (name, definition_hash)):
+                if (row["frozen_receipt_id"] != receipt.receipt_id
+                        or not str(first) <= row["start_date"] <= row["end_date"] <= str(last)):
+                    raise RuntimeError("Partial publication Source or bounds changed during recovery")
+            if not self._lake.inputs.is_current(receipt):
+                raise RuntimeError("Original frozen Source changed during recovery")
+            lease = db.execute("select run_id from update_leases where source='items' and dataset=?", (name,)).fetchone()
+            if lease is None or lease[0] != recovery_id:
+                raise RuntimeError("Original-bound recovery no longer owns its DataItem writer lease")
+        try:
+            with self._store.dataset_writer("items", name, recovery_id):
+                with self._store.connect() as db:
+                    completion_check(db)
+                return self._build(name, start=first, end=last, initialize=False, config=config, stack=(),
+                    progress=progress, cancelled=cancelled, frozen_receipt=receipt, frozen_spec=spec,
+                    pinned_producer=producer, pinned_policy=policy, completion_check=completion_check,
+                    writer_run_id=recovery_id)
+        except CancelledError:
+            return ItemBuildReport(name, "cancelled", 0, original["result_commit"], receipt.max_commit,
+                first, last, receipt.dependency_digest, receipt.receipt_id)
+
     def _incremental_update(self, name: str, *, first: date, last: date,
                             config: ExecutionOptions | None,
                             progress: Callable[[ItemBuildReport], None] | None,
@@ -955,6 +1044,8 @@ class ItemAPI:
                 receipt.dependency_digest, receipt.receipt_id)
         with self._store.connect() as db:
             db.execute("begin immediate")
+            if cancelled and cancelled():
+                raise CancelledError("DataItem completed-range publication cancelled")
             current = db.execute("select spec_hash from item_definitions where name=?", (name,)).fetchone()
             if current is None or current[0] != definition_hash:
                 raise RuntimeError("DataItem definition changed before completed-range publication")
@@ -982,6 +1073,8 @@ class ItemAPI:
                 if unit is not None:
                     pending.extend(pending_dates(db, unit[0]))
             _save_completion(db, cursor.lastrowid, pending=pending)
+            if cancelled and cancelled():
+                raise CancelledError("DataItem completed-range publication cancelled")
         return ItemBuildReport(name, "success", sum(value.rows_committed for value in reports), result_commit,
             receipt.max_commit, reports[0].start, reports[-1].end, receipt.dependency_digest, receipt.receipt_id,
             {metric: sum(value.work.get(metric, 0) for value in reports)
@@ -1809,6 +1902,7 @@ class ItemAPI:
                pinned_producer: Producer | None = None,
                pinned_policy: ProducerUpdatePolicy | None = None,
                publish_completion: bool = True,
+               completion_check: Callable[[sqlite3.Connection], None] | None = None,
                writer_run_id: str | None = None) -> ItemBuildReport:
         self._store.ensure_writable()
         if end < start:
@@ -2028,14 +2122,24 @@ class ItemAPI:
 
         committed_rows = 0
         result_commit: int | None = None
+        def output_fence():
+            with self._store.connect() as db:
+                return (db.execute("select coalesce(max(seq),0) from version_commits where source='items' "
+                    "and dataset=? and status='committed'", (name,)).fetchone()[0],
+                    db.execute("select coalesce(max(id),0) from version_checks where source='items' "
+                    "and dataset=?", (name,)).fetchone()[0])
+        expected_output = output_fence() if completion_check is not None else None
 
         def publish_group(frame, baseline, *, executor, writer_buffer=0,
                           publication_bytes=None):
             before = committed_rows
             def published(rows, commit):
-                nonlocal committed_rows, result_commit
+                nonlocal committed_rows, result_commit, expected_output
                 committed_rows = before + rows
                 result_commit = commit
+                if completion_check is not None:
+                    # Called while this publication still owns its dataset lease.
+                    expected_output = output_fence()
                 if progress:
                     progress(ItemBuildReport(name, "running", committed_rows, result_commit, max_commit,
                         start, end, dependency_digest, receipt.receipt_id))
@@ -2114,10 +2218,24 @@ class ItemAPI:
                         except CancelledError:
                             return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
                                 max_commit, start, end, dependency_digest, receipt.receipt_id)
-        with self._store.connect() as db:
-            db.execute("begin immediate")
-            cursor = db.execute("insert into item_builds(name,definition_hash,dependency_digest,start_date,end_date,input_commit,result_commit,status,created_at,frozen_receipt_id) values(?,?,?,?,?,?,?,?,?,?)", (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat(), max_commit, result_commit, "success" if publish_completion else "unit_success", datetime.now(UTC).isoformat(), receipt.receipt_id))
-            _save_completion(db, cursor.lastrowid, pending=pending_output, publish_node=publish_completion)
+        completion_context = self._store.atomic_transaction() if completion_check is not None else self._store.connect()
+        try:
+            with completion_context as db:
+                if completion_check is None:
+                    db.execute("begin immediate")
+                if cancelled and cancelled():
+                    raise CancelledError("DataItem completion cancelled")
+                if completion_check is not None:
+                    if output_fence() != expected_output:
+                        raise RuntimeError("DataItem output changed before recovery completion")
+                    completion_check(db)
+                cursor = db.execute("insert into item_builds(name,definition_hash,dependency_digest,start_date,end_date,input_commit,result_commit,status,created_at,frozen_receipt_id) values(?,?,?,?,?,?,?,?,?,?)", (name, definition_hash, dependency_digest, start.isoformat(), end.isoformat(), max_commit, result_commit, "success" if publish_completion else "unit_success", datetime.now(UTC).isoformat(), receipt.receipt_id))
+                _save_completion(db, cursor.lastrowid, pending=pending_output, publish_node=publish_completion)
+                if cancelled and cancelled():
+                    raise CancelledError("DataItem completion cancelled")
+        except CancelledError:
+            return ItemBuildReport(name, "cancelled", committed_rows, result_commit,
+                max_commit, start, end, dependency_digest, receipt.receipt_id)
         return ItemBuildReport(name, "success", committed_rows, result_commit, max_commit, start, end, dependency_digest, receipt.receipt_id, work)
 
     def _input_requests(self, spec: DataItemSpec,

@@ -12,12 +12,13 @@ from bagelquant_data.items import timing
 
 
 class Fixture:
-    def __init__(self, root, *, empty=False, calendar_known=None, category="one"):
-        self.first, self.previous, self.known = date(2020, 1, 29), date(2020, 2, 1), date(2020, 2, 2)
+    def __init__(self, root, *, empty=False, calendar_known=None, category="one", first=date(2020, 1, 29)):
+        self.first, self.previous, self.known = first, date(2020, 2, 1), date(2020, 2, 2)
         self.lake = DataLake.open(data_meta_path=root / "meta.sqlite", lake_path=root / "lake")
         self.calls = []
         self.fail_tail = False
-        self.calendar = pl.DataFrame({"time": [self.first + timedelta(days=i) for i in range(5)], "is_open": [1]*5})
+        days = (self.known - self.first).days + 1
+        self.calendar = pl.DataFrame({"time": [self.first + timedelta(days=i) for i in range(days)], "is_open": [1]*days})
         self.membership = pl.DataFrame({"asset_id": [] if empty else ["A"], "category": [] if empty else [category]},
             schema={"asset_id": pl.String, "category": pl.String})
         for name, frame in (("calendar", self.calendar), ("membership", self.membership)):
@@ -105,6 +106,24 @@ def test_timing_cancellation_reuses_completed_month_on_retry(tmp_path, monkeypat
     assert f.update().status == "success"
     assert (f.first, date(2020, 1, 31)) not in reads
     assert f.calls == [(f.known, f.known)]
+
+
+def test_many_timing_checkpoints_do_not_reread_completed_visibility_events(tmp_path, monkeypatch):
+    f = Fixture(tmp_path, first=date(2019, 2, 1))
+    scans, completed = [], []
+    scan = pl.scan_parquet
+
+    def tracked(path, **options):
+        if not isinstance(path, list) and ".visibility" in str(path):
+            scans.append(path)
+        return scan(path, **options)
+
+    monkeypatch.setattr(pl, "scan_parquet", tracked)
+    assert f.update(progress=lambda report: completed.append((report.start, report.end))).status == "success"
+    assert scans == []
+    assert f.calls == [(f.known, f.known)]
+    assert len({(first.year, first.month) for first, _ in completed}) == 13
+    assert f.lake.items.read("item", view="snapshot", as_of=f.known, strict=True).collect().height == 367
 
 
 def test_timing_check_and_unit_certificate_roll_back_together(tmp_path, monkeypatch):

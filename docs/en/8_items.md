@@ -16,6 +16,27 @@ Definitions, dependencies and producer revisions persist in the Data SQLite.
 pending-visibility authorities. `builds(name)` also includes ordinary successful
 row ingests and cannot establish completeness. Missing legacy proofs require
 explicit `index_completion` with the original complete producer report.
+
+Native initialization and updates check cancellation before and after saving
+each completion certificate in its metadata transaction. A late cancellation
+rolls back that certificate and reports `cancelled`; committed output rows and
+earlier completed units remain available for retry. Cancellation of the final
+combined range does not discard an already completed append unit.
+
+An interrupted first build of a new numerical definition can leave successful
+row publications without a completed requested range. Explicitly resume that
+attempt with `lake.items.resume_update(name, build_id=original_partial_build_id,
+start=original_start, end=original_end)`. The saved build must bind the current
+definition and its original frozen Source; `end` must equal that Source's
+cutoff. Register the same runtime producer before retrying. Recovery reuses the
+existing producer/publication path and preserves every original file. It never
+promotes partial rows to completion. Completed current definitions, ambiguous
+lost whole-range certificates, stale or different Sources/bounds, and existing
+initialization authority are rejected. A dataset lease excludes competing Item
+publishers; final completion rechecks Source, definition, output/check counters
+and cancellation in one finite writer transaction. Normal update remains the
+path for append, repair and no-op work after successful recovery.
+
 `items.recertify(name, start=..., end=..., update_policy=...)` explicitly updates
 only a proven unchanged completion's source records. It never initializes,
 updates dependencies, reads values or invokes a producer. Recertify dependencies
@@ -458,6 +479,13 @@ transaction. Retry skips completed units. The prefix is certified only after all
 units succeed; the extended range is certified after its numerical append.
 `recertify` rejects this work because it changes timing and consumes saved values.
 
+Bounded reads discard first-visibility events whose registered observation bounds
+are disjoint before opening their Parquet or joining the saved baseline. A monthly
+timing unit therefore does not reread witnesses for previously completed months.
+Unknown bounds retain typed event reads; overlapping events retain their original
+check/commit ceilings, availability dates and natural-key matching. Stored date
+extents alone do not establish completed verification or current dependencies.
+
 Saved-output admission uses original row/schema/file metadata and Parquet footer
 sizes before collection, then checks the collected working set. These are soft
 allocation estimates, including variable-width channels, rather than hard RSS
@@ -603,6 +631,11 @@ Optional exact `index_selection(s)` and small coordinate axes are explicit;
 ordinary identity stays unchanged by preparation. `inputs.verify` audits exact
 original Parquet bytes, typed schema, bounds and summaries with bounded readers.
 Damaged or missing originals require a trusted backup.
+
+A visibility overlay shares its observation-bounded original natural-key
+projection within one collection, so witness branches do not encode original
+rows repeatedly. This temporary sharing expires with the collection and does
+not change typed keys, visibility dates or frozen evidence.
 
 Raw and Item `description` is retained in complete declarations and exports,
 while numerical definition, dependency and range identities exclude it.

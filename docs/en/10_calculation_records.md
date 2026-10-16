@@ -47,7 +47,11 @@ coordinate intersections; exact equality may require explicit selected summaries
 
 `prepare_coordinate_selector` retains only caller-supplied Domain coordinates;
 `prepare_range_selections` registers small metadata summaries and preserves their
-original Source reference. `index_selection(s)` and `prepare_general_projections`
+original Source reference. Each finite group expands parent metadata only for
+its original proof aliases, including when a consumer uses a different alias.
+Unconsumed aliases stay lazy; Source checksum checks, closing descriptor checks
+and transactional publication still apply. This does not replace whole-Source
+currentness or original-byte audits. `index_selection(s)` and `prepare_general_projections`
 explicitly compare admitted original typed selections. Coordinate identities
 require an explicitly prepared small date axis; missing axes return `None`.
 These operations never create historical row indexes.

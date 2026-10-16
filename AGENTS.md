@@ -8,7 +8,7 @@ The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
 Read-only update plans require actual new/affected ranges and record-only prerequisites; `items.recertify` admits only proven no-op reuse without producers; follow update-rule acceptance.
 Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint empty sparse groups share one fenced Source check and atomic completion publication.
 Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
-DataItem updates accept caller-declared input windows pinned in frozen receipts; new scoped freezes preserve late revisions and legacy receipt identity.
+DataItem updates pin caller input windows in frozen receipts, preserving revisions and legacy identity. `items.resume_update` recovers uncertified first builds from original Sources; completed/lost authority blocks.
 Independent ready Item batches share bounded original/key/visibility preparation;
 same-date initialization resumes certified windows under its original Source and
 cutoff, and publishes whole completion only after all windows. Other producer

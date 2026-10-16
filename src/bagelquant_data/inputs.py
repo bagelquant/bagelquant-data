@@ -1858,8 +1858,8 @@ class InputsAPI:
                                  check_canceled: Callable[[],None] = lambda: None) -> tuple[dict[str,Any],...]:
         """Save compact metadata range summaries during explicit Snapshot preparation.
 
-        The writer retains only immutable parent-ID tuples from each verified
-        proof Source for this operation; entry and closing checks remain fresh.
+        The writer retains immutable parent-ID tuples only for consumed aliases
+        in each verified proof Source; entry and closing checks remain fresh.
         """
         from bagelquant_data import input_index
         self._store.ensure_writable()
@@ -1867,6 +1867,10 @@ class InputsAPI:
             raise RuntimeError("Range summary publication requires an independent writer")
         frozen = self.get(receipt)
         descriptors = self.selection_descriptors(frozen,scopes,config=config,check_canceled=check_canceled)
+        aliases_by_source: dict[tuple[str, str], set[str]] = {}
+        for descriptor in descriptors:
+            source = descriptor["proof_source"]
+            aliases_by_source.setdefault((source["id"], source["digest"]), set()).add(source["alias"])
         with self._store.connect() as db:
             db.execute("begin immediate")
             parents_by_source: dict[tuple[str, str], Mapping[str, tuple[str, ...]]] = {}
@@ -1879,13 +1883,13 @@ class InputsAPI:
                     if authority.digest != source["digest"]:
                         raise RuntimeError("Frozen input receipt checksum mismatch")
                     parents_by_source[source_key] = MappingProxyType({
-                        alias: tuple(sorted(evidence["parent_receipts"]))
-                        for alias, evidence in authority.evidence.items()})
+                        alias: tuple(sorted(authority.evidence[alias]["parent_receipts"]))
+                        for alias in sorted(aliases_by_source[source_key])})
                     del authority
                 input_index.save_projection(db,descriptor["evidence_key"],descriptor["request_key"],
-                    {"kind":"segment_range.v1","identity":descriptor["content_token"],"parents":parents_by_source[source_key][descriptor["alias"]],
-                     "has_rows":descriptor["has_rows"]}, receipt_id=descriptor["proof_source"]["id"],
-                    receipt_digest=descriptor["proof_source"]["digest"],alias=descriptor["alias"])
+                    {"kind":"segment_range.v1","identity":descriptor["content_token"],"parents":parents_by_source[source_key][source["alias"]],
+                     "has_rows":descriptor["has_rows"]}, receipt_id=source["id"],
+                    receipt_digest=source["digest"],alias=source["alias"])
         # Return the same public descriptor shape as future metadata reads.
         return self.selection_descriptors(frozen,scopes,config=config,check_canceled=check_canceled)
 
