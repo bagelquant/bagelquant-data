@@ -169,6 +169,19 @@ independent copy for isolated work without scanning all historical proof bytes.
 Its report explicitly returns `valid=None`, `verification="unverified"` and
 `generation_count`; it is not a verified archival backup. Verify the required
 original frozen input receipts in the copied lake before computation.
+`generation_count` counts manifest generations as before. `immutable_file_count`
+counts all independently copied registered files, including committed historical
+segments outside the manifest and visibility events; `visibility_count` counts
+the visibility subset. Both snapshot and verified backup derive that complete
+inventory from copied metadata, reject missing or escaping references, and ignore
+unregistered loose files. Verified backup audits all committed originals and
+registered visibility events, including those without retained frozen Sources.
+
+Empty scalar Item ranges use the same canonical empty proof in ordinary
+planning and full verification. Their metadata summaries retain the original
+Source dependencies. Verification still checks every retained original byte and
+captured bound, including files outside the empty selected range; a damaged
+original or incorrect summary remains an error.
 
 The snapshot checks source main/WAL/journal signatures around copying and
 rejects active rollback journals. It includes committed WAL evidence without
@@ -180,5 +193,37 @@ receipts and compact headers remain in SQLite. No symlinks/hardlinks connect ori
 Destinations must be new and must not overlap original metadata/sidecars/lake;
 failed-copy cleanup removes only those newly created destinations. `backup` and
 `verify_backup` retain full verification of every retained proof.
+
+Direct `inputs.verify(source)` audits share one finite read-only SQLite snapshot
+while traversing lazy retained evidence. A later direct call rechecks original
+bytes and metadata; successful proofs do not survive the call. Every retained
+full-commit seal is checked, with one shared retained-batch membership set per
+alias rather than rereading that alias's full history for each seal.
+Lazy seal evidence uses the original materialized canonical JSON encoding and
+retains its exact saved digest.
+Full audits reuse one validated selection-set inventory within the unchanged
+read view while checking every member, descriptor and original proof. Public
+keyed reads and later audits prepare fresh inventories; no inventory cache
+survives an audit.
+Empty original audit projections validate key selection and temporal conversion
+without hashing unused virtual record IDs for primitive scalar keys when both
+selection and normalization retain the original row count and nonempty columns. Complex or
+malformed key declarations use the ordinary key derivation path. Captured-bound
+auditing alone may also omit unused IDs for its present date axes when all
+original columns are primitive or temporal and the same key/normalization/shape
+guards pass. Ordinary nonempty projections retain their existing behavior and
+signature. Audits still verify every original byte, full typed Arrow
+structure, schema, row count, bounds and field-change evidence under the same
+cancellation and buffer limits.
+
+Temporary typed-row-v1 hashing reuses lazily encoded String tokens within each
+call. Columns share one conservative reserve of at most 4 MiB, further bounded
+by the selected frame's estimated bytes; a column may use the remaining shared
+reserve. Each cached token debits `512 + 2 * len(encoded_token)` bytes. Exhausted
+or oversized tokens use the same uncached encoder without retaining another
+entry. There is no unique-value scan, cross-call cache, new resource allowance,
+or skipped record-key/content/attestation hash. Token bytes, typed headers,
+temporal precision, null/nonfinite handling and all persisted identities remain
+unchanged. This reserve estimate is not a hard process RSS guarantee.
 
 `raw_categories(source).update(id, name=..., parent_id=...)` and the item category API atomically rename/move a folder. Cycles, cross-provider parents and nonempty deletion are rejected. Classification changes do not alter data paths, versions or receipts.

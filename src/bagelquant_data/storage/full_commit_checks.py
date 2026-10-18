@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 COMPACT_MIN_ROWS = 100_000
@@ -15,7 +15,8 @@ COMPACT_MIN_ROWS = 100_000
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      default=lambda value: dict(value) if isinstance(value, Mapping) else str(value))
+                      default=lambda value: dict(value) if isinstance(value, Mapping) else
+                      list(value) if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) else str(value))
 
 
 def validate_seal(seal: Mapping[str, Any]) -> None:

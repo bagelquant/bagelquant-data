@@ -170,6 +170,22 @@ def project_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: st
                   columns: tuple[str,...], consume: Callable[[pl.DataFrame],None],
                   buffer_bytes: int, check_canceled: Callable[[],None] | None = None) -> None:
     """Explicit audit/projection visits bounded typed chunks of the sole original."""
+    _project_batch(data_meta,partition,seq,digest,columns=columns,consume=consume,
+        buffer_bytes=buffer_bytes,check_canceled=check_canceled)
+
+
+def _project_audit_bounds(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
+                          consume: Callable[[pl.DataFrame],None], buffer_bytes: int,
+                          check_canceled: Callable[[],None] | None = None) -> None:
+    """Project only audit date axes; admitted unused primitive IDs may be omitted."""
+    _project_batch(data_meta,partition,seq,digest,columns=("time","source_time"),consume=consume,
+        buffer_bytes=buffer_bytes,check_canceled=check_canceled,_audit_bounds=True)
+
+
+def _project_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
+                   columns: tuple[str,...], consume: Callable[[pl.DataFrame],None],
+                   buffer_bytes: int, check_canceled: Callable[[],None] | None = None,
+                   _audit_bounds: bool = False) -> None:
     row,path = _registered(data_meta,partition,seq,digest)
     if _file_hash(path,check_canceled) != digest:
         raise RuntimeError(f"Original Parquet segment {seq} checksum mismatch; restore a trusted backup")
@@ -193,7 +209,32 @@ def project_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: st
                 if actual[field] is not None:
                     previous = audited_bounds[field]
                     audited_bounds[field] = actual[field] if previous is None else reduce(previous,actual[field])
-            original = with_record_key(original,keys=expected_bounds["keys"])
+            derive_key = True
+            omit_key = columns == () and "source_time" in original.columns and "_record_id" not in original.columns
+            if (_audit_bounds and columns == ("time","source_time")
+                    and "source_time" in original.columns and "_record_id" not in original.columns
+                    and all(name in original.columns for name in columns)):
+                omit_key = all(_primitive_audit_key(dtype) or dtype.is_temporal()
+                               for dtype in original.schema.values())
+            if omit_key:
+                # Admitted audit projections consume no virtual IDs. Retain
+                # the original key selection/cast validation, then omit row
+                # encoding only where Arrow-valid primitive scalars cannot
+                # fail that encoding. Complex keys keep the original path.
+                from bagelquant_data.pipeline.versions import _payload_expression
+                declared = expected_bounds["keys"]
+                if declared is None or isinstance(declared, list) and all(isinstance(key, str) for key in declared):
+                    keys = original.select(declared or ["source_time", "asset_id"])
+                    if keys.width and keys.height == original.height and all(
+                        _primitive_audit_key(dtype) or dtype.is_temporal() for dtype in keys.schema.values()
+                    ):
+                        normalized = keys.select(_payload_expression(pl.col(name), dtype).alias(name)
+                            for name, dtype in keys.schema.items())
+                        derive_key = not (normalized.width and normalized.height == original.height and all(
+                            _primitive_audit_key(dtype) for dtype in normalized.schema.values()
+                        ))
+            if derive_key:
+                original = with_record_key(original,keys=expected_bounds["keys"])
             if "_payload_hash" in columns and "source_time" in original.columns:
                 from bagelquant_data.pipeline.versions import _payload_hashes, VERSION_FIELDS
                 fields = sorted(set(original.columns)-VERSION_FIELDS-{"time","year","month","_dependency_digest"})
@@ -273,3 +314,7 @@ def with_record_key(frame: pl.DataFrame, *, keys: list[str] | None = None) -> pl
     # producer/query caller selects the exact declared compound key when needed.
     from bagelquant_data.pipeline.versions import _payload_hashes
     return frame.with_columns(_payload_hashes(frame,keys or ["source_time","asset_id"]).rename("_record_id"))
+
+
+def _primitive_audit_key(dtype: pl.DataType) -> bool:
+    return dtype in {pl.Null, pl.Boolean, pl.String, pl.Binary} or dtype.is_integer() or dtype.is_float()

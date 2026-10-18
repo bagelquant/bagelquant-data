@@ -196,7 +196,7 @@ def project_original(store, batch, *, max_bytes, check_canceled=None, values=Fal
 
 def audit_captured_bounds(store, batch, *, max_bytes, check_canceled=None) -> None:
     """Audit immutable receipt bounds against every retained original row."""
-    from bagelquant_data.storage.recovery import project_batch
+    from bagelquant_data.storage.recovery import _project_audit_bounds
     observed: dict[str, str | None] = {key: None for key in ("min_available", "max_available", "min_observation", "max_observation")}
     def consume(frame):
         for axis, lower, upper in (("time", "min_available", "max_available"),
@@ -208,8 +208,8 @@ def audit_captured_bounds(store, batch, *, max_bytes, check_canceled=None) -> No
                     current = str(value)
                     previous = observed[key]
                     observed[key] = current if previous is None else select(previous, current)
-    project_batch(store, batch["partition_path"], batch["commit_seq"], batch["content_hash"],
-        columns=("time", "source_time"), consume=consume, buffer_bytes=max_bytes // 2,
+    _project_audit_bounds(store, batch["partition_path"], batch["commit_seq"], batch["content_hash"],
+        consume=consume, buffer_bytes=max_bytes // 2,
         check_canceled=check_canceled)
     if observed != {key: batch.get(key) for key in observed}:
         raise RuntimeError("Captured batch bounds differ from original evidence")

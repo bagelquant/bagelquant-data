@@ -736,13 +736,20 @@ class InputsAPI:
             config: ExecutionOptions | None = None,
             check_canceled: Callable[[], None] = lambda: None) -> tuple[dict[str, Any], ...]:
         """Read selected descriptor keys; all-key reads are explicit preparation/audit."""
-        header = self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
+        self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
         if isinstance(keys, (str, bytes)):
             raise ValueError("Selection set keys require a finite sequence")
         if keys is not None and not keys:
             return ()
-        header, reader, members, blocks = self._selection_membership(reference, config=config,
+        membership = self._selection_membership(reference, config=config,
             check_canceled=check_canceled)
+        return self._read_selection_members(*membership, keys=keys, config=config,
+            check_canceled=check_canceled)
+
+    def _read_selection_members(self, header, reader, members, blocks, *, keys,
+            config=None, check_canceled=lambda: None):
+        """Read a bounded group through an already validated membership view."""
+        check_canceled()
         with self._store.connect() as db:
             query = "SELECT e.descriptor_key,e.ordinal,e.reference_json,e.block_ref," \
                 "json_extract(b.value,'$.start') AS start,json_extract(b.value,'$.count') AS block_count " \
@@ -758,6 +765,8 @@ class InputsAPI:
                 if len(rows) != len(set(keys)):
                     raise KeyError("Selection set descriptor key is unknown")
         source = self.get(header["source"]["id"])
+        if source.digest != header["source"]["digest"]:
+            raise RuntimeError("Selection set names a different original Source")
         result, charge = [], 0
         options = config or ExecutionOptions()
         for row in rows:
@@ -808,6 +817,14 @@ class InputsAPI:
         # Keep actual original bounds for every segment, so interval tokens never
         # depend on enclosing receipt IDs, global commit/check counters or run IDs.
         batches = _selection_batches(frozen,alias,request,cutoff,fields=fields)
+        if (values_only and fields is None and coordinates is None and coordinate_key is None
+                and isinstance(request, ItemInput) and not batches):
+            # Ordinary scalar planning already uses this canonical empty token.
+            # Metadata range publication retains the whole Source's parent
+            # provenance; its audit must reproduce both channels independently.
+            empty = self._empty_scalar_selection(frozen, alias, request, causal_versions)
+            return {"kind": "segment_range.v1", "identity": empty["identity"],
+                "parents": sorted(evidence["parent_receipts"]), "has_rows": False}
         selected = None
         if evidence["general_snapshots"]:
             selected = _selected_general(frozen,alias,request,cutoff)
@@ -3775,6 +3792,20 @@ class InputsAPI:
                progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         """Raise on lost or corrupt evidence, even after object archival."""
         single = isinstance(receipt, (FrozenInputReceipt, str))
+        if not single and not receipt:
+            raise ValueError("Verification requires at least one frozen input receipt")
+        # Lazy evidence shares one finite metadata snapshot. A newly entered
+        # context has no successful byte proofs from an earlier audit.
+        view = (self.read_context(receipt, config=config, check_canceled=check_canceled)
+                if self._read_context() is None else nullcontext())
+        with view:
+            return self._verify(receipt, config=config, check_canceled=check_canceled, progress=progress)
+
+    def _verify(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,
+                config: ExecutionOptions | None,
+                check_canceled: Callable[[], None] | None,
+                progress: Callable[[dict[str, Any]], None] | None) -> dict[str, Any]:
+        single = isinstance(receipt, (FrozenInputReceipt, str))
         roots = [self.get(receipt)] if single else [self.get(value) for value in receipt]
         if not roots:
             raise ValueError("Verification requires at least one frozen input receipt")
@@ -3819,9 +3850,11 @@ class InputsAPI:
             parents: dict[str, FrozenInputReceipt] = {}
             for evidence in value.evidence.values():
                 from bagelquant_data.storage.full_commit_checks import validate_seal
+                retained = None
                 for seal in evidence.get("full_commit_checks", ()):
                     validate_seal(seal)
-                    retained = {(batch["commit_seq"], batch["partition_path"], batch["content_hash"], batch["row_count"]) for batch in evidence["batches"]}
+                    if retained is None:
+                        retained = {(batch["commit_seq"], batch["partition_path"], batch["content_hash"], batch["row_count"]) for batch in evidence["batches"]}
                     if any((batch["commit_seq"], batch["partition_path"], batch["content_hash"], batch["row_count"]) not in retained for batch in seal["binding"]["batches"]):
                         raise RuntimeError("Full-commit check seal retained batch mismatch")
                 for batch in evidence["batches"]:
@@ -3940,7 +3973,9 @@ class InputsAPI:
                     raise RuntimeError("Registered selection set membership is missing")
                 immutable_metadata.MetadataReader(database=db).audit(
                     {"ref": saved["root_ref"], "kind": root["kind"], "count": root["item_count"]}, metadata_verified)
-                _, reader, _, blocks = self._selection_membership(reference, config=options)
+                membership = self._selection_membership(reference, config=options,
+                    check_canceled=check_canceled or (lambda: None))
+                _, reader, _, blocks = membership
                 cursor = db.execute("SELECT e.descriptor_key,e.reference_json FROM input_selection_chunk_entries e "
                     "JOIN json_each(?) b ON e.block_ref=json_extract(b.value,'$.ref') "
                     "ORDER BY json_extract(b.value,'$.start'),e.ordinal", (_json(blocks),))
@@ -3948,8 +3983,15 @@ class InputsAPI:
                 while group := cursor.fetchmany(16):
                     for row in group:
                         reader.audit(json.loads(row["reference_json"]), metadata_verified)
-                    descriptors = self.read_selection_set(reference, keys=[row[0] for row in group],
-                        config=options, check_canceled=check_canceled or (lambda: None))
+                    # The fixed read view already validated this set's complete
+                    # chunk inventory. Recheck every selected member without
+                    # rebuilding that same inventory for each small group.
+                    if context is not None and context.memo_available:
+                        descriptors = self._read_selection_members(*membership, keys=[row[0] for row in group],
+                            config=options, check_canceled=check_canceled or (lambda: None))
+                    else:
+                        descriptors = self.read_selection_set(reference, keys=[row[0] for row in group],
+                            config=options, check_canceled=check_canceled or (lambda: None))
                     grouped = {}
                     for descriptor in descriptors:
                         grouped.setdefault(descriptor["alias"], []).append(descriptor)

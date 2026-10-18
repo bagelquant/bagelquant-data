@@ -294,6 +294,32 @@ and one caller-bounded pool. Multiple roots deduplicate originals only within th
 invocation. Small range summaries are audited according to their proof kind;
 exact summaries compare consumed values, metadata summaries compare original
 registered headers whose files are separately audited.
+An empty original audit projection preserves declared key selection and temporal
+normalization, but need not derive discarded virtual record IDs when both key
+selection and normalization retain nonempty columns and the original row count,
+and normalized keys are only Null, Boolean, String, Binary, integer or floating scalars. Missing
+or duplicate key names still fail; malformed selectors and complex key types
+retain the ordinary record-key path. The private captured-bound date audit may
+apply the same admission only to present `time`/`source_time` axes when the entire
+original schema is primitive or temporal. Ordinary nonempty projections retain
+their exact key derivation path; the audit-only entry shares one private engine
+with that unchanged public signature. Full original
+checksums, Arrow validation, schema/count/bounds and field-change audits remain
+mandatory, including their cancellation and buffer limits.
+A direct audit opens its own finite read-only metadata snapshot. Successful
+proofs expire when it exits; a later direct audit rechecks original bytes and
+metadata. Each retained full-commit seal is validated separately, while its
+alias's immutable retained-batch membership is read once for those seal checks.
+Lazy seal mappings/sequences serialize to the original materialized canonical
+JSON bytes; auditing never assigns a replacement digest to retained evidence.
+Within an unchanged read view, a full audit prepares each registered selection
+set's bounded member inventory once and checks every member in finite groups.
+Public keyed reads and later audits prepare fresh inventories. A writing shared
+view loses reuse admission and revalidates through the ordinary keyed reader.
+An unprojected scalar Item scope with no selected original batches retains the
+ordinary canonical empty token during metadata-range audit, including causal
+baseline evidence and full Source parent provenance. This never skips the
+preceding original-byte/bounds audit or accepts a different summary identity.
 
 There is no second data copy for local corruption repair. Missing/damaged original
 segments or visibility files require checksum-verified backup restoration. Never
@@ -332,3 +358,13 @@ Backups copy the metadata snapshot and all retained original content/visibility
 files. Total metadata loss requires restoration of that trusted backup. Unverified
 snapshot copies remain explicitly unverified; strict backup audits required
 original evidence. Preserve historical receipts, lake identity and declarations.
+Snapshot and verified export share one inventory from the copied SQLite view:
+manifest generations, every committed version segment and all registered
+visibility events. Deduplicate confined physical paths; reject malformed paths,
+symbolic links and missing originals rather than adopting loose files. Historical
+committed originals remain required even when absent from the current manifest.
+Verified backup checks committed originals and visibility events even without a
+frozen Source. Snapshot performs no historical decode or checksum audit and still
+requires explicit verification before computation. Its `generation_count` retains
+the manifest count; `immutable_file_count` counts the complete copied inventory
+and `visibility_count` counts its visibility files.

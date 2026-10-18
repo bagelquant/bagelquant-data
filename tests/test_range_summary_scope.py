@@ -1,8 +1,11 @@
 """Range publication expands only the aliases owned by its original proofs."""
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
+import hashlib
+import sqlite3
 
 import polars as pl
+import pytest
 
 from bagelquant_data import DataItemSpec, DataLake, DatasetSpec, InputSelectionScope, ItemInput, RawInput
 from bagelquant_data import input_index, inputs
@@ -99,3 +102,65 @@ def test_renamed_consumer_keeps_original_proof_alias_and_parents(tmp_path, monke
     assert lake.inputs.prepare_range_selections(current, [scope]) == (expected,)
     assert published == [first["content_token"]]
     assert lake.inputs.get(original).digest == original.digest
+
+
+@pytest.mark.parametrize("view", ["snapshot", "history", "versions"])
+def test_empty_item_range_summary_audits_original_and_independent_snapshot(tmp_path, monkeypatch, view):
+    lake, original, _, _, _, _ = setup(tmp_path / "original")
+    first, last = DAY - timedelta(days=31), DAY - timedelta(days=1)
+    scope = InputSelectionScope("selected", start=first, end=last, view=view,
+        causal_versions=view == "versions")
+    identity = lake.inputs.selection_identity(original, "selected", start=first, end=last,
+        view=view, values_only=True, causal_versions=view == "versions")
+    originals = {path.relative_to(lake.lake_path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in lake.lake_path.rglob("*.parquet")}
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Empty range metadata preparation decoded Original values")
+    with monkeypatch.context() as patch:
+        patch.setattr(inputs, "read_batch", forbidden)
+        patch.setattr(input_index, "project_original", forbidden)
+        descriptor, = lake.inputs.prepare_range_selections(original, [scope])
+        assert descriptor["content_token"] == identity
+        assert descriptor["has_rows"] is False
+        assert lake.inputs.prepare_range_selections(original, [scope]) == (descriptor,)
+        assert lake.inputs.selection_identity(original, "selected", start=first, end=last,
+            view=view, values_only=True, causal_versions=view == "versions") == identity
+    assert lake.inputs.verify(original)["valid"]
+    copy = tmp_path / "copy"
+    lake.integrity.snapshot(data_meta_path=copy / "meta.sqlite", lake_path=copy / "lake")
+    with DataLake.open(data_meta_path=copy / "meta.sqlite", lake_path=copy / "lake", read_only=True) as copied:
+        assert copied.inputs.get(original.receipt_id).digest == original.digest
+        assert copied.inputs.verify(original.receipt_id)["valid"]
+        assert {path.relative_to(copied.lake_path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in copied.lake_path.rglob("*.parquet")} == originals
+    assert lake.inputs.get(original).digest == original.digest
+    assert {path.relative_to(lake.lake_path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in lake.lake_path.rglob("*.parquet")} == originals
+
+
+def test_empty_item_range_audit_rejects_self_consistent_wrong_summary(tmp_path):
+    lake, original, _, _, _, _ = setup(tmp_path)
+    scope = InputSelectionScope("selected", start=DAY - timedelta(days=1),
+        end=DAY - timedelta(days=1), view="snapshot")
+    lake.inputs.prepare_range_selections(original, [scope])
+    with sqlite3.connect(lake.data_meta_path) as db:
+        db.row_factory = sqlite3.Row
+        row = dict(db.execute("select * from input_projection_index").fetchone())
+        assert row["version"] == "segment_range.v1" and not row["has_rows"]
+        row["identity"] = "0" * 64
+        digest = input_index._digest({key: value for key, value in row.items() if key != "digest"})
+        db.execute("update input_projection_index set identity=?,digest=?", (row["identity"], digest))
+    with pytest.raises(RuntimeError, match="Scalar selection summary differs from original evidence"):
+        lake.inputs.verify(original)
+
+
+def test_empty_item_range_audit_still_checks_out_of_window_original_bytes(tmp_path):
+    lake, original, _, _, _, _ = setup(tmp_path)
+    scope = InputSelectionScope("selected", start=DAY - timedelta(days=1),
+        end=DAY - timedelta(days=1), view="snapshot")
+    lake.inputs.prepare_range_selections(original, [scope])
+    assert lake.inputs.verify(original)["valid"]
+    path = next(lake.lake_path.rglob("*.parquet"))
+    path.write_bytes(path.read_bytes() + b"corruption")
+    with pytest.raises(RuntimeError, match="Original Parquet segment .*checksum"):
+        lake.inputs.verify(original)

@@ -93,10 +93,8 @@ def _payload_encoder(dtype: pl.DataType | DataTypeClass,
 
     if dtype == pl.String:
         tokens: dict[object, bytes] = {}
-        column_bytes = 0
 
         def string_token(value: object) -> bytes:
-            nonlocal column_bytes
             cached = tokens.get(value)
             if cached is not None:
                 return cached
@@ -104,9 +102,8 @@ def _payload_encoder(dtype: pl.DataType | DataTypeClass,
             # Reserve dictionary, Python key/value and encoded-token storage.
             # Build lazily from the bounded row iterator: never collect uniques.
             reserve = 512 + 2 * len(encoded)
-            if reserve <= min(1024**2 - column_bytes, cache_budget[0]):
+            if reserve <= cache_budget[0]:
                 tokens[value] = encoded
-                column_bytes += reserve
                 cache_budget[0] -= reserve
             return encoded
 
@@ -129,8 +126,8 @@ def _payload_hashes(frame: pl.DataFrame, fields: list[str]) -> pl.Series:
     Schema and temporal precision remain part of identity; floating hex retains
     signed zero, infinities and NaN/null distinction. Nested values retain the
     recursive JSON representation. String caches share a conservative 4 MiB
-    reserve (at most 1 MiB per column), further bounded by input-frame bytes,
-    with no unique-value materialization.
+    reserve, further bounded by input-frame bytes. Each column may use the
+    remaining shared reserve, with no unique-value materialization.
     """
     selected = frame.select(fields)
     header = json.dumps([(name, str(dtype)) for name, dtype in selected.schema.items()],
