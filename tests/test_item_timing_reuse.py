@@ -204,6 +204,54 @@ def test_timing_memory_admission_precedes_saved_value_collection(tmp_path, monke
     assert not f.calls
 
 
+@pytest.mark.parametrize("surviving_baseline", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_calendar_verification_plan_uses_only_metadata_for_partial_raw_checks(
+    tmp_path, monkeypatch, surviving_baseline, reverse,
+):
+    lake = DataLake.open(data_meta_path=tmp_path / "data.sqlite", lake_path=tmp_path / "lake")
+    first, previous, through = date(2020, 1, 1), date(2020, 2, 2), date(2020, 2, 3)
+    frame = pl.DataFrame({"time": [first, date(2020, 2, 1)] if surviving_baseline else [date(2020, 2, 1)],
+        "asset_id": ["A", "A"] if surviving_baseline else ["A"],
+        "value": [1., 2.] if surviving_baseline else [2.]})
+    calendar = pl.DataFrame({"time": [first, previous, through], "is_open": [1, 1, 1]})
+    raw = DatasetSpec("raw", "by_date", date_kind="calendar",
+        field_mappings={"time": "time", "asset_id": "asset_id"})
+    general = DatasetSpec("calendar", "general")
+    received = datetime(2020, 2, 2, tzinfo=UTC)
+    lake.raw.ingest(raw, frame, mode="initialize", ingested_at=received)
+    lake.raw.ingest(general, calendar, mode="initialize", ingested_at=received)
+    raw_alias, calendar_alias = ("z", "a") if reverse else ("a", "z")
+    requests = (RawInput("custom", "raw", alias=raw_alias), RawInput("custom", "calendar", alias=calendar_alias))
+    policy = ProducerUpdatePolicy("forward", timing_neutral_inputs=(calendar_alias,))
+    calls = []
+    def producer(context):
+        calls.append((context.start, context.end))
+        return context.frames[raw_alias].select(pl.col("source_time").alias("time"), "asset_id", "value")
+    lake.items.register_producer("p", "1", producer, update_policy=policy)
+    lake.items.register(DataItemSpec("item", requests,
+        producer_key="p", producer_revision="1"))
+    lake.items.initialize("item", start=first, end=previous)
+    calls.clear()
+    verified = datetime(2020, 2, 3, tzinfo=UTC)
+    lake.raw.ingest(raw, frame.tail(1), ingested_at=verified)
+    lake.raw.ingest(general, calendar, ingested_at=verified)
+
+    from bagelquant_data import input_index, inputs
+    def forbidden(*args, **kwargs):
+        pytest.fail("timing prerequisite planning decoded originals or ran a producer")
+    monkeypatch.setattr(input_index, "project_original", forbidden)
+    monkeypatch.setattr(inputs, "read_batch", forbidden)
+    monkeypatch.setattr(lake.inputs, "_baseline_at", forbidden)
+    actions = lake.items.plan_update("item", start=first, end=through)
+    assert not calls
+    if surviving_baseline:
+        assert actions == [{"mode": "incremental", "start": str(through), "end": str(through)}]
+    else:
+        assert len(actions) == 1 and actions[0]["mode"] == "blocked"
+        assert "timing" in actions[0]["reason"]
+
+
 def test_staggered_general_verification_and_unrelated_counters_keep_content_identity(tmp_path):
     f = Fixture(tmp_path, calendar_known=datetime(2020, 1, 30, tzinfo=UTC))
     selection = {"item": ItemInput("item", view="snapshot", start=f.first, end=f.previous)}

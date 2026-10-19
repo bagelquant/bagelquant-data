@@ -158,6 +158,12 @@ into a bounded verified tail. Empty inputs retain their original transitive
 timing proof; their parent requests may require a halo or complete General event.
 External Item publications retain whole-request timing admission. Neutral
 General timing checks require a registered numerical/trace-neutral contract.
+Read-only neutral-timing planning requires a positive metadata baseline proof
+at every changed boundary across the complete dependency OR; it must never fall
+back to original row selection. Partial visibility headers disqualify only
+baseline candidates with intersecting original commits and observation bounds,
+including multiple partitions of one commit. Unknown/missing event scope remains
+conservative and follows ordinary impact/block handling without index preparation.
 A pointwise native input window may extend only its upper observation bound
 without a uniform-baseline proof when both frozen and current declarations are
 the same `by_date` Raw, every non-window request field and the lower bound remain

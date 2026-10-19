@@ -395,3 +395,43 @@ def test_verified_general_cannot_hide_unknown_daily_timing(tmp_path):
     data.items.ingest("output", rows((10,), (2.,)), available_date="2020-01-10", input_receipt=frozen)
     assert data.items.read("output").collect()["value"].to_list() == [2.]
     assert data.items.read("output", strict=True).collect()["value"].to_list() == [2.]
+
+
+def test_partial_visibility_event_preserves_disjoint_partition_of_same_commit(tmp_path):
+    data = lake(tmp_path)
+    frame = pl.DataFrame({"time": [date(2020, 1, 1), date(2020, 2, 1)],
+        "asset_id": ["A", "A"], "value": [1., 2.]})
+    data.raw.ingest(spec(), frame, mode="initialize",
+        ingested_at=datetime(2020, 2, 2, tzinfo=UTC))
+    data.raw.ingest(spec(), frame.tail(1), ingested_at=datetime(2020, 2, 3, tzinfo=UTC))
+    frozen = data.inputs.freeze({"raw": RawInput("custom", "raw", view="snapshot",
+        start="2020-01-01", end="2020-02-29")}, information_cutoff="2020-02-29")
+    evidence = frozen.evidence["raw"]
+    assert len(evidence["batches"]) == 2
+    assert len({batch["commit_seq"] for batch in evidence["batches"]}) == 1
+    event, = evidence["record_checks"]
+    assert event["event"] and event["min_observation"] == event["max_observation"] == "2020-02-01"
+    assert proven(frozen, "raw", date(2020, 2, 3)) is True
+    selected = data.inputs.read(frozen, "raw", as_of="2020-02-03").collect()
+    assert selected["_baseline"].to_list() == [True, False]
+
+    # The witnessed partition alone cannot prove a surviving baseline.
+    restricted = replace(frozen, requests={"raw": replace(frozen.requests["raw"], start="2020-02-01")})
+    assert proven(restricted, "raw", date(2020, 2, 3)) is None
+    assert proven(restricted, "raw", date(2020, 2, 2)) is True
+    assert proven(restricted, "raw", date(2020, 2, 3), max_check_id=0) is True
+    assert proven(frozen, "raw", date(2020, 2, 3), max_commit=0) is None
+    assert proven(replace(frozen, information_cutoff=date(2020, 2, 2)), "raw", date(2020, 2, 3)) is True
+
+    # A witness for another commit cannot attest these candidate rows, even
+    # when its observation bounds overlap both partitions.
+    elsewhere = {**event, "version_commits": [frozen.max_commit + 1], "min_observation": "2020-01-01"}
+    assert proven(replace(frozen, evidence={"raw": {**evidence, "record_checks": [elsewhere]}}),
+        "raw", date(2020, 2, 3)) is True
+
+    # Unknown/reversed event scopes cannot justify disjointness for that commit.
+    for changes in ({"min_observation": None}, {"max_observation": None},
+                    {"min_observation": "2020-02-04", "max_observation": "2020-02-01"},
+                    {"version_commits": []}, {"min_observation": "2020-01-01"}):
+        changed = {**evidence, "record_checks": [{**event, **changes}]}
+        assert proven(replace(frozen, evidence={"raw": changed}), "raw", date(2020, 2, 3)) is None

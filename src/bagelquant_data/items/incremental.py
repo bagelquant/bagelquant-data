@@ -104,7 +104,11 @@ def _neutral_timing_preserved(owner: ItemAPI, db, receipt, *, name: str,
     current = owner._lake.inputs._receipt("timing-impact", captured, hashlib.sha256(_json(captured).encode()).hexdigest())
     boundaries = {_date_value(check["pit_date"]) for check in checks} | {end}
     for cutoff in sorted(boundaries):
-        if not any(owner._lake.inputs._baseline_at(current, key, cutoff) for key in current.requests):
+        # Planning requires a surviving baseline OR, not complete row timing.
+        # Finish the metadata proofs across all aliases; unresolved evidence
+        # follows ordinary impact/block handling without decoding originals.
+        if not any(owner._lake.inputs._proven_baseline_at(current, key, cutoff) is True
+                   for key in current.requests):
             return False
     return True
 

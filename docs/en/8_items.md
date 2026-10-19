@@ -241,10 +241,22 @@ including future batches, remain unchanged.
 A positive-only timing proof can avoid frame reads if every scoped retained batch
 has a uniform baseline flag, its known observation bounds are entirely inside
 the request, and a nonempty batch proves a physically visible original row.
-Eligible nonbaseline witnesses prevent this shortcut; full seals are validated.
-Strict/history by-date views, legacy/unknown bounds, mixed flags and
-partial overlap use ordinary selection. This never proves a negative result,
+Eligible nonbaseline witnesses disqualify the candidates they can affect; full
+seals are validated. A partial first-visibility event binds both its original
+commit set and observation bounds. An untouched partition can still prove a
+surviving baseline, even when another partition of the same commit was verified.
+Missing or reversed event bounds remain conservative for the referenced commits;
+an eligible check without witness metadata leaves the proof unknown.
+Strict/history by-date views, legacy/unknown bounds, mixed flags and partial
+overlap cannot use this positive shortcut. It never proves a negative result,
 overrides a supplied frame, or replaces complete original byte verification.
+
+Read-only Item plans use these metadata proofs across all dependencies at every
+new timing boundary. They never decode historical rows to decide whether a
+declared neutral General input's first verification preserves an existing
+baseline. Unresolved evidence follows the existing selected-event impact or
+blocked-plan path. Completed history, producer identity and buffer limits remain
+unchanged; admitted updates calculate only new or affected output intervals.
 
 Writable lake initialization creates a derived covering metadata index and
 analyzes the batch table once, atomically. This avoids traversing recovery payload

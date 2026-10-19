@@ -3374,7 +3374,7 @@ class InputsAPI:
     def _proven_baseline_at(frozen: FrozenInputReceipt, alias: str, cutoff: date, *,
                             max_commit: int | None = None,
                             max_check_id: int | None = None) -> bool | None:
-        """Prove a visible baseline row; uncertainty requires ordinary selection.
+        """Prove a visible baseline row; unknown remains inconclusive for planning.
 
         Uniform committed flags and entire coordinate containment establish
         a surviving row only when no visible witness can replace its timing.
@@ -3415,8 +3415,19 @@ class InputsAPI:
             and check["id"] <= check_bound and _date_value(check["pit_date"]) <= cutoff}
         witnessed_checks = set(sealed_commits)
         affected_commits = {seq for key, seq in sealed_commits.items() if key in eligible_checks}
+        events = []
         for witness in evidence["record_checks"]:
             if witness.get("event"):
+                commits = witness.get("version_commits")
+                if not commits:
+                    continue
+                witnessed_checks.add(witness["check_id"])
+                if witness["check_id"] in eligible_checks:
+                    first, last = witness.get("min_observation"), witness.get("max_observation")
+                    if first is None or last is None or _date_value(first) > _date_value(last):
+                        affected_commits.update(commits)
+                    else:
+                        events.append((frozenset(commits), _date_value(first), _date_value(last)))
                 continue
             witnessed_checks.add(witness["check_id"])
             if witness["check_id"] in eligible_checks:
@@ -3442,6 +3453,12 @@ class InputsAPI:
                 candidates.append((first, last, batch["commit_seq"]))
         for first, last, seq in candidates:
             if seq in affected_commits:
+                continue
+            # Visibility events retain natural-key bounds rather than a row
+            # index. A single commit can contain many observation partitions;
+            # only intersecting event ranges can replace a candidate's timing.
+            if any(seq in commits and lower <= last and upper >= first
+                   for commits, lower, upper in events):
                 continue
             if all(batch["baseline"]
                    or batch.get("min_available") is not None and _date_value(batch["min_available"]) > cutoff
