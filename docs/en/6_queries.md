@@ -78,6 +78,55 @@ complete event selection; Raw availability lower bounds remain after latest
 version resolution. Requested field projection follows PIT selection, and full
 byte verification remains an explicit audit.
 
+### Secondary primary-key dates
+
+For a by-date Raw request with effective `view="versions"`, a date stored in an
+immutable extra primary-key column can select the consumed events:
+
+```python
+with lake.inputs.read_context(receipt, config=execution, progress=progress) as reader:
+    events = reader.read(receipt, "events",
+        date_range=("event_date", "2024-06-01", "2024-06-30")).collect()
+```
+
+The inclusive range parses Date/Datetime values or compact/ISO date text using
+nullable parsing. Invalid/null dates do not match. Original text and types are
+returned unchanged, including non-padded or whitespace-bearing values accepted
+by that parser. The frozen observation window, Source, cutoff, commit/check
+ceilings, complete natural keys and first-visibility witnesses remain in force.
+This selector neither rewrites the Raw declaration nor creates another receipt
+identity. It rejects General, Item, history/snapshot views, non-key fields and
+system/timing fields such as `time`, `source_time` and `ingested_at`.
+
+For this selection, fragments of one Original retain its exact registered
+schema. Compatible schemas across captured Originals are reconciled without
+normalizing selected all-null payloads to `Null`; typed empty pieces retain their
+original types too. A current/global dataset schema never replaces those
+captured schemas. Ordinary reads retain their existing normalization behavior.
+Thus a pruned ordinary read can infer `Null` where this selector retains the
+registered `Float64` or `String`; values, natural keys and PIT witnesses agree.
+
+The reader searches only the selected date column in admitted row-group chunks
+before opening candidate payload groups and constructing their temporary keys.
+Typed temporal statistics can skip disjoint groups; string extrema do not prove
+all-row date formatting and never justify that skip. Matching payload groups
+remain subject to the ordinary pre-allocation and retained-byte limits. The same
+predicate is applied to visibility-event keys before their temporary key encoding.
+No persistent row index, implicit audit or historical producer replay is added.
+
+`read_context(progress=...)` emits `phase="date_range_read"` for original and
+visibility-key work. It separates decoded `predicate_rows` and compressed
+`predicate_column_bytes` from conservative `candidate_payload_rows/bytes`, actual
+`selected_rows` and `row_groups_skipped`. Candidate payload work is a row-group
+upper bound, since a matching group can contain unrelated rows. A legacy file
+whose date column spans the whole history can still require that column's full
+lookup on append; this is explicit read work, not metadata-only or a universal
+bound on total input I/O. Unchanged Source/currentness checks perform no search.
+
+For authoritative update-scope inspection, `integrity.update_scopes(...,
+scope_keys=...)` filters the native ledger before materializing rows. Omission
+retains the complete inventory; an empty iterable returns no rows.
+
 ## Optional metadata lookup maintenance
 
 `lake.inputs.index_record_lookups(config=ExecutionOptions(...))` explicitly
@@ -98,6 +147,12 @@ Ordinary is_current calls hold one finite metadata view and reuse exact recorded
 check-to-commit relationships within its budget. Writer generations invalidate
 local memos, while outside WAL commits remain outside that fixed view until the
 next operation. This reuse never verifies historical bytes or creates proofs.
+When one alias needs conservative provenance checks, other aliases retain their
+own exact current completion authority. This includes an empty bounded Item
+range completed by adjacent publications. Original Source state, complete range,
+checked cutoff, dependency definitions and pending-output checks still apply;
+unknown or gapped coverage remains incomplete. The compact Source header map is
+read once for the operation rather than once for every fallback alias.
 
 
 inputs.index_selection explicitly builds a canonical scalar summary directly

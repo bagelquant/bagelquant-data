@@ -1344,25 +1344,28 @@ class ItemAPI:
         """Bind published input metadata for one serial publication operation."""
         if cancelled and cancelled():
             raise CancelledError("DataItem publication cancelled")
-        receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
-        verification = _PublicationVerification(self, "" if receipt is None else receipt.receipt_id,
-            "" if receipt is None else receipt.digest,
-            # A conservative 1KiB entry reserve; never retain producer frames.
-            timing_cache_entries=min(1024, (config or ExecutionOptions()).max_buffer_bytes // 4 // 1024),
-            timing_buffer_bytes=(config or ExecutionOptions()).max_buffer_bytes)
-        try:
-            if cancelled and cancelled():
-                raise CancelledError("DataItem publication cancelled")
-            yield ItemPublisher(self, receipt, verification, cancelled)
-            if get_ident() != verification.thread_id:
-                raise RuntimeError("DataItem publication requires its owning thread")
-            if not verification.active:
-                raise RuntimeError("DataItem publication operation failed")
-            if cancelled and cancelled():
-                raise CancelledError("DataItem publication cancelled")
-        finally:
-            verification.active = False
-            verification.baseline_dates.clear()
+        # Lazy immutable timing headers share a coordinator connection; each
+        # helper retains its own finite transaction and publication fence.
+        with self._store.writer_session():
+            receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
+            verification = _PublicationVerification(self, "" if receipt is None else receipt.receipt_id,
+                "" if receipt is None else receipt.digest,
+                # A conservative 1KiB entry reserve; never retain producer frames.
+                timing_cache_entries=min(1024, (config or ExecutionOptions()).max_buffer_bytes // 4 // 1024),
+                timing_buffer_bytes=(config or ExecutionOptions()).max_buffer_bytes)
+            try:
+                if cancelled and cancelled():
+                    raise CancelledError("DataItem publication cancelled")
+                yield ItemPublisher(self, receipt, verification, cancelled)
+                if get_ident() != verification.thread_id:
+                    raise RuntimeError("DataItem publication requires its owning thread")
+                if not verification.active:
+                    raise RuntimeError("DataItem publication operation failed")
+                if cancelled and cancelled():
+                    raise CancelledError("DataItem publication cancelled")
+            finally:
+                verification.active = False
+                verification.baseline_dates.clear()
 
     def _publish(self, publications: Sequence[ItemPublication], *,
                 input_receipt: FrozenInputReceipt | str | None = None,

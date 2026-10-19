@@ -96,11 +96,13 @@ class StatusManager:
         dataset: str | None = None,
         source: str | None = None,
         status: str | Iterable[str] | None = None,
+        *,
+        scope_keys: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return filtered authoritative update-scope rows."""
 
         return self.metadata.update_scopes(
-            source=source, dataset=dataset, status=status
+            source=source, dataset=dataset, status=status, scope_keys=scope_keys
         )
 
     def provider_scope_checks(

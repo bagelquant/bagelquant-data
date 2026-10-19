@@ -28,6 +28,11 @@ Run history, failures, scopes, coverage and active leases are available through
 `lake.integrity`; object summaries through `lake.raw.status/status_many` and
 `lake.items.status`. Scope resets and abandoned-owner recovery are explicit
 mutations, distinct from passive scans. Tests never use the real workspace data root.
+`lake.integrity.update_scopes(dataset=..., source=..., status=...,
+scope_keys=...)` applies all filters in the native ledger before returning
+deterministically ordered rows. Keys may be a finite iterable; omission retains
+the full inventory, and an empty iterable returns immediately without a query.
+This read-only selection neither resets scopes nor changes currentness evidence.
 `lake.items.status(name)["committed_definition_current"]` compares the current
 physical declaration with the latest committed batch in every current manifest
 partition. Registering a new producer revision alone does not make older stored

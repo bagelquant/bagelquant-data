@@ -9,32 +9,28 @@ Read-only update plans require actual new/affected ranges and record-only prereq
 Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint empty sparse groups share one fenced Source check and atomic completion publication.
 Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
 DataItem updates pin caller input windows in frozen receipts, preserving revisions and legacy identity. `items.resume_update` recovers uncertified first builds from original Sources; completed/lost authority blocks.
-Independent ready Item batches share bounded original/key/visibility preparation;
-same-date initialization resumes certified windows under its original Source and
-cutoff, and publishes whole completion only after all windows. Other producer
-policies retain their declared input requirements and explicit buffer admission.
+Ready Item batches share bounded original/key/visibility preparation. Same-date initialization resumes certified windows under its original Source/cutoff and completes only after all windows.
+Other producer policies retain their declared input requirements and explicit buffer admission.
 `items.completed_builds` exposes whole-range authorities; `inputs.publication_guard` fences Data writers through consumer CAS without audit/maintenance.
+External Item publication reuses one finite metadata connection; ordinary transactions, Source/definition fences and cancellation remain independent.
 Schema 9 retains one immutable Parquet body and shared segment/check/schema headers; selection handles bind immutable scope/PIT proof, with Source/requested cutoff in set bindings and shared chunk indexes across append.
-Frozen receipts are thin references; their public evidence Mapping is explicitly
-lazy. get/describe/request_identity never expand history. Registered selection
-sets expose header-only validation and keyed reads; audits traverse all originals.
-Node completion rows prove successful contiguous coverage, definitions and direct
-dependency revisions; failed/partial updates cannot advance success flags.
-`integrity.update_owner` binds Raw/native writers to one workflow owner; explicit
-abandonment requires verified publisher exit and never relies on heartbeat age.
+Frozen receipts expose lazy evidence; get/describe/request_identity never expand history.
+Selection sets expose header-only validation and keyed reads; audits traverse all originals.
+Node completion proves contiguous coverage, definitions and direct dependency revisions; failed/partial updates cannot advance success flags.
+`integrity.update_owner` binds writers; abandonment requires verified publisher exit, never heartbeat age.
 `integrity.item_removal_plan/remove_items` explicitly discard exact unreferenced
 Item histories; retained references block removal and shared upstreams survive.
-Ordinary freeze, plans, currentness and range/selection identities read metadata
-only. Missing exact optional summaries permit conservative metadata range tokens;
-optional maintenance never changes ordinary identity. Coordinate axes and caller
-Domain selectors are small explicit summaries, never historical row indexes.
-`inputs.prepare_range_selections` registers compact consumed scopes;
-`index_selection(s)` and `prepare_general_projections` explicitly admit exact typed
-comparisons where conservative range evidence cannot prove equality.
-`inputs.verify` audits exact original Parquet bytes, schema, bounds and saved
-summaries. Missing/damaged originals require a trusted backup. Schema 8 databases
-are rejected; there is no compatibility reader, Arrow body replica or row-proof
-backfill. `index_record_lookups` adds metadata access indexes only.
+Freeze, plans, currentness and range/selection identities read metadata only.
+Missing optional summaries permit conservative tokens; maintenance never changes ordinary identity.
+Coordinate axes and caller Domain selectors are small summaries, never historical row indexes.
+`inputs.prepare_range_selections` registers compact scopes; `index_selection(s)` and
+`prepare_general_projections` explicitly admit exact typed comparisons when range evidence cannot prove equality.
+`inputs.verify` audits original bytes/schema/bounds/summaries; missing originals require trusted backups.
+Reject schema 8, compatibility readers, Arrow replicas and row-proof backfill; `index_record_lookups` adds metadata access indexes only.
+`inputs.read(date_range=...)` selects only immutable extra Raw keys in by-date versions views.
+Preserve captured nullable payload/key types and PIT witnesses; reject timing fields and other views.
+Report necessary date-column lookup separately from candidate payload/key work; legacy layouts can still scan that column's history.
+`integrity.update_scopes(scope_keys=...)` filters the native ledger before row materialization.
 
 Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
 affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)

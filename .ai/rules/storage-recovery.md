@@ -29,6 +29,10 @@ access consumes only the corresponding registered metadata. Ordinary unchanged
 Source checks use alias-local publication evidence and, for Items, current
 whole-range completion flags and the live declaration dependency closure.
 Unknown, partial or changed authority takes the conservative metadata path.
+A sibling requiring conservative checks does not discard another alias's exact
+current completion, including a bounded empty range completed in adjacent groups.
+Reuse the same checksum, captured state, coverage, dependency and pending-output
+fences per alias; load the trusted compact Source header map once per read view.
 
 `register_selection_set` validates owner descriptors once and publishes immutable
 Source-bound shared references. `describe_selection_set` validates only the set
@@ -229,6 +233,11 @@ owns commit/rollback; nested helpers cannot commit an enclosing transaction.
 An atomic publication fence may borrow an idle session connection, while active
 transaction nesting and read-view upgrades remain rejected. Release every
 transaction promptly so later reads observe other writers' committed changes.
+External `items.publication` uses that same finite writer session for immutable
+header traversal across its output dates and groups. It must not retain a
+transaction/read snapshot across helpers, bypass any per-group Source/definition
+fence, or commit/close an enclosing borrowed session. Cancellation/failure/exit
+release owned resources; repeated metadata reads never create another authority.
 
 Logical Raw field selections remain in each original Source. Original aliases
 with identical immutable header, physical request/window and cutoff can share
@@ -267,6 +276,33 @@ Keep availability lower bounds after latest-version resolution, preserve the
 actual first-known date, and leave General event selection unchanged. Ordinary
 reads do not audit file bytes; explicit verification still checks the complete
 original. Unbounded internal reads retain their full-row contract.
+
+`inputs.read(date_range=(field,start,end))` is restricted to an immutable extra
+Raw primary-key date in effective by-date `versions` view. Preserve its original
+typed/text key representation, declaration, frozen Source, cutoff and check
+overlays. Reject General/Item inputs, other views, non-key fields and mutable
+system/timing fields. Date/Datetime and compact/ISO nullable parsing are row-local
+predicates only. Apply the same predicate before visibility-event key encoding;
+never substitute a source/announcement-date window for an economic event date.
+Within an Original, concatenate exact typed fragments without all-null inference.
+For this selector only, reconcile captured Original schemas with compatible
+types, retaining typed empty pieces; an all-null selected payload must not erase
+its registered type. Never substitute a current/global schema or change ordinary
+read normalization while implementing this selection.
+
+Search only that key column in caller-admitted chunks before candidate payload
+groups and temporary natural-key construction. Typed temporal statistics can
+skip disjoint groups; canonical-looking string extrema do not certify all-row
+formatting. Preserve invalid/null/whitespace/non-padded parsing behavior. Progress
+must distinguish predicate rows/column bytes from candidate payload group upper
+bounds and selected rows. Legacy overlapping layouts may still require the full
+date-column lookup on append: bounded retention is not bounded total input work.
+No historical row index, alternate authority or implicit audit is permitted.
+Preparation cache keys include the exact secondary-date selection and remain
+operation-local; original receipts and canonical identities are unchanged.
+
+`integrity.update_scopes(scope_keys=...)` composes the native metadata filter;
+omission retains inventory, and an empty iterable performs no ledger query.
 
 Initialization is an unverified historical baseline. Strict reads exclude it
 until a retained natural-key visibility event establishes actual later timing.

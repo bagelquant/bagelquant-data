@@ -209,6 +209,15 @@ and each new context rechecks original registered identities. Ordinary `ingest`
 and `replace_range` validate their declared source identities independently;
 original-byte verification belongs to explicit `inputs.verify` audits.
 
+The publication operation shares the existing finite metadata writer-session
+connection while repeatedly reading immutable input headers. This avoids opening
+one SQLite connection per metadata block or output date. It retains no transaction
+or read snapshot across helpers/groups: each ordinary publication transaction,
+definition/Source check and completion fence remains independent and observes
+later committed writers. Nested borrowing does not commit or close an enclosing
+session. Cancellation, failure and exit release the operation's resources;
+there is no persistent validity cache or new completion authority.
+
 Baseline timing checks all aliases' immutable positive proofs before decoding
 optional timing projections. A selected complete General baseline, including
 an empty event, is proven from the original snapshot/check headers at the actual

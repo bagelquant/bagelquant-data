@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -668,9 +668,17 @@ class IntegrityAPI:
         return self._status.failures(dataset=dataset, source=source)
 
     def update_scopes(
-        self, dataset: str | None = None, source: str | None = None, status=None
+        self,
+        dataset: str | None = None,
+        source: str | None = None,
+        status: str | Iterable[str] | None = None,
+        *,
+        scope_keys: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        return self._status.update_scopes(dataset=dataset, source=source, status=status)
+        """Return authoritative scope rows, optionally restricted to exact keys."""
+        return self._status.update_scopes(
+            dataset=dataset, source=source, status=status, scope_keys=scope_keys
+        )
 
     def update_summary(
         self, dataset: str | None = None, source: str | None = None

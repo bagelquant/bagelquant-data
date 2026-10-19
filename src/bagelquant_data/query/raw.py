@@ -249,6 +249,10 @@ def _attested_versions(
     event_paths: LakePaths | None = None,
     observation_start: DateLike | None = None,
     observation_end: DateLike | None = None,
+    date_range: tuple[str, date, date] | None = None,
+    max_buffer_bytes: int | None = None,
+    progress=None,
+    check_canceled=None,
 ) -> pl.LazyFrame:
     """Overlay exact unchanged-content witnesses without replacing stored history.
 
@@ -336,7 +340,13 @@ def _attested_versions(
         path = (base / str(event["generation_path"])).resolve()
         if not path.is_relative_to(base) or path == base:
             raise RuntimeError("Visibility event reference escapes its dataset")
-        event_frame = pl.scan_parquet(path,hive_partitioning=False).rename({"version_commit":"_commit_seq","available_date":"_attested_date"})
+        if date_range is None:
+            event_frame = pl.scan_parquet(path, hive_partitioning=False)
+        else:
+            from bagelquant_data.storage.recovery import read_date_range
+            event_frame = read_date_range(path, date_range, max_buffer_bytes=max_buffer_bytes,
+                progress=progress, check_canceled=check_canceled, kind="visibility_keys").lazy()
+        event_frame = event_frame.rename({"version_commit":"_commit_seq","available_date":"_attested_date"})
         # Retain the full typed natural key while pruning unrelated observations
         # before Python key encoding. Do not restrict first-known availability
         # to the requested observation dates: genuinely late events remain late.

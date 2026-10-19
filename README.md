@@ -63,6 +63,13 @@ First verification of an unknown baseline preserves an immutable availability
 event. Known identical rechecks preserve its original timing and create no file.
 Explicit typed Item timing changes remain real PIT data. Frozen receipts pin both commit and check boundaries.
 
+Frozen by-date Raw `versions` reads may select an immutable extra primary-key
+date with `inputs.read(receipt, alias, date_range=("event_date", start, end))`.
+The original Source, key text/types and PIT witnesses remain unchanged. A
+byte-admitted key-column search precedes matching payload/key preparation; legacy
+string layouts may still require a historical date-column scan. Read-context
+progress reports that lookup separately from candidate payload work.
+
 Read [overview](docs/en/1_overview.md), [quickstart](docs/en/2_quickstart.md),
 [datasets](docs/en/3_datasets.md), [sources](docs/en/4_sources.md),
 [updates](docs/en/5_updates.md), [queries](docs/en/6_queries.md),

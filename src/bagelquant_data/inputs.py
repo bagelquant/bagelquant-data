@@ -22,7 +22,7 @@ import polars as pl
 from bagelquant_data.core.hashing import frame_content_hash
 import pyarrow as pa
 
-from bagelquant_data.core.schema import concat_compatible_frames
+from bagelquant_data.core.schema import align_frame, compatible_schema, concat_compatible_frames
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_from_payload, input_payload
 from bagelquant_data.query.raw import _date_value
@@ -415,6 +415,7 @@ class _ReadContext:
     receipts: dict[str, FrozenInputReceipt]
     check_canceled: Callable[[], None] | None
     options: ExecutionOptions
+    progress: Callable[[dict[str, Any]], None] | None = None
     verified_batches: set[tuple[int, str, str]] = field(default_factory=set)
     verified_graph: dict[str, tuple[int, tuple[FrozenInputReceipt, ...]]] = field(default_factory=dict)
     currentness: dict[tuple[str, str, Path, InputReadBoundary | None, sqlite3.Connection, int, int], bool] = field(default_factory=dict)
@@ -479,7 +480,7 @@ class InputsAPI:
         parent = self._read_context() if source is None else source._shared_context
         if source is not None and (parent is None or parent.closed or parent.path != self._store.data_meta_path.resolve()):
             raise ValueError("Frozen metadata source is not an active matching read context")
-        state = _ReadContext(self._store.data_meta_path.resolve(), get_ident(), {}, check_canceled, config or ExecutionOptions())
+        state = _ReadContext(self._store.data_meta_path.resolve(), get_ident(), {}, check_canceled, config or ExecutionOptions(), progress=progress)
         if parent is not None:
             state.receipts, state.lock, state.parent = parent.receipts, parent.lock, parent
         previous_shared, self._shared_context = self._shared_context, state
@@ -2475,7 +2476,8 @@ class InputsAPI:
             "commit": db.execute("SELECT coalesce(max(seq),0) FROM version_commits WHERE source=? AND dataset=? AND status='committed'", (source, dataset)).fetchone()[0],
             "check": db.execute("SELECT coalesce(max(id),0) FROM version_checks WHERE source=? AND dataset=?", (source, dataset)).fetchone()[0]}
 
-    def _completed_source_current(self, db, frozen):
+    def _completed_source_current(self, db, frozen, alias_names: Sequence[str] | None = None,
+                                  alias_headers: Mapping[str, Mapping[str, Any]] | None = None):
         """Admit unchanged Source headers under existing whole-range authorities.
 
         Raw has no producer dependency. Items additionally require current
@@ -2484,7 +2486,7 @@ class InputsAPI:
         """
         if frozen.receipt_id == "current" or self._boundary is not None:
             return None
-        aliases = self.describe(frozen)["aliases"]
+        aliases = self.describe(frozen)["aliases"] if alias_headers is None else alias_headers
         checked, visiting = set(), set()
 
         def completed(name):
@@ -2517,7 +2519,9 @@ class InputsAPI:
             checked.add(name)
             return True
 
-        for alias, request in frozen.requests.items():
+        selected = frozen.requests if alias_names is None else alias_names
+        for alias in selected:
+            request = frozen.requests[alias]
             header = aliases[alias]
             state = header["state"]
             if (state is None or not state["active"] or state["commit"] > frozen.max_commit
@@ -2873,7 +2877,8 @@ class InputsAPI:
                     checked[value.receipt_id] = context.currentness[memo_key]
                     return checked[value.receipt_id]
                 visiting.add(value.receipt_id)
-                if self._completed_source_current(db, value) is True:
+                alias_headers = self.describe(value)["aliases"]
+                if self._completed_source_current(db, value, None, alias_headers) is True:
                     checked[value.receipt_id] = True
                     visiting.remove(value.receipt_id)
                     if progress is not None:
@@ -2940,6 +2945,13 @@ class InputsAPI:
                                     "alias": alias, "current": False})
                             result = False
                             break
+                        if self._completed_source_current(db, value, (alias,), alias_headers) is True:
+                            # A sibling may need conservative provenance checks
+                            # while this alias has exact current whole-range
+                            # authority, including composed empty publications.
+                            # Reuse the same frozen-state/coverage fences without
+                            # bypassing pending outputs or validating siblings.
+                            continue
                         proof = evidence["empty_item_build"]
                         covers = proof is not None and self._completion_covers_request(value, alias, proof)
                         empty_parents = self._uncovered_empty_parents(value, alias, proof if covers else None)
@@ -3590,11 +3602,16 @@ class InputsAPI:
         strict: bool | None = None,
         observations: bool = False,
         start: DateLike | None = None, end: DateLike | None = None,
+        date_range: tuple[str, DateLike, DateLike] | None = None,
     ) -> pl.LazyFrame:
         """Replay frozen evidence with an optional tighter information cutoff.
 
         View and projection overrides retain the original observation window,
         definition, commit boundary and check boundary after object archival.
+        ``date_range=(extra_key, first, last)`` is an inclusive row-local
+        secondary-date predicate for by-date Raw versions only. It preserves
+        original keys/PIT witnesses; legacy string keys can require a full
+        date-column lookup, reported by the read-context progress callback.
         """
         frozen = self.get(receipt)
         if alias not in frozen.requests:
@@ -3620,9 +3637,21 @@ class InputsAPI:
             projection = tuple(fields)
         request = replace(request, view=request.view if view is None else view,
                           strict=request.strict if strict is None else strict)
+        selected_dates = None
+        if date_range is not None:
+            column, first, last = date_range
+            definition = frozen.evidence[alias]["definition"]
+            if (not isinstance(column, str) or not isinstance(request, RawInput) or request.view != "versions"
+                    or definition.get("update_type") != "by_date"
+                    or column not in definition.get("primary_key_extra", ())
+                    or column.startswith("_") or column in {"time", "source_time", "ingested_at", "asset_id", "snapshot_date", "available_date", "observation_date", "year", "month"}):
+                raise ValueError("date_range requires an immutable extra Raw key and by-date versions view")
+            selected_dates = (column, _date_value(first), _date_value(last))
+            if selected_dates[1] > selected_dates[2]:
+                raise ValueError("date_range end precedes start")
         if isinstance(request, RawInput):
             request = replace(request, fields=())
-        frame = self._select(self._read_frame(frozen, alias, request=request), request, cutoff,
+        frame = self._select(self._read_frame(frozen, alias, request=request, date_range=selected_dates), request, cutoff,
                              evidence=frozen.evidence[alias])
         if observations and isinstance(request, RawInput) and "source_time" in frame.columns:
             frame = frame.with_columns(pl.col("source_time").alias("time"))
@@ -3685,7 +3714,8 @@ class InputsAPI:
                 "min_available": summary["available"]}, True
 
     def _read_frame(self, frozen: FrozenInputReceipt, alias: str, *,
-                    timing_cutoff: date | None = None, request: DataInput | None = None) -> pl.DataFrame:
+                    timing_cutoff: date | None = None, request: DataInput | None = None,
+                    date_range: tuple[str, date, date] | None = None) -> pl.DataFrame:
         """Load exact retained versions before view or field selection."""
         if alias not in frozen.requests:
             raise KeyError(f"Unknown frozen input alias: {alias}")
@@ -3699,7 +3729,7 @@ class InputsAPI:
         preparation_key = None
         if prepared is not None and isinstance(evidence, immutable_metadata.LazyMetadataMapping):
             preparation_key = (evidence.reference["ref"], _json(input_payload(request)),
-                frozen.information_cutoff, timing_cutoff)
+                frozen.information_cutoff, timing_cutoff, date_range)
             cached = prepared.get(preparation_key)
             if cached is not None:
                 return cached
@@ -3759,13 +3789,22 @@ class InputsAPI:
             piece = read_batch(self._store, value["partition_path"], int(value["commit_seq"]), value["content_hash"],
                 check_canceled=None if context is None else context.check_canceled,
                 observation_start=observation_start, observation_end=observation_end,
+                date_range=date_range,
+                progress=None if context is None else context.progress,
                 max_buffer_bytes=None if context is None else max(1, context.options.max_buffer_bytes - retained_bytes))
             retained_bytes += int(piece.estimated_size())
             if context is not None and retained_bytes > context.options.max_buffer_bytes:
                 raise MemoryError("Frozen DataItem inputs exceed max_buffer_bytes; use smaller declared input windows")
             pieces.append(piece)
         if pieces:
-            frame = concat_compatible_frames(pieces)
+            if date_range is None:
+                frame = concat_compatible_frames(pieces)
+            else:
+                # Preserve the captured Originals' nullable types, including
+                # typed empty pieces. A selected all-null payload is not a
+                # declaration that the original field's type became Null.
+                schema = compatible_schema(piece.schema for piece in pieces)
+                frame = pl.concat([align_frame(piece, schema) for piece in pieces], how="vertical", rechunk=False)
         elif evidence["schema_ipc"]:
             schema = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(evidence["schema_ipc"])))
             frame = cast(pl.DataFrame, pl.from_arrow(pa.Table.from_batches([], schema=schema)))
@@ -3779,7 +3818,11 @@ class InputsAPI:
                                    as_of_date=effective_cutoff,
                                    max_check_id=frozen.max_check_id,
                                    full_commit_checks=evidence.get("full_commit_checks", ()),event_paths=self._lake._paths,
-                                   observation_start=observation_start, observation_end=observation_end).collect()
+                                   observation_start=observation_start, observation_end=observation_end,
+                                   date_range=date_range,
+                                   max_buffer_bytes=None if context is None else context.options.max_buffer_bytes,
+                                   progress=None if context is None else context.progress,
+                                   check_canceled=None if context is None else context.check_canceled).collect()
         if prepared is not None and preparation_key is not None:
             prepared.source_rows += sum(piece.height for piece in pieces)
             prepared.key_rows += sum(piece.height for piece in pieces if "source_time" in piece.columns)

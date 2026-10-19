@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -102,6 +102,8 @@ def _registered(data_meta: DataMetaStore, partition: str, seq: int, digest: str)
 def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
                check_canceled: Callable[[], None] | None = None, verify: bool = False,
                observation_start: date | None = None, observation_end: date | None = None,
+               date_range: tuple[str, date, date] | None = None,
+               progress: Callable[[dict], None] | None = None,
                max_buffer_bytes: int | None = None) -> pl.DataFrame:
     """Consume exact original Parquet; explicit audit verifies every original byte."""
     row,path = _registered(data_meta,partition,seq,digest)
@@ -110,13 +112,24 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
     if verify and _file_hash(path,check_canceled) != digest:
         raise RuntimeError(f"Original Parquet segment {seq} checksum mismatch; restore a trusted backup")
     schema = pl.Schema(pa.ipc.read_schema(pa.BufferReader(row["schema_ipc"])))
-    bounded = "source_time" in schema and (observation_start is not None or observation_end is not None)
+    bounded = ("source_time" in schema and (observation_start is not None or observation_end is not None)
+        or date_range is not None)
     if bounded or max_buffer_bytes is not None:
         # Validate the complete original's physical authority before selecting
         # observations. Its footer row count is not the selected row count.
         with pq.ParquetFile(path) as reader:
             if pl.Schema(reader.schema_arrow) != schema or reader.metadata.num_rows != row["row_count"]:
                 raise RuntimeError(f"Original Parquet segment {seq} typed schema/row count mismatch")
+        if date_range is not None:
+            frame = read_date_range(path, date_range, max_buffer_bytes=max_buffer_bytes,
+                check_canceled=check_canceled, progress=progress)
+            if observation_start is not None:
+                frame = frame.filter(pl.col("source_time") >= observation_start)
+            if observation_end is not None:
+                frame = frame.filter(pl.col("source_time") <= observation_end)
+            if frame.schema != schema:
+                raise RuntimeError(f"Original Parquet segment {seq} typed schema/row count mismatch")
+            return with_record_key(frame, keys=json.loads(row["bounds_json"])["keys"])
         scan = pl.scan_parquet(path, hive_partitioning=False)
         if observation_start is not None:
             scan = scan.filter(pl.col("source_time") >= observation_start)
@@ -137,6 +150,80 @@ def read_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, 
     if frame.schema != schema or not bounded and frame.height != row["row_count"]:
         raise RuntimeError(f"Original Parquet segment {seq} typed schema/row count mismatch")
     return with_record_key(frame,keys=json.loads(row["bounds_json"])["keys"])
+
+
+def read_date_range(path: Path, selection: tuple[str, date, date], *,
+                    max_buffer_bytes: int | None,
+                    check_canceled: Callable[[], None] | None = None,
+                    progress: Callable[[dict], None] | None = None,
+                    kind: str = "original") -> pl.DataFrame:
+    """Search only one key column before admitting matching original row groups.
+
+    String extrema do not certify every row's date encoding. Their necessary
+    predicate-column lookup is reported separately from candidate payload work;
+    no persistent row index or historical byte audit is created.
+    """
+    from bagelquant_data.selection_dates import date_range_expression
+    from bagelquant_data.execution import ExecutionOptions
+    column, first, last = selection
+    allocation = max_buffer_bytes if max_buffer_bytes is not None else ExecutionOptions().max_buffer_bytes
+    frames, retained, offset = [], 0, 0
+    with pq.ParquetFile(path) as reader:
+        schema = pl.Schema(reader.schema_arrow)
+        if column not in schema:
+            raise ValueError(f"Original input is missing date_range key: {column}")
+        expression = date_range_expression(schema, selection)
+        for index in range(reader.metadata.num_row_groups):
+            if check_canceled is not None:
+                check_canceled()
+            group = reader.metadata.row_group(index)
+            columns = [number for number in range(group.num_columns)
+                if group.column(number).path_in_schema == column]
+            if len(columns) != 1:
+                raise ValueError("date_range requires an unambiguous top-level scalar Parquet key")
+            key_column = group.column(columns[0])
+            statistic = key_column.statistics
+            disjoint = False
+            if schema[column] == pl.Date or isinstance(schema[column], pl.Datetime):
+                if statistic is not None and statistic.has_min_max:
+                    minimum, maximum = statistic.min, statistic.max
+                    minimum = minimum.date() if isinstance(minimum, datetime) else minimum
+                    maximum = maximum.date() if isinstance(maximum, datetime) else maximum
+                    disjoint = maximum < first or minimum > last
+            selected, predicate_rows = 0, 0
+            if not disjoint:
+                for batch in reader.iter_batches(row_groups=[index], columns=[column],
+                        batch_size=max(1, min(65536, (allocation - retained) // 256))):
+                    if check_canceled is not None:
+                        check_canceled()
+                    keys = cast(pl.DataFrame, pl.from_arrow(batch, rechunk=False))
+                    if keys.estimated_size() > allocation - retained:
+                        raise MemoryError("Original date-key lookup exceeds max_buffer_bytes; use a larger explicit read allocation")
+                    predicate_rows += keys.height
+                    selected += keys.select(expression.sum()).item() or 0
+            row_reserve = 96 + sum(16 if dtype.is_numeric() or dtype.is_temporal() or dtype == pl.Boolean
+                else 128 if dtype == pl.String else 256 for dtype in schema.values())
+            if selected * row_reserve > allocation - retained:
+                raise MemoryError("Original input state exceeds max_buffer_bytes; use a smaller observation window or larger explicit budget")
+            if progress is not None:
+                progress({"phase": "date_range_read", "kind": kind,
+                    "predicate_rows": predicate_rows,
+                    "predicate_column_bytes": 0 if not predicate_rows else key_column.total_compressed_size,
+                    "candidate_payload_rows": group.num_rows if selected else 0,
+                    "candidate_payload_bytes": group.total_byte_size if selected else 0,
+                    "selected_rows": selected, "row_groups_skipped": int(not selected)})
+            if selected:
+                frame = pl.scan_parquet(path, hive_partitioning=False, parallel="prefiltered").slice(
+                    offset, group.num_rows).filter(expression).collect()
+                retained += int(frame.estimated_size())
+                if retained > allocation:
+                    raise MemoryError("Original input state exceeds max_buffer_bytes; use a smaller observation window or larger explicit budget")
+                frames.append(frame)
+            offset += group.num_rows
+    # All pieces come from this one Original and already have its exact schema.
+    # Canonical reconciliation would normalize a typed column to Null when
+    # only the selected rows are null, changing the registered Original type.
+    return pl.concat(frames, how="vertical", rechunk=False) if frames else pl.DataFrame(schema=schema)
 
 
 def verify_batch(data_meta: DataMetaStore, partition: str, seq: int, digest: str, *,
