@@ -251,7 +251,14 @@ causal-impact plan under the Data writer fence, preserve pending coordinates and
 all old builds/creator receipts, and bind original/current sources, predecessor
 completion and producer policy. Fence definitions and output/check boundaries;
 cancel after metadata preparation rolls back completion. Already-current no-ops
-do not freeze or write new completion. This does not weaken Raw currentness.
+do not freeze or write new completion. When the whole original Source is current
+but its direct dependency-state flag is stale, the same fenced no-op may refresh
+that flag alone. Bind the exact verified original build, output commit/check
+ceiling, definition, publication revision and full existing flag bounds. Preserve
+checked target, semantic version, Source and result reference; a narrower request
+cannot lower them. Missing, incomplete, wider/unioned or otherwise different
+flags require separate evidence. A fully current repeat performs no flag write;
+post-refresh cancellation rolls back. This does not weaken Raw currentness.
 Explicit `items.recertify` uses this same no-op path with numerical work
 forbidden: reject any new/changed/unknown plan before input value reads or
 producer invocation, and never recursively update dependencies. Callers

@@ -47,6 +47,14 @@ the captured definition is checked again on admission and publication. A runtime
 producer key/revision's declared causal policy cannot change or be removed.
 An initially absent policy may be declared later; active recertification still
 checks that policy at admission and publication.
+If the original Source is still current but a later dependency publication made
+its live completion flag stale, an admitted no-op refreshes only the dependency
+state of that exact completed build. Original covered dates, checked target,
+semantic identity, Source and result reference stay unchanged, including when
+the requested end is earlier. The original output/check ceilings, definition,
+current publication and complete flag must still match; wider or missing
+authority requires separate evidence. No values, new Source or build are created,
+and a current repeat writes no flag. Cancellation rolls back the metadata refresh.
 For a consumer publishing saved completion references,
 `lake.inputs.publication_guard(receipts)` holds the Data writer fence and one
 fixed metadata view through the consumer's own revision CAS. It requires a
@@ -98,6 +106,14 @@ it is cleared at the end of each window and never becomes stored history or
 proof authority. Producers receive declared payload fields plus causal coordinate
 and version channels. A shared read cannot widen an Item's logical dependency.
 
+That same bounded window cache can reuse output natural-key encoding across
+Items only when the ordered primitive/temporal key schema and every key value
+match exactly. It charges the retained keys and record hashes together and
+expires them with the window. Floating/nested keys retain scalar encoding.
+Each Item still hashes its own typed payload. Publication reuses its initial
+payload hashes only when schema alignment leaves all payload dtypes unchanged
+and no semantic-version timing comparison requires a fresh encoding.
+
 The initialization ledger pins its original Source, definition, causal producer
 policy and whole requested bounds. Each window uses that original information
 cutoff and preserves all causal revisions, removals and pending visibility.
@@ -133,6 +149,9 @@ do not sum them into a critical path. Cache `prepared_hits`, `prepared_misses`,
 `source_rows_read`, `key_rows_prepared` and `prepared_peak_bytes` are totals for
 the entire batch, repeated in each report: do not sum sibling reports. Key rows
 count original by-date rows, excluding separate visibility-event key work.
+`output_key_cache_hits` and `output_key_rows_encoded` count the shared
+output-key work for the batch, also
+repeated rather than additive across sibling reports.
 
 `ExecutionOptions.native_admission` accepts a caller-owned context-manager
 factory for `columnar` or `mixed` work. It is execution-only, omitted from repr

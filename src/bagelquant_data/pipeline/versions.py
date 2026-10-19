@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -43,6 +45,47 @@ VERSION_FIELDS = frozenset(
         "_attestation_id",
     }
 )
+
+# The Item coordinator supplies its existing byte-bounded frame memo. Pipeline
+# encoding never owns a second buffer budget or retains publication authority.
+_KEY_PREPARATION: ContextVar[tuple | None] = ContextVar("output_key_preparation", default=None)
+
+
+@contextmanager
+def _record_key_preparation(path, get, put, counts):
+    token = _KEY_PREPARATION.set((path.resolve(), get, put, counts))
+    try:
+        yield
+    finally:
+        _KEY_PREPARATION.reset(token)
+
+
+def _record_hashes(frame: pl.DataFrame, fields: list[str], path: Path) -> pl.Series:
+    """Reuse exact ordered primitive keys only inside an admitted Item window.
+
+    Floating/nested keys retain scalar encoding: ordinary frame equality does
+    not distinguish every typed-row floating representation, notably signed zero.
+    The cache retains owned keys as well as hashes and charges both together.
+    """
+    state = _KEY_PREPARATION.get()
+    if state is None or state[0] != path.resolve():
+        return _payload_hashes(frame, fields).rename("_record_id")
+    _, get, put, counts = state
+    selected = frame.select(fields)
+    eligible = all(dtype.is_integer() or dtype.is_temporal()
+        or dtype in (pl.Null, pl.Boolean, pl.String, pl.Binary)
+        for dtype in selected.schema.values())
+    locator = ("output_record_keys", tuple(selected.schema.items()), selected.height)
+    if eligible:
+        cached = get(locator)
+        if cached is not None and selected.equals(cached.select(fields)):
+            counts["output_key_cache_hits"] = counts.get("output_key_cache_hits", 0) + 1
+            return cached["_record_id"].clone()
+    counts["output_key_rows_encoded"] = counts.get("output_key_rows_encoded", 0) + selected.height
+    hashes = _payload_hashes(selected, fields).rename("_record_id")
+    if eligible:
+        put(locator, selected.with_columns(hashes))
+    return hashes
 
 def _payload_value(value: object) -> object:
     """Encode logical scalars without JSON's null/nonfinite conflation."""
@@ -245,7 +288,7 @@ def commit_versions(
     changed_fields = None
     if spec.update_type == "by_date":
         keys = list(record_key(spec))
-        frame = frame.with_columns(_payload_hashes(frame,keys).rename("_record_id"))
+        frame = frame.with_columns(_record_hashes(frame, keys, parquet.metadata.data_meta_path))
         payload = sorted(set(frame.columns) - {"time", "year", "month", "_record_id", "_dependency_digest"})
         if preserve_semantic_timing:
             payload.append("time")
@@ -299,10 +342,14 @@ def commit_versions(
                 old = old.drop("_payload_hash") if "_payload_hash" in old.columns else old
                 common_schema = compatible_schema([frame.select(payload).schema,
                     old.select([field for field in payload if field in old.columns]).schema])
+                payload_schema_changed = any(frame.schema[field] != common_schema[field] for field in payload)
                 old = old.with_columns((pl.col(field).cast(common_schema[field]) if field in old.columns
                     else pl.lit(None,dtype=common_schema[field])).alias(field) for field in payload)
                 frame = frame.with_columns(pl.col(field).cast(common_schema[field]) for field in payload)
-                frame = frame.with_columns(_payload_hashes(frame,payload))
+                # Conflict validation already hashed the incoming payload. Its
+                # tokens survive de-duplication and non-payload timing changes.
+                if payload_schema_changed or preserve_semantic_timing:
+                    frame = frame.with_columns(_payload_hashes(frame,payload))
                 old = old.with_columns(_payload_hashes(old,payload))
                 if spec.source == "items" and input_receipt_id is not None:
                     from bagelquant_data.core.hashing import frame_content_hash

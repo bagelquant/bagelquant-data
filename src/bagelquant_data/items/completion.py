@@ -136,6 +136,46 @@ def pending_dates(db, build_id) -> list[tuple[str, str]]:
     return [tuple(value) for value in payload["coordinates"]]
 
 
+def refresh_completion_dependencies(db, original, source, *, output_commit, output_check) -> None:
+    """Refresh a proven current build's dependency flag under its writer fence.
+
+    The caller has rechecked the whole original Source, output/check boundaries
+    and definition. Never replace an incomplete, different or wider completion.
+    Original builds, Source receipts and checked/covered dates remain unchanged.
+    """
+    from bagelquant_data.storage.data_meta import DataMetaStore
+    flag = db.execute("select * from node_completions where node_key=?",
+        ("items/" + original["name"],)).fetchone()
+    state = db.execute("select publication_revision,update_incomplete from datasets "
+        "where source='items' and name=?", (original["name"],)).fetchone()
+    if (flag is None or state is None or state["update_incomplete"]
+            or flag["publication_revision"] != state["publication_revision"]
+            or flag["result_ref"] != str(original["id"])
+            or flag["definition_hash"] != original["definition_hash"]
+            or flag["dependency_digest"] != original["dependency_digest"]
+            or flag["completed_start"] != original["start_date"]
+            or flag["completed_end"] != original["end_date"]
+            or source.receipt_id != original["frozen_receipt_id"]
+            or source.dependency_digest != original["dependency_digest"]
+            or source.max_commit != original["input_commit"]
+            or (original["result_commit"] or 0) != output_commit
+            or source.information_cutoff is None or flag["checked_target"] is None
+            or flag["checked_target"] < flag["completed_end"]
+            or flag["checked_target"] > str(source.information_cutoff)):
+        return
+    row = db.execute("select * from item_builds where id=?", (original["id"],)).fetchone()
+    if row is None or dict(row) != original:
+        raise RuntimeError("Original completion changed before dependency flag refresh")
+    verified_completion_digest(db, original["id"])
+    if output_check_bound(db, original["id"]) != output_check:
+        return
+    dependency = DataMetaStore.dependency_state(db, "items", original["name"])
+    if dependency != flag["dependency_state_digest"]:
+        DataMetaStore.write_completion(db, **{key: flag[key] for key in (
+            "node_key", "definition_hash", "completed_start", "completed_end", "checked_target",
+            "semantic_version", "dependency_digest", "result_ref")})
+
+
 def save_completion(db, build_id, *, pending=(), authority=None, checked_target=None,
                     publish_node=True) -> None:
     """Publish original range authority atomically with its pending coordinates."""

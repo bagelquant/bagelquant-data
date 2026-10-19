@@ -290,6 +290,8 @@ def initialize_many(api: ItemAPI, names: Sequence[str], *, start, end,
                 totals["source_rows_read"] += prepared.source_rows
                 totals["key_rows_prepared"] += prepared.key_rows
                 totals["prepared_peak_bytes"] = max(totals["prepared_peak_bytes"], prepared.peak_bytes)
+                for metric, value in prepared.encoding_counts.items():
+                    totals[metric] = totals.get(metric, 0) + value
         for name, state in active.items():
             if stopped:
                 result[name] = ItemBuildReport(name, "cancelled", state.rows, state.result_commit,

@@ -26,7 +26,7 @@ from bagelquant_data.transforms import Cast, Filter, MapValues, Select, apply_tr
 
 from .types import BuildContext, DataItemSpec, ItemBuildReport, ItemCompletionAttestation, ItemInput, ItemPublication, Producer, ProducerUpdatePolicy, RawInput, input_payload, spec_from_payload, spec_payload
 from .pit import _comparison_frame, _same_ordered_rows, general_input_snapshot, iter_computed_versions
-from .completion import output_check_bound, pending_dates, verified_completion_digest, save_completion as _save_completion
+from .completion import output_check_bound, pending_dates, refresh_completion_dependencies, verified_completion_digest, save_completion as _save_completion
 
 if TYPE_CHECKING:
     from bagelquant_data.management.lake import DataLake
@@ -788,7 +788,7 @@ class ItemAPI:
                     progress=progress, cancelled=cancelled)
             work = {"prepared_hits": prepared.hits, "prepared_misses": prepared.misses,
                 "source_rows_read": prepared.source_rows, "key_rows_prepared": prepared.key_rows,
-                "prepared_peak_bytes": prepared.peak_bytes}
+                "prepared_peak_bytes": prepared.peak_bytes, **prepared.encoding_counts}
             return {name: replace(report, work={**report.work, **work}) for name, report in result.items()}
 
     def resume_update(self, name: str, *, build_id: int, start: DateLike, end: DateLike,
@@ -1005,6 +1005,9 @@ class ItemAPI:
                             "requests": {alias: input_payload(request) for alias, request in requests.items()},
                             "information_cutoff": str(receipt.information_cutoff), "impact": "none",
                         }})
+                else:
+                    refresh_completion_dependencies(db, previous, original,
+                        output_commit=output_commit_before, output_check=output_check_before)
                 check_noop_canceled()
                 return ItemBuildReport(name, "unchanged", 0,
                     (output_commit_before or None) if rebind else previous["result_commit"], receipt.max_commit,

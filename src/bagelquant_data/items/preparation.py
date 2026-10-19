@@ -22,20 +22,24 @@ class PreparedWindow:
     source_rows: int = 0
     key_rows: int = 0
     peak_bytes: int = 0
+    encoding_counts: dict[str, int] = field(default_factory=dict)
 
-    def get(self, key: tuple[Any, ...]) -> pl.DataFrame | None:
+    def get(self, key: tuple[Any, ...], *, count: bool = True) -> pl.DataFrame | None:
         cached = self.frames.pop(key, None)
         if cached is None:
-            self.misses += 1
+            self.misses += int(count)
             return None
         self.frames[key] = cached
-        self.hits += 1
+        self.hits += int(count)
         return cached[0].clone()
 
     def put(self, key: tuple[Any, ...], frame: pl.DataFrame) -> None:
         charge = 4096 + int(frame.estimated_size())
         if charge > self.byte_limit:
             return
+        previous = self.frames.pop(key, None)
+        if previous is not None:
+            self.retained_bytes -= previous[1]
         while self.frames and (self.retained_bytes + charge > self.byte_limit or len(self.frames) >= 128):
             _, (_, removed) = self.frames.popitem(last=False)
             self.retained_bytes -= removed
@@ -58,7 +62,10 @@ def prepared_window(path: Path, byte_limit: int) -> Iterator[PreparedWindow]:
     state = PreparedWindow(path.resolve(), byte_limit)
     token = _PREPARED.set(state)
     try:
-        yield state
+        from bagelquant_data.pipeline.versions import _record_key_preparation
+        with _record_key_preparation(state.path, lambda key: state.get(key, count=False),
+                                     state.put, state.encoding_counts):
+            yield state
     finally:
         state.frames.clear()
         state.retained_bytes = 0
