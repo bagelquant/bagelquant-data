@@ -86,6 +86,30 @@ def test_inventory_deduplicates_hardlinks_and_readonly_cleanup_rejected(tmp_path
         readonly.integrity.cleanup_temporary(readonly.integrity.temporary_cleanup_plan())
 
 
+def test_public_filesystem_inventory_counts_hidden_unknown_links_and_allocation(tmp_path):
+    import os
+
+    lake = DataLake.open(data_meta_path=tmp_path / "meta.sqlite", lake_path=tmp_path / "lake")
+    setup(lake)
+    hidden = lake.lake_path / ".hidden"
+    hidden.write_bytes(b"unknown")
+    os.link(hidden, lake.lake_path / "duplicate")
+    (lake.lake_path / "symlink").symlink_to(tmp_path / "outside")
+    usage = lake.integrity.storage_inventory()
+    identities = {}
+    for entry in usage["entries"]:
+        identities.setdefault((entry["device"], entry["inode"]), entry)
+    assert usage["bytes"] == sum(entry["bytes"] for entry in identities.values())
+    assert usage["allocated_bytes"] == sum(entry["allocated_bytes"] for entry in identities.values())
+    assert any(entry["path"] == str(hidden) for entry in usage["entries"])
+    assert any(entry["kind"] == "symlink" for entry in usage["entries"])
+    assert usage["paths"] == [
+        str(lake.data_meta_path), str(lake.data_meta_path) + "-wal",
+        str(lake.data_meta_path) + "-shm", str(lake.data_meta_path) + "-journal",
+        str(lake.lake_path),
+    ]
+
+
 def test_late_writer_and_forged_candidate_cannot_delete_retained_bytes(tmp_path):
     lake = DataLake.open(data_meta_path=tmp_path / "meta.sqlite", lake_path=tmp_path / "lake")
     temporary = setup(lake)

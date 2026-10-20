@@ -232,3 +232,19 @@ temporal precision, null/nonfinite handling and all persisted identities remain
 unchanged. This reserve estimate is not a hard process RSS guarantee.
 
 `raw_categories(source).update(id, name=..., parent_id=...)` and the item category API atomically rename/move a folder. Cycles, cross-provider parents and nonempty deletion are rejected. Classification changes do not alter data paths, versions or receipts.
+
+## Complete filesystem inventory
+
+`lake.integrity.storage_inventory(within_root=None)` stats the metadata database,
+its WAL/SHM/journal sidecars and every entry under the lake, including hidden,
+unknown and temporary files. It reports owner paths, per-entry logical bytes,
+allocated bytes (`st_blocks * 512`), file kind and device/inode, plus unique-inode
+totals. Directory logical bytes are zero; symbolic links count their own object,
+not target contents. `within_root` restricts traversal to selected root paths.
+Consumers can merge this public inventory with other owners and attribute hard
+links once by lexical path. Errors other than disappearing files fail the scan.
+It never reads numerical bodies or initializes or repairs storage.
+
+`storage_usage()` still supplies Data's semantic current/history/temporary counts.
+The new inventory does not expand `temporary_cleanup_plan/cleanup_temporary`:
+unknown files, retained originals and recovery evidence stay protected.

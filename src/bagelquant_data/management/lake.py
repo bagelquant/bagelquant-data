@@ -481,6 +481,15 @@ class IntegrityAPI:
         return reopen_initialization(self._lake._data_meta, self._lake.raw.get(dataset, source=source),
                                      start=_as_date(start), end=_as_date(end), reason=reason)
 
+    def storage_inventory(self, *, within_root: Path | None = None) -> dict[str, Any]:
+        """Return complete filesystem facts, including links and unknown files.
+
+        Independent owner inventories can be composed by path and inode without
+        reading backend files. This does not expand the temporary cleanup scope.
+        """
+        from bagelquant_data.management.storage_usage import store_usage
+        return store_usage(self._lake._data_meta.data_meta_path, self._lake.lake_path, within_root=within_root)
+
     def storage_usage(self) -> dict[str, Any]:
         """Read actual Data-owned storage usage, including retained history."""
         from bagelquant_data.management.maintenance import storage_usage

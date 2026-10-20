@@ -47,3 +47,7 @@ Active authored documentation and new AI records use English. Public behavior,
 formula, metric, PIT/data or workflow changes update relevant owner docs and
 private wiki pages in the same task; integrated tasks record wiki impact, page
 UUIDs and verification. Read the verified workspace `.ai/rules/wiki.md`.
+
+Complete filesystem accounting uses integrity.storage_inventory; semantic Data
+statistics and protected temporary cleanup retain their existing APIs. See
+[Operations](../docs/en/7_operations.md#complete-filesystem-inventory).

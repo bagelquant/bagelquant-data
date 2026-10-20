@@ -425,3 +425,10 @@ frozen Source. Snapshot performs no historical decode or checksum audit and stil
 requires explicit verification before computation. Its `generation_count` retains
 the manifest count; `immutable_file_count` counts the complete copied inventory
 and `visibility_count` counts its visibility files.
+
+`integrity.storage_inventory(within_root=...)` is the public complete stat
+inventory for metadata/sidecars and the lake. Include hidden/unknown entries,
+logical and allocated sizes, and inode identities for consumer deduplication.
+No body reads, initialization or cleanup occur. Data remains independent of Core;
+the inventory uses only the standard library. Semantic `storage_usage` and the
+existing conservative temporary-cleanup authority remain separate contracts.
