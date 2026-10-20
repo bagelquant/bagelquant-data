@@ -19,6 +19,10 @@ blocks are content addressed and shared across receipts. Live ledger projections
 never replace a frozen original header after indexing or metadata changes. Provider
 commit request batches share templates and per-scope deltas. No schema 8 reader
 or automatic migration exists.
+Row queries decode immutable request blocks and schemas on their original query
+connection, including an enclosing uncommitted writer. Do not reopen a connection
+for each lazy descendant or substitute a separate read snapshot during decoding;
+retain the original checksum and missing-evidence failures.
 An identical thin receipt digest reuses its original receipt ID. Different
 cutoffs, declarations or retained boundaries remain distinct immutable evidence;
 only selected semantic identities govern numerical reuse.
@@ -51,6 +55,15 @@ bound. Different explicit `as_of` values retain distinct keys. Member indexes
 belong to immutable 64-member chunks, not to Source-bound set IDs. Source removal
 retains shared indexes like other shared metadata; it never deletes another
 Source's evidence. Earlier set formats are not read or automatically migrated.
+
+An ordinary selection-set read keeps header admission and complete lazy
+descriptor materialization in one finite read view, with bounded Inputs memos.
+Validate the registered header before loading its claimed Source. Existing
+Inputs readers and active writers retain their original connection and
+uncommitted visibility. Registration shares one finite validation context across
+its bounded groups, then closes that newly owned context before the original
+writer transaction and Source recheck. No context or successful read survives
+the operation; cancellation, corruption and buffer limits still fail closed.
 
 Each actual content delta is one immutable Parquet segment. Never rewrite/copy
 an entire historical month for an append. SQLite stores file references, exact
@@ -190,6 +203,14 @@ small exact consumed-value summaries. They are a stronger equality proof, not a
 second ordinary identity authority. `selection_equivalent(summaries_only=True)`
 compares only registered exact summaries when metadata cannot prove equality.
 No per-batch row/scalar index or automatic full-history maintenance exists.
+
+Scoped equivalence first prunes immutable sequence/branch references using the
+receipt's captured observation/availability bounds, then applies the existing
+per-batch visibility and exact-summary checks. Missing bounds remain conservative.
+Optional Raw summary bounds apply independently to each batch and cannot enable
+receipt-level pruning for unbounded historical receipts. This is a scoped proof,
+not an audit of disjoint descendants: explicit `inputs.verify()` still traverses
+and validates all retained evidence.
 
 DataItem producer policies declare affected output intervals and read windows.
 Append computes new outputs; bounded repairs reuse unaffected history. Newly

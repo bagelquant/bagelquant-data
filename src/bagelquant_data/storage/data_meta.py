@@ -1773,19 +1773,21 @@ class DataMetaStore:
     def _rows(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = [dict(row) for row in db.execute(sql, tuple(params)).fetchall()]
-        for row in rows:
-            if "schema_ref" in row:
-                from .immutable_metadata import schema_bytes
-                with self.connect() as db:
+            # Decode immutable references on the query's own connection. Besides
+            # avoiding one connection per lazy block, this retains visibility of
+            # metadata published by an enclosing, uncommitted writer.
+            for row in rows:
+                if "schema_ref" in row:
+                    from .immutable_metadata import schema_bytes
                     row["schema_ipc"] = schema_bytes(db, row["schema_ref"])
-            if "request_json" in row and str(row["request_json"]).startswith('{"request_ref":'):
-                from .immutable_metadata import decode_requests
-                row["request_json"] = decode_requests(self, row["request_json"])
-            request_params = row.get("request_params")
-            if "metrics_json" in row:
-                row["metrics"] = json.loads(row.pop("metrics_json"))
-            if isinstance(request_params, bytes):
-                row["request_params"] = zlib.decompress(request_params).decode("utf-8")
+                if "request_json" in row and str(row["request_json"]).startswith('{"request_ref":'):
+                    from .immutable_metadata import decode_requests
+                    row["request_json"] = decode_requests(db, row["request_json"])
+                request_params = row.get("request_params")
+                if "metrics_json" in row:
+                    row["metrics"] = json.loads(row.pop("metrics_json"))
+                if isinstance(request_params, bytes):
+                    row["request_params"] = zlib.decompress(request_params).decode("utf-8")
         return rows
 
     def _initialize(self) -> None:

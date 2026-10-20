@@ -116,7 +116,7 @@ def test_request_templates_are_shared_and_commit_records_replay_logically(tmp_pa
         raw_bytes = len(json.dumps(requests).encode())
         stored = db.execute("SELECT sum(length(payload_json)) FROM immutable_metadata").fetchone()[0]
         assert len(encoded) < 200 and stored < raw_bytes // 2
-    assert json.loads(immutable_metadata.decode_requests(lake._data_meta, encoded)) == requests
+        assert json.loads(immutable_metadata.decode_requests(db, encoded)) == requests
 
 
 def test_explicit_audit_detects_mutated_shared_descendant(tmp_path):

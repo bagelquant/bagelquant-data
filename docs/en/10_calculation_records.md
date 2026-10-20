@@ -22,6 +22,14 @@ references. Neither operation expands historical metadata. Unchanged currentness
 uses recorded alias-local revisions and complete producer authorities; unknown
 or changed evidence keeps the conservative metadata comparison.
 
+Scoped `selection_equivalent` comparisons use captured observation and availability
+bounds to skip disjoint immutable branches before loading segment headers.
+Missing bounds retain candidates, and optional Raw summary bounds apply separately
+to each batch. The same visibility and exact-summary fallback still decide equality.
+This reduces repeated metadata decoding without reading original values or building
+indexes. A scoped proof does not audit skipped descendants; explicit `inputs.verify`
+still checks all retained evidence.
+
 `register_selection_set(receipt, descriptors)` validates complete public
 descriptors and returns `{id, digest, source, count}`. `describe_selection_set`
 checks that header and original Source without resolving historical descriptors.

@@ -292,6 +292,6 @@ def encode_requests(db, requests: Sequence[Mapping[str, Any]]) -> str:
     return canonical({"request_ref": save(db, requests)})
 
 
-def decode_requests(store, serialized: str) -> str:
+def decode_requests(database, serialized: str) -> str:
     value = json.loads(serialized)
-    return canonical(MetadataReader(store).value(value["request_ref"]))
+    return canonical(MetadataReader(database=database).value(value["request_ref"]))

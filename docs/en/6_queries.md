@@ -60,6 +60,11 @@ with lake.inputs.read_context(receipt, check_canceled=check_canceled,
                           end="2020-01-10").collect()
 ```
 
+Metadata row queries decode shared request blocks and schemas on the same
+connection that fetched the rows. This also preserves visibility within an
+enclosing write transaction. Immutable-reference checksum and missing-evidence
+checks still apply; the connection is released when its owning scope exits.
+
 `inputs.window_read_supported(receipt, alias)` is a metadata-only planning query:
 true means every retained by-date batch has captured/sealed bounds or an existing
 checked original index header capable of safe pruning. General/missing bounds
@@ -192,6 +197,15 @@ fail. The consumer must separately prove unchanged Universe/calendar/policy
 axes before reusing a stored descriptor. First or changed axes require actual keys.
 Registered proof memoization is finite and expires with the read context or writes.
 
+`inputs.read_selection_set` admits the registered header before its Source,
+then materializes the selected plain descriptors in one finite metadata snapshot.
+Lazy descendants reuse that connection through the end of the call. Existing
+readers and writers retain their transaction, including uncommitted writer rows.
+`register_selection_set` shares bounded validation memos across its groups and
+closes its newly owned reader before the publication transaction. Ordering,
+descriptor identities, memory checks and original Source fences are unchanged.
+Neither operation reads historical numerical bodies or retains a cross-call cache.
+
 General `coordinate_identity` now inherits exact selected atomic authority across
 Sources. Explicit `index_coordinates` retains one original date payload and
 records its canonical locator/source in the existing projection index. Ordinary
@@ -271,3 +285,10 @@ Optional exact `index_selection(s)` and small coordinate axes are explicit;
 ordinary identity stays unchanged by preparation. `inputs.verify` audits exact
 original Parquet bytes, typed schema, bounds and summaries with bounded readers.
 Damaged or missing originals require a trusted backup.
+
+Scoped `selection_equivalent` checks prune immutable metadata branches using
+captured observation/availability bounds before loading segment headers. Missing
+bounds retain candidates; optional Raw summary bounds apply independently to
+each batch. The existing visibility and exact-summary checks still decide
+equality. Skipped disjoint descendants are outside this scoped proof; explicit
+`inputs.verify` continues to audit every retained descendant.

@@ -641,13 +641,17 @@ class InputsAPI:
         for descriptor in descriptors:
             check_canceled()
             grouped.setdefault(str(descriptor["alias"]), []).append(descriptor)
-        for values in grouped.values():
-            for first in range(0, len(values), 16):
-                group = values[first:first + 16]
-                resolved = self.resolve_selection_descriptors(frozen, group,
-                    config=config, check_canceled=check_canceled)
-                if list(resolved) != list(group):
-                    raise ValueError("Selection set descriptor differs from its registered Source")
+        context = (self.read_context(frozen, config=config, check_canceled=check_canceled)
+            if self._read_context() is None
+            and getattr(self._store._thread_state, "writer_connection", None) is None else nullcontext())
+        with context:
+            for values in grouped.values():
+                for first in range(0, len(values), 16):
+                    group = values[first:first + 16]
+                    resolved = self.resolve_selection_descriptors(frozen, group,
+                        config=config, check_canceled=check_canceled)
+                    if list(resolved) != list(group):
+                        raise ValueError("Selection set descriptor differs from its registered Source")
         keys = [self.selection_descriptor_identity(value) for value in descriptors]
         if len(keys) != len(set(keys)):
             raise ValueError("Selection set descriptor identities must be unique")
@@ -737,15 +741,24 @@ class InputsAPI:
             config: ExecutionOptions | None = None,
             check_canceled: Callable[[], None] = lambda: None) -> tuple[dict[str, Any], ...]:
         """Read selected descriptor keys; all-key reads are explicit preparation/audit."""
-        self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
-        if isinstance(keys, (str, bytes)):
-            raise ValueError("Selection set keys require a finite sequence")
-        if keys is not None and not keys:
-            return ()
-        membership = self._selection_membership(reference, config=config,
-            check_canceled=check_canceled)
-        return self._read_selection_members(*membership, keys=keys, config=config,
-            check_canceled=check_canceled)
+        scoped = (self._read_context() is None
+            and getattr(self._store._thread_state, "writer_connection", None) is None)
+        # Admit the registered header before its claimed Source, and keep lazy
+        # descendants on that same finite SQLite snapshot. An existing writer
+        # must retain visibility of its uncommitted selection inventory.
+        with self._store.read_view() if scoped else nullcontext():
+            header = self.describe_selection_set(reference, config=config, check_canceled=check_canceled)
+            if isinstance(keys, (str, bytes)):
+                raise ValueError("Selection set keys require a finite sequence")
+            if keys is not None and not keys:
+                return ()
+            context = (self.read_context(header["source"]["id"], config=config, check_canceled=check_canceled)
+                if scoped else nullcontext())
+            with context:
+                membership = self._selection_membership(reference, config=config,
+                    check_canceled=check_canceled)
+                return self._read_selection_members(*membership, keys=keys, config=config,
+                    check_canceled=check_canceled)
 
     def _read_selection_members(self, header, reader, members, blocks, *, keys,
             config=None, check_canceled=lambda: None):
@@ -1290,9 +1303,16 @@ class InputsAPI:
             batches = []
             lower = None if request.start is None else _date_value(request.start)
             upper = None if request.end is None else _date_value(request.end)
+            captured_bounds = bool(evidence.get("scoped_batches") or evidence.get("retained_batch_bounds"))
+            candidates = evidence["batches"]
+            if captured_bounds and isinstance(candidates, immutable_metadata.LazyMetadataSequence):
+                # Use the same retained bounds before decoding unrelated segment
+                # headers. Missing bounds stay conservative; summary-only Raw
+                # bounds below still apply independently to each candidate.
+                candidates = candidates.selected(lower, upper, day)
             with self._store.connect() as bounds_db:
-                for batch in evidence["batches"]:
-                    bounded = bool(evidence.get("scoped_batches") or evidence.get("retained_batch_bounds"))
+                for batch in candidates:
+                    bounded = captured_bounds
                     if (not bounded and isinstance(request, RawInput)
                             and evidence["definition"]["update_type"] == "by_date"):
                         # Optional original-batch summaries may narrow this proof,
