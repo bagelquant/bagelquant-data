@@ -162,8 +162,18 @@ Read-only neutral-timing planning requires a positive metadata baseline proof
 at every changed boundary across the complete dependency OR; it must never fall
 back to original row selection. Partial visibility headers disqualify only
 baseline candidates with intersecting original commits and observation bounds,
-including multiple partitions of one commit. Unknown/missing event scope remains
+including multiple partitions of one commit. Within a fully visible batch whose
+entire observation range is consumed, an occupied minimum or maximum observation
+date also proves a surviving row if it lies outside every matching visibility
+range and potentially visible nonbaseline revision. Full-commit seals still
+disqualify the entire commit. Unknown/missing event scope remains
 conservative and follows ordinary impact/block handling without index preparation.
+Same-date General first verification uses the same authenticated native-unit
+proof as consumed-field equality, including callers without `general_fields`.
+A finite-history producer needs proof for its consumed halo; a whole-request
+baseline alone cannot authorize its first promotion.
+Whole-input forward producers retain original requests but share the complete
+dependency-boundary proof, including intermediate baseline loss/restoration.
 A pointwise native input window may extend only its upper observation bound
 without a uniform-baseline proof when both frozen and current declarations are
 the same `by_date` Raw, every non-window request field and the lower bound remain
@@ -195,6 +205,14 @@ Runtime `ProducerUpdatePolicy.general_fields` may declare immutable
 identity. The producer must consume precisely those columns and independently
 declare timing neutrality. For an already-known nonbaseline snapshot, registered
 typed summaries may prove that new content changes only unconsumed columns.
+A same-date producer can also reuse an originally selected baseline when exact
+consumed equality holds and metadata proves aggregate baseline timing survives
+within every completed execution subwindow. Refine the prefix at retained native
+build/unit boundaries, clip by-date requests to each subwindow, retain atomic
+General scope, and check original/current evidence at every dependency timing
+boundary and each atomic General commit ceiling. Only complete output-anchor
+absence can exempt an empty subwindow. A baseline found only in another unit or
+new dates does not qualify. This exception does not admit asset-key additions.
 Field proofs require a selected atomic snapshot (typed empty is supported),
 never a current/union schema for no eligible event.
 Every captured atomic schema must agree on consumed-field dtypes; conflicting
@@ -205,7 +223,7 @@ boundary. Bind the selected original schema, full row multiplicity and complete
 request. Missing summaries require explicit original/current index_selection
 maintenance at the named max_commit/as_of; ordinary planning never decodes
 originals or row indexes. Actual consumed changes, first/earlier visibility,
-baseline promotion or unsupported scopes remain actionable blocked plans, not
+unproved baseline transitions or unsupported scopes remain actionable blocked plans, not
 full-history replay. Output anchors and other dependency impacts remain separate.
 Direct update/recertify config and an explicit plan read_context both bound
 General metadata/summary admission; resource settings never change proof identity.

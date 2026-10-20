@@ -435,3 +435,40 @@ def test_partial_visibility_event_preserves_disjoint_partition_of_same_commit(tm
                     {"version_commits": []}, {"min_observation": "2020-01-01"}):
         changed = {**evidence, "record_checks": [{**event, **changes}]}
         assert proven(replace(frozen, evidence={"raw": changed}), "raw", date(2020, 2, 3)) is None
+
+
+@pytest.mark.parametrize("verified,revision,expected", [
+    ((1,), False, True), ((15,), False, True),
+    ((1, 15), False, None), ((15,), True, None),
+])
+def test_partial_verification_keeps_only_uncovered_occupied_endpoints(
+    tmp_path, monkeypatch, verified, revision, expected,
+):
+    data = lake(tmp_path)
+    original = rows()
+    data.raw.ingest(spec(), original, mode="initialize", ingested_at=datetime(2020, 1, 16, tzinfo=UTC))
+    data.raw.ingest(spec(), original.filter(pl.col("time").dt.day().is_in(verified)),
+        ingested_at=datetime(2020, 1, 20, tzinfo=UTC))
+    if revision:
+        data.raw.ingest(spec(), rows((1,), (9.,)), ingested_at=datetime(2020, 1, 21, tzinfo=UTC))
+    frozen = scoped(data)
+    assert data.inputs._baseline_at(frozen, "raw", date(2020, 1, 25)) == (expected is True)
+    monkeypatch.setattr(data.inputs, "_read_frame", lambda *a, **k: pytest.fail("Proof read original values"))
+    assert proven(frozen, "raw", date(2020, 1, 25)) is expected
+
+
+def test_occupied_endpoint_requires_complete_visibility_and_known_witness_scope(tmp_path):
+    data = lake(tmp_path)
+    data.raw.ingest(spec(), rows(), mode="initialize", ingested_at=datetime(2020, 1, 16, tzinfo=UTC))
+    data.raw.ingest(spec(), rows((1,), (1.,)), ingested_at=datetime(2020, 1, 5, tzinfo=UTC))
+    frozen = scoped(data)
+    # The uncovered January 15 endpoint is not yet visible on January 10.
+    assert proven(frozen, "raw", date(2020, 1, 10)) is None
+    assert data.inputs._baseline_at(frozen, "raw", date(2020, 1, 10)) is False
+    assert proven(frozen, "raw", date(2020, 1, 20)) is True
+    evidence = frozen.evidence["raw"]
+    event, = evidence["record_checks"]
+    for changes in ({"min_observation": None}, {"max_observation": None},
+                    {"version_commits": []}, {"min_observation": "2020-02-01"}):
+        changed = {**evidence, "record_checks": [{**event, **changes}]}
+        assert proven(replace(frozen, evidence={"raw": changed}), "raw", date(2020, 1, 20)) is None

@@ -33,8 +33,9 @@ def _merge(windows: list[tuple[date, date]]) -> list[tuple[date, date]]:
     return result
 
 
-def _neutral_timing_preserved(owner: ItemAPI, db, receipt, *, name: str,
-                              alias: str, checks, end: date, commit_bound: int) -> bool:
+def _neutral_timing_preserved(owner: ItemAPI, db, receipt, *, previous, policy,
+                              first: date, last: date, alias: str, checks,
+                              end: date, commit_bound: int) -> bool:
     """Prove unchanged output timing for a producer-declared neutral General input.
 
     Already-known General timing is alias-local; other aliases are planned
@@ -93,24 +94,26 @@ def _neutral_timing_preserved(owner: ItemAPI, db, receipt, *, name: str,
     if any(_date_value(check["pit_date"]) <= receipt.information_cutoff for check in checks):
         return False
     if db.execute("select 1 from version_commits where source='items' and dataset=? "
-                  "and status='committed' and baseline=0 limit 1", (name,)).fetchone():
+                  "and status='committed' and baseline=0 limit 1", (previous["name"],)).fetchone():
         return False
     if not owner._lake.inputs.is_current(receipt):
         return False
-    captured = owner._lake.inputs._capture(db, receipt.requests, cutoff=end, max_commit=commit_bound,
-        compact_aliases={key for key, value in receipt.evidence.items() if "full_commit_checks" in value},
-        scoped_aliases={key for key, value in receipt.evidence.items() if value.get("scoped_batches")},
-        retained_bounds_aliases=set(receipt.requests))
-    current = owner._lake.inputs._receipt("timing-impact", captured, hashlib.sha256(_json(captured).encode()).hexdigest())
-    boundaries = {_date_value(check["pit_date"]) for check in checks} | {end}
-    for cutoff in sorted(boundaries):
-        # Planning requires a surviving baseline OR, not complete row timing.
-        # Finish the metadata proofs across all aliases; unresolved evidence
-        # follows ordinary impact/block handling without decoding originals.
-        if not any(owner._lake.inputs._proven_baseline_at(current, key, cutoff) is True
-                   for key in current.requests):
-            return False
-    return True
+    inputs = owner._lake.inputs
+    context = inputs._read_context()
+    budget = (context.options if context is not None else ExecutionOptions()).max_buffer_bytes
+    # Finite-history inputs need their actual consumed halo. Whole-input
+    # forward producers retain the original observation scope.
+    if policy.historical_impact != "same_date" and policy.history_observations is not None:
+        return False
+    captured = inputs._capture(db, {alias: request}, cutoff=end, max_commit=commit_bound,
+        max_buffer_bytes=budget)
+    candidate = inputs._receipt("neutral-general-timing", captured,
+        hashlib.sha256(_json(captured).encode()).hexdigest())
+    windows = (_baseline_windows(db, receipt, previous, policy=policy, first=first, last=last,
+        end=end, commit_bound=commit_bound, budget=budget) if policy.historical_impact == "same_date" else None)
+    return _baseline_timing_preserved(inputs, db, receipt, first=first, last=last,
+        end=end, commit_bound=commit_bound, budget=budget, general_alias=alias, candidate=candidate,
+        windows=windows)
 
 
 def general_projection_states(inputs, receipt, payload, *, alias: str, end: date):
@@ -159,9 +162,151 @@ def general_projection_states(inputs, receipt, payload, *, alias: str, end: date
         yield bounded, min(day, end), ceiling, bounded_payload
 
 
+def _anchors_empty(db, receipt, *, anchors, first: date, last: date, end: date, commit_bound: int) -> bool:
+    """Prove absent output coordinates using original and current anchor headers."""
+    anchor_empty = bool(anchors)
+    for alias in anchors:
+        anchor = receipt.requests.get(alias)
+        if (not isinstance(anchor, RawInput)
+                or receipt.evidence[alias]["definition"]["update_type"] != "by_date"):
+            raise ValueError("Output anchor requires a declared by-date Raw input")
+        # Absence is a complete coordinate proof, not an output-row count.
+        # A late observation version in the old interval prevents reuse.
+        anchor_batches = db.execute("select " + ",".join("b." + field for field in _BATCH_COLUMNS.split(","))
+            + ",c.baseline from version_segments b join version_commits c on c.seq=b.commit_seq "
+            "where c.source=? and c.dataset=? and c.status='committed' and c.seq<=?",
+            (anchor.source, anchor.dataset, commit_bound)).fetchall()
+        registered = {(batch["commit_seq"], batch["partition_path"]): batch for batch in anchor_batches}
+        for original in receipt.evidence[alias]["batches"]:
+            if original["row_count"] and (original.get("min_observation") is None
+                    or original.get("max_observation") is None):
+                anchor_empty = False
+            current = registered.get((original["commit_seq"], original["partition_path"]))
+            if current is None or any(original[field] != current[field] for field in
+                    (*_BATCH_COLUMNS.split(","), "baseline") if field in original):
+                # A current header cannot disprove coordinates retained in
+                # the immutable original receipt. Corruption is explicit.
+                raise RuntimeError("Output anchor original batch binding changed; explicit integrity recovery is required")
+        for batch in anchor_batches:
+            if not batch["row_count"]:
+                continue
+            if (not batch["baseline"] and batch["min_available"] is not None
+                    and _date_value(batch["min_available"]) > end):
+                continue
+            if (batch["min_observation"] is None or batch["max_observation"] is None
+                    or _date_value(batch["min_observation"]) <= last
+                    and _date_value(batch["max_observation"]) >= first):
+                anchor_empty = False
+                break
+    return anchor_empty
+
+
+def _baseline_windows(db, receipt, previous, *, policy, first: date, last: date,
+                      end: date, commit_bound: int, budget: int):
+    """Authenticated native unit boundaries, excluding proven empty coordinates."""
+    from .completion import verified_completion_digest
+    # Whole-range completions can combine many native execution units.
+    # Refine at every retained unit boundary; one unit's baseline must not
+    # mask another unit's first verification. Obsolete boundaries can only
+    # make this positive proof more conservative.
+    stops = {first, last + timedelta(days=1)}
+    for row in db.execute("select b.id,b.start_date,b.end_date from item_builds b "
+            "left join item_completion_proofs p on p.build_id=b.id "
+            "left join item_completion_authorities a on a.build_id=b.id "
+            "where b.name=? and b.definition_hash=? and b.id<=? "
+            "and b.status in ('success','unit_success') and b.start_date<=? and b.end_date>=? "
+            "and (p.build_id is not null or a.build_id is not null or b.status='unit_success')",
+            (previous["name"], previous["definition_hash"],
+                previous["id"], str(last), str(first))):
+        verified_completion_digest(db, row["id"])
+        stops.update((max(first, _date_value(row["start_date"])),
+            min(last, _date_value(row["end_date"])) + timedelta(days=1)))
+        if len(stops) * 128 > budget // 4:
+            raise MemoryError("General completed-unit timing metadata exceeds max_buffer_bytes")
+    boundaries = sorted(stops)
+    return [(first, stop - timedelta(days=1)) for first, stop in zip(boundaries, boundaries[1:])
+        if not _anchors_empty(db, receipt, anchors=policy.output_anchors, first=first,
+            last=stop - timedelta(days=1), end=end, commit_bound=commit_bound)]
+
+
+def _baseline_timing_preserved(inputs, db, receipt, *, first: date, last: date,
+                               end: date, commit_bound: int, budget: int,
+                               general_alias: str, candidate, windows) -> bool:
+    """Prove baseline across each consumed scope at every timing boundary.
+
+    These are transient metadata views, not new Sources. General inputs retain
+    atomic scope; same-date dependencies are clipped to authenticated units.
+    Whole-input forward producers retain their original observation requests.
+    Non-General verification and partial availability boundaries also matter.
+    """
+    old_cutoff = receipt.information_cutoff
+    if old_cutoff is None or end < old_cutoff:
+        return False
+    requests = {}
+    for alias, request in receipt.requests.items():
+        if windows is not None and (not isinstance(request, RawInput)
+                or receipt.evidence[alias]["definition"].get("update_type") == "by_date"):
+            lower = max([first, *(_date_value(value) for value in (request.start,) if value is not None)])
+            upper = min([last, *(_date_value(value) for value in (request.end,) if value is not None)])
+            if lower > upper:
+                return False
+            request = replace(request, start=lower, end=upper)
+        requests[alias] = request
+    original = replace(receipt, requests=requests)
+    # A future timing event can belong to a General commit already captured
+    # before the other original dependencies. Retain those original parents
+    # while selecting precisely this atomic General event below.
+    captured = inputs._capture(db, requests, cutoff=end, max_commit=max(commit_bound, receipt.max_commit),
+        compact_aliases={key for key, value in receipt.evidence.items() if "full_commit_checks" in value},
+        retained_bounds_aliases=set(requests), max_buffer_bytes=budget)
+    captured["evidence"][general_alias] = candidate.evidence[general_alias]
+    serialized = _json(captured)
+    if len(serialized.encode()) * 16 > budget // 4:
+        raise MemoryError("General prefix timing metadata exceeds max_buffer_bytes")
+    current = inputs._receipt("general-prefix-timing", captured,
+        hashlib.sha256(serialized.encode()).hexdigest())
+    boundaries = {old_cutoff, end}
+    for source in (original, current):
+        for alias, evidence in source.evidence.items():
+            if evidence["definition_hash"] != receipt.evidence[alias]["definition_hash"]:
+                return False
+            snapshots = {row["seq"]: row for row in evidence["general_snapshots"]}
+            boundaries.update(_date_value(row["pit_date"]) for row in snapshots.values())
+            checks = [*evidence["checks"],
+                *(seal["binding"]["check"] for seal in evidence.get("full_commit_checks", ()))]
+            for check in checks:
+                day = _date_value(check["pit_date"])
+                if check["visible_commit"] in snapshots:
+                    day = max(day, _date_value(snapshots[check["visible_commit"]]["pit_date"]))
+                boundaries.add(day)
+            for batch in evidence["batches"]:
+                boundaries.update(_date_value(batch[key]) for key in ("min_available", "max_available")
+                    if batch.get(key) is not None)
+    for window in (None,) if windows is None else windows:
+        scoped_requests = requests
+        if window is not None:
+            lower, upper = window
+            scoped_requests = {}
+            for alias, request in requests.items():
+                if not isinstance(request, RawInput) or receipt.evidence[alias]["definition"].get("update_type") == "by_date":
+                    assert request.start is not None and request.end is not None
+                    request = replace(request, start=max(lower, _date_value(request.start)),
+                        end=min(upper, _date_value(request.end)))
+                scoped_requests[alias] = request
+            if any(request.start is not None and request.end is not None
+                   and _date_value(request.start) > _date_value(request.end) for request in scoped_requests.values()):
+                return False
+        for source in (original, current):
+            scoped = replace(source, requests=scoped_requests)
+            if not all(any(inputs._proven_baseline_at(scoped, alias, day) is True for alias in requests)
+                       for day in sorted(boundaries) if old_cutoff <= day <= end):
+                return False
+    return True
+
+
 def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: tuple[str, ...],
                             end: date, commit_bound: int, policy: ProducerUpdatePolicy,
-                            completed_start: date, completed_end: date,
+                            completed_start: date, completed_end: date, previous,
                             changed: bool = True) -> str | None:
     """Admit whole atomic consumed equality, separately from timing provenance."""
     from .pit import _general_snapshot_identity
@@ -196,9 +341,17 @@ def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: 
         # No selected event means no new field-absence authority. Preserve the
         # existing unchanged historical completion rather than inventing one.
         return None
-    if (alias not in policy.timing_neutral_inputs or request.strict
-            or initial is None or initial["baseline"]):
-        return f"{alias}: changed General consumed fields require an already-known timing-neutral snapshot; explicit timing-impact proof is required"
+    if (alias not in policy.timing_neutral_inputs or request.strict or initial is None
+            or initial["baseline"] and policy.historical_impact != "same_date"):
+        return f"{alias}: changed General consumed fields require timing-neutral selected evidence; explicit timing-impact proof is required"
+    baseline_proofs: dict[int, bool] = {}
+    windows = []
+    if initial["baseline"]:
+        try:
+            windows = _baseline_windows(db, receipt, previous, policy=policy,
+                first=completed_start, last=completed_end, end=end, commit_bound=commit_bound, budget=budget)
+        except (ValueError, MemoryError) as error:
+            return f"{alias}: General prefix timing proof cannot be admitted: {error}"
     # Only new/captured-future transitions need comparison. Include every
     # relevant event, rather than comparing the last A in an A -> B -> A path.
     # Backdated new events are checked at their original availability as well.
@@ -206,7 +359,9 @@ def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: 
         original_cutoff = min(cutoff, old_cutoff)
         before, after = selected(original, original_cutoff), selected(candidate.evidence[alias], cutoff)
         if ((before is None) != (after is None)
-                or before is not None and after is not None and before["baseline"] != after["baseline"]):
+                or initial["baseline"] and (cutoff < old_cutoff or before is None or not before["baseline"])
+                or not initial["baseline"] and before is not None and after is not None
+                and before["baseline"] != after["baseline"]):
             return f"{alias}: General first visibility/baseline timing changed at {cutoff}; explicit timing-impact proof is required"
         try:
             original_request = replace(request,view="snapshot")
@@ -222,7 +377,7 @@ def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: 
                 f"run explicit inputs.index_selection(original receipt {receipt.receipt_id}, {alias!r}, "
                 f"view='snapshot', fields={fields!r}, as_of={str(original_cutoff)!r}) and the same "
                 f"projection on an original-bound current frozen receipt{bounded_source} at as_of={str(cutoff)!r}")
-        if not equivalent and alias in policy.general_asset_local_inputs:
+        if not equivalent and not initial["baseline"] and alias in policy.general_asset_local_inputs:
             from bagelquant_data.general_key_appends import positive
             options = context.options if context is not None else ExecutionOptions()
             try:
@@ -233,6 +388,17 @@ def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: 
                 return f"{alias}: General asset-local append proof cannot be admitted: {error}"
         if not equivalent:
             return f"{alias}: General consumed fields changed at {cutoff}{bounded_source}; explicit selected-input impact resolution is required"
+        if initial["baseline"]:
+            bound = commit_bound if ceiling is None else ceiling
+            try:
+                if bound not in baseline_proofs:
+                    baseline_proofs[bound] = _baseline_timing_preserved(inputs, db, receipt,
+                        first=completed_start, last=completed_end, end=end,
+                        commit_bound=bound, budget=budget, general_alias=alias, candidate=candidate, windows=windows)
+            except (ValueError, MemoryError) as error:
+                return f"{alias}: General prefix timing proof cannot be admitted: {error}"
+            if not baseline_proofs[bound]:
+                return f"{alias}: General baseline timing is not proven unchanged over the completed prefix; explicit timing-impact proof is required"
     return None
 
 
@@ -262,42 +428,8 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
         if commit_bound < receipt.max_commit or check_bound < receipt.max_check_id:
             return [{"mode": "blocked", "start": start.isoformat(), "end": end.isoformat(),
                 "reason": "active input boundary precedes completed evidence; explicit impact proof is required"}]
-        anchor_empty = False
-        if policy is not None and policy.output_anchors:
-            anchor_empty = True
-        for alias in (() if policy is None else policy.output_anchors):
-            anchor = receipt.requests.get(alias)
-            if (not isinstance(anchor, RawInput)
-                    or receipt.evidence[alias]["definition"]["update_type"] != "by_date"):
-                raise ValueError("Output anchor requires a declared by-date Raw input")
-            # Absence is a complete coordinate proof, not an output-row count.
-            # A late observation version in the old interval prevents reuse.
-            anchor_batches = db.execute("select " + ",".join("b." + field for field in _BATCH_COLUMNS.split(","))
-                + ",c.baseline from version_segments b join version_commits c on c.seq=b.commit_seq "
-                "where c.source=? and c.dataset=? and c.status='committed' and c.seq<=?",
-                (anchor.source, anchor.dataset, commit_bound)).fetchall()
-            registered = {(batch["commit_seq"], batch["partition_path"]): batch for batch in anchor_batches}
-            for original in receipt.evidence[alias]["batches"]:
-                if original["row_count"] and (original.get("min_observation") is None
-                        or original.get("max_observation") is None):
-                    anchor_empty = False
-                current = registered.get((original["commit_seq"], original["partition_path"]))
-                if current is None or any(original[field] != current[field] for field in
-                        (*_BATCH_COLUMNS.split(","), "baseline") if field in original):
-                    # A current header cannot disprove coordinates retained in
-                    # the immutable original receipt. Corruption is explicit.
-                    raise RuntimeError("Output anchor original batch binding changed; explicit integrity recovery is required")
-            for batch in anchor_batches:
-                if not batch["row_count"]:
-                    continue
-                if (not batch["baseline"] and batch["min_available"] is not None
-                        and _date_value(batch["min_available"]) > end):
-                    continue
-                if (batch["min_observation"] is None or batch["max_observation"] is None
-                        or _date_value(batch["min_observation"]) <= through
-                        and _date_value(batch["max_observation"]) >= start):
-                    anchor_empty = False
-                    break
+        anchor_empty = _anchors_empty(db, receipt, anchors=() if policy is None else policy.output_anchors,
+            first=start, last=through, end=end, commit_bound=commit_bound)
         # Later direct publications do not inherit the completed-range proof.
         # Rebuild their bounded output coordinates before issuing a new proof.
         batch_columns = ",".join("b." + field for field in _BATCH_COLUMNS.split(","))
@@ -373,7 +505,7 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                     assert policy is not None
                     unknown = _general_fields_problem(owner, db, receipt, alias=alias, fields=fields,
                         end=end, commit_bound=commit_bound, policy=policy, changed=changed,
-                        completed_start=start, completed_end=through)
+                        completed_start=start, completed_end=through, previous=previous)
                     general_projection_equal = changed and unknown is None
                 elif changed:
                     unknown = f"{alias}: {'changed' if new_general else 'newly visible'} full snapshot needs a selected-row impact proof"
@@ -460,8 +592,8 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                     commit_bound, end.isoformat())).fetchall()
             timing = [] if anchor_empty and evidence["general_snapshots"] else [*timing, *captured_future_timing]
             if timing and not (general_projection_equal or policy is not None and alias in policy.timing_neutral_inputs
-                    and _neutral_timing_preserved(owner, db, receipt, name=previous["name"], alias=alias,
-                        checks=timing, end=end, commit_bound=commit_bound)):
+                    and _neutral_timing_preserved(owner, db, receipt, previous=previous, policy=policy,
+                        first=start, last=through, alias=alias, checks=timing, end=end, commit_bound=commit_bound)):
                 events = owner._store.visibility_headers(db,evidence["source"],evidence["dataset"],check_bound=check_bound)
                 identifiers = {check["id"] for check in timing}
                 relevant = [event for event in events if event["check_id"] in identifiers]

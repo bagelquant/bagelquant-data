@@ -3398,6 +3398,8 @@ class InputsAPI:
 
         Uniform committed flags and entire coordinate containment establish
         a surviving row only when no visible witness can replace its timing.
+        Fully visible batches also retain occupied observation endpoints when
+        partial verification or revisions affect only other dates.
         This positive-only proof never substitutes for original byte integrity.
         """
         request, evidence = frozen.requests[alias], frozen.evidence[alias]
@@ -3470,20 +3472,30 @@ class InputsAPI:
                     and _date_value(batch["min_available"]) <= cutoff
                     and not any(value is not None and first < _date_value(value) for value in lower)
                     and not any(value is not None and last > _date_value(value) for value in upper)):
-                candidates.append((first, last, batch["commit_seq"]))
-        for first, last, seq in candidates:
+                candidates.append((first, last, batch["commit_seq"],
+                    batch.get("max_available") is not None
+                    and _date_value(batch["max_available"]) <= cutoff))
+        for first, last, seq, fully_visible in candidates:
             if seq in affected_commits:
                 continue
             # Visibility events retain natural-key bounds rather than a row
             # index. A single commit can contain many observation partitions;
             # only intersecting event ranges can replace a candidate's timing.
-            if any(seq in commits and lower <= last and upper >= first
-                   for commits, lower, upper in events):
-                continue
-            if all(batch["baseline"]
-                   or batch.get("min_available") is not None and _date_value(batch["min_available"]) > cutoff
-                   or _date_value(batch["max_observation"]) < first
-                   or _date_value(batch["min_observation"]) > last for batch in batches):
+            overlaps = [(lower, upper) for commits, lower, upper in events
+                        if seq in commits and lower <= last and upper >= first]
+            overlaps.extend((_date_value(batch["min_observation"]), _date_value(batch["max_observation"]))
+                for batch in batches if not batch["baseline"]
+                and not (batch.get("min_available") is not None
+                    and _date_value(batch["min_available"]) > cutoff)
+                and _date_value(batch["min_observation"]) <= last
+                and _date_value(batch["max_observation"]) >= first)
+            if not overlaps:
+                return True
+            # Bounds name occupied dates, not every date between them. All
+            # rows must be visible before an endpoint can witness survival;
+            # a later-available endpoint cannot stand in for an earlier row.
+            if fully_visible and any(not any(lower <= day <= upper for lower, upper in overlaps)
+                                     for day in (first, last)):
                 return True
         return None
 

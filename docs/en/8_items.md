@@ -264,10 +264,15 @@ Eligible nonbaseline witnesses disqualify the candidates they can affect; full
 seals are validated. A partial first-visibility event binds both its original
 commit set and observation bounds. An untouched partition can still prove a
 surviving baseline, even when another partition of the same commit was verified.
+A fully visible batch can also retain a baseline row at its occupied minimum or
+maximum observation date when that endpoint lies outside every matching
+verification range and potentially visible nonbaseline revision. The entire
+batch must be within the consumed request; full-commit verification still
+disqualifies it.
 Missing or reversed event bounds remain conservative for the referenced commits;
 an eligible check without witness metadata leaves the proof unknown.
 Strict/history by-date views, legacy/unknown bounds, mixed flags and partial
-overlap cannot use this positive shortcut. It never proves a negative result,
+request containment cannot use this positive shortcut. It never proves a negative result,
 overrides a supplied frame, or replaces complete original byte verification.
 
 Read-only Item plans use these metadata proofs across all dependencies at every
@@ -276,6 +281,14 @@ declared neutral General input's first verification preserves an existing
 baseline. Unresolved evidence follows the existing selected-event impact or
 blocked-plan path. Completed history, producer identity and buffer limits remain
 unchanged; admitted updates calculate only new or affected output intervals.
+For same-date producers, unchanged-content General first verification and
+consumed-field equality share the same authenticated execution-unit proof. A
+baseline from another unit cannot mask a timing promotion, including for
+producers without `general_fields`. Finite-history producers require evidence
+for their consumed halo rather than a whole-request baseline.
+Whole-input forward producers retain their original observation scope while
+checking the same complete dependency timeline, including intermediate loss and
+restoration of baseline timing.
 
 Writable lake initialization creates a derived covering metadata index and
 analyzes the batch table once, atomically. This avoids traversing recovery payload
@@ -562,6 +575,19 @@ full replay. Baseline promotion, output anchors, other inputs and closing fences
 retain their independent contracts. `update`/`recertify(config=...)` carry the
 caller budget into this metadata planning and no-op binding; read-only
 `plan_update` inherits an explicit `inputs.read_context(config=...)` budget.
+
+For a same-date producer, an originally selected baseline can also qualify when
+the exact consumed projection is unchanged and metadata proves aggregate
+baseline timing survives within every completed execution subwindow. The proof
+refines the prefix at retained native build/unit boundaries, clips by-date
+dependencies to each subwindow, keeps General snapshots atomic, and checks both
+original and current evidence at every dependency timing boundary and every
+intermediate General commit ceiling. Complete output-anchor absence can exempt
+an empty subwindow. A baseline present only in another unit or appended dates
+cannot justify reuse. Missing surviving-row evidence remains blocked; this
+exception does not permit asset-key additions. Historical values, Sources and
+PIT evidence remain intact, and the native producer computes only new or
+independently affected intervals.
 
 Same-date producers may declare `output_anchors=("daily", "suspensions")`.
 For a per-asset General lookup, they may also declare

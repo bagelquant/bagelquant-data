@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
-from bagelquant_data import DataLake, DatasetSpec, ExecutionOptions, InputSelectionScope
+from bagelquant_data import DataLake, DatasetSpec, ExecutionOptions, InputSelectionScope, ItemInput
 from bagelquant_data import input_index, inputs
 from bagelquant_data.items import DataItemSpec, ProducerUpdatePolicy, RawInput
 
@@ -314,11 +314,16 @@ def test_general_null_nan_inf_and_typed_empty_fields_remain_distinct(tmp_path):
     assert all(tokens) and len(set(tokens)) == 6
 
 
-def item_setup(tmp_path, *, timing_neutral=True, baseline=False, future=False, known_at=None, windowed=False):
+def item_setup(tmp_path, *, timing_neutral=True, baseline=False, future=False, known_at=None,
+               windowed=False, baseline_daily=False, baseline_tail=False, initialization_config=None,
+               consumed_fields=True):
     lake, metadata, data, _ = setup(tmp_path, baseline=baseline)
     daily = DatasetSpec("daily", "by_date", date_kind="calendar", field_mappings={"time": "time", "asset_id": "asset_id"})
     rows = pl.DataFrame({"time": [date(2025, 1, day) for day in (2, 3)], "asset_id": ["A", "A"], "value": [2.0, 3.0]})
-    lake.raw.ingest(daily, rows, ingested_at=received(3))
+    initial = pl.concat([rows, pl.DataFrame({"time": [date(2025, 1, 4)], "asset_id": ["A"], "value": [4.]})]) if baseline_tail else rows
+    lake.raw.ingest(daily, initial, mode="initialize" if baseline_daily or baseline_tail else "incremental", ingested_at=received(3))
+    if baseline_tail:
+        lake.raw.ingest(daily, rows, ingested_at=received(3))
     if known_at is not None:
         lake.raw.ingest(metadata, data, ingested_at=received(known_at))
     if future:
@@ -331,13 +336,13 @@ def item_setup(tmp_path, *, timing_neutral=True, baseline=False, future=False, k
             pl.col("source_time").alias("time"), "asset_id",
             pl.when(pl.col("market") == "main").then(pl.col("value")).otherwise(pl.col("value") + 10).alias("value"))
     policy = ProducerUpdatePolicy("same_date", timing_neutral_inputs=("metadata",) if timing_neutral else (),
-        general_fields=(("metadata", FIELDS),))
+        general_fields=(("metadata", FIELDS),) if consumed_fields else ())
     lake.items.register_producer("p", "1", producer, update_policy=policy)
     requests = (RawInput("custom", "daily", alias="daily"), RawInput("custom", "metadata", alias="metadata"))
     lake.items.register(DataItemSpec("item", requests, producer_key="p", producer_revision="1"))
     report = (lake.items.update("item", start="2025-01-02", end="2025-01-03",
         input_windows={"daily": ("2025-01-02", "2025-01-03")}) if windowed else
-        lake.items.initialize("item", start="2025-01-02", end="2025-01-03"))
+        lake.items.initialize("item", start="2025-01-02", end="2025-01-03", config=initialization_config))
     assert report.frozen_receipt_id is not None
     original = lake.inputs.get(report.frozen_receipt_id)
     calls.clear()
@@ -383,6 +388,159 @@ def test_item_unused_general_change_reuses_history_and_computes_only_tail(tmp_pa
             actual = lake.items.read("item", view=view, as_of="2025-01-04", strict=strict).collect().select(fields)
             expected = lake.items.read("reference", view=view, as_of="2025-01-04", strict=strict).collect().select(fields)
             assert_frame_equal(actual.sort("time"), expected.sort("time"))
+
+
+def test_baseline_general_equality_and_partial_daily_verification_reuse_prefix(tmp_path, monkeypatch):
+    lake, spec, data, daily, producer, calls, old = item_setup(tmp_path,
+        baseline=True, baseline_daily=True, known_at=4, windowed=True)
+    old_build = lake.items.completed_builds("item")[-1]
+    original = lake.items.read("item", view="versions").collect()
+    lake.raw.ingest(spec, data.with_columns(pl.lit("new actor").alias("act_name")), ingested_at=received(4))
+    lake.raw.ingest(daily, pl.DataFrame({"time": [date(2025, 1, 3)], "asset_id": ["A"], "value": [3.]}),
+        ingested_at=received(4))
+    append_daily(lake, daily)
+    lake.inputs.prepare_general_projections(old, "metadata", FIELDS, through="2025-01-04")
+    windows = {"daily": ("2025-01-02", "2025-01-04")}
+    with monkeypatch.context() as patch:
+        ban_originals(patch, lake)
+        assert lake.items.plan_update("item", start="2025-01-02", end="2025-01-04",
+            input_windows=windows) == [{"mode": "incremental", "start": "2025-01-04", "end": "2025-01-04"}]
+        assert not calls
+    report = lake.items.update("item", start="2025-01-02", end="2025-01-04", input_windows=windows)
+    assert report.status == "success" and report.rows_committed == 1
+    assert calls == [(date(2025, 1, 4), date(2025, 1, 4))]
+    assert_frame_equal(lake.items.read("item", end="2025-01-03", view="versions").collect(), original)
+    assert old_build in lake.items.completed_builds("item")
+    assert lake.inputs.get(old).digest == old.digest
+    lake.items.register_producer("reference", "1", producer)
+    lake.items.register(DataItemSpec("reference", lake.items.get("item").inputs,
+        producer_key="reference", producer_revision="1"))
+    lake.items.initialize("reference", start="2025-01-02", end="2025-01-04")
+    math = ["time", "asset_id", "value", "observation_date", "available_date", "version_available_date"]
+    assert_frame_equal(lake.items.read("item", view="snapshot", as_of="2025-01-04").collect().select(math),
+        lake.items.read("reference", view="snapshot", as_of="2025-01-04").collect().select(math))
+    lake.items.register(DataItemSpec("tail_reference", tuple(replace(value, start="2025-01-04", end="2025-01-04")
+        if value.key == "daily" else value for value in lake.items.get("item").inputs),
+        producer_key="reference", producer_revision="1"))
+    lake.items.initialize("tail_reference", start="2025-01-04", end="2025-01-04")
+    for strict in (False, True):
+        assert_frame_equal(lake.items.read("item", start="2025-01-04", view="snapshot", as_of="2025-01-04", strict=strict)
+            .collect().select(*math, "_baseline"), lake.items.read("tail_reference", view="snapshot", as_of="2025-01-04", strict=strict)
+            .collect().select(*math, "_baseline"))
+    calls.clear()
+    with monkeypatch.context() as patch:
+        ban_originals(patch, lake)
+        patch.setattr(lake.inputs, "read", lambda *a, **k: pytest.fail("Repeat consumed inputs"))
+        assert lake.items.update("item", start="2025-01-02", end="2025-01-04", input_windows=windows).status == "unchanged"
+        assert not calls
+
+
+@pytest.mark.parametrize("build", ["split_initialization", "appended_unit"])
+@pytest.mark.parametrize("same_content,consumed_fields", [(False, True), (True, True), (True, False)])
+def test_general_baseline_cannot_cross_original_execution_units(tmp_path, monkeypatch, build, same_content, consumed_fields):
+    options = ExecutionOptions(observation_window_days=1)
+    lake, spec, data, daily, producer, calls, old = item_setup(tmp_path,
+        baseline=True, baseline_daily=True,
+        initialization_config=options if build == "split_initialization" else None, consumed_fields=consumed_fields)
+    if build == "appended_unit":
+        append_daily(lake, daily)
+        report = lake.items.update("item", start="2025-01-02", end="2025-01-04")
+        assert report.frozen_receipt_id is not None
+        old = lake.inputs.get(report.frozen_receipt_id)
+    through = 4 if build == "split_initialization" else 5
+    promoted = date(2025, 1, through - 1)
+    lake.raw.ingest(spec, data if same_content else data.with_columns(pl.lit("new actor").alias("act_name")),
+        ingested_at=received(through))
+    if build == "split_initialization":
+        lake.raw.ingest(daily, pl.DataFrame({"time": [promoted], "asset_id": ["A"], "value": [3.]}),
+            ingested_at=received(through))
+    append_daily(lake, daily, through)
+    lake.inputs.prepare_general_projections(old, "metadata", FIELDS, through=date(2025, 1, through))
+    calls.clear()
+    completions = lake.items.completed_builds("item")
+    with monkeypatch.context() as patch:
+        ban_originals(patch, lake)
+        plan = lake.items.plan_update("item", start="2025-01-02", end=date(2025, 1, through))
+        assert plan[0]["mode"] == "blocked" and "timing" in plan[0]["reason"]
+        with pytest.raises(RuntimeError, match="timing"):
+            lake.items.update("item", start="2025-01-02", end=date(2025, 1, through))
+        assert not calls and lake.items.completed_builds("item") == completions
+    lake.items.register(DataItemSpec("unit_reference", lake.items.get("item").inputs,
+        producer_key="p", producer_revision="1"))
+    lake.items.initialize("unit_reference", start="2025-01-02", end=date(2025, 1, through), config=options)
+    original = lake.items.read("item", start=promoted, end=promoted, view="snapshot", as_of=date(2025, 1, through)).collect()
+    reference = lake.items.read("unit_reference", start=promoted, end=promoted,
+        view="snapshot", as_of=date(2025, 1, through), strict=True).collect()
+    assert original["_baseline"].to_list() == [True]
+    assert reference["_baseline"].to_list() == [False]
+    assert original["value"].to_list() == reference["value"].to_list()
+
+
+@pytest.mark.parametrize("damage", ["bounds", "missing_proof"])
+def test_general_unit_baseline_proof_authenticates_retained_boundaries(tmp_path, monkeypatch, damage):
+    lake, spec, data, daily, _, calls, old = item_setup(tmp_path,
+        baseline=True, baseline_daily=True, initialization_config=ExecutionOptions(observation_window_days=1))
+    lake.raw.ingest(spec, data.with_columns(pl.lit("new actor").alias("act_name")), ingested_at=received(4))
+    append_daily(lake, daily)
+    lake.inputs.prepare_general_projections(old, "metadata", FIELDS, through="2025-01-04")
+    with lake._data_meta.connect() as db:
+        unit = db.execute("select id from item_builds where name='item' and status='unit_success' order by id limit 1").fetchone()[0]
+        if damage == "bounds":
+            db.execute("update item_builds set end_date='2025-01-03' where id=?", (unit,))
+        else:
+            db.execute("delete from item_completion_proofs where build_id=?", (unit,))
+    ban_originals(monkeypatch, lake)
+    with pytest.raises(RuntimeError, match="completion proof source binding"):
+        lake.items.plan_update("item", start="2025-01-02", end="2025-01-04")
+    assert not calls
+
+
+@pytest.mark.parametrize("tail_baseline", [False, True])
+def test_general_baseline_loss_cannot_borrow_baseline_from_the_tail(tmp_path, monkeypatch, tail_baseline):
+    lake, spec, data, daily, _, calls, old = item_setup(tmp_path, baseline=True, baseline_tail=tail_baseline)
+    lake.raw.ingest(spec, data.with_columns(pl.lit("new actor").alias("act_name")), ingested_at=received(4))
+    if not tail_baseline:
+        append_daily(lake, daily)
+    lake.inputs.prepare_general_projections(old, "metadata", FIELDS, through="2025-01-04")
+    ban_originals(monkeypatch, lake)
+    action, = lake.items.plan_update("item", start="2025-01-02", end="2025-01-04")
+    assert action["mode"] == "blocked" and "timing" in action["reason"] and not calls
+
+
+@pytest.mark.parametrize("impact", ["same_date", "forward"])
+def test_general_prefix_proof_checks_intermediate_dependency_timing_loss(tmp_path, monkeypatch, impact):
+    lake, metadata, data, _ = setup(tmp_path, baseline=True)
+    lake.items.register(DataItemSpec("leaf"))
+    row = pl.DataFrame({"time": [date(2025, 1, 2)], "asset_id": ["A"], "value": [2.]})
+    later = pl.DataFrame({"time": [date(2025, 1, 3)], "asset_id": ["A"], "value": [3.]})
+    lake.items.ingest("leaf", pl.concat([row, later]), available_date="2025-01-02", historical_baseline=True)
+    calls = []
+    def producer(context):
+        calls.append((context.start, context.end))
+        return context.frames["leaf"].select("time", "asset_id", "value")
+    policy = ProducerUpdatePolicy(impact, timing_neutral_inputs=("metadata",),
+        general_fields=(("metadata", FIELDS),))
+    lake.items.register_producer("p", "1", producer, update_policy=policy)
+    lake.items.register(DataItemSpec("item", (ItemInput("leaf", alias="leaf"),
+        RawInput("custom", "metadata", alias="metadata")), producer_key="p", producer_revision="1"))
+    report = lake.items.initialize("item", start="2025-01-02", end="2025-01-03")
+    assert report.frozen_receipt_id is not None
+    old = lake.inputs.get(report.frozen_receipt_id)
+    calls.clear()
+    lake.raw.ingest(metadata, data if impact == "forward" else data.with_columns(pl.lit("actor 4").alias("act_name")),
+        ingested_at=received(4))
+    lake.items.ingest("leaf", later, available_date="2025-01-04")
+    lake.items.ingest("leaf", row, available_date="2025-01-05")
+    lake.items.ingest("leaf", pl.DataFrame({"time": [date(2025, 1, 3)], "asset_id": ["B"], "value": [3.]}),
+        available_date="2025-01-06", historical_baseline=True)
+    lake.raw.ingest(metadata, data if impact == "forward" else data.with_columns(pl.lit("actor 6").alias("act_name")),
+        ingested_at=received(6))
+    current = lake.inputs.freeze(old.requests, information_cutoff="2025-01-06", retain_batch_bounds=True)
+    assert [lake.inputs._baseline_at(current, "leaf", date(2025, 1, day)) for day in (4, 5, 6)] == [True, False, True]
+    lake.inputs.prepare_general_projections(old, "metadata", FIELDS, through="2025-01-06")
+    ban_originals(monkeypatch, lake)
+    action, = lake.items.plan_update("item", start="2025-01-02", end="2025-01-06")
+    assert action["mode"] == "blocked" and "timing" in action["reason"] and not calls
 
 
 @pytest.mark.parametrize("change", ["market", "new_asset", "missing", "intermediate", "baseline"])

@@ -1,4 +1,5 @@
 """Native timing follows consumed observations without rereading old originals."""
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 
@@ -76,15 +77,17 @@ def test_real_first_visibility_append_uses_only_consumed_tail_timing(
     old_selected = lake.inputs.read(retained, "close").collect()
     preserved = _originals(lake)
 
-    # A genuine same-body verification creates a retained wide first-known
-    # event, so the positive-only header proof really is uncertain.
+    # A genuine same-body verification covers the old range. An unverified
+    # occupied tail endpoint can prove only the unbounded request's baseline.
     lake.raw.ingest(raw, old, ingested_at=_received(TAIL))
     if not tail_baseline:
         lake.raw.ingest(raw, tail, ingested_at=_received(TAIL))
     timing = lake.inputs.freeze({"raw": RawInput("custom", "quotes", view="versions")},
         information_cutoff=TAIL, retain_batch_bounds=True)
     assert any(event.get("event") for event in timing.evidence["raw"]["record_checks"])
-    assert lake.inputs._proven_baseline_at(timing, "raw", TAIL) is None
+    assert lake.inputs._proven_baseline_at(timing, "raw", TAIL) is (True if tail_baseline else None)
+    prefix = replace(timing, requests={"raw": replace(timing.requests["raw"], start=FIRST, end=LAST)})
+    assert lake.inputs._proven_baseline_at(prefix, "raw", TAIL) is None
     assert lake.items.plan_update("close", start=FIRST, end=TAIL) == [
         {"mode": "incremental", "start": TAIL.isoformat(), "end": TAIL.isoformat()}]
 
