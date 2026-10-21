@@ -218,6 +218,18 @@ def _scalar_selection_records(frozen, alias, request, cutoff, *, fields=None):
     return batches, checks, records, seals
 
 
+def _range_events(evidence, batches, request, cutoff):
+    """Retain witnesses that can change precedence inside this observation range."""
+    lower = max((_date_value(value) for value in (request.start, getattr(request, "observation_start", None)) if value is not None), default=None)
+    upper = min((_date_value(value) for value in (request.end, getattr(request, "observation_end", None)) if value is not None), default=None)
+    commits = {batch["commit_seq"] for batch in batches}
+    return [dict(row) for row in evidence["record_checks"] if row.get("event")
+        and commits.intersection(row["version_commits"])
+        and (cutoff is None or _date_value(row["pit_date"]) <= cutoff)
+        and not (lower is not None and row.get("max_observation") is not None and _date_value(row["max_observation"]) < lower
+            or upper is not None and row.get("min_observation") is not None and _date_value(row["min_observation"]) > upper)]
+
+
 def _scalar_selection_evidence(frozen, alias, request, cutoff, *, fields=None):
     """Bind scalar selection mechanics, separately from enclosing provenance.
 
@@ -287,6 +299,16 @@ def _validate_raw_payload_projection(request):
     if isinstance(request, RawInput) and any(field in {"time", "year", "month", "ingested_at",
             "version_available_date"} or field.startswith("_") for field in request.fields):
         raise ValueError("Raw payload projections exclude partition and version provenance fields")
+
+
+def _scalar_value_request(request):
+    """Bind the consumed Raw observation intersection, not its enclosing bounds."""
+    if not isinstance(request, RawInput):
+        return request
+    return replace(request,
+        start=max((_date_value(day) for day in (request.start, request.observation_start) if day is not None), default=None),
+        end=min((_date_value(day) for day in (request.end, request.observation_end) if day is not None), default=None),
+        observation_start=None, observation_end=None)
 
 
 def _scalar_complete_cutoff(frozen, alias, request, cutoff, *, fields=None):
@@ -850,12 +872,7 @@ class InputsAPI:
             or upper is not None and batch.get("min_observation") is not None and _date_value(batch["min_observation"]) > upper
             or cutoff is not None and batch.get("min_available") is not None and _date_value(batch["min_available"]) > cutoff
                 and selected is None)]
-        commits = {batch["commit_seq"] for batch in batches}
-        events = [dict(row) for row in evidence["record_checks"] if row.get("event")
-            and commits.intersection(row["version_commits"])
-            and (cutoff is None or _date_value(row["pit_date"]) <= cutoff)
-            and not (lower is not None and row.get("max_observation") is not None and _date_value(row["max_observation"]) < lower
-                or upper is not None and row.get("min_observation") is not None and _date_value(row["min_observation"]) > upper)]
+        events = _range_events(evidence, batches, request, cutoff)
         consumed = tuple(fields) if fields else (("value",) if values_only and isinstance(request,ItemInput) else ())
         selected_changes = []
         if consumed:
@@ -1248,8 +1265,11 @@ class InputsAPI:
         Otherwise compare optional canonical selection proofs. This establishes
         consumed-content equivalence, independently of producer currentness.
         It never calculates, audits bytes, freezes receipts or warms indexes.
-        ``records_only=True`` returns unknown instead of decoding optional row
-        indexes when retained headers cannot establish the stronger equality.
+        ``records_only=True`` also admits equal compact scalar snapshot ranges
+        when their selected values are fully visible and relevant visibility
+        witnesses are unchanged. Raw observation bounds
+        are intersected only for this comparison; stored tokens stay unchanged.
+        Otherwise it returns unknown without consulting optional summaries.
         ``summaries_only=True`` permits existing canonical summary records but
         does not decode per-row indexes.
         ``fields`` uses typed projected summaries and implies that restriction;
@@ -1277,10 +1297,14 @@ class InputsAPI:
                               coordinates: pl.DataFrame | None = None,
                               fields: tuple[str, ...] | list[str] | None = None) -> bool | None:
         """Compare resolved original metadata in the caller's fixed read view."""
+        context = self._read_context()
+        if context is not None and context.check_canceled is not None:
+            context.check_canceled()
         fields = _selection_fields(fields)
         values_only = values_only or fields is not None
         summaries_only = summaries_only or fields is not None
         scoped = []
+        selected_requests = []
         effective_requests = []
         for frozen, cutoff in ((before, as_of), (after, current_as_of)):
             request, day = self._selection_scope(frozen, alias, start=start, end=end, as_of=cutoff,
@@ -1295,6 +1319,7 @@ class InputsAPI:
             if values_only and fields is None:
                 _validate_raw_payload_projection(request)
             effective_requests.append(input_payload(request))
+            selected_requests.append(request)
             if causal_versions and (not values_only or request.view != "versions" or coordinates is not None):
                 raise ValueError("causal_versions requires a scalar versions projection without coordinates")
             if values_only and request.view == "versions" and not causal_versions:
@@ -1356,7 +1381,10 @@ class InputsAPI:
             for batch in frozen.evidence[alias]["batches"]:
                 if batch.get("max_available") is not None and _date_value(batch["max_available"]) <= day:
                     continue
-                if not isinstance(selected, ItemInput) or selected.end is None:
+                if not (isinstance(selected, ItemInput) or frozen.evidence[alias]["definition"]["update_type"] == "by_date"):
+                    return False
+                selected = _scalar_value_request(selected)
+                if selected.end is None:
                     return False
                 with self._store.connect() as db:
                     summary = input_index.describe_bounds(db, batch)
@@ -1364,23 +1392,76 @@ class InputsAPI:
                 if delay is None or _date_value(selected.end) + timedelta(days=int(delay)) > day:
                     return False
             return True
-        fully_visible = old.information_cutoff == new.information_cutoff or all(visible(frozen) for frozen in scoped)
+        fully_visible = all(visible(frozen) for frozen in scoped)
         old_content = _content_metadata_selection(old, alias, values_only=values_only)
-        if (effective_requests[0] == effective_requests[1] and fully_visible
+        if (effective_requests[0] == effective_requests[1]
+                and (old.information_cutoff == new.information_cutoff or fully_visible)
                 and old_content is not None and old_content == _content_metadata_selection(new, alias, values_only=values_only)):
             return True
+        scalar_snapshot = (values_only and fields is None and coordinates is None and not causal_versions
+            and all(request.view == "snapshot" for request in selected_requests)
+            and all(isinstance(request, ItemInput) or frozen.evidence[alias]["definition"]["update_type"] == "by_date"
+                for frozen, request in zip(scoped, selected_requests, strict=True)))
+        range_supported = (scalar_snapshot and fully_visible and not any(request.strict for request in selected_requests)
+            and all(not frozen.evidence[alias].get("full_commit_checks")
+                and all(row.get("event") for row in frozen.evidence[alias]["record_checks"])
+                and (not isinstance(request, ItemInput)
+                    or all("field_changes_json" in batch for batch in frozen.evidence[alias]["batches"]))
+                for frozen, request in zip(scoped, selected_requests, strict=True)))
+        if range_supported and not summaries_only:
+            # Admit only these actual scoped Sources. Optional exact summaries
+            # may belong to a much wider Source and are unnecessary for this
+            # proof. Charge both metadata projections before constructing tokens.
+            budget = (context.options if context is not None else ExecutionOptions()).max_buffer_bytes // 4
+            charge = 0
+            for frozen, request in zip(scoped, selected_requests, strict=True):
+                charge += 16 * len(_json(input_payload(request)).encode())
+                # Audit-only history and producer declarations do not enter a
+                # consumed range token. Keep them lazy and admit the channels
+                # actually used by the range/schema and witness comparisons.
+                evidence = frozen.evidence[alias]
+                for key in ("definition_hash", "schema_hash", "schema_ipc", "batches", "checks",
+                        "record_checks", "empty_checks", "empty_item_build", "parent_receipts"):
+                    value = evidence[key]
+                    rows = value if isinstance(value, (list, tuple, immutable_metadata.LazyMetadataSequence)) else (value,)
+                    for row in rows:
+                        if context is not None and context.check_canceled is not None:
+                            context.check_canceled()
+                        charge += 16 * len(_json(row).encode())
+                        if charge > budget:
+                            return None
+            # An attestation can give an older value a later availability date,
+            # changing snapshot precedence without adding a value segment.
+            # Bind the associated check's eligibility and ingestion ordering too.
+            witnesses = []
+            for frozen, request in zip(scoped, selected_requests, strict=True):
+                evidence = frozen.evidence[alias]
+                events = _range_events(evidence, evidence["batches"], request, frozen.information_cutoff)
+                identifiers = {row["check_id"] for row in events}
+                witnesses.append((events, [dict(row) for row in evidence["checks"] if row["id"] in identifiers]))
+            range_supported = witnesses[0] == witnesses[1]
+            if range_supported:
+                tokens = [self._range_selection(frozen, alias, _scalar_value_request(request),
+                    frozen.information_cutoff, values_only=True)["identity"]
+                    for frozen, request in zip(scoped, selected_requests, strict=True)]
+                if tokens[0] == tokens[1]:
+                    return True
         if records_only:
             return None
+        # A range token does not encode which rows of a partial batch have
+        # become visible. Even equal cutoffs cannot justify ignoring changed
+        # timing metadata. Require existing exact summaries in that case.
+        exact_summaries = summaries_only or scalar_snapshot and not range_supported
         old_request, old_cutoff = self._selection_scope(before, alias, start=start, end=end, as_of=as_of, view=view, strict=strict)
         new_request, new_cutoff = self._selection_scope(after, alias, start=start, end=end, as_of=current_as_of, view=view, strict=strict)
         old_selection = self._indexed_selection(before, alias, request=old_request, cutoff=old_cutoff,
             values_only=values_only, causal_versions=causal_versions, summaries_only=summaries_only,
-            coordinates=coordinates, fields=fields,exact_summaries=summaries_only)
+            coordinates=coordinates, fields=fields,exact_summaries=exact_summaries)
         if old_selection is None:
             return None
         new_selection = self._indexed_selection(after, alias, request=new_request, cutoff=new_cutoff,
             values_only=values_only, causal_versions=causal_versions, summaries_only=summaries_only,
-            coordinates=coordinates, fields=fields,exact_summaries=summaries_only)
+            coordinates=coordinates, fields=fields,exact_summaries=exact_summaries)
         return None if new_selection is None else old_selection["identity"] == new_selection["identity"]
 
     def _indexed_selection(self, frozen, alias, *, request=None, cutoff=None, db=None, recompute=False, options=None, values_only=False,
@@ -1656,12 +1737,7 @@ class InputsAPI:
                     "time", "asset_id") if selected.height else selected
             else:
                 scalar = selected.select("time", "asset_id", "_value_hash") if selected.height else selected
-            value_request = request
-            if isinstance(request, RawInput):
-                value_request = replace(request,
-                    start=max((_date_value(day) for day in (request.start, request.observation_start) if day is not None), default=None),
-                    end=min((_date_value(day) for day in (request.end, request.observation_end) if day is not None), default=None),
-                    observation_start=None, observation_end=None)
+            value_request = _scalar_value_request(request)
             body = {"version": "raw_payload_values.v1" if isinstance(request, RawInput)
                     else "causal_value_versions.v1" if causal_versions else "value.v1",
                 "definition": evidence["definition_hash"],

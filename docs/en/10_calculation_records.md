@@ -30,6 +30,20 @@ This reduces repeated metadata decoding without reading original values or build
 indexes. A scoped proof does not audit skipped descendants; explicit `inputs.verify`
 still checks all retained evidence.
 
+For non-strict scalar snapshots, `records_only=True` can also prove equality
+from unchanged range metadata without preparing exact summaries. This requires
+complete visibility of the selected interval, using captured availability bounds
+or the original segment's maximum availability delay, plus unchanged relevant
+visibility witnesses and their check timing. Equal cutoffs alone do not
+justify ignoring changed timing evidence. Partial visibility or unsupported
+witnesses retain the exact-summary fallback; a missing proof remains unknown.
+Raw `start`/`end` and `observation_start`/`observation_end` are intersected for
+this comparison, so widening an enclosing request does not invalidate an
+unchanged prefix. Frozen requests, ordinary range identities and registered
+selection descriptors retain their original identity. Metadata admission uses
+the operation's buffer and cancellation checks without loading an unrelated
+optional summary Source.
+
 `register_selection_set(receipt, descriptors)` validates complete public
 descriptors and returns `{id, digest, source, count}`. `describe_selection_set`
 checks that header and original Source without resolving historical descriptors.

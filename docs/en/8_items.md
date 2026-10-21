@@ -315,13 +315,16 @@ it is neither complete Source equivalence nor a producer freshness proof.
 actual consumed window/view/strictness and information cutoffs. A missing current
 receipt captures only current alias metadata inside the read view, without
 persisting a freeze. Exact retained header/witness equality can prove reuse;
-otherwise optional canonical indexes are needed. `records_only=True` permits
-only that header proof; `summaries_only=True` also permits saved canonical
-summaries but never decodes per-row indexes. Unknown stays `None`.
+`records_only=True` also permits equal compact range proofs for non-strict scalar
+snapshots with complete selected visibility. Raw observation bounds are
+intersected transiently, preserving stored identities. Otherwise existing exact
+summaries are required; `summaries_only=True` permits those saved summaries when
+header equality is insufficient. Neither mode reads values or prepares proofs.
+Unknown stays `None`; partial batch visibility cannot establish range equality.
 
 Explicit `inputs.index_selection(receipt, alias, start=..., end=..., view=...,
-causal_versions=..., config=...)` records a scalar summary from existing value
-indexes; it never builds missing batch indexes. Each summary binds selected
+causal_versions=..., config=...)` explicitly consumes bounded original Parquet
+to record a small exact scalar summary. Each summary binds selected
 original headers, creator ordering, witnesses, unknown empty baselines, the
 effective selector/cutoff and its registered original source. Unrelated global
 counters/aliases and known empty covers do not invalidate it. `inputs.verify`

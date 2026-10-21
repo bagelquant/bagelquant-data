@@ -204,6 +204,18 @@ second ordinary identity authority. `selection_equivalent(summaries_only=True)`
 compares only registered exact summaries when metadata cannot prove equality.
 No per-batch row/scalar index or automatic full-history maintenance exists.
 
+Record-only scalar snapshot equivalence may also admit equal range tokens for
+non-strict Item/by-date Raw selections with fully visible selected values and
+unchanged scoped visibility witnesses, including their check timing/ordering.
+Use original availability/delay bounds; equal cutoffs alone
+cannot admit changed timing evidence. Partial visibility and unsupported witness
+forms require existing exact summaries when full header equality fails. A range
+mismatch remains unknown in record-only mode. Intersect redundant Raw observation
+bounds only in the transient comparison; preserve frozen requests, ordinary
+identities and registered descriptors. Charge scoped metadata to the active
+buffer, honor cancellation, and do not load optional summary Sources for an
+already sufficient range proof.
+
 Scoped equivalence first prunes immutable sequence/branch references using the
 receipt's captured observation/availability bounds, then applies the existing
 per-batch visibility and exact-summary checks. Missing bounds remain conservative.
