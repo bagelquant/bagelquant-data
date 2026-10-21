@@ -91,7 +91,6 @@ def test_missing_bounds_remain_conservative(tmp_path):
 
 
 def test_optional_raw_summary_bounds_do_not_leak_to_next_batch(tmp_path, monkeypatch):
-    from copy import deepcopy
     from dataclasses import replace
     from datetime import UTC, datetime
     from bagelquant_data import DatasetSpec, RawInput, input_index
@@ -103,8 +102,8 @@ def test_optional_raw_summary_bounds_do_not_leak_to_next_batch(tmp_path, monkeyp
                         mode="initialize" if day == 1 else "incremental", ingested_at=datetime(2024, 1, day, tzinfo=UTC))
         frozen = lake.inputs.freeze({"raw": RawInput("custom", "raw", view="versions")}, information_cutoff="2024-01-31")
         # Exercise retained older evidence lacking receipt-level bound authority.
-        evidence = deepcopy(frozen.evidence)
-        evidence["raw"].update(scoped_batches=False, retained_batch_bounds=False)
+        evidence = {**frozen.evidence, "raw": {**frozen.evidence["raw"],
+            "scoped_batches": False, "retained_batch_bounds": False}}
         if day == 1:
             before = replace(frozen, evidence=evidence)
         else:
