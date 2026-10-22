@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
+from collections.abc import Callable
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -128,10 +130,50 @@ def save_selection_membership(db, members: Sequence[Mapping[str, Any]], *, run_e
             for block in blocks])}, len(members)), blocks
 
 
+class MetadataMemo:
+    """Authenticated decoded blocks retained only by one admitted read view."""
+
+    def __init__(self, maximum_bytes: int):
+        self.maximum_bytes = maximum_bytes
+        self.entries: OrderedDict[tuple, tuple[Any, int]] = OrderedDict()
+        self.resident_bytes = self.peak_bytes = self.reads = self.hits = 0
+        self.enabled = True
+
+    def get(self, key):
+        entry = self.entries.pop(key, None)
+        if entry is None:
+            return None
+        self.entries[key] = entry
+        self.hits += 1
+        return entry
+
+    def put(self, key, value, charge):
+        if charge > self.maximum_bytes:
+            return
+        while self.resident_bytes + charge > self.maximum_bytes:
+            _, (_, previous) = self.entries.popitem(last=False)
+            self.resident_bytes -= previous
+        self.entries[key] = (value, charge)
+        self.resident_bytes += charge
+        self.peak_bytes = max(self.peak_bytes, self.resident_bytes)
+
+    def clear(self):
+        self.entries.clear()
+        self.resident_bytes = 0
+
+    def shrink(self, maximum_bytes):
+        self.maximum_bytes = min(self.maximum_bytes, maximum_bytes)
+        while self.resident_bytes > self.maximum_bytes:
+            _, (_, charge) = self.entries.popitem(last=False)
+            self.resident_bytes -= charge
+
+
 class MetadataReader:
-    """One store-bound reader; views never retain a connection or validation cache."""
-    def __init__(self, store=None, *, database=None):
+    """Resolve originals through the current store view and its optional memo."""
+    def __init__(self, store=None, *, database=None,
+                 memo: Callable[[], MetadataMemo | None] | None = None):
         self.store, self.database = store, database
+        self.memo = memo
 
     @contextmanager
     def connection(self):
@@ -144,6 +186,11 @@ class MetadataReader:
                 yield db
 
     def block(self, reference: Mapping[str, Any]) -> Any:
+        memo = None if self.memo is None else self.memo()
+        key = (reference["ref"], reference["kind"], reference["count"])
+        cached = None if memo is None or not memo.enabled else memo.get(key)
+        if cached is not None:
+            return cached[0]
         with self.connection() as db:
             row = db.execute("SELECT kind,payload_json,item_count FROM immutable_metadata WHERE digest=?",
                 (reference["ref"],)).fetchone()
@@ -153,15 +200,30 @@ class MetadataReader:
         if (kind != reference["kind"] or count != reference["count"]
                 or hashlib.sha256((kind + ":" + payload).encode()).hexdigest() != reference["ref"]):
             raise RuntimeError("Registered immutable metadata block checksum mismatch")
-        return json.loads(payload)
+        value = json.loads(payload)
+        if memo is not None and memo.enabled:
+            memo.reads += 1
+            # Include parsed Python cells, references and the LRU entry, rather
+            # than charging only the serialized body. Oversize blocks bypass it.
+            memo.put(key, value, 256 + 8 * len(payload.encode()) + 64 * count)
+        return value
 
     def value(self, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
         if "schema" in value:
-            with self.connection() as db:
-                encoded = schema_bytes(db, value["schema"]).hex()
+            memo = None if self.memo is None else self.memo()
+            key = (value["schema"], "schema")
+            cached = None if memo is None or not memo.enabled else memo.get(key)
+            if cached is not None:
+                encoded = cached[0]
                 return encoded.upper() if value["uppercase"] else encoded
+            with self.connection() as db:
+                payload = schema_bytes(db, value["schema"])
+            encoded = payload.hex()
+            if memo is not None and memo.enabled:
+                memo.put(key, encoded, 256 + 8 * len(encoded))
+            return encoded.upper() if value["uppercase"] else encoded
         if value["kind"] == "mapping":
             return LazyMetadataMapping(self, value)
         if value["kind"] in {"sequence", "branches"}:
@@ -214,6 +276,10 @@ class LazyMetadataMapping(Mapping[str, Any]):
         self._body = None
 
     def _contents(self):
+        if self.reader.memo is not None and self.reader.memo() is not None:
+            # The context owns the bounded decoded body. A retained lazy view
+            # must not pin it after eviction, exit or a writer-generation change.
+            return self.reader.block(self.reference)
         if self._body is None:
             self._body = self.reader.block(self.reference)
         return self._body

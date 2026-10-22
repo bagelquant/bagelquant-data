@@ -170,6 +170,7 @@ def test_all_roots_use_one_read_view_during_a_new_commit(forest, monkeypatch):
         return result
 
     monkeypatch.setattr(lake.inputs, "_capture", capture)
+    monkeypatch.setattr(lake.inputs, "_unchanged_alias_state", lambda *_: False)
     assert lake.inputs.is_current(roots)
     assert inserted
     assert not lake.inputs.is_current(roots)

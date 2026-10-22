@@ -348,6 +348,26 @@ nonfinite/signed floating values and deterministic version precedence.
 SQLite view. Caller objects supply only ID/digest. Publication guards hold the
 writer fence only for finite metadata/reference CAS, never providers or kernels.
 No frame, proof-validity cache or authority survives the operation context.
+Authenticated decoded blocks, schemas, current captures and alias fingerprints use one byte-bounded
+same-connection reserve, shared by nested contexts at their smallest explicit
+limit; omitted nested options inherit the parent. Original digest,
+kind and count checks precede insertion; oversize blocks bypass retention.
+Any own-connection write disables reuse even after rollback. Owner exit clears
+the reserve; explicit audits and closing publication use fresh original checks.
+Currentness and selection comparison share current captures in that same shrinking
+reserve using full requests, cutoff, read boundary, representation flags and
+unchanged write generation. Original Source identities, pending outputs,
+creator relationships and completion/range checks remain independently required.
+An exact unchanged registered alias state establishes content equality only;
+it never admits producer freshness or bypasses pending/creator/completion checks.
+`inputs.currentness_identity` streams authoritative mutable metadata and original
+completion bindings in one current view. It is an owner-state identity, never
+a currentness verdict or audit. A consumer may bind it only in an independently
+validated completed publication, after equality from before readiness validation
+through the Data writer fence. Fresh fenced equality can reuse that publication;
+unknown/changed state needs normal validation. No post-commit qualification,
+new Data proof artifact or schema change is involved. Optional selectors and
+unrelated frozen Source registrations do not invalidate the identity.
 
 ## Inspection, audits and backups
 

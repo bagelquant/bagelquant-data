@@ -327,6 +327,7 @@ def test_currentness_context_does_not_cache_failed_capture_or_partial_roots(tmp_
     # Exercise the conservative path when compact completion authority cannot
     # establish currentness; unchanged schema-nine Sources need no capture.
     monkeypatch.setattr(lake.inputs, "_completed_source_current", lambda *_: None)
+    monkeypatch.setattr(lake.inputs, "_unchanged_alias_state", lambda *_: False)
     def fail_second(*args, **kwargs):
         nonlocal captures
         captures += 1
@@ -338,7 +339,11 @@ def test_currentness_context_does_not_cache_failed_capture_or_partial_roots(tmp_
             patch.setattr(lake.inputs, "_capture", fail_second)
             with pytest.raises(RuntimeError, match="transient capture"):
                 lake.inputs.is_current([frozen, second])
+            state = lake.inputs._read_context()
+            assert state is not None and not state.currentness
             assert lake.inputs.is_current([frozen, second])
-            assert captures == 4
+            # The first root's authenticated capture can be shared on retry;
+            # neither a partial currentness verdict nor the failed capture is.
+            assert captures == 3
             assert lake.inputs.is_current([frozen, second])
-            assert captures == 4
+            assert captures == 3

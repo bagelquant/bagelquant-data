@@ -65,6 +65,42 @@ connection that fetched the rows. This also preserves visibility within an
 enclosing write transaction. Immutable-reference checksum and missing-evidence
 checks still apply; the connection is released when its owning scope exits.
 
+Decoded immutable blocks, schemas, current captures and alias fingerprints share
+an authenticated LRU reserve within that view.
+The reserve is at most one sixteenth of `ExecutionOptions.max_buffer_bytes`;
+same-connection nested contexts share it and shrink to the smallest admitted
+limit. Omitted nested options inherit the parent admission. Every block miss
+checks its original digest, kind and count. Oversized
+blocks bypass retention, so very small budgets can repeat decoding. No frames,
+misses or failed checks are cached. A write on the view's connection disables
+reuse, including after savepoint rollback, and the owning context clears the
+reserve on exit. Unscoped lazy mappings retain their existing per-view behavior.
+Explicit audits and publication guards still establish fresh authority.
+Identical current captures use that same shrinking reserve, keyed
+by complete requests, cutoff, read boundary, representation and write generation.
+This shares metadata across original Sources while retaining each Source's
+identity, pending-output, creator and completion checks.
+Unchanged registered alias state can establish content equality without a
+recapture. Producer freshness, pending outputs and complete range/creator
+authority are still checked; identical output metadata alone is insufficient.
+
+`inputs.currentness_identity(receipt=None, config=..., check_canceled=...)`
+streams registered declarations, schema bindings, commit/check records,
+completion authorities and pending-output bindings in one current metadata
+view. It returns an owner-state identity. It makes no currentness or integrity
+claim. An optional receipt authenticates that Source root; the state identity
+itself is independent of Source IDs and resource settings. Explicit historical
+boundaries are rejected. New optional selectors or unrelated frozen Sources
+do not change this identity.
+
+A consumer can record this identity before complete readiness validation,
+require equality through Data's publication guard, and bind it in its existing
+completed publication. Later exact equality under a fresh guard permits reuse
+of that already validated publication, subject to its other owner fences.
+Missing or changed state requires ordinary validation. Never qualify an old
+publication by sampling state after it committed, or treat the identity as a
+standalone readiness certificate. Original immutable-body audits remain explicit.
+
 `inputs.window_read_supported(receipt, alias)` is a metadata-only planning query:
 true means every retained by-date batch has captured/sealed bounds or an existing
 checked original index header capable of safe pruning. General/missing bounds

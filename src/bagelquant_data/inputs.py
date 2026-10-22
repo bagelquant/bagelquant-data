@@ -443,12 +443,12 @@ class _ReadContext:
     currentness: dict[tuple[str, str, Path, InputReadBoundary | None, sqlite3.Connection, int, int], bool] = field(default_factory=dict)
     selections: dict[tuple[str, str, str, bool, bool, bool, bool], tuple[dict, int]] = field(default_factory=dict)
     request_identities: dict[tuple[str, str], str] = field(default_factory=dict)
-    current_selections: dict[str, tuple[FrozenInputReceipt, int]] = field(default_factory=dict)
     capture_batches: dict[tuple[sqlite3.Connection, int, str, str, int], tuple[tuple[sqlite3.Row, ...], int]] = field(default_factory=dict)
     capture_parents: dict[tuple[sqlite3.Connection, int, str], tuple[str, int]] = field(default_factory=dict)
     capture_records: dict[tuple[sqlite3.Connection, int, str, str, tuple[int, ...], tuple[int, ...]], tuple[frozenset[int], int]] = field(default_factory=dict)
     database: sqlite3.Connection | None = None
     entry_changes: int | None = None
+    metadata_memo: immutable_metadata.MetadataMemo | None = None
     parent: _ReadContext | None = None
     closed: bool = False
     lock: Any = field(default_factory=RLock)
@@ -471,6 +471,7 @@ class InputsAPI:
     def __init__(self, lake: DataLake) -> None:
         self._lake = lake
         self._store = lake._data_meta
+        self._metadata_path = self._store.data_meta_path.resolve()
         self._boundary = _boundary_record(self._store.data_meta_path)
         self._shared_context: _ReadContext | None = None
         if not self._store.read_only:
@@ -478,9 +479,19 @@ class InputsAPI:
                 db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null unique,created_at text not null)")
 
     def _read_context(self) -> _ReadContext | None:
-        path = self._store.data_meta_path.resolve()
+        path = self._metadata_path
         return next((value for value in reversed(_READ_CONTEXTS.get())
                      if value.path == path and value.thread == get_ident()), None)
+
+    def _metadata_memo(self):
+        context = self._read_context()
+        if context is None or context.closed:
+            return None
+        if not context.memo_available:
+            if context.metadata_memo is not None:
+                context.metadata_memo.clear()
+                context.metadata_memo.enabled = False
+        return context.metadata_memo
 
     @contextmanager
     def read_context(self, receipt: FrozenInputReceipt | str | Sequence[FrozenInputReceipt | str], *,
@@ -502,7 +513,8 @@ class InputsAPI:
         parent = self._read_context() if source is None else source._shared_context
         if source is not None and (parent is None or parent.closed or parent.path != self._store.data_meta_path.resolve()):
             raise ValueError("Frozen metadata source is not an active matching read context")
-        state = _ReadContext(self._store.data_meta_path.resolve(), get_ident(), {}, check_canceled, config or ExecutionOptions(), progress=progress)
+        options = config or (parent.options if parent is not None else ExecutionOptions())
+        state = _ReadContext(self._metadata_path, get_ident(), {}, check_canceled, options, progress=progress)
         if parent is not None:
             state.receipts, state.lock, state.parent = parent.receipts, parent.lock, parent
         previous_shared, self._shared_context = self._shared_context, state
@@ -516,11 +528,17 @@ class InputsAPI:
                 if (parent is not None and parent.thread == get_ident()
                         and parent.database is database
                         and parent.options.max_buffer_bytes == state.options.max_buffer_bytes):
-                    state.current_selections = parent.current_selections
                     state.selections = parent.selections
                     state.capture_batches = parent.capture_batches
                     state.capture_parents = parent.capture_parents
                     state.capture_records = parent.capture_records
+                if (parent is not None and parent.thread == get_ident()
+                        and parent.database is database):
+                    state.metadata_memo = parent.metadata_memo
+                    if state.metadata_memo is not None:
+                        state.metadata_memo.shrink(state.options.max_buffer_bytes // 16)
+                if state.metadata_memo is None:
+                    state.metadata_memo = immutable_metadata.MetadataMemo(state.options.max_buffer_bytes // 16)
                 roots = [self.get(value) for value in supplied]
                 visiting: set[str] = set()
                 loaded: set[str] = set()
@@ -560,8 +578,9 @@ class InputsAPI:
             if state.parent is None or state.selections is not state.parent.selections:
                 state.selections.clear()
             state.request_identities.clear()
-            if state.parent is None or state.current_selections is not state.parent.current_selections:
-                state.current_selections.clear()
+            if state.metadata_memo is not None and (state.parent is None
+                    or state.metadata_memo is not state.parent.metadata_memo):
+                state.metadata_memo.clear()
             if state.parent is None or state.capture_batches is not state.parent.capture_batches:
                 state.capture_batches.clear()
             if state.parent is None or state.capture_parents is not state.parent.capture_parents:
@@ -633,6 +652,54 @@ class InputsAPI:
         if context is not None and context.memo_available:
             context.request_identities[key] = identity
         return identity
+
+    def currentness_identity(self, receipt: FrozenInputReceipt | str | None = None, *,
+                            config: ExecutionOptions | None = None,
+                            check_canceled: Callable[[], None] = lambda: None) -> str:
+        """Identify registered Data state for reuse of a previously complete consumer.
+
+        This is a metadata revision identity, not a currentness verdict. The
+        consumer must bind it while validating its complete publication inside
+        publication_guard, then compare it under a fresh guard before reuse.
+        It never validates original numerical bytes or creates proof records.
+        Immutable bodies retain their registered identities; audits are separate.
+        """
+        if self._boundary is not None:
+            raise ValueError("Currentness state requires an unbounded current Data view")
+        context = self._read_context()
+        options = config or (context.options if context is not None else ExecutionOptions())
+        digest = hashlib.sha256(b"data.currentness.state.v1\n")
+        # Mutable declarations, publication heads, visibility/completion records
+        # and original completion bindings. Optional selectors and new unrelated
+        # frozen Sources do not change these authorities. No row values or
+        # immutable metadata descendants are expanded or audited here.
+        tables = ("datasets", "dataset_schemas", "item_definitions", "item_dependencies",
+            "node_completions", "version_commits", "version_checks", "item_builds",
+            "item_completion_proofs", "item_completion_authorities", "item_pending_outputs",
+            "item_completion_attestations")
+        with self._store.read_view() as db:
+            if receipt is not None:
+                self.get(receipt)
+            for table in tables:
+                check_canceled()
+                present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                digest.update(_json((table, bool(present))).encode() + b"\n")
+                if not present:
+                    continue
+                for index, row in enumerate(db.execute(f'SELECT * FROM "{table}" ORDER BY rowid')):
+                    if index % 128 == 0:
+                        check_canceled()
+                    size = sum(sys.getsizeof(cell) for cell in row)
+                    if size * 8 > options.max_buffer_bytes:
+                        raise MemoryError("Currentness metadata row exceeds max_buffer_bytes")
+                    digest.update(_json(tuple(row)).encode() + b"\n")
+            for index, row in enumerate(db.execute("SELECT b.id,f.receipt_id,f.digest FROM item_builds b "
+                    "LEFT JOIN frozen_inputs f ON f.receipt_id=b.frozen_receipt_id ORDER BY b.id")):
+                if index % 128 == 0:
+                    check_canceled()
+                digest.update(_json(tuple(row)).encode() + b"\n")
+        check_canceled()
+        return digest.hexdigest()
 
     @staticmethod
     def selection_descriptor_identity(descriptor: Mapping[str, Any]) -> str:
@@ -737,7 +804,7 @@ class InputsAPI:
                 "JOIN immutable_metadata m ON m.digest=s.root_ref WHERE s.id=?", (header["id"],)).fetchone()
         if root is None or root["kind"] != "selection_membership" or root["item_count"] != header["count"]:
             raise RuntimeError("Registered selection membership is missing or unsupported")
-        reader = immutable_metadata.MetadataReader(self._store)
+        reader = immutable_metadata.MetadataReader(self._store, memo=self._metadata_memo)
         body = reader.block({"ref": root["root_ref"], "kind": root["kind"], "count": root["item_count"]})
         if body.get("schema") != "selection.membership.v1" or body["members"]["count"] != header["count"]:
             raise RuntimeError("Registered selection membership inventory changed")
@@ -1209,12 +1276,19 @@ class InputsAPI:
             raise ValueError("snapshot requests require an information cutoff")
         return request, cutoff
 
-    def _current_selection_receipt(self, original, *, cutoff):
+    def _current_selection_receipt(self, original, *, cutoff, config=None):
         """Capture current alias metadata in the existing fixed read view."""
         if self._boundary is not None and self._boundary.as_of is not None and (
                 cutoff is None or cutoff > self._boundary.as_of):
             raise ValueError("Current selection exceeds the active frozen information boundary")
+        return self._capture_current_receipt(original, cutoff=cutoff, config=config)
+
+    def _capture_current_receipt(self, original, *, cutoff, config=None):
+        """Capture exact registered requests once, without changing caller cutoff semantics."""
         context = self._read_context()
+        options = config or (context.options if context is not None else ExecutionOptions())
+        if context is not None and context.options.max_buffer_bytes != options.max_buffer_bytes:
+            context = None
         if context is not None and context.check_canceled is not None:
             context.check_canceled()
         compact = {alias for alias, evidence in original.evidence.items() if "full_commit_checks" in evidence}
@@ -1226,29 +1300,47 @@ class InputsAPI:
                 "as_of": self._boundary.as_of}, "compact": sorted(compact),
             "scoped": sorted(scoped), "retained": sorted(retained),
             "write_generation": None if context is None or context.database is None else context.database.total_changes})
-        reserve = 0 if context is None else context.options.max_buffer_bytes // 16
-        if context is not None and context.memo_available and key in context.current_selections:
-            cached, size = context.current_selections[key]
-            if size <= reserve:
-                return cached
+        memo = self._metadata_memo() if context is not None else None
+        memo_key = ("current_capture", key)
+        cached = None if memo is None or not memo.enabled else memo.get(memo_key)
+        if cached is not None:
+            return cached[0]
         with self._store.connect() as db:
             if not db.in_transaction:
                 db.execute("begin")
             payload = self._capture(db, original.requests, cutoff=cutoff,
                 max_commit=None if self._boundary is None else self._boundary.max_commit,
-                compact_aliases=compact, scoped_aliases=scoped, retained_bounds_aliases=retained)
+                compact_aliases=compact, scoped_aliases=scoped, retained_bounds_aliases=retained,
+                max_buffer_bytes=options.max_buffer_bytes)
         serialized = _json(payload)
         value = self._receipt("current-selection", payload, hashlib.sha256(serialized.encode()).hexdigest())
         # Same-thread nested readers share the owner's SQLite snapshot. Keep
         # only immutable headers, with a finite entry and buffer reserve; a
         # different request/boundary or a later operation always captures anew.
-        size = (len(serialized.encode()) + len(key.encode())) * 4 + 256
-        if context is not None and context.memo_available and size <= reserve:
+        size = (len(serialized.encode()) + len(key.encode())) * 8 + 256
+        if memo is not None and memo.enabled and size <= memo.maximum_bytes:
             value = replace(value, requests=_readonly(value.requests), evidence=_readonly(value.evidence))
-            while context.current_selections and (len(context.current_selections) >= 128
-                    or sum(entry[1] for entry in context.current_selections.values()) + size > reserve):
-                context.current_selections.pop(next(iter(context.current_selections)))
-            context.current_selections[key] = (value, size)
+            memo.put(memo_key, value, size)
+        return value
+
+    def _currentness_selection(self, frozen, alias, *, general=False):
+        """Reuse an immutable alias fingerprint inside this fixed metadata view."""
+        memo = self._metadata_memo()
+        evidence = frozen.evidence
+        reference = (_json(evidence.references[alias])
+            if isinstance(evidence, immutable_metadata.FrozenEvidenceMapping) else frozen.digest + ":" + alias)
+        key = ("currentness_selection", general, reference,
+            _selection_key(frozen.requests[alias], frozen.information_cutoff))
+        cached = None if memo is None or not memo.enabled else memo.get(key)
+        if cached is not None:
+            return cached[0]
+        value = (_general_metadata_selection(frozen, alias) if general
+            else _content_metadata_selection(frozen, alias))
+        if value is not None:
+            value = hashlib.sha256(value.encode()).hexdigest()
+        if memo is not None and memo.enabled:
+            memo.put(key, value, 256 + 8 * (len(reference.encode()) + len(key[-1].encode())
+                + (0 if value is None else len(value.encode()))))
         return value
 
     def selection_equivalent(self, original: FrozenInputReceipt | str, current: FrozenInputReceipt | str | None,
@@ -2572,6 +2664,15 @@ class InputsAPI:
             "commit": db.execute("SELECT coalesce(max(seq),0) FROM version_commits WHERE source=? AND dataset=? AND status='committed'", (source, dataset)).fetchone()[0],
             "check": db.execute("SELECT coalesce(max(id),0) FROM version_checks WHERE source=? AND dataset=?", (source, dataset)).fetchone()[0]}
 
+    def _unchanged_alias_state(self, db, frozen, header):
+        """Unchanged content headers do not establish producer freshness."""
+        if frozen.receipt_id == "current" or self._boundary is not None:
+            return False
+        state = header["state"]
+        return (state is not None and state["active"] and state["commit"] <= frozen.max_commit
+            and state["check"] <= frozen.max_check_id
+            and state == self._registered_source_state(db, header["source"], header["dataset"]))
+
     def _completed_source_current(self, db, frozen, alias_names: Sequence[str] | None = None,
                                   alias_headers: Mapping[str, Mapping[str, Any]] | None = None):
         """Admit unchanged Source headers under existing whole-range authorities.
@@ -2584,11 +2685,17 @@ class InputsAPI:
             return None
         aliases = self.describe(frozen)["aliases"] if alias_headers is None else alias_headers
         checked, visiting = set(), set()
+        context = self._read_context()
+        memo = self._metadata_memo() if context is not None and context.database is db else None
 
         def completed(name):
             if name in visiting:
                 raise RuntimeError("DataItem declaration dependency cycle")
             if name in checked:
+                return True
+            memo_key = ("completed_node", name, frozen.information_cutoff)
+            if memo is not None and memo.enabled and memo.get(memo_key) is not None:
+                checked.add(name)
                 return True
             visiting.add(name)
             row = db.execute("SELECT f.*,d.update_incomplete,d.publication_revision AS active_revision,i.spec_hash AS active_definition,i.active FROM node_completions f JOIN datasets d ON d.source='items' AND d.name=? JOIN item_definitions i ON i.name=d.name WHERE f.node_key=?", (name, "items/" + name)).fetchone()
@@ -2597,12 +2704,11 @@ class InputsAPI:
                     or row["publication_revision"] != row["active_revision"]
                     or row["dependency_state_digest"] != self._store.dependency_state(db, "items", name)):
                 return False
-            from .items.completion import pending_dates, verified_completion_digest
+            from .items.completion import pending_dates
             try:
                 build_id = int(row["result_ref"])
             except (TypeError, ValueError):
                 return False
-            verified_completion_digest(db, build_id)
             if any(frozen.information_cutoff is None or _date_value(available) <= frozen.information_cutoff
                     for _, available in pending_dates(db, build_id)):
                 return False
@@ -2613,16 +2719,15 @@ class InputsAPI:
                     return False
             visiting.remove(name)
             checked.add(name)
+            if memo is not None and memo.enabled:
+                memo.put(memo_key, True, 256 + 8 * len(name.encode()))
             return True
 
         selected = frozen.requests if alias_names is None else alias_names
         for alias in selected:
             request = frozen.requests[alias]
             header = aliases[alias]
-            state = header["state"]
-            if (state is None or not state["active"] or state["commit"] > frozen.max_commit
-                    or state["check"] > frozen.max_check_id
-                    or state != self._registered_source_state(db, header["source"], header["dataset"])):
+            if not self._unchanged_alias_state(db, frozen, header):
                 return None
             if isinstance(request, ItemInput):
                 if frozen.information_cutoff is None or not completed(request.name):
@@ -2987,25 +3092,34 @@ class InputsAPI:
                 # even a large new attestation can be outside this fixed cutoff.
                 # Reuse registered proofs and admit any inline representation
                 # before the actual cutoff-aware metadata comparison.
-                try:
-                    payload = self._capture(db, value.requests, cutoff=value.information_cutoff,
-                        max_commit=None if self._boundary is None else self._boundary.max_commit,
-                        compact_aliases={alias for alias, evidence in value.evidence.items() if "full_commit_checks" in evidence},
-                        scoped_aliases={alias for alias, evidence in value.evidence.items() if evidence.get("scoped_batches")},
-                        retained_bounds_aliases={alias for alias, evidence in value.evidence.items()
-                                                if evidence.get("retained_batch_bounds")}, max_buffer_bytes=options.max_buffer_bytes)
-                except KeyError:
-                    checked[value.receipt_id] = False
-                    visiting.remove(value.receipt_id)
-                    return False
-                result = payload["dependency_digest"] == value.dependency_digest
-                if not result:
-                    captured = self._receipt("current", payload, hashlib.sha256(_json(payload).encode()).hexdigest())
-                    def alias_current(alias):
-                        general = _general_metadata_selection(value, alias)
-                        general_equal = general is not None and general == _general_metadata_selection(captured, alias)
-                        content = _content_metadata_selection(value, alias)
-                        content_equal = content is not None and content == _content_metadata_selection(captured, alias)
+                completed_aliases = set()
+                def alias_current(alias):
+                    if self._completed_source_current(db, value, (alias,), alias_headers) is True:
+                        completed_aliases.add(alias)
+                        return True
+                    if self._unchanged_alias_state(db, value, alias_headers[alias]):
+                        # The captured content is identical, even when a monthly
+                        # producer cannot certify this Source's wider range or
+                        # later cutoff. Its original creator/pending/completion
+                        # checks below still establish producer freshness.
+                        if progress is not None:
+                            progress({"phase": "currentness_selection", "receipt_id": value.receipt_id,
+                                "alias": alias, "current": True, "registered_state_equal": True})
+                        return True
+                    original_alias = replace(value, requests={alias: value.requests[alias]},
+                        evidence={alias: value.evidence[alias]})
+                    try:
+                        captured = replace(self._capture_current_receipt(original_alias,
+                            cutoff=value.information_cutoff, config=options), receipt_id="current")
+                    except KeyError:
+                        return False
+                    if len(value.requests) == 1 and captured.dependency_digest == value.dependency_digest:
+                        return True
+                    else:
+                        general = self._currentness_selection(value, alias, general=True)
+                        general_equal = general is not None and general == self._currentness_selection(captured, alias, general=True)
+                        content = self._currentness_selection(value, alias)
+                        content_equal = content is not None and content == self._currentness_selection(captured, alias)
                         raw_equal = content_equal and isinstance(value.requests[alias], RawInput)
                         item_equal = content_equal and isinstance(value.requests[alias], ItemInput)
                         record_equal = (not general_equal and not content_equal
@@ -3029,10 +3143,10 @@ class InputsAPI:
                                 "original_schema": before["schema_hash"], "current_schema": after["schema_hash"],
                                 "definition_equal": before["definition_hash"] == after["definition_hash"]})
                         return same
-                    result = all(alias_current(alias) for alias in value.requests)
+                result = all(alias_current(alias) for alias in value.requests)
                 if result:
                     for alias, request in value.requests.items():
-                        if not isinstance(request, ItemInput):
+                        if alias in completed_aliases or not isinstance(request, ItemInput):
                             continue
                         evidence = value.evidence[alias]
                         if self._has_pending_item_outputs(value, alias):
@@ -4336,7 +4450,7 @@ class InputsAPI:
     def _receipt(self, key: str, payload: Mapping[str, Any], digest: str) -> FrozenInputReceipt:
         evidence = payload["evidence"]
         if payload.get("format") == 9:
-            reader = immutable_metadata.MetadataReader(self._store)
+            reader = immutable_metadata.MetadataReader(self._store, memo=self._metadata_memo)
             evidence = immutable_metadata.FrozenEvidenceMapping(reader, evidence)
         return FrozenInputReceipt(key, int(payload["max_commit"]), int(payload["max_check_id"]), None if payload["information_cutoff"] is None else _date_value(payload["information_cutoff"]), {name: input_from_payload(value) for name, value in payload["requests"].items()}, evidence, digest, payload["dependency_digest"])
 

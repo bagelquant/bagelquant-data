@@ -53,7 +53,8 @@ class DataMetaStore:
         "input_selection_sets", "input_selection_chunk_entries"}
 
     def __init__(self, data_meta_path: str | Path, *, read_only: bool = False, runtime: bool = False) -> None:
-        self.data_meta_path = Path(data_meta_path)
+        self.data_meta_path = Path(data_meta_path).resolve()
+        self._metadata_path = self.data_meta_path
         self.read_only = read_only
         if read_only and not self.data_meta_path.is_file():
             raise FileNotFoundError("Read-only Data metadata must already exist")
@@ -224,7 +225,7 @@ class DataMetaStore:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         """Yield one transactional connection and close owned connections."""
-        path = self.data_meta_path.resolve()
+        path = self._metadata_path
         for view_path, thread, connection in reversed(_READ_VIEWS.get()):
             if view_path == path and thread == get_ident():
                 yield connection
@@ -252,7 +253,7 @@ class DataMetaStore:
     @contextmanager
     def read_view(self) -> Iterator[sqlite3.Connection]:
         """Share one operation-local SQLite snapshot across same-thread readers."""
-        path = self.data_meta_path.resolve()
+        path = self._metadata_path
         for view_path, thread, connection in reversed(_READ_VIEWS.get()):
             if view_path == path and thread == get_ident():
                 yield connection

@@ -84,7 +84,8 @@ def test_current_metadata_reused_only_in_same_fixed_operation_and_boundary(tmp_p
         captures.append(kwargs["cutoff"])
         return original_capture(self, *args, **kwargs)
     monkeypatch.setattr(owner, "_capture", capture)
-    options = ExecutionOptions(max_buffer_bytes=2**20)
+    # Captures and decoded blocks now share one conservatively charged reserve.
+    options = ExecutionOptions(max_buffer_bytes=4 * 2**20)
     with lake.inputs.read_context(frozen, config=options):
         assert lake.inputs.selection_equivalent(frozen, None, "value", values_only=True, causal_versions=True)
         with lake.inputs.read_context(frozen, config=options):
