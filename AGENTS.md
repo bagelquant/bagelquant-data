@@ -5,12 +5,12 @@ category trees, coverage, versions, PIT, frozen input receipts and local recover
 Data has no BagelQuant package dependency; never import Core, BT or Workbench.
 The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
 `lake.integrity` and `lake.inputs`; pure statistics live in `exploration`.
-Read-only update plans require actual new/affected ranges and record-only prerequisites; `items.recertify` admits only proven no-op reuse without producers; follow update-rule acceptance.
+Read-only update plans accept caller `config` for metadata/timing admission and require actual new/affected ranges and record-only prerequisites; `items.recertify` admits only proven no-op reuse without producers; follow update-rule acceptance.
 Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint empty sparse groups share one fenced Source check and atomic completion publication.
 Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
 DataItem updates pin caller input windows in frozen receipts, preserving revisions and legacy identity. `items.resume_update` recovers uncertified first builds from original Sources; completed/lost authority blocks.
 Ready Item batches share bounded original/key/visibility preparation. Same-date initialization resumes certified windows under its original Source/cutoff and completes only after all windows.
-Other producer policies retain their declared input requirements and explicit buffer admission.
+Other producer policies retain their declared input requirements and explicit buffer admission. Finite-history General timing reuse needs a surviving baseline within every authenticated output unit; halo-only or out-of-unit evidence remains blocked.
 `items.completed_builds` exposes whole-range authorities; `inputs.publication_guard` fences Data writers through consumer CAS without audit/maintenance.
 External Item publication reuses one finite metadata connection; ordinary transactions, Source/definition fences and cancellation remain independent.
 Schema 9 retains one immutable Parquet body and shared segment/check/schema headers; selection handles bind immutable scope/PIT proof, with Source/requested cutoff in set bindings and shared chunk indexes across append.

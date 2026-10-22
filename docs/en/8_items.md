@@ -518,6 +518,15 @@ becomes verified, the narrow saved-value path below handles the timing change.
 Other unproved timing changes remain blocked. New General contents require
 selected-row impact proof when historical output coordinates exist.
 
+For a finite-history producer, metadata can prove first same-content General
+verification safe when a baseline survives inside every authenticated original
+output unit, in both old and current Sources at every timing boundary. Each
+output unit is contained in its actual input window, so this proves the aggregate
+baseline without scanning historical inputs or evaluating the producer again.
+Evidence only in an earlier halo, another unit or appended dates is insufficient
+for this conservative proof. Missing evidence stays blocked; the declared causal
+history, calendar and point-in-time selection are unchanged.
+
 For completed native producers whose whole General Raw inputs all declare
 timing neutrality, unchanged selected snapshots and schemas can prove the first
 aggregate baseline-to-verified boundary. With no pending outputs or numerical
@@ -575,9 +584,14 @@ visibility boundaries. Missing proof gives exact original/current
 plans never read originals or row indexes. Actual consumed changes or first/
 earlier visibility remain blocked for explicit impact resolution, with no silent
 full replay. Baseline promotion, output anchors, other inputs and closing fences
-retain their independent contracts. `update`/`recertify(config=...)` carry the
-caller budget into this metadata planning and no-op binding; read-only
-`plan_update` inherits an explicit `inputs.read_context(config=...)` budget.
+retain their independent contracts. `plan_update`/`update`/`recertify(config=...)`
+carry the caller budget into metadata planning, including timing-neutral inputs
+without consumed General-field projections. Read-only `plan_update` also inherits
+an enclosing `inputs.read_context(config=...)` when its own config is omitted;
+without either, the standalone 64 MiB default applies. Explicit planning scopes
+retain enclosing cancellation/progress callbacks. Grouped updates keep the
+shared preparation reserve and plan within each Item's reduced allocation.
+Budgets affect admission, never numerical identity or historical reuse proofs.
 
 For a same-date producer, an originally selected baseline can also qualify when
 the exact consumed projection is unchanged and metadata proves aggregate

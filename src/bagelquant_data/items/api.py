@@ -510,12 +510,15 @@ class ItemAPI:
 
     def plan_update(self, name: str, *, end: DateLike, start: DateLike = "2000-01-01",
                     update_policy: ProducerUpdatePolicy | None = None,
-                    input_windows: Mapping[str, tuple[DateLike, DateLike]] | None = None) -> list[dict[str, str]]:
+                    input_windows: Mapping[str, tuple[DateLike, DateLike]] | None = None,
+                    config: ExecutionOptions | None = None) -> list[dict[str, str]]:
         """Plan from committed records, optionally binding a caller's producer policy.
 
         Read-only callers may supply the immutable producer's causal contract
         without registering executable code or changing the catalog. A supplied
         contract must agree with any already registered runtime policy.
+        Config bounds metadata proofs, including timing-only checks. When
+        omitted, an enclosing input read context or the standalone defaults apply.
         """
         spec = self.get(name)
         policy = self._policy(spec)
@@ -526,7 +529,19 @@ class ItemAPI:
                 raise ValueError("Update policy conflicts with the registered producer contract")
             policy = update_policy
         return self._plan_update(name, spec=spec, policy=policy, start=start, end=end,
-            input_windows=input_windows)
+            input_windows=input_windows, config=config)
+
+    @contextmanager
+    def _planning_context(self, receipt_id: str, config: ExecutionOptions | None) -> Iterator[None]:
+        """Scope caller admission to metadata work without masking callbacks."""
+        if config is None:
+            yield
+            return
+        parent = self._lake.inputs._read_context()
+        with self._lake.inputs.read_context(receipt_id, config=config,
+                check_canceled=None if parent is None else parent.check_canceled,
+                progress=None if parent is None else parent.progress):
+            yield
 
     def _policy(self, spec: DataItemSpec) -> ProducerUpdatePolicy | None:
         if spec.producer_key:
@@ -601,9 +616,7 @@ class ItemAPI:
             "and definition_hash=? and status='success' and start_date<=? and end_date>=? "
             "order by end_date desc,id desc limit 1", (name, definition_hash, first.isoformat(), first.isoformat()))
         if completed:
-            context = (self._lake.inputs.read_context(completed[0]["frozen_receipt_id"], config=config)
-                if config is not None and policy is not None and policy.general_fields else nullcontext())
-            with context:
+            with self._planning_context(completed[0]["frozen_receipt_id"], config):
                 problem = self._input_scope_problem(completed[0], requests, policy=policy,
                     first=first, last=last)
                 if problem is not None:
@@ -915,9 +928,7 @@ class ItemAPI:
             "and status='success' and start_date<=? and end_date>=? order by end_date desc,id desc limit 1",
             (name, definition_hash, first.isoformat(), first.isoformat()))
         if predecessor:
-            context = (self._lake.inputs.read_context(predecessor[0]["frozen_receipt_id"], config=config)
-                if config is not None and pinned_policy is not None and pinned_policy.general_fields else nullcontext())
-            with context:
+            with self._planning_context(predecessor[0]["frozen_receipt_id"], config):
                 problem = self._input_scope_problem(predecessor[0], requests, policy=pinned_policy,
                     first=first, last=last)
                 if problem is not None:

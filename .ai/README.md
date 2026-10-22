@@ -51,3 +51,12 @@ UUIDs and verification. Read the verified workspace `.ai/rules/wiki.md`.
 Complete filesystem accounting uses integrity.storage_inventory; semantic Data
 statistics and protected temporary cleanup retain their existing APIs. See
 [Operations](../docs/en/7_operations.md#complete-filesystem-inventory).
+
+## Integrated engineering routes
+
+After validating the workspace, use its `.ai/README.md` task/skill/check matrix
+and `docs/ai-system-map.md` for affected consumers. Workspace skills cover
+performance, documentation, UI and verification; its `scripts/contracts.py`
+selects owner tests separately from real application composition. Run Data
+checks first, then affected consumers. Standalone work uses the local rules
+and tests above without requiring workspace tools or dependencies.

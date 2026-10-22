@@ -101,16 +101,18 @@ def _neutral_timing_preserved(owner: ItemAPI, db, receipt, *, previous, policy,
     inputs = owner._lake.inputs
     context = inputs._read_context()
     budget = (context.options if context is not None else ExecutionOptions()).max_buffer_bytes
-    # Finite-history inputs need their actual consumed halo. Whole-input
-    # forward producers retain the original observation scope.
-    if policy.historical_impact != "same_date" and policy.history_observations is not None:
-        return False
     captured = inputs._capture(db, {alias: request}, cutoff=end, max_commit=commit_bound,
         max_buffer_bytes=budget)
     candidate = inputs._receipt("neutral-general-timing", captured,
         hashlib.sha256(_json(captured).encode()).hexdigest())
+    # Finite reads contain their output unit plus an earlier halo. A surviving
+    # baseline inside every authenticated output unit is therefore sufficient
+    # for the consumed-input OR. Do not borrow witnesses from the halo, another
+    # unit or an appended date; halo-only evidence remains unsupported here.
+    # Whole-input forward producers retain the original observation scope.
+    bounded = policy.historical_impact == "same_date" or policy.history_observations is not None
     windows = (_baseline_windows(db, receipt, previous, policy=policy, first=first, last=last,
-        end=end, commit_bound=commit_bound, budget=budget) if policy.historical_impact == "same_date" else None)
+        end=end, commit_bound=commit_bound, budget=budget) if bounded else None)
     return _baseline_timing_preserved(inputs, db, receipt, first=first, last=last,
         end=end, commit_bound=commit_bound, budget=budget, general_alias=alias, candidate=candidate,
         windows=windows)
@@ -235,7 +237,8 @@ def _baseline_timing_preserved(inputs, db, receipt, *, first: date, last: date,
     """Prove baseline across each consumed scope at every timing boundary.
 
     These are transient metadata views, not new Sources. General inputs retain
-    atomic scope; same-date dependencies are clipped to authenticated units.
+    atomic scope; bounded dependencies are clipped to authenticated output units.
+    For finite history this is a sufficient subset of the consumed input window.
     Whole-input forward producers retain their original observation requests.
     Non-General verification and partial availability boundaries also matter.
     """

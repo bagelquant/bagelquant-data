@@ -170,8 +170,11 @@ disqualify the entire commit. Unknown/missing event scope remains
 conservative and follows ordinary impact/block handling without index preparation.
 Same-date General first verification uses the same authenticated native-unit
 proof as consumed-field equality, including callers without `general_fields`.
-A finite-history producer needs proof for its consumed halo; a whole-request
-baseline alone cannot authorize its first promotion.
+A finite-history producer can reuse the same authenticated output-unit proof:
+a surviving baseline within each output unit is necessarily inside its consumed
+input window, including the earlier halo. This is a sufficient positive proof,
+not full halo support. Halo-only, other-unit, appended-date or unknown evidence
+cannot authorize first promotion; a whole-request baseline alone is insufficient.
 Whole-input forward producers retain original requests but share the complete
 dependency-boundary proof, including intermediate baseline loss/restoration.
 A pointwise native input window may extend only its upper observation bound
@@ -225,8 +228,13 @@ maintenance at the named max_commit/as_of; ordinary planning never decodes
 originals or row indexes. Actual consumed changes, first/earlier visibility,
 unproved baseline transitions or unsupported scopes remain actionable blocked plans, not
 full-history replay. Output anchors and other dependency impacts remain separate.
-Direct update/recertify config and an explicit plan read_context both bound
-General metadata/summary admission; resource settings never change proof identity.
+Direct plan_update/update/recertify config bounds all metadata/summary and timing
+admission, including timing-neutral policies without general_fields. Omitted
+plan config inherits an existing read_context or the standalone defaults;
+explicit planning scopes preserve enclosing cancellation/progress callbacks.
+Close those read scopes before dependency updates and publication. Grouped
+updates plan within their reduced child allocation after the shared preparation
+reserve. Resource settings never change proof identity.
 Runtime `general_asset_local_inputs=(alias, ...)` is a behavioral contract only
 for same-date producers with consumed `asset_id` and complete `output_anchors`.
 Each General lookup affects only its output's nonnull asset key; NULL-key rows
