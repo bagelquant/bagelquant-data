@@ -624,6 +624,121 @@ class InputsAPI:
             value["aliases"] = json.loads(db.execute("SELECT json_extract(payload_json,'$.aliases') FROM frozen_inputs WHERE receipt_id=?", (key,)).fetchone()[0])
         return value
 
+    def completed_range(self, receipt: FrozenInputReceipt | str, alias: str, *,
+                        start: DateLike, end: DateLike) -> bool:
+        """Prove complete Item coverage inside an original frozen Source.
+
+        Only original source-bound completion certificates at the captured
+        content and output-check ceilings qualify. Sparse and empty outputs
+        retain their certified ranges; mutable live completion flags are not
+        consulted. This metadata-only read creates no evidence and proves no
+        currentness beyond the selected Source.
+        """
+        from .items.completion import output_check_bound, pending_dates, verified_completion_digest
+        frozen = self.get(receipt)
+        request = frozen.requests[alias]
+        if not isinstance(request, ItemInput):
+            raise ValueError("Completed ranges require a frozen Item input")
+        first, last = _date_value(start), _date_value(end)
+        if last < first:
+            raise ValueError("end precedes start")
+        if (request.start is not None and first < _date_value(request.start)
+                or request.end is not None and last > _date_value(request.end)):
+            return False
+        evidence = frozen.evidence[alias]
+        parents = evidence["parent_receipts"]
+        covered = []
+        certificates = []
+        with self.read_context(frozen):
+            context = self._read_context()
+            with self._store.connect() as db:
+                if not db.execute("select 1 from sqlite_master where name='item_completion_proofs'").fetchone():
+                    return False
+                rows = db.execute("select b.* from item_builds b join item_completion_proofs p on p.build_id=b.id "
+                    "where name=? and definition_hash=? and status='success' and input_commit<=? "
+                    "and (result_commit is null or result_commit<=?) and start_date<=? and end_date>=? "
+                    "order by b.id desc", (request.name, evidence["definition_hash"],
+                        frozen.max_commit, frozen.max_commit, str(last), str(first)))
+                for row in rows:
+                    if context is not None and context.check_canceled is not None:
+                        context.check_canceled()
+                    parent_id = row["frozen_receipt_id"]
+                    if parent_id not in parents:
+                        continue
+                    verified_completion_digest(db, row["id"])
+                    check = output_check_bound(db, row["id"])
+                    if check is None or check > frozen.max_check_id:
+                        continue
+                    parent = self.get(parent_id)
+                    if (parent.digest != parents[parent_id] or parent.max_check_id > frozen.max_check_id
+                            or parent.max_commit != row["input_commit"]
+                            or parent.dependency_digest != row["dependency_digest"]):
+                        raise RuntimeError("Frozen Item completion source binding differs")
+                    if (frozen.information_cutoff is not None and (parent.information_cutoff is None
+                            or parent.information_cutoff > frozen.information_cutoff)):
+                        continue
+                    for day, available in pending_dates(db, row["id"]):
+                        day = _date_value(day)
+                        if (first <= day <= last
+                                and (frozen.information_cutoff is None or _date_value(available) <= frozen.information_cutoff)
+                                and not any(lower <= day <= upper for lower, upper in covered)):
+                            return False
+                    span = (_date_value(row["start_date"]), _date_value(row["end_date"]))
+                    covered.append(span)
+                    certificates.append((*span, row["result_commit"] or 0, check))
+                    if context is not None and len(certificates) * 2048 > context.options.max_buffer_bytes // 4:
+                        raise MemoryError("Frozen completion metadata exceeds max_buffer_bytes")
+
+            def covers(lower, upper, commit=0, check=0):
+                following = lower
+                for left, right, content, checked in sorted(certificates):
+                    if content < commit or checked < check or right < following:
+                        continue
+                    if left > following:
+                        return False
+                    if right >= upper:
+                        return True
+                    following = max(following, right + timedelta(days=1))
+                return False
+
+            if not covers(first, last):
+                return False
+            # A range certificate cannot cover a later row-only ingest or
+            # changed visibility merely because its creator Source survived.
+            selected = replace(request, start=first, end=last)
+            for batch in _selection_batches(frozen, alias, selected, frozen.information_cutoff):
+                if not batch["row_count"]:
+                    continue
+                lower, upper = batch.get("min_observation"), batch.get("max_observation")
+                if lower is None or upper is None:
+                    return False
+                lower, upper = max(first, _date_value(lower)), min(last, _date_value(upper))
+                if lower <= upper and not covers(lower, upper, commit=batch["commit_seq"]):
+                    return False
+            for channel in ("audit_checks", "empty_checks"):
+                for check in evidence[channel]:
+                    if (frozen.information_cutoff is not None
+                            and _date_value(check["pit_date"]) > frozen.information_cutoff):
+                        continue
+                    queries = json.loads(check["request_json"])
+                    if not queries:
+                        # Row-scoped same-value attestations have no declared
+                        # range. Require a stronger complete consumer-range
+                        # certificate that includes this original witness.
+                        if not covers(first, last, commit=check["visible_commit"] or 0, check=check["id"]):
+                            return False
+                        continue
+                    scopes = [query["item_range"] for query in queries if "item_range" in query]
+                    if not scopes or len(scopes) != len(queries):
+                        return False
+                    for scope in scopes:
+                        lower = max(first, _date_value(scope["start"]))
+                        upper = min(last, _date_value(scope["end"]))
+                        if lower <= upper and not covers(lower, upper,
+                                commit=check["visible_commit"] or 0, check=check["id"]):
+                            return False
+            return True
+
     def request_identity(self, receipt: FrozenInputReceipt | str, alias: str) -> str:
         """Identify an alias from original immutable request/evidence metadata.
 

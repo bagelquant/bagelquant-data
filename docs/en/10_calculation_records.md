@@ -13,6 +13,16 @@ on a read-only lake and does not block competing Data writers. Later contexts
 observe later commits. Use it for metadata-only readiness planning; consumer
 reference publication uses the writable publication guards described below.
 
+`inputs.completed_range(receipt, alias, start=..., end=...)` checks certified
+Item coverage inside the selected frozen Source. Sparse rows and entirely empty
+outputs can cover a complete range. The check uses original completion proofs,
+captured producer parents, content and visibility ceilings; later completion
+flags, builds and row-only ingests cannot extend that authority. It returns
+`False` for an unproved range, raises for damaged bindings, and rejects Raw
+aliases. It reads metadata only, honors the enclosing read context's buffer and
+cancellation limits, and creates no evidence. This proves completion in the
+original Source; current readiness and byte integrity have separate checks.
+
 Schema 9 stores each immutable Arrow schema once. Frozen inputs contain thin
 headers and alias-to-Source references; shared metadata blocks retain one frozen
 original segment/check snapshot across receipts. Live projections cannot replace it.
