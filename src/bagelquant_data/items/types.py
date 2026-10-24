@@ -130,6 +130,14 @@ class ProducerUpdatePolicy:
     It requires consumed asset_id, same_date and complete output anchors. Only
     explicitly prepared pure additions outside every completed anchor can reuse
     history; this declaration alone supplies no selected-input impact proof.
+
+    ``general_intervals`` declares alias/start/end fields whose complete consumed
+    tuples affect outputs only on their inclusive-start, exclusive-end dates.
+    Null ends are unbounded. Row ranking and cross-sectional effects must stay
+    within those dates, including any interval-end ranking.
+    This requires same_date and timing-neutral general_fields. Explicit
+    preparation records conservative unions of changed old/new tuple intervals;
+    missing/invalid dates, timing changes and full-history impact remain blocked.
     """
 
     historical_impact: str = "forward"
@@ -141,6 +149,7 @@ class ProducerUpdatePolicy:
     output_anchors: tuple[str, ...] = ()
     general_fields: tuple[tuple[str, tuple[str, ...]], ...] = ()
     general_asset_local_inputs: tuple[str, ...] = ()
+    general_intervals: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.historical_impact not in {"same_date", "forward"}:
@@ -170,6 +179,15 @@ class ProducerUpdatePolicy:
                     or not self.output_anchors or any("asset_id" not in dict(self.general_fields).get(alias, ())
                         for alias in self.general_asset_local_inputs))):
             raise ValueError("Asset-local General inputs require same_date, consumed asset_id and output anchors")
+        if (not isinstance(self.general_intervals, tuple)
+                or any(not isinstance(value, tuple) or len(value) != 3
+                    or any(not isinstance(field, str) or not field for field in value)
+                    or value[1] == value[2]
+                    or not {value[1], value[2]}.issubset(dict(self.general_fields).get(value[0], ()))
+                    or value[0] not in self.timing_neutral_inputs for value in self.general_intervals)
+                or len({value[0] for value in self.general_intervals}) != len(self.general_intervals)
+                or self.general_intervals and self.historical_impact != "same_date"):
+            raise ValueError("General intervals require unique timing-neutral same-date consumed start/end fields")
 
 
 @dataclass(frozen=True, slots=True)

@@ -172,6 +172,8 @@ def verify_authority(db, original, body):
     policy = {**body["policy"], "general_fields": tuple((key, tuple(fields)) for key, fields in body["policy"]["general_fields"]),
         "output_anchors": tuple(body["policy"]["output_anchors"]),
         "general_asset_local_inputs": tuple(body["policy"]["general_asset_local_inputs"])}
+    if "general_intervals" in policy:
+        policy["general_intervals"] = tuple(tuple(value) for value in policy["general_intervals"])
     registered = SimpleNamespace(information_cutoff=_date_value(before["information_cutoff"]),
         requests={key: input_from_payload(value) for key, value in before["requests"].items()},
         evidence=before["evidence"], max_commit=before["max_commit"])

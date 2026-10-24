@@ -64,11 +64,15 @@ def _body(inputs, saved, evidence_key, request_key, *, options, historical_audit
     required = {"original", "current", "alias", "fields", "anchors", "start", "end",
                 "cutoff", "added_keys", "selector", "empty_anchors"}
     scoped = isinstance(body, dict) and "anchor_evidence" in body
+    witnessed = isinstance(body, dict) and "selected_witness" in body
     if scoped:
         required.add("anchor_evidence")
     elif not historical_audit:
         raise RuntimeError("Current General append admission requires scoped anchor evidence")
-    if not isinstance(body, dict) or set(body) != required:
+    if witnessed:
+        required.add("selected_witness")
+    if (not isinstance(body, dict) or set(body) != required
+            or witnessed and body["selected_witness"] is not True):
         raise RuntimeError("General append descriptor shape is damaged")
     original, current = (_source(inputs, body[name], max_bytes=options.max_buffer_bytes)
         for name in ("original", "current"))
@@ -156,6 +160,13 @@ def positive(inputs, db, original, current, *, alias, fields, anchors, first, la
     if saved is None or saved["kind"] != VERSION:
         return False
     body, old, retained = _body(inputs, saved, *key, options=options)
+    from .inputs import _selected_general
+    selected = _selected_general(old, alias, replace(old.requests[alias], view="snapshot"), old.information_cutoff)
+    if selected is not None and selected["attestation_id"] is not None and not body.get("selected_witness"):
+        # Earlier optional proofs could compare an empty physical baseline to
+        # a later selected check. Only a proof built with witness replay can
+        # certify this class; explicit preparation/audit uses the original rows.
+        return False
     if (old.digest != original.digest or locator(inputs, old, retained, alias, fields,
             anchors, first, last, cutoff) != key or body["anchors"] != list(anchors)
             or not body["added_keys"] or any(not isinstance(key, str) or not key for key in body["added_keys"])
@@ -190,6 +201,25 @@ def _general_frame(inputs, source, alias, fields, cutoff, options, check):
     if not pieces:
         raise ValueError("General append needs an original typed atomic schema")
     frame = pl.concat(pieces, how="diagonal_relaxed")
+    # A selected baseline may be known through a later unchanged-content
+    # check. Replay those same immutable witnesses as ordinary input reads
+    # before resolving the complete General event; its original body alone
+    # still has the acquisition date and cannot match the selected check.
+    from .query.raw import _attested_versions
+    from .inputs import _selected_general
+    evidence = source.evidence[alias]
+    selected = _selected_general(source, alias, request, cutoff)
+    # Only this atomic state's witness is consumed. Replaying every old
+    # same-content check would multiply rows that selection immediately drops.
+    checks = [] if selected is None else [row for row in evidence["checks"]
+        if row["id"] == selected["attestation_id"]]
+    if frame.estimated_size() * (24 if checks else 12) > options.max_buffer_bytes // 4:
+        raise MemoryError("General selected witness rows exceed max_buffer_bytes")
+    frame = _attested_versions(frame.lazy(), checks, (),
+        as_of_date=cutoff, max_check_id=source.max_check_id,
+        max_buffer_bytes=options.max_buffer_bytes // 4, check_canceled=check).collect()
+    if frame.estimated_size() * 12 > options.max_buffer_bytes // 4:
+        raise MemoryError("General selected witness rows exceed max_buffer_bytes")
     evidence = {**source.evidence[alias], "general_snapshots": [
         {**snapshot, "schema_ipc": None} for snapshot in source.evidence[alias]["general_snapshots"]]}
     return inputs._select(frame, request, cutoff, evidence=evidence).select(fields)
@@ -300,7 +330,8 @@ def prepare(inputs, original, alias, fields, *, anchors, first, last, end, optio
         body = {"original": _reference(original), "current": _reference(current), "alias": alias,
             "fields": list(fields), "anchors": list(anchors), "start": str(first), "end": str(last),
             "cutoff": str(cutoff), "added_keys": added, "selector": selector, "empty_anchors": records,
-            "anchor_evidence": _anchor_namespace(inputs, current, anchors, first, last, cutoff)}
+            "anchor_evidence": _anchor_namespace(inputs, current, anchors, first, last, cutoff),
+            "selected_witness": True}
         key = locator(inputs, original, current, alias, fields, anchors, first, last, cutoff)
         with inputs._store.connect() as db:
             db.execute("begin immediate")

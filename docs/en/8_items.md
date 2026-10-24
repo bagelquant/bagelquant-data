@@ -518,6 +518,39 @@ becomes verified, the narrow saved-value path below handles the timing change.
 Other unproved timing changes remain blocked. New General contents require
 selected-row impact proof when historical output coordinates exist.
 
+A same-date producer may declare `general_intervals=((alias, start_field,
+end_field),)` together with its complete `general_fields` and timing-neutral
+alias. This promises that each consumed tuple affects outputs only during its
+inclusive-start, exclusive-end interval; a null end is open. Ranking and
+cross-sectional effects, including interval-end ranking, must also remain inside
+the changed tuples' dates. It does not change numerical identity.
+During an admitted update, explicitly call
+`inputs.prepare_general_projections(original, alias, fields, through=end,
+interval_fields=(start_field, end_field))`. Data compares complete typed tuple
+multiplicities at every selected atomic state, including intermediate same-day
+commits, and retains only compact unions of changed old/new intervals bound to
+the immutable original Sources. No row index or second data body is created.
+
+Ordinary planning uses these registered unions without reading original data.
+For example, memberships first effective on October 23 preserve completed
+history through October 22 and compute only the new tail. Finite historical
+revisions/deletions repair their affected dates through the same native producer.
+Date/compact-String/ISO-String bounds are supported; missing starts, invalid
+nonnull dates, schema changes, unproven exact tuple equality and unknown first-visibility/baseline timing fail
+closed. Unions are conservative: changing a long-lived tuple's end can include
+its earlier active interval. Proven impact covering the complete history remains
+blocked, rather than silently rebuilding it. Explicit `inputs.verify` follows
+both original Sources and recomputes each retained interval proof. Preparation,
+native work and audit obey caller memory/admission and cancellation limits.
+
+Selected General proof preparation replays the original same-content verification
+witness before resolving an initialized snapshot. It compares the selected
+verified rows, rather than treating their earlier physical acquisition date as
+absence. Only the chosen witness is materialized, with admitted expansion bounds.
+Asset-addition proofs for these attested baselines require recorded selected-witness
+semantics; earlier optional proofs without that evidence require fresh admitted
+preparation. Historical audits still recompute their original assertions.
+
 For a finite-history producer, metadata can prove first same-content General
 verification safe when a baseline survives inside every authenticated original
 output unit, in both old and current Sources at every timing boundary. Each

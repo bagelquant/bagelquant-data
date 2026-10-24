@@ -255,7 +255,7 @@ def projection(db, evidence_key: str, key: str, *, max_bytes: int | None = None)
             return None
     row = db.execute("SELECT * FROM input_projection_index WHERE evidence_key=? AND request_key=?",
         (evidence_key, key)).fetchone()
-    if row is None or row["version"] not in {VERSION,"segment_range.v1","general_asset_append.v1"}:
+    if row is None or row["version"] not in {VERSION,"segment_range.v1","general_asset_append.v1","general_interval_impact.v1"}:
         return None
     body = {name: row[name] for name in row.keys() if name != "digest"}
     if row["digest"] != _digest(body):

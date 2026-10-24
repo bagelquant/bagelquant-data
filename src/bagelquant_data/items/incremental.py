@@ -310,6 +310,7 @@ def _baseline_timing_preserved(inputs, db, receipt, *, first: date, last: date,
 def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: tuple[str, ...],
                             end: date, commit_bound: int, policy: ProducerUpdatePolicy,
                             completed_start: date, completed_end: date, previous,
+                            impact_windows: list[tuple[date, date]],
                             changed: bool = True) -> str | None:
     """Admit whole atomic consumed equality, separately from timing provenance."""
     from .pit import _general_snapshot_identity
@@ -389,6 +390,22 @@ def _general_fields_problem(owner: ItemAPI, db, receipt, *, alias: str, fields: 
                     cutoff=cutoff, options=options)
             except (ValueError, MemoryError) as error:
                 return f"{alias}: General asset-local append proof cannot be admitted: {error}"
+        interval = next((value[1:] for value in policy.general_intervals if value[0] == alias), None)
+        if not equivalent and interval is not None:
+            from bagelquant_data.general_intervals import impact
+            options = context.options if context is not None else ExecutionOptions()
+            try:
+                ranges = impact(inputs, db, receipt, candidate, alias=alias, fields=fields,
+                    interval=interval, cutoff=cutoff, options=options)
+            except (ValueError, MemoryError) as error:
+                return f"{alias}: General interval impact cannot be admitted: {error}"
+            if ranges is None:
+                return (f"{alias}: General interval impact proof is missing at {cutoff}; run explicit "
+                    f"inputs.prepare_general_projections(original receipt {receipt.receipt_id}, {alias!r}, "
+                    f"fields={fields!r}, interval_fields={interval!r}, through={str(end)!r})")
+            impact_windows.extend((max(first, completed_start), min(last, completed_end))
+                for first, last in ranges if first <= completed_end and last >= completed_start)
+            equivalent = True
         if not equivalent:
             return f"{alias}: General consumed fields changed at {cutoff}{bounded_source}; explicit selected-input impact resolution is required"
         if initial["baseline"]:
@@ -508,7 +525,7 @@ def completed_actions(owner: ItemAPI, previous, *, start: date, end: date,
                     assert policy is not None
                     unknown = _general_fields_problem(owner, db, receipt, alias=alias, fields=fields,
                         end=end, commit_bound=commit_bound, policy=policy, changed=changed,
-                        completed_start=start, completed_end=through, previous=previous)
+                        completed_start=start, completed_end=through, previous=previous, impact_windows=windows)
                     general_projection_equal = changed and unknown is None
                 elif changed:
                     unknown = f"{alias}: {'changed' if new_general else 'newly visible'} full snapshot needs a selected-row impact proof"

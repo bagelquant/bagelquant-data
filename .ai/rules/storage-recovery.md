@@ -77,6 +77,17 @@ General projections against their originals. It stores no data body, per-row int
 Arrow recovery copy. Typed observation key tokens are temporary read/commit
 projections; `_record_id` and `_payload_hash` are not stored in original Parquet.
 
+Runtime `general_intervals` requires same-date, timing-neutral consumed fields
+and declares inclusive-start/exclusive-end tuple-local date effects. Explicit
+General preparation stores only original-Source-bound changed-tuple interval
+unions, never rows. Ordinary planning reads those proofs as metadata and retains
+all timing/schema/publication fences; unknown bounds or complete-history impact
+remain blocked. Audits follow both original Sources and recompute the unions.
+General projection preparation replays the selected original verification check
+before snapshot resolution, with at most one admitted witness per selected state.
+Attested-baseline asset-addition reuse requires that selected-witness proof marker;
+unmarked optional proofs stay unknown and need explicit preparation/audit.
+
 A first verification of unknown baseline timing may publish an immutable natural
 key visibility event (observation keys, original creator commit and first known
 availability). Its small SQLite header binds the exact file bytes, schema and

@@ -2232,6 +2232,7 @@ class InputsAPI:
 
     def prepare_general_projections(self, original: FrozenInputReceipt | str, alias: str,
                                     fields: tuple[str, ...] | list[str], *, through: DateLike,
+                                    interval_fields: tuple[str, str] | None = None,
                                     key_anchors: tuple[str, ...] = (),
                                     completed_start: DateLike | None = None,
                                     completed_end: DateLike | None = None,
@@ -2252,6 +2253,13 @@ class InputsAPI:
         nonbaseline timing cannot regress, and every new atomic commit is
         checked, including commits at the original PIT day. Unsupported states
         remain actionable for the ordinary plan.
+
+        interval_fields=(start_field, end_field) additionally prepares compact
+        changed-tuple interval unions for a registered same-date interval policy.
+        Starts are inclusive, ends exclusive, and null ends unbounded. Dates
+        must be Date or compact/ISO String; unknown bounds remain unsupported.
+        This does not execute a producer or certify completion. Preparation may
+        read the selected original snapshots; later plans read metadata only.
         """
         from .items.incremental import general_projection_states
         self._store.ensure_writable()
@@ -2264,6 +2272,10 @@ class InputsAPI:
         if normalized_fields is None:
             raise ValueError("General projection preparation requires explicit consumed fields")
         fields = tuple(normalized_fields)
+        if interval_fields is not None and (not isinstance(interval_fields, tuple)
+                or len(interval_fields) != 2 or interval_fields[0] == interval_fields[1]
+                or not set(interval_fields).issubset(fields)):
+            raise ValueError("General interval preparation requires two consumed start/end fields")
         check_canceled()
         receipt = self._summary_source(original, max_bytes=options.max_buffer_bytes)
         request = receipt.requests[alias]
@@ -2355,6 +2367,10 @@ class InputsAPI:
             report()
         result = {"original_source": {"id": receipt.receipt_id, "digest": receipt.digest},
             "alias": alias, "fields": list(fields), "through": str(end), "states": states, "work": work}
+        if interval_fields is not None:
+            from .general_intervals import prepare
+            result["intervals"] = prepare(self, receipt, alias, fields, interval_fields, end=end,
+                options=options, check=check_canceled, progress=progress)
         if key_anchors:
             assert completed_start is not None and completed_end is not None
             from .general_key_appends import prepare
@@ -4359,6 +4375,11 @@ class InputsAPI:
                                     for dependency in references(self, proof):
                                         retained_receipts[dependency.receipt_id] = dependency
                                         verify_retained(dependency)
+                                if key.get("projection") == "general_interval_impact.v1":
+                                    from .general_intervals import references
+                                    for dependency in references(self, proof, options=options):
+                                        retained_receipts[dependency.receipt_id] = dependency
+                                        verify_retained(dependency)
         with self._store.connect() as db:
             sets = db.execute("SELECT * FROM input_selection_sets WHERE source_id IN(SELECT value FROM json_each(?))", (_json(list(retained_receipts)),)).fetchall()
             for saved in sets:
@@ -4494,6 +4515,13 @@ class InputsAPI:
                         key = json.loads(row["request_key"])
                         if key.get("projection") == "general_asset_append.v1":
                             from .general_key_appends import audit
+                            saved = input_index.projection(db, row["evidence_key"], row["request_key"],
+                                max_bytes=options.max_buffer_bytes // 2)
+                            audit(self, db, row["evidence_key"], row["request_key"], saved,
+                                options=options, check=check_canceled or (lambda: None))
+                            continue
+                        if key.get("projection") == "general_interval_impact.v1":
+                            from .general_intervals import audit
                             saved = input_index.projection(db, row["evidence_key"], row["request_key"],
                                 max_bytes=options.max_buffer_bytes // 2)
                             audit(self, db, row["evidence_key"], row["request_key"], saved,
