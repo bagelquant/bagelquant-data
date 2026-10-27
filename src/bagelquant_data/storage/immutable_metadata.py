@@ -71,10 +71,17 @@ def save(db, value: Any) -> Any:
     if isinstance(value, Mapping):
         body = {}
         for key, item in sorted(value.items()):
+            schema_reference = None
             if key == "schema_ipc" and isinstance(item, str):
-                body[key] = {"schema": save_schema(db, bytes.fromhex(item)), "uppercase": item == item.upper()}
-            else:
-                body[key] = save(db, item)
+                try:
+                    payload = bytes.fromhex(item)
+                except ValueError:
+                    pass  # Arbitrary authored metadata can use the same key.
+                else:
+                    encoded = payload.hex()
+                    if item in (encoded, encoded.upper()):
+                        schema_reference = {"schema": save_schema(db, payload), "uppercase": item == item.upper()}
+            body[key] = save(db, item) if schema_reference is None else schema_reference
         reference = _save(db, "mapping", body, len(body))
         if set(value) == set(BATCH_FIELDS):
             reference.update(entity="segment", **{key: value[key]

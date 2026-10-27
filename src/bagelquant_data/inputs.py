@@ -625,17 +625,22 @@ class InputsAPI:
         return value
 
     def completed_range(self, receipt: FrozenInputReceipt | str, alias: str, *,
-                        start: DateLike, end: DateLike) -> bool:
+                        start: DateLike, end: DateLike, as_of: DateLike | None = None) -> bool:
         """Prove complete Item coverage inside an original frozen Source.
 
         Only original source-bound completion certificates at the captured
         content and output-check ceilings qualify. Sparse and empty outputs
         retain their certified ranges; mutable live completion flags are not
         consulted. This metadata-only read creates no evidence and proves no
-        currentness beyond the selected Source.
+        currentness beyond the selected Source. Optional as_of narrows the
+        original cutoff and requires both the producer Source and original
+        completion check to have been available by that date.
         """
         from .items.completion import output_check_bound, pending_dates, verified_completion_digest
         frozen = self.get(receipt)
+        cutoff = frozen.information_cutoff
+        if as_of is not None:
+            cutoff = _date_value(as_of) if cutoff is None else min(cutoff, _date_value(as_of))
         request = frozen.requests[alias]
         if not isinstance(request, ItemInput):
             raise ValueError("Completed ranges require a frozen Item input")
@@ -651,6 +656,13 @@ class InputsAPI:
         certificates = []
         with self.read_context(frozen):
             context = self._read_context()
+            completion_dates = {}
+            if as_of is not None:
+                for channel in ("audit_checks", "empty_checks"):
+                    for check in evidence[channel]:
+                        completion_dates[check["id"]] = _date_value(check["pit_date"])
+                        if context is not None and len(completion_dates) * 256 > context.options.max_buffer_bytes // 4:
+                            raise MemoryError("Frozen completion dates exceed max_buffer_bytes")
             with self._store.connect() as db:
                 if not db.execute("select 1 from sqlite_master where name='item_completion_proofs'").fetchone():
                     return False
@@ -669,18 +681,20 @@ class InputsAPI:
                     check = output_check_bound(db, row["id"])
                     if check is None or check > frozen.max_check_id:
                         continue
+                    if as_of is not None and cutoff is not None and (check not in completion_dates or completion_dates[check] > cutoff):
+                        continue
                     parent = self.get(parent_id)
                     if (parent.digest != parents[parent_id] or parent.max_check_id > frozen.max_check_id
                             or parent.max_commit != row["input_commit"]
                             or parent.dependency_digest != row["dependency_digest"]):
                         raise RuntimeError("Frozen Item completion source binding differs")
-                    if (frozen.information_cutoff is not None and (parent.information_cutoff is None
-                            or parent.information_cutoff > frozen.information_cutoff)):
+                    if (cutoff is not None and (parent.information_cutoff is None
+                            or parent.information_cutoff > cutoff)):
                         continue
                     for day, available in pending_dates(db, row["id"]):
                         day = _date_value(day)
                         if (first <= day <= last
-                                and (frozen.information_cutoff is None or _date_value(available) <= frozen.information_cutoff)
+                                and (cutoff is None or _date_value(available) <= cutoff)
                                 and not any(lower <= day <= upper for lower, upper in covered)):
                             return False
                     span = (_date_value(row["start_date"]), _date_value(row["end_date"]))
@@ -706,7 +720,7 @@ class InputsAPI:
             # A range certificate cannot cover a later row-only ingest or
             # changed visibility merely because its creator Source survived.
             selected = replace(request, start=first, end=last)
-            for batch in _selection_batches(frozen, alias, selected, frozen.information_cutoff):
+            for batch in _selection_batches(frozen, alias, selected, cutoff):
                 if not batch["row_count"]:
                     continue
                 lower, upper = batch.get("min_observation"), batch.get("max_observation")
@@ -717,8 +731,7 @@ class InputsAPI:
                     return False
             for channel in ("audit_checks", "empty_checks"):
                 for check in evidence[channel]:
-                    if (frozen.information_cutoff is not None
-                            and _date_value(check["pit_date"]) > frozen.information_cutoff):
+                    if cutoff is not None and _date_value(check["pit_date"]) > cutoff:
                         continue
                     queries = json.loads(check["request_json"])
                     if not queries:

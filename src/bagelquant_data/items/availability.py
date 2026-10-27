@@ -101,14 +101,13 @@ class AvailabilityPolicy:
                 if not value.get("base_available_date_field")
                 else str(value["base_available_date_field"])
             ),
-            availability_buffer_sessions=int(
-                value["availability_buffer_sessions"]
-            ),
+            availability_buffer_sessions=_session_integer(value["availability_buffer_sessions"],
+                "availability_buffer_sessions"),
             alignment=AvailabilityAlignment(str(value["alignment"])),
             max_forward_fill_sessions=(
                 None
                 if value.get("max_forward_fill_sessions") is None
-                else int(value["max_forward_fill_sessions"])
+                else _session_integer(value["max_forward_fill_sessions"], "max_forward_fill_sessions")
             ),
             calendar_id=str(value["calendar_id"]),
             base_available_date_source_field=(
@@ -127,6 +126,16 @@ class AvailabilityPolicy:
         value = asdict(self)
         value["alignment"] = self.alignment.value
         return value
+
+
+def _session_integer(value: Any, field: str) -> int:
+    """Retain integer-string declarations without truncating timing values."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be an integer") from error
 
 
 def advance_available_date(

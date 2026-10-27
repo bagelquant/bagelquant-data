@@ -26,6 +26,12 @@ original Source; current readiness and byte integrity have separate checks.
 Schema 9 stores each immutable Arrow schema once. Frozen inputs contain thin
 headers and alias-to-Source references; shared metadata blocks retain one frozen
 original segment/check snapshot across receipts. Live projections cannot replace it.
+
+User metadata may use the key `schema_ipc` for arbitrary text. Only canonical
+compact hexadecimal strings are pooled as schema bytes; other strings retain
+their exact spelling. Registered schema references still validate their checksum
+on explicit audit. Existing registered receipts remain unchanged; canonical
+generated-schema encodings retain their identities.
 `inputs.get` returns an explicit lazy `evidence` Mapping. `describe` includes
 small per-alias definition/schema identities, row/batch counts, bounds and Source
 references. Neither operation expands historical metadata. Unchanged currentness

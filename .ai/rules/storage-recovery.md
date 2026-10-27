@@ -242,6 +242,15 @@ bound impact. First-visibility changes begin at the actual information
 availability boundary, not the earlier observation date. Unknown or full-history impact is actionable, never silent replay.
 Completed-range authority and pending visibility publish with the success flag;
 row-only ingestion cannot create a complete-range certificate.
+Complete external ItemPublication binds its declared observation range to
+initial ingest witnesses as well as final replacement checks. Mixed same-value
+and new rows cannot invalidate disjoint complete or empty points. Initial
+ingest never publishes a range certificate; completion remains the final
+successful replacement's authority. Preserve conservative row-only witnesses.
+Optional inputs.completed_range(as_of=...) narrows the original cutoff and
+requires both original producer and completion-check availability. Earlier
+partial rows cannot borrow a later certificate; use captured immutable check
+dates, bounded metadata and no new receipts, value reads or live flags.
 
 Same-date initialization uses the existing Item initialization/build ledger with
 one pinned original Source, definition and immutable runtime causal policy.

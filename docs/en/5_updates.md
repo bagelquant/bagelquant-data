@@ -1,5 +1,9 @@
 # Updates and execution
 
+`ExecutionOptions.workers` and `max_buffer_bytes` require positive integers;
+`None`, booleans and fractional values raise `ValueError`. Optional limits such
+as `max_in_flight` and `batch_size` still accept `None` for their default policy.
+
 ```python
 from bagelquant_data import ExecutionOptions
 

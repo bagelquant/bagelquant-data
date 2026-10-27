@@ -17,6 +17,7 @@ from queue import Empty, SimpleQueue
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.normalization import _date_expr
 from bagelquant_data.core.request import RequestContext
 from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.pipeline.commit import (
@@ -2046,16 +2047,6 @@ def _source_column(spec: DatasetSpec, canonical: str) -> str:
             if target == canonical
         ),
         canonical,
-    )
-
-
-def _date_expr(field: str) -> pl.Expr:
-    return (
-        pl.when(pl.col(field).cast(pl.String).str.len_chars() == 8)
-        .then(
-            pl.col(field).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False)
-        )
-        .otherwise(pl.col(field).cast(pl.Date, strict=False))
     )
 
 

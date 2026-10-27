@@ -69,3 +69,53 @@ def test_row_scoped_same_value_check_requires_a_new_complete_certificate(tmp_pat
     certified = source(lake)
     assert lake.inputs.completed_range(certified, "x", start="2024-01-02", end="2024-01-03")
     assert lake.inputs.completed_range(original, "x", start="2024-01-02", end="2024-01-03")
+
+
+def test_complete_point_publication_keeps_disjoint_nonempty_and_empty_certificates(tmp_path, monkeypatch):
+    lake = fixture(tmp_path)
+    january, september, october = date(2024, 1, 2), date(2024, 9, 17), date(2024, 10, 1)
+    def publish(day, assets):
+        rows = pl.DataFrame({"source_time": [day] * len(assets), "asset_id": assets,
+            "close": [10.] * len(assets), "version_available_date": [day] * len(assets)},
+            schema={"source_time": pl.Date, "asset_id": pl.String, "close": pl.Float64, "version_available_date": pl.Date})
+        receipt = lake.inputs.freeze({"daily": RawInput("custom", "daily")}, information_cutoff=day)
+        with lake.items.publication(input_receipt=receipt) as publisher:
+            publisher.publish([ItemPublication("value", rows, start=day, end=day, complete_at=day)])
+    publish(january, ["A"])
+    publish(october, ["A"])
+    original = source(lake, end=october.isoformat())
+    publish(september, [])
+    # Mixed same-value and new coordinates must scope both the initial witness
+    # and final completion to October, retaining January and empty September.
+    publish(october, ["A", "B"])
+    current = source(lake, end=october.isoformat())
+    monkeypatch.setattr(lake.inputs, "read", lambda *_a, **_k:
+        pytest.fail("completion metadata decoded values"))
+    for day in (january, september, october):
+        assert lake.inputs.completed_range(current, "x", start=day, end=day)
+    assert lake.inputs.completed_range(original, "x", start=january, end=january)
+
+
+@pytest.mark.parametrize("partial_rows", [False, True])
+def test_earlier_asof_cannot_borrow_later_completion_even_with_earlier_parent_or_rows(tmp_path, monkeypatch, partial_rows):
+    lake = fixture(tmp_path)
+    day, later = date(2024, 1, 2), date(2024, 1, 21)
+    rows = pl.DataFrame({"source_time": [day], "asset_id": ["A"], "close": [10.],
+        "version_available_date": [day]})
+    if not partial_rows:
+        rows = rows.head(0)
+    parent = lake.inputs.freeze({"daily": RawInput("custom", "daily")}, information_cutoff=day)
+    if partial_rows:
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(lake.items, "_replace_range", lambda *_a, **_k:
+                (_ for _ in ()).throw(RuntimeError("before complete certificate")))
+            with pytest.raises(RuntimeError, match="before complete certificate"):
+                with lake.items.publication(input_receipt=parent) as publisher:
+                    publisher.publish([ItemPublication("value", rows, start=day, end=day, complete_at=day)])
+    with lake.items.publication(input_receipt=parent) as publisher:
+        publisher.publish([ItemPublication("value", rows, start=day, end=day, complete_at=later)])
+    original = source(lake, end="2024-02-01")
+    monkeypatch.setattr(lake.inputs, "read", lambda *_a, **_k: pytest.fail("completion proof decoded values"))
+    assert lake.inputs.completed_range(original, "x", start=day, end=day)
+    assert not lake.inputs.completed_range(original, "x", start=day, end=day, as_of="2024-01-16")
+    assert lake.inputs.completed_range(original, "x", start=day, end=day, as_of=later)

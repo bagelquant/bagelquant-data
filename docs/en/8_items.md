@@ -12,6 +12,11 @@ A DataItem has unique deterministic `(time, asset_id)` keys and a declared scala
 `value` type: floats, integers, booleans, strings, dates, datetimes or categorical.
 Definitions, dependencies and producer revisions persist in the Data SQLite.
 
+Availability-policy mappings accept integer session counts and integer strings.
+Booleans and floating-point values are rejected before coercion, so a fractional
+buffer cannot silently advance availability. Buffers remain nonnegative;
+forward-fill limits remain positive and valid only for forward-fill alignment.
+
 `lake.items.completed_builds(name)` reads verified whole-range completion and
 pending-visibility authorities. `builds(name)` also includes ordinary successful
 row ingests and cannot establish completeness. Missing legacy proofs require
@@ -210,6 +215,17 @@ expected_definition_hash=...)` carries historical versions; supply `start`,
 preflights its target definitions, dependency identities and frames before
 writing and uses the ordinary historical-ingest and complete-range commit path.
 Returned reports describe each table's last suboperation, not cumulative rows.
+For a complete publication, both historical-ingest witnesses and final checks
+retain the declared observation range. Mixed unchanged/new rows in October
+therefore preserve an unrelated January completion, including previously
+certified empty points. Only the final successful replacement certifies the
+range; partial ingestion and row-only writes cannot create that authority.
+`inputs.completed_range(receipt, alias, start=..., end=..., as_of=...)` can
+narrow the original information cutoff using metadata only. Both the producer
+Source and original completion check must be available by that date. An earlier
+row witness or parent cannot borrow a later completion, including an empty one.
+Missing original date evidence fails closed and requires explicit maintenance;
+this read never creates a receipt or changes captured history.
 For a derived result with proved discrete repairs, supply the original native
 `reuse_build_id` and disjoint `affected_ranges` together with whole coverage.
 Data replaces only those ranges, including withdrawals, and certifies reused

@@ -26,9 +26,9 @@ class ExecutionOptions:
     def __post_init__(self) -> None:
         for name in ("workers", "max_in_flight", "batch_size", "max_buffer_bytes", "commit_batch_rows", "observation_window_days"):
             value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 1
-            ):
+            if value is None and name not in {"workers", "max_buffer_bytes"}:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if self.native_admission is not None and not callable(self.native_admission):
             raise ValueError("native_admission must be callable")

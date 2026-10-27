@@ -1442,7 +1442,15 @@ class ItemAPI:
                     result = self._ingest(value.name, value.frame, available_date=None,
                         historical_baseline=False, ingested_at=None, input_receipt=receipt,
                         expected_definition_hash=value.expected_definition_hash, run_id=run_id,
-                        cancelled=cancelled, _verification=verification)
+                        cancelled=cancelled, _verification=verification,
+                        # Scope even mixed same-value/new-row witnesses. This
+                        # initial ingest does not certify the range; only the
+                        # following replacement can publish its completion.
+                        check_requests=[{"item_range": {
+                            "start": _date_value(value.start).isoformat(),
+                            "end": _date_value(value.end).isoformat(),
+                        }}] if value.start is not None and value.end is not None
+                            and value.complete_at is not None else None)
                 if value.start is not None and value.end is not None and value.complete_at is not None:
                     if cancelled and cancelled():
                         raise CancelledError("DataItem publication cancelled")

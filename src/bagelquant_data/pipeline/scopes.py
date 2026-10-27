@@ -13,6 +13,7 @@ import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.exceptions import ConfigurationError, DataSourceError
+from bagelquant_data.core.normalization import _date_expr
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.query.raw import RawQueryService
 from bagelquant_data.storage.data_meta import DataMetaStore
@@ -608,16 +609,6 @@ def _calendar_dates(spec: DatasetSpec, raw: RawQueryService) -> list[date]:
         .sort("value")
         .get_column("value")
         .to_list()
-    )
-
-
-def _date_expr(field: str) -> pl.Expr:
-    return (
-        pl.when(pl.col(field).cast(pl.String).str.len_chars() == 8)
-        .then(
-            pl.col(field).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False)
-        )
-        .otherwise(pl.col(field).cast(pl.Date, strict=False))
     )
 
 
