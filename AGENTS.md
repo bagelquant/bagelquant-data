@@ -1,80 +1,14 @@
-# Data agent entry
+# BagelQuant Data agent entrance
 
-This repository owns provider-neutral Raw and typed DataItems, declarations,
-category trees, coverage, versions, PIT, frozen input receipts and local recovery.
-Data has no BagelQuant package dependency; never import Core, BT or Workbench.
-The library-only facades are `lake.catalog`, `lake.raw`, `lake.items`,
-`lake.integrity` and `lake.inputs`; pure statistics live in `exploration`.
-Read-only update plans accept caller `config` for metadata/timing admission and require actual new/affected ranges and record-only prerequisites; `items.recertify` admits only proven no-op reuse without producers; follow update-rule acceptance.
-Both `data_meta_path` and `lake_path` are mandatory caller-owned paths; disjoint empty sparse groups share one fenced Source check and atomic completion publication.
-Catalog declaration batches are atomic and receipt-backed; integrity exposes storage usage and frozen temporary cleanup without deleting history. Conditional `items.register(expected_definition_hash=...)` fences one captured active declaration; it does not make several restores atomic or prove original recovery evidence.
-DataItem updates pin caller input windows in frozen receipts, preserving revisions and legacy identity. `items.resume_update` recovers uncertified first builds from original Sources; completed/lost authority blocks.
-Ready Item batches share bounded original/key/visibility preparation. Same-date initialization resumes certified windows under its original Source/cutoff and completes only after all windows.
-Other producer policies retain their declared input requirements and explicit buffer admission. Finite-history General timing reuse needs a surviving baseline within every authenticated output unit; halo-only or out-of-unit evidence remains blocked.
-`items.completed_builds` exposes whole-range authorities; `inputs.publication_guard` fences Data writers through consumer CAS without audit/maintenance.
-External Item publication reuses one finite metadata connection; ordinary transactions, Source/definition fences and cancellation remain independent.
-Schema 9 retains one immutable Parquet body and shared segment/check/schema headers; selection handles bind immutable scope/PIT proof, with Source/requested cutoff in set bindings and shared chunk indexes across append.
-Frozen receipts expose lazy evidence; get/describe/request_identity never expand history.
-Selection sets expose header-only validation and keyed reads; audits traverse all originals.
-Node completion proves contiguous coverage, definitions and direct dependency revisions; failed/partial updates cannot advance success flags.
-`integrity.update_owner` binds writers; abandonment requires verified publisher exit, never heartbeat age.
-`integrity.item_removal_plan/remove_items` explicitly discard exact unreferenced
-Item histories; retained references block removal and shared upstreams survive.
-Freeze, plans, currentness and range/selection identities read metadata only.
-Missing optional summaries permit conservative tokens; maintenance never changes ordinary identity.
-Coordinate axes and caller Domain selectors are small summaries, never historical row indexes.
-`inputs.prepare_range_selections` registers compact scopes; `index_selection(s)` and
-`prepare_general_projections` explicitly admit exact typed comparisons when range evidence cannot prove equality.
-`inputs.verify` audits original bytes/schema/bounds/summaries; missing originals require trusted backups.
-Reject schema 8, compatibility readers, Arrow replicas and row-proof backfill; `index_record_lookups` adds metadata access indexes only.
-`inputs.read(date_range=...)` selects only immutable extra Raw keys in by-date versions views.
-Preserve captured nullable payload/key types and PIT witnesses; reject timing fields and other views.
-Report necessary date-column lookup separately from candidate payload/key work; legacy layouts can still scan that column's history.
-`integrity.update_scopes(scope_keys=...)` filters the native ledger before row materialization.
+Read [CONTRIBUTING.md](CONTRIBUTING.md), [README.md](README.md) and
+[pyproject.toml](pyproject.toml), then the affected technical contracts routed
+by the contributor guide. [Owner boundaries](docs/en/engineering/development.md) remain authoritative.
 
-Before work, read [`.ai/README.md`](.ai/README.md), mandatory development rules,
-affected topic rules, [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
-and relevant local docs. Inspect tracked and untracked Git changes first.
-Keep this entry short; detailed owner contracts live under `.ai/rules/`.
+Data owns neutral Raw/DataItem datasets, PIT, coverage, versions, frozen inputs and recovery. It has no BagelQuant package dependencies. Keep provider adapters at the edge and retain one authority for committed input history.
 
-- Use Python 3.13 and `uv`; run commands from this repository.
-- Preserve unrelated work, Git metadata, credentials, environments and data.
-- Tests use isolated temporary lakes and fake providers; never read or mutate
-  the workspace's real data root or consume provider quota for validation.
-- Do not commit, push, create PRs, merge, release, deploy, install services,
-  call providers, update real data or change governance unless explicitly requested.
-- Coverage is commit-backed truth; queries never submit updates or call providers.
-- Schema 9 is a fresh-lake hard cut; do not add migration/compatibility readers,
-  adopt orphan files or substitute current provider bytes for historical evidence.
-- Default `DataLake.inspect` checks committed schema/lake binding without changing
-  original files or SQLite sidecars. Ordinary read-only queries use normal WAL
-  coordination; do not replace them with immutable main-file reads that omit WAL.
-  Explicit runtime inspection/open uses ordinary WAL coordination without copies.
-- Expose neutral data and evidence; Core owns Domain/Panel conversion and numerical
-  artifacts, BT owns account/evaluation artifacts. Do not duplicate their storage.
-- Workbench supplies China semantics and research intent through public APIs;
-  it owns app metadata/governance/orchestration, not generic data mechanisms.
-- Workbench owns global scheduling, hardware detection, admission and runtime
-  policy. Data uses explicit local limits, one pool and serial metadata publication;
-  default execution is serial. Never infer worker counts from machine resources.
-
-For formal work in an integrated workspace, create/resume a root `.ai/tasks/`
-record using the workspace CLI. Discover the workspace with
-`git rev-parse --show-superproject-working-tree`. If empty, inspect checkout
-ancestors as candidates. Accept only a candidate that is its own Git root,
-declares the four component paths in `.gitmodules` and has their index gitlinks
-(mode `160000`); this checkout must match its exact declared relative owner path.
-For every candidate, also verify
-root `AGENTS.md`, `.ai/README.md`, `.ai/workflow.md`, `.ai/rules/workspace.md`
-and `scripts/ai.py` exist. Read root workflow and workspace rules; load
-cross-repository contracts only for affected topics. Never guess parent paths.
-In a standalone checkout, follow these local rules and record plan, validation
-and handoff in the conversation; do not create a component task directory.
-Plan/read-only mode never writes task records or implementation files.
-
-Validate with `uv run pytest`, `uv run pyright` and `uv run ruff check .`; report actual results and unrun checks.
-
-Schema-nine completion flags and range identities use metadata only. Read the
-storage rule for exact single-body Parquet, visibility, frozen/PIT, optional
-compact summary and backup-required recovery contracts. Retired per-row indexes
-and Arrow-body backup APIs must not be reintroduced.
+Inspect tracked and untracked Git changes before editing. Preserve unrelated
+work, Git metadata and historical evidence. Use Python 3.13 and uv; tests use
+isolated temporary roots and synthetic inputs or fake providers.
+Run the applicable owner checks in CONTRIBUTING.md and report actual results.
+Publication, commits, provider calls and real-data/service changes require
+explicit authorization. Keep generated references owned by their generators.

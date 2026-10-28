@@ -75,7 +75,7 @@ Read [overview](docs/en/1_overview.md), [quickstart](docs/en/2_quickstart.md),
 [updates](docs/en/5_updates.md), [queries](docs/en/6_queries.md),
 [operations](docs/en/7_operations.md), [DataItems](docs/en/8_items.md) and
 [exploration](docs/en/9_exploration.md).
-AI contributors start with [AGENTS.md](AGENTS.md) and [.ai/README.md](.ai/README.md).
+For development setup, checks and engineering contracts, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 uv run pytest

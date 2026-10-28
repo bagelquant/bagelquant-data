@@ -1,5 +1,7 @@
 # Overview
 
+For implementation invariants, read the [engineering contracts](engineering/index.md).
+
 Data owns the provider-neutral lake: Raw, DataItems, classification, schemas,
 versions, coverage, frozen input evidence and recovery. Its five facades are
 `catalog`, `raw`, `items`, `integrity` and `inputs`; descriptive functions live in
