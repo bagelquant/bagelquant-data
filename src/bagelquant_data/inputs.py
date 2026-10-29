@@ -4180,14 +4180,11 @@ class InputsAPI:
                 raise MemoryError("Frozen DataItem inputs exceed max_buffer_bytes; use smaller declared input windows")
             pieces.append(piece)
         if pieces:
-            if date_range is None:
-                frame = concat_compatible_frames(pieces)
-            else:
-                # Preserve the captured Originals' nullable types, including
-                # typed empty pieces. A selected all-null payload is not a
-                # declaration that the original field's type became Null.
-                schema = compatible_schema(piece.schema for piece in pieces)
-                frame = pl.concat([align_frame(piece, schema) for piece in pieces], how="vertical", rechunk=False)
+            # Inference belongs to ingestion. Frozen reads combine typed
+            # Originals, including empty/all-null windows, without erasing
+            # their registered numeric, category or temporal types.
+            schema = compatible_schema(piece.schema for piece in pieces)
+            frame = pl.concat([align_frame(piece, schema) for piece in pieces], how="vertical", rechunk=False)
         elif evidence["schema_ipc"]:
             schema = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(evidence["schema_ipc"])))
             frame = cast(pl.DataFrame, pl.from_arrow(pa.Table.from_batches([], schema=schema)))
@@ -4196,6 +4193,9 @@ class InputsAPI:
             frame = pl.DataFrame(schema={"time": pl.Date,"source_time": pl.Date,"asset_id": pl.String,"value": scalar_dtype(evidence["definition"]["value_dtype"])})
         else:
             frame = pl.DataFrame()
+        if isinstance(request, ItemInput) and frame.schema.get("value") == pl.Null:
+            from bagelquant_data.transforms import scalar_dtype
+            frame = frame.with_columns(pl.col("value").cast(scalar_dtype(evidence["definition"]["value_dtype"])))
         from bagelquant_data.query.raw import _attested_versions
         frame = _attested_versions(frame.lazy(), evidence["checks"], evidence["record_checks"],
                                    as_of_date=effective_cutoff,

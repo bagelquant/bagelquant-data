@@ -87,13 +87,13 @@ def test_selected_source_reconciles_added_fields_from_original_schemas(tmp_path)
     assert lake.inputs.get(original).digest == original.digest
 
 
-def test_pruned_nullable_original_uses_its_own_schema_and_leaves_ordinary_normalization(tmp_path):
+def test_pruned_nullable_original_preserves_types_in_ordinary_and_selected_reads(tmp_path):
     lake, _ = fixture(tmp_path)
     receipt = lake.inputs.freeze({"x": RawInput("custom", "events", start="2020-01-02", end="2020-01-02", view="versions")},
         information_cutoff="2024-07-31")
     assert len(receipt.evidence["x"]["batches"]) == 1
     ordinary = lake.inputs.read(receipt, "x").collect()
-    assert ordinary.schema["stk_bo_rate"] == pl.Null
+    assert ordinary.schema["stk_bo_rate"] == pl.Float64
     selected = lake.inputs.read(receipt, "x", date_range=("ex_date", "2024-06-01", "2024-06-30")).collect()
     assert selected.schema["stk_bo_rate"] == pl.Float64
     assert selected.schema["div_listdate"] == pl.String

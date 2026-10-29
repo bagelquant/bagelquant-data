@@ -338,10 +338,13 @@ system/timing fields. Date/Datetime and compact/ISO nullable parsing are row-loc
 predicates only. Apply the same predicate before visibility-event key encoding;
 never substitute a source/announcement-date window for an economic event date.
 Within an Original, concatenate exact typed fragments without all-null inference.
-For this selector only, reconcile captured Original schemas with compatible
-types, retaining typed empty pieces; an all-null selected payload must not erase
-its registered type. Never substitute a current/global schema or change ordinary
-read normalization while implementing this selection.
+Frozen reads reconcile compatible captured Original schemas, retaining typed
+empty pieces and all-null numeric, category and temporal columns. Item columns
+stored as Null use the frozen Item's declared value type. Ingestion inference
+remains separate: reading an all-null window cannot erase an Original's type.
+Never substitute a current/global schema or coerce genuinely nonnumeric Item
+payloads into numeric values. Ordinary and secondary-date reads use this same
+typed concatenation; original receipts and files remain unchanged.
 
 Search only that key column in caller-admitted chunks before candidate payload
 groups and temporary natural-key construction. Typed temporal statistics can
