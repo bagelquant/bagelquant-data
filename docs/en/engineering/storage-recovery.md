@@ -124,6 +124,18 @@ under one definition/parent/lease fence. Cancellation/failure preserves committe
 partial work and the previous complete receipt. Every registered original is
 immutable and retained for frozen replay; queries never adopt loose files.
 
+External Item publication validates every full consumed selection, not just its
+physical dataset identity. Distinct declared aliases require distinct frozen
+selections; field supersets and retained versions can substantiate narrower
+projections, while strictness and required historical-baseline visibility remain
+explicit. Public receipts cover explicit declaration bounds; unbounded
+declarations allow finite captures, and native validated input windows may narrow
+declared bounds. Physical dependency edges remain deduplicated even when a stored
+definition declares several selections from the same source. Null explicit
+version dates and invalid selections fail the entire group's preflight before
+output or completion writes. Replacement-generated withdrawals receive the
+replacement cutoff and never fabricate null version dates.
+
 ## Completion flags and normal planning
 
 `raw.completion_statuses` and `items.completion_statuses` batch-read small node

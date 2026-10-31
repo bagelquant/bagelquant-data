@@ -61,18 +61,20 @@ class StandardNormalizer:
             else frame
         )
         renamed_names = set(lf.collect_schema().names())
+        schema = lf.collect_schema()
         expressions: list[pl.Expr] = [pl.lit(context.source).alias("source")]
         if "asset_id" in renamed_names:
             expressions.append(pl.col("asset_id").cast(pl.String).alias("asset_id"))
         if "time" in renamed_names:
-            expressions.append(_date_expr("time").alias("time"))
+            expressions.append(_date_expr("time", schema["time"]).alias("time"))
         if "period" in renamed_names:
-            expressions.append(_date_expr("period").alias("period"))
+            expressions.append(_date_expr("period", schema["period"]).alias("period"))
         accepted = lf.with_columns(expressions)
         if spec.update_type == "by_date":
             source_dates = spec.source_time_fields or ("time",)
+            accepted_schema = accepted.collect_schema()
             accepted = accepted.with_columns(
-                pl.coalesce([_date_expr(field) for field in source_dates]).alias(
+                pl.coalesce([_date_expr(field, accepted_schema[field]) for field in source_dates]).alias(
                     "source_time"
                 )
             ).with_columns(pl.col("source_time").alias("time"))
@@ -81,11 +83,19 @@ class StandardNormalizer:
         return NormalizeResult(accepted=accepted, rejected=rejected)
 
 
-def _date_expr(field: str) -> pl.Expr:
+def _date_cast_expr(field: str, dtype: pl.DataType, *, strict: bool = False) -> pl.Expr:
+    """Parse ISO strings explicitly; retain typed Date/Datetime/epoch casts."""
+    if dtype == pl.String:
+        return pl.col(field).str.strip_chars().str.strptime(pl.Date, "%Y-%m-%d", strict=strict)
+    return pl.col(field).cast(pl.Date, strict=strict)
+
+
+def _date_expr(field: str, dtype: pl.DataType) -> pl.Expr:
+    """Retain compact provider dates and ordinary typed/ISO date semantics."""
     return (
         pl.when(pl.col(field).cast(pl.String).str.len_chars() == 8)
         .then(
             pl.col(field).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False)
         )
-        .otherwise(pl.col(field).cast(pl.Date, strict=False))
+        .otherwise(_date_cast_expr(field, dtype))
     )

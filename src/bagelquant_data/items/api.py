@@ -18,6 +18,7 @@ from time import perf_counter
 import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
+from bagelquant_data.core.normalization import _date_cast_expr
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.execution import ExecutionOptions
 from bagelquant_data.pipeline.versions import VERSION_FIELDS, commit_versions
@@ -42,6 +43,75 @@ def _definition_hash(spec: DataItemSpec) -> str:
     """Bind all numerical declaration fields, retaining description as prose."""
     definition = {key: value for key, value in spec_payload(spec).items() if key != "description"}
     return hashlib.sha256(_json(definition).encode()).hexdigest()
+
+
+def _validate_input_selections(spec: DataItemSpec, receipt: FrozenInputReceipt | None,
+                               *, narrowed_windows: bool = False) -> None:
+    """Bind every declared selection to distinct sufficient frozen evidence.
+
+    Alias labels may change and versions retain history/snapshot projections.
+    Unbounded declarations permit caller-bounded captures. Explicit declaration
+    bounds must be covered; only native preparation may narrow them using its
+    already validated input_windows. No numerical work or historical reads occur.
+    """
+    if receipt is None:
+        if spec.inputs:
+            raise ValueError("DataItem dependency publication requires an input_receipt")
+        return
+    actual = tuple(receipt.requests.values())
+
+    def covers(declared, captured):
+        if type(declared) is not type(captured):
+            return False
+        if isinstance(declared, RawInput):
+            if (declared.source, declared.dataset) != (captured.source, captured.dataset):
+                return False
+            if captured.fields and (not declared.fields or not set(declared.fields).issubset(captured.fields)):
+                return False
+            if declared.include_historical_baseline and not captured.include_historical_baseline:
+                return False
+        elif declared.name != captured.name:
+            return False
+        if declared.strict != captured.strict or captured.view not in {declared.view, "versions"}:
+            return False
+        intervals = [("start", "end")]
+        if isinstance(declared, RawInput):
+            intervals.append(("observation_start", "observation_end"))
+        for lower, upper in intervals:
+            first, last = (getattr(declared, name) for name in (lower, upper))
+            begin, stop = (getattr(captured, name) for name in (lower, upper))
+            first, last, begin, stop = (
+                None if value is None else _date_value(value)
+                for value in (first, last, begin, stop))
+            if begin is not None and stop is not None and stop < begin:
+                return False
+            if narrowed_windows:
+                if (first is not None and (begin is None or begin < first)
+                        or last is not None and (stop is None or stop > last)):
+                    return False
+            elif (first is not None and begin is not None and begin > first
+                    or last is not None and stop is not None and stop < last
+                    or first is not None and stop is not None and stop < first
+                    or last is not None and begin is not None and begin > last):
+                return False
+        return True
+
+    # A broad capture may match several declarations. Rematch earlier choices
+    # instead of greedily consuming the only witness for a later selection.
+    matched: dict[int, int] = {}
+
+    def match(index, visited):
+        for candidate, captured in enumerate(actual):
+            if candidate in visited or not covers(spec.inputs[index], captured):
+                continue
+            visited.add(candidate)
+            if candidate not in matched or match(matched[candidate], visited):
+                matched[candidate] = index
+                return True
+        return False
+
+    if len(actual) != len(spec.inputs) or any(not match(index, set()) for index in range(len(spec.inputs))):
+        raise ValueError("Frozen input receipt does not match declared DataItem input selections")
 
 
 def _pointwise_scope_extension(previous, requests, *, policy, completed_start, completed_end,
@@ -455,8 +525,8 @@ class ItemAPI:
             db.execute("delete from item_dependencies where item_name=?", (spec.name,))
             db.executemany(
                 "insert into item_dependencies values(?,?,?,?)",
-                [(spec.name, "raw", value.source, value.dataset) if isinstance(value, RawInput)
-                 else (spec.name, "item", "items", value.name) for value in spec.inputs],
+                sorted({(spec.name, "raw", value.source, value.dataset) if isinstance(value, RawInput)
+                 else (spec.name, "item", "items", value.name) for value in spec.inputs}),
             )
             self._store._write_dataset(db, physical)
         if category_id is not None:
@@ -1134,13 +1204,8 @@ class ItemAPI:
         if expected_definition_hash is not None and definition_hash != expected_definition_hash:
             raise RuntimeError("DataItem definition changed while computing producer output")
         receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
-        if spec.inputs and receipt is None:
-            raise ValueError("DataItem dependency publication requires an input_receipt")
+        _validate_input_selections(spec, receipt, narrowed_windows=_baseline_proven)
         if receipt is not None:
-            def identity(value):
-                return ("raw", value.source, value.dataset) if isinstance(value, RawInput) else ("item", value.name)
-            if {identity(value) for value in spec.inputs} != {identity(value) for value in receipt.requests.values()}:
-                raise ValueError("Frozen input receipt does not match declared DataItem dependencies")
             if _verification is not None and not (_verification.active and _verification.owner is self
                       and _verification.receipt_id == receipt.receipt_id
                       and _verification.digest == receipt.digest):
@@ -1345,6 +1410,10 @@ class ItemAPI:
         tombstones = removed.select("time", "asset_id").with_columns(pl.lit(None, dtype=scalar_dtype(spec.value_dtype)).alias("value"))
         from bagelquant_data.core.schema import concat_compatible_frames
         combined = concat_compatible_frames([normalized, tombstones]) if tombstones.height else normalized
+        # Replacement assigns one explicit cutoff to every row, including new
+        # tombstones. Do not fabricate null version dates while aligning them
+        # with a previously versioned output schema.
+        combined = combined.drop("version_available_date", strict=False)
         return self._ingest(name, combined, available_date=cutoff,
             historical_baseline=historical_baseline, ingested_at=None,
             input_receipt=input_receipt, expected_definition_hash=expected_definition_hash,
@@ -1398,17 +1467,12 @@ class ItemAPI:
         if len({value.name for value in values}) != len(values):
             raise ValueError("Publication item names must be unique")
         receipt = None if input_receipt is None else self._lake.inputs.get(input_receipt)
-        def identity(value):
-            return ("raw", value.source, value.dataset) if isinstance(value, RawInput) else ("item", value.name)
         for value in values:
             spec = self.get(value.name)
             definition_hash = _definition_hash(spec)
             if value.expected_definition_hash is not None and value.expected_definition_hash != definition_hash:
                 raise RuntimeError("DataItem definition changed while computing producer output")
-            if spec.inputs and receipt is None:
-                raise ValueError("DataItem dependency publication requires an input_receipt")
-            if receipt is not None and {identity(v) for v in spec.inputs} != {identity(v) for v in receipt.requests.values()}:
-                raise ValueError("Frozen input receipt does not match declared DataItem dependencies")
+            _validate_input_selections(spec, receipt)
             if value.start is not None and value.end is not None and _date_value(value.end) < _date_value(value.start):
                 raise ValueError("end precedes start")
             if not value.frame.is_empty() or value.start is not None:
@@ -1902,12 +1966,12 @@ class ItemAPI:
             frame = frame.with_columns(pl.col("time").alias("available_date"))
         collision = [value for key, value in mapping.items() if key != value and value in frame.columns]
         frame = frame.drop(collision).rename({key: value for key, value in mapping.items() if key != value})
-        frame = frame.with_columns(pl.col("time").cast(pl.Date, strict=True), pl.col("asset_id").cast(pl.String, strict=True), pl.col("value").cast(scalar_dtype(spec.value_dtype), strict=True))
+        frame = frame.with_columns(_date_cast_expr("time", frame.schema["time"], strict=True), pl.col("asset_id").cast(pl.String, strict=True), pl.col("value").cast(scalar_dtype(spec.value_dtype), strict=True))
         if frame.select(pl.any_horizontal(pl.col("time").is_null(), pl.col("asset_id").is_null(), pl.col("asset_id").str.strip_chars().str.len_chars() == 0).any()).item():
             raise ValueError("DataItem keys must not be null")
         frame = frame.with_columns(
-            (pl.col("observation_date").cast(pl.Date) if "observation_date" in frame.columns else pl.col("time")).alias("observation_date"),
-            (pl.col("available_date").cast(pl.Date) if "available_date" in frame.columns else pl.col("time")).alias("available_date"),
+            (_date_cast_expr("observation_date", frame.schema["observation_date"], strict=True) if "observation_date" in frame.columns else pl.col("time")).alias("observation_date"),
+            (_date_cast_expr("available_date", frame.schema["available_date"], strict=True) if "available_date" in frame.columns else pl.col("time")).alias("available_date"),
         )
         frame = frame.with_columns(
             pl.when(pl.col("value").is_null() & pl.col(name).is_null()).then(pl.col("time")).otherwise(pl.col(name)).alias(name)
@@ -1916,7 +1980,9 @@ class ItemAPI:
         if frame["available_date"].null_count() or frame["observation_date"].null_count():
             raise ValueError("DataItem evidence dates must not be null")
         if "version_available_date" in frame.columns:
-            frame = frame.with_columns(pl.col("version_available_date").cast(pl.Date, strict=True))
+            frame = frame.with_columns(_date_cast_expr("version_available_date", frame.schema["version_available_date"], strict=True))
+            if frame["version_available_date"].null_count():
+                raise ValueError("DataItem version availability dates must not be null")
         return frame.sort("time", "asset_id", *( ["version_available_date"] if "version_available_date" in frame.columns else []))
 
     def _build(self, name: str, *, start: date, end: date, initialize: bool, config: ExecutionOptions | None, stack: tuple[str, ...],

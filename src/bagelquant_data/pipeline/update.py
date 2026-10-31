@@ -889,7 +889,7 @@ def _split_daily_scope_results(
         if request.request_date_field in frame.columns
         else _source_column(spec, "time")
     )
-    scoped = frame.with_columns(_date_expr(time_column).alias("__scope_date"))
+    scoped = frame.with_columns(_date_expr(time_column, frame.schema[time_column]).alias("__scope_date"))
     groups = {key[0]: value.drop("__scope_date")
               for key, value in scoped.partition_by("__scope_date", as_dict=True, maintain_order=True).items()}
     nonempty: list[tuple[pl.DataFrame, LedgerRequest]] = []
@@ -1192,7 +1192,7 @@ def _validate_response(
     )
     if date_field not in frame.columns:
         return f"response missing request date column: {date_field}"
-    values = frame.select(_date_expr(date_field).alias("d"))["d"]
+    values = frame.select(_date_expr(date_field, frame.schema[date_field]).alias("d"))["d"]
     if values.null_count():
         return "response contains invalid dates"
     expected = {_date_value(scope.scope_key) for scope in request.daily_scopes} or {
@@ -1547,7 +1547,7 @@ def _fetch_and_prepare_response(*, spec, source_adapter, ledger_request, request
                     return PreparedFetch(tuple(replace(page, frame=None) for page in pages), frame,
                                          f"response missing source date column: {time_column}")
                 selected_dates = [_date_value(scope.scope_key) for scope in ledger_request.daily_scopes]
-                frame = frame.filter(_date_expr(time_column).is_in(selected_dates))
+                frame = frame.filter(_date_expr(time_column, frame.schema[time_column]).is_in(selected_dates))
         allow_all_null_payload = request_options.get("allow_all_null_payload", False)
         if not isinstance(allow_all_null_payload, bool):
             raise ValueError("source_options.allow_all_null_payload must be boolean")

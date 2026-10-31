@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 import polars as pl
 
+from bagelquant_data.core.normalization import _date_cast_expr
+
 
 FORWARD_FILL_RUNTIME_VERSION = 2
 
@@ -199,11 +201,9 @@ def materialize_daily_pit(
     if not period_sessions or observations.is_empty():
         return _empty(observations.schema.get("value", pl.Float64))
     prepared = observations.with_columns(
-        pl.col(policy.observation_date_field)
-        .cast(pl.Date, strict=False)
+        _date_cast_expr(policy.observation_date_field, observations.schema[policy.observation_date_field])
         .alias("observation_date"),
-        pl.col(base_available_date_field)
-        .cast(pl.Date, strict=False)
+        _date_cast_expr(base_available_date_field, observations.schema[base_available_date_field])
         .alias("base_available_date"),
         pl.col("asset_id").cast(pl.String),
     ).drop_nulls(["observation_date", "base_available_date", "asset_id"])
@@ -307,7 +307,7 @@ def _derived_panel(
     return (
         observations.with_columns(
             pl.max_horizontal(
-                pl.col("time").cast(pl.Date),
+                _date_cast_expr("time", observations.schema["time"], strict=True),
                 pl.col("available_date"),
             ).alias("time")
         )
@@ -334,7 +334,7 @@ def _reject_conflicting_versions(frame: pl.DataFrame) -> None:
 def _open_sessions(calendar: pl.DataFrame) -> list[date]:
     if "time" not in calendar.columns:
         raise ValueError("availability calendar is missing time")
-    frame = calendar.with_columns(pl.col("time").cast(pl.Date, strict=False))
+    frame = calendar.with_columns(_date_cast_expr("time", calendar.schema["time"]))
     if "is_open" in frame.columns:
         frame = frame.filter(pl.col("is_open").cast(pl.Int64) == 1)
     sessions = (

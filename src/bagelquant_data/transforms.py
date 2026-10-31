@@ -13,6 +13,8 @@ from typing import Any, Literal, TypeAlias
 
 import polars as pl
 
+from bagelquant_data.core.normalization import _date_cast_expr
+
 
 _DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
     "float64": pl.Float64, "float32": pl.Float32,
@@ -220,12 +222,12 @@ def align_panel(
             raise ValueError(f"{name} contains duplicate time-asset keys")
         if any(frame[key].null_count() for key in keys):
             raise ValueError(f"{name} has null time-asset keys")
-    grid = coordinates.select(keys).with_columns(pl.col("time").cast(pl.Date), pl.col("asset_id").cast(pl.String))
-    events = observations.with_columns(pl.col("time").cast(pl.Date), pl.col("asset_id").cast(pl.String))
+    grid = coordinates.select(keys).with_columns(_date_cast_expr("time", coordinates.schema["time"], strict=True), pl.col("asset_id").cast(pl.String))
+    events = observations.with_columns(_date_cast_expr("time", observations.schema["time"], strict=True), pl.col("asset_id").cast(pl.String))
     if available_column not in events.columns:
         events = events.with_columns(pl.col("time").alias(available_column))
     else:
-        events = events.with_columns(pl.col(available_column).cast(pl.Date))
+        events = events.with_columns(_date_cast_expr(available_column, events.schema[available_column], strict=True))
     if events[available_column].null_count():
         raise ValueError("availability dates must not be null")
     # Observations cannot be exposed before either their observation date or

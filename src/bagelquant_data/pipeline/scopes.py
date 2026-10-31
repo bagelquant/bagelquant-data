@@ -603,7 +603,7 @@ def _calendar_dates(spec: DatasetSpec, raw: RawQueryService) -> list[date]:
     if "is_open" in frame.columns:
         frame = frame.filter(pl.col("is_open").cast(pl.Int8, strict=False) == 1)
     return (
-        frame.select(_date_expr("time").alias("value"))
+        frame.select(_date_expr("time", frame.schema["time"]).alias("value"))
         .drop_nulls()
         .unique()
         .sort("value")

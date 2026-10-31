@@ -202,7 +202,14 @@ publish tombstones; historical versions remain. Direct neutral results use
 
 Direct output with declared dependencies must pass `input_receipt` from
 `lake.inputs.freeze`; Data verifies the input identities and stores that receipt
-with its commit. `expected_definition_hash` rejects definitions changed during
+with its commit. Every declared selection needs its own matching frozen selection,
+including repeated inputs from one dataset. Receipt aliases may differ; selected
+fields must cover the declaration, strictness must agree, and the retained view
+must match or retain all versions. Explicit declaration windows must be covered;
+an unbounded declaration permits a finite caller-selected capture. Native builds
+can narrow explicit windows through validated `input_windows`. Receipts must retain
+historical baselines when the declaration requires them.
+`expected_definition_hash` rejects definitions changed during
 external computation. Without explicit availability evidence, direct ingestion
 becomes visible at collection time. Historical baseline ingestion remains
 explicit and strict reads exclude it. Complete external ranges use
@@ -219,6 +226,9 @@ expected_definition_hash=...)` carries historical versions; supply `start`,
 `end` and `complete_at` together to certify a complete range. Every group
 preflights its target definitions, dependency identities and frames before
 writing and uses the ordinary historical-ingest and complete-range commit path.
+Explicit `version_available_date` values must be non-null valid dates. Invalid
+version dates and mismatched input selections fail group preflight before any
+member publishes output or completion evidence.
 Returned reports describe each table's last suboperation, not cumulative rows.
 For a complete publication, both historical-ingest witnesses and final checks
 retain the declared observation range. Mixed unchanged/new rows in October
