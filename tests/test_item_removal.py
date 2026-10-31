@@ -58,6 +58,10 @@ def _protected(lake, receipts):
         tables = {row[0] for row in db.execute("select name from sqlite_master where type='table'")}
         rows = {}
         for table in sorted(tables):
+            if table == "data_currentness_clock":
+                # This mutable admission token must change when target evidence
+                # is removed; it is not unrelated immutable history.
+                continue
             if table == "data_meta_state":
                 rows[table] = [tuple(row) for row in db.execute("select * from data_meta_state where key not like 'item_removal:%' order by rowid")]
             elif table == "sqlite_sequence":
@@ -94,6 +98,7 @@ def _protected(lake, receipts):
 def test_exact_risk_publications_and_visibility_removed_shared_history_unchanged(tmp_path, monkeypatch):
     lake, upstream, regular, source, output = _setup(tmp_path)
     before = _protected(lake, (upstream, regular, source))
+    before_state = lake.inputs.currentness_identity()
     plan = lake.integrity.item_removal_plan(TARGETS)
     assert plan["required_receipts"] == [output.receipt_id]
     assert {row["kind"] for row in plan["files"]} == {"content", "visibility"}
@@ -107,6 +112,7 @@ def test_exact_risk_publications_and_visibility_removed_shared_history_unchanged
     assert result["status"] == "complete" and result["bytes"] == plan["bytes"]
     assert all(not (lake.lake_path / row["path"]).exists() for row in plan["files"])
     assert _protected(lake, (upstream, regular, source)) == before
+    assert lake.inputs.currentness_identity() != before_state
     for name in TARGETS:
         with pytest.raises(KeyError):
             lake.items.get(name, include_inactive=True)
@@ -221,6 +227,7 @@ def test_unsafe_file_cannot_detach_or_unlink_any_original(tmp_path, unsafe):
 def test_interrupted_file_cleanup_resumes_without_touching_recreated_name(tmp_path, monkeypatch):
     lake, upstream, regular, source, output = _setup(tmp_path)
     before = _protected(lake, (upstream, regular, source))
+    before_state = lake.inputs.currentness_identity()
     plan = lake.integrity.item_removal_plan(TARGETS, discard_receipts=[output.receipt_id])
     specs = [lake.items.get(name) for name in TARGETS]
     old_unlink, calls = Path.unlink, []
@@ -233,6 +240,7 @@ def test_interrupted_file_cleanup_resumes_without_touching_recreated_name(tmp_pa
     with pytest.raises(OSError, match="interruption"):
         lake.integrity.remove_items(plan)
     assert _protected(lake, (upstream, regular, source)) == before
+    assert lake.inputs.currentness_identity() != before_state
     assert not lake.integrity.active_update_leases()
     with pytest.raises(KeyError):
         lake.items.get(TARGETS[0])
@@ -253,6 +261,7 @@ def test_interrupted_file_cleanup_resumes_without_touching_recreated_name(tmp_pa
 def test_forced_process_exit_requires_exact_owner_recovery_then_resumes(tmp_path):
     lake, upstream, regular, source, output = _setup(tmp_path)
     before = _protected(lake, (upstream, regular, source))
+    before_state = lake.inputs.currentness_identity()
     plan = lake.integrity.item_removal_plan(TARGETS, discard_receipts=[output.receipt_id])
     plan_file = tmp_path / "remove.json"
     plan_file.write_text(json.dumps(plan))
@@ -273,6 +282,7 @@ lake.integrity.remove_items(plan)
     worker = subprocess.run([sys.executable, "-c", script, str(tmp_path)], timeout=30, check=False)
     assert worker.returncode == 23
     assert _protected(lake, (upstream, regular, source)) == before
+    assert lake.inputs.currentness_identity() != before_state
     assert len(lake.integrity.active_update_leases()) == len(TARGETS)
     with pytest.raises(ConfigurationError, match="active Data"):
         lake.integrity.remove_items(plan)

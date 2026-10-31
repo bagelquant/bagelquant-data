@@ -32,18 +32,13 @@ class SourceManager:
             raise ConfigurationError(
                 "Source name must be a safe path component and cannot be 'items'"
             )
-        saved_options = {
-            key: value
-            for key, value in self.metadata.source_options(str(name)).items()
-            if value != "<redacted>"
-        }
+        saved_options = _replay_options(self.metadata.source_options(str(name)))
         if saved_options and hasattr(source, "configure"):
             source.configure(**saved_options)  # type: ignore[attr-defined]
         self.registries.sources.register(str(name), source)
         self.metadata.upsert_source(
             str(name),
             type(source).__name__,
-            configured=bool(saved_options),
         )
 
     def remove(self, name: str) -> None:
@@ -88,3 +83,12 @@ class SourceManager:
 
     def test(self, name: str) -> None:
         self.get(name).test_connection()  # type: ignore[attr-defined]
+
+
+def _replay_options(value: Any) -> Any:
+    """Replay ordinary configuration without passing credential placeholders."""
+    if isinstance(value, dict):
+        return {key: _replay_options(item) for key, item in value.items() if item != "<redacted>"}
+    if isinstance(value, list):
+        return [_replay_options(item) for item in value if item != "<redacted>"]
+    return value

@@ -179,11 +179,12 @@ def refresh_completion_dependencies(db, original, source, *, output_commit, outp
 def save_completion(db, build_id, *, pending=(), authority=None, checked_target=None,
                     publish_node=True) -> None:
     """Publish original range authority atomically with its pending coordinates."""
-    db.execute("create table if not exists item_completion_proofs(build_id integer primary key, digest text not null)")
+    from bagelquant_data.storage.currentness import create_tracked_table
+    create_tracked_table(db, "item_completion_proofs", "create table if not exists item_completion_proofs(build_id integer primary key, digest text not null)")
     original = db.execute("select * from item_builds where id=?", (build_id,)).fetchone()
     digest = hashlib.sha256(_json(dict(original)).encode()).hexdigest()
     db.execute("insert into item_completion_proofs values(?,?)", (build_id, digest))
-    db.execute("create table if not exists item_completion_authorities(build_id integer primary key, "
+    create_tracked_table(db, "item_completion_authorities", "create table if not exists item_completion_authorities(build_id integer primary key, "
                "payload_json text not null,digest text not null)")
     pending_payload = _json({"completion_digest": digest, "coordinates": sorted(set(pending))})
     check_bound = (authority["output_check_bound"] if authority is not None and "output_check_bound" in authority
@@ -196,7 +197,7 @@ def save_completion(db, build_id, *, pending=(), authority=None, checked_target=
         hashlib.sha256(payload.encode()).hexdigest()))
     # Persist an explicit empty list too: losing a pending record cannot silently
     # turn a completed calculation into a fully visible publication.
-    db.execute("create table if not exists item_pending_outputs(build_id integer primary key, "
+    create_tracked_table(db, "item_pending_outputs", "create table if not exists item_pending_outputs(build_id integer primary key, "
                "payload_json text not null,digest text not null)")
     payload = pending_payload
     db.execute("insert into item_pending_outputs values(?,?,?)", (build_id, payload,

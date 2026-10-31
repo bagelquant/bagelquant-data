@@ -27,6 +27,25 @@ An identical thin receipt digest reuses its original receipt ID. Different
 cutoffs, declarations or retained boundaries remain distinct immutable evidence;
 only selected semantic identities govern numerical reuse.
 
+Currentness-state tokens use a separate optional metadata index. Fresh stores
+install a clock and mutation triggers; existing stores require explicit
+`integrity.initialize_currentness_index()` maintenance. The index tracks the
+registered definitions, schemas, completion state, commits, checks, builds and
+completion authorities previously inspected by currentness admission. Frozen
+Source identity changes count only when referenced by a build, using an indexed
+lookup. Dynamically created completion tables attach their tracking in the same
+transaction. Triggers cover direct maintenance SQL and roll back with the write.
+Fixed schema/trigger checks and clock reads replace historical row scans.
+
+The token binds an index epoch, revision and fresh mutation nonce, so independent
+copies cannot alias after equal numbers of different mutations. It is an
+admission shortcut under the existing publication fences, never numerical
+identity, readiness certification or a replacement for original-byte audits.
+Unrelated tracked writes may conservatively invalidate a shortcut without
+invalidating unchanged numerical history. Missing/damaged tracking fails with
+explicit maintenance instructions; opening never initializes an old index or
+falls back to a historical scan. A held WAL view retains its original token.
+
 `inputs.get/describe/request_identity` do not expand historical evidence. The
 public `FrozenInputReceipt.evidence` is an explicit lazy Mapping: field/sequence
 access consumes only the corresponding registered metadata. Ordinary unchanged

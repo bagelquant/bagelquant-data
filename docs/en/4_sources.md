@@ -11,8 +11,14 @@ lake.catalog.sources.register(TushareSource())
 lake.catalog.sources.configure("tushare", token="runtime-secret")
 ```
 
-Credentials remain runtime configuration and are redacted from persisted public
-configuration. Dataset mappings, China-market calendars and availability
+Credentials remain runtime configuration. Data recursively replaces token,
+password, secret, credential, API-key and authorization fields with redacted
+markers before saving source options. Adapter registration restores ordinary
+options and never replays credential markers or older persisted credentials.
+Registration and configuration preserve an existing disabled source; only
+`enable()` enables it. Existing metadata and backups may already contain older
+credential bytes; ordinary opening does not scrub or vacuum that history.
+Dataset mappings, China-market calendars and availability
 conventions are caller declarations. Data defaults to neutral UTC timing; it
 does not infer exchange sessions or China semantics.
 

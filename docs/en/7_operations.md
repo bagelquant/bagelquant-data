@@ -56,6 +56,29 @@ not reclaim any lease automatically, and an expired heartbeat never establishes
 process exit. An interrupted standalone lease can be recovered by its exact
 reported owner only after the coordinator verifies its publisher has exited.
 
+## Currentness admission index
+
+`inputs.currentness_identity()` reads a bounded metadata token for an independently
+validated complete publication. It is separate from `inputs.is_current()` and
+the full original-byte audit in `inputs.verify()`. The token tracks authoritative
+metadata changes transactionally, without scanning historical checks or builds.
+Unrelated frozen Sources and optional proof preparation do not change it.
+
+New metadata databases initialize this optional index. Existing schema-9 databases
+remain unchanged on opening. If a caller needs a token and the index is absent
+or damaged, Data requests explicit maintenance:
+
+```python
+result = lake.integrity.initialize_currentness_index()
+```
+
+Run this explicitly on a writable lake under normal maintenance admission. It
+holds a finite SQLite writer transaction, creates tracking triggers and the
+referenced-Source lookup index, and returns `schema` and `identity`. Cancellation
+rolls back the operation. It reads no numerical values, calls no providers and
+changes no frozen receipts, completion evidence or original files. A new index
+epoch invalidates old shortcuts; it never requests historical recalculation.
+
 ## Storage usage and temporary cleanup
 
 ```python

@@ -343,8 +343,8 @@ class DataMetaStore:
         self,
         name: str,
         adapter: str,
-        configured: bool = False,
-        enabled: bool = True,
+        configured: bool | None = None,
+        enabled: bool | None = None,
         options: dict[str, Any] | None = None,
     ) -> None:
         self.ensure_writable()
@@ -352,29 +352,29 @@ class DataMetaStore:
         options_json = (
             None
             if options is None
-            else json.dumps(options, sort_keys=True, default=str)
+            else json.dumps(_redact_options(options), sort_keys=True, default=str)
         )
         with self.connect() as db:
             db.execute(
                 """
                 insert into sources(name, adapter, configured, enabled, options_json, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, coalesce(?,0), coalesce(?,1), ?, ?, ?)
                 on conflict(name) do update set
                     adapter=excluded.adapter,
-                    configured=excluded.configured,
-                    enabled=excluded.enabled,
+                    configured=coalesce(?,sources.configured),
+                    enabled=coalesce(?,sources.enabled),
                     options_json=coalesce(excluded.options_json, sources.options_json),
                     active=1,
                     updated_at=excluded.updated_at
                 """,
-                (name, adapter, int(configured), int(enabled), options_json, now, now),
+                (name, adapter, configured, enabled, options_json, now, now, configured, enabled),
             )
 
     def source_options(self, name: str) -> dict[str, Any]:
         rows = self._rows("select options_json from sources where name = ?", (name,))
         if not rows or not rows[0].get("options_json"):
             return {}
-        return json.loads(str(rows[0]["options_json"]))
+        return _redact_options(json.loads(str(rows[0]["options_json"])))
 
     def remove_source(self, name: str) -> None:
         self.ensure_writable()
@@ -2031,6 +2031,8 @@ class DataMetaStore:
                         now,
                     ),
                 )
+                from .currentness import initialize
+                initialize(db)
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -2127,12 +2129,12 @@ def _api_result_kind(row: dict[str, Any]) -> str:
 
 
 def _redact_options(options: dict[str, Any]) -> dict[str, Any]:
-    redacted = dict(options)
-    for key in list(redacted):
-        if (
-            "token" in key.lower()
-            or "secret" in key.lower()
-            or "password" in key.lower()
-        ):
-            redacted[key] = "<redacted>"
-    return redacted
+    def redact(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: ("<redacted>" if any(part in str(key).lower()
+                for part in ("token", "secret", "password", "credential", "api_key", "authorization"))
+                else redact(item)) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [redact(item) for item in value]
+        return value
+    return redact(options)

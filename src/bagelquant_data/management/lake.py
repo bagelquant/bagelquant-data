@@ -470,6 +470,18 @@ class IntegrityAPI:
         self._lake = lake
         self._status = StatusManager(lake._data_meta, lake._paths)
 
+    def initialize_currentness_index(self, *, check_canceled: Callable[[], None] = lambda: None) -> dict[str, str]:
+        """Explicitly initialize optional metadata tracking; never audit values.
+
+        Existing Sources, receipts and numerical artifacts remain unchanged.
+        The new epoch invalidates earlier currentness shortcuts only.
+        """
+        from bagelquant_data.storage.currentness import initialize
+
+        with self._lake._data_meta.atomic_transaction() as db:
+            identity = initialize(db, check_canceled=check_canceled)
+        return {"schema": "data.currentness.index.v1", "identity": identity}
+
     def reopen_raw_initialization(self, dataset: str, *, source: str, start: DateLike, end: DateLike,
                                   reason: str) -> dict[str, Any]:
         """Reopen unchanged, prematurely completed Raw before any incremental evidence.

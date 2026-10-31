@@ -476,7 +476,8 @@ class InputsAPI:
         self._shared_context: _ReadContext | None = None
         if not self._store.read_only:
             with self._store.connect() as db:
-                db.execute("create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null unique,created_at text not null)")
+                from bagelquant_data.storage.currentness import create_tracked_table
+                create_tracked_table(db, "frozen_inputs", "create table if not exists frozen_inputs(receipt_id text primary key,payload_json text not null,digest text not null unique,created_at text not null)")
 
     def _read_context(self) -> _ReadContext | None:
         path = self._metadata_path
@@ -817,38 +818,11 @@ class InputsAPI:
             raise ValueError("Currentness state requires an unbounded current Data view")
         context = self._read_context()
         options = config or (context.options if context is not None else ExecutionOptions())
-        digest = hashlib.sha256(b"data.currentness.state.v1\n")
-        # Mutable declarations, publication heads, visibility/completion records
-        # and original completion bindings. Optional selectors and new unrelated
-        # frozen Sources do not change these authorities. No row values or
-        # immutable metadata descendants are expanded or audited here.
-        tables = ("datasets", "dataset_schemas", "item_definitions", "item_dependencies",
-            "node_completions", "version_commits", "version_checks", "item_builds",
-            "item_completion_proofs", "item_completion_authorities", "item_pending_outputs",
-            "item_completion_attestations")
+        from bagelquant_data.storage.currentness import identity
         with self._store.read_view() as db:
             if receipt is not None:
                 self.get(receipt)
-            for table in tables:
-                check_canceled()
-                present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-                digest.update(_json((table, bool(present))).encode() + b"\n")
-                if not present:
-                    continue
-                for index, row in enumerate(db.execute(f'SELECT * FROM "{table}" ORDER BY rowid')):
-                    if index % 128 == 0:
-                        check_canceled()
-                    size = sum(sys.getsizeof(cell) for cell in row)
-                    if size * 8 > options.max_buffer_bytes:
-                        raise MemoryError("Currentness metadata row exceeds max_buffer_bytes")
-                    digest.update(_json(tuple(row)).encode() + b"\n")
-            for index, row in enumerate(db.execute("SELECT b.id,f.receipt_id,f.digest FROM item_builds b "
-                    "LEFT JOIN frozen_inputs f ON f.receipt_id=b.frozen_receipt_id ORDER BY b.id")):
-                if index % 128 == 0:
-                    check_canceled()
-                digest.update(_json(tuple(row)).encode() + b"\n")
-        check_canceled()
-        return digest.hexdigest()
+            return identity(db, max_buffer_bytes=options.max_buffer_bytes, check_canceled=check_canceled)
 
     @staticmethod
     def selection_descriptor_identity(descriptor: Mapping[str, Any]) -> str:

@@ -250,7 +250,8 @@ class ItemAPI:
                     "where seq=? and source='items' and dataset=? and status='committed'",
                     (attestation.result_commit, attestation.name)).fetchone() is None:
                 raise ValueError("Completion result commit is not an original committed item publication")
-            db.execute("create table if not exists item_completion_attestations("
+            from bagelquant_data.storage.currentness import create_tracked_table
+            create_tracked_table(db, "item_completion_attestations", "create table if not exists item_completion_attestations("
                 "build_id integer primary key,payload_json text not null,digest text not null)")
             saved = db.execute("select digest from item_completion_attestations where build_id=?",
                 (attestation.build_id,)).fetchone()
@@ -377,30 +378,29 @@ class ItemAPI:
         self._update_policies: dict[tuple[str, str], ProducerUpdatePolicy] = {}
         if not self._store.read_only:
             with self._store.connect() as db:
-                db.executescript("""
-                    create table if not exists item_definitions (
+                from bagelquant_data.storage.currentness import create_tracked_table
+                create_tracked_table(db, "item_definitions", """create table if not exists item_definitions (
                         name text primary key, spec_json text not null,
                         spec_hash text not null, active integer not null default 1
-                    );
-                    create table if not exists item_dependencies (
+                    )""")
+                create_tracked_table(db, "item_dependencies", """create table if not exists item_dependencies (
                         item_name text not null, kind text not null,
                         source text not null, dataset text not null,
                         primary key(item_name,kind,source,dataset)
-                    );
-                    create table if not exists item_builds (
+                    )""")
+                create_tracked_table(db, "item_builds", """create table if not exists item_builds (
                         id integer primary key, name text not null,
                         definition_hash text not null, dependency_digest text not null,
                         start_date text not null, end_date text not null,
                         input_commit integer not null, result_commit integer,
                         status text not null, created_at text not null,
                         frozen_receipt_id text not null
-                    );
-                    create table if not exists item_initializations (
+                    )""")
+                db.execute("""create table if not exists item_initializations (
                         name text primary key, definition_hash text not null,
                         start_date text not null, end_date text not null,
                         status text not null
-                    );
-                """)
+                    )""")
 
     def register(self, spec: DataItemSpec, *, category_id: str | None = None,
                  expected_definition_hash: str | None = None) -> None:
