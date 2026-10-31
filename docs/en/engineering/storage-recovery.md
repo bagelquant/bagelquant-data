@@ -96,6 +96,18 @@ General projections against their originals. It stores no data body, per-row int
 Arrow recovery copy. Typed observation key tokens are temporary read/commit
 projections; `_record_id` and `_payload_hash` are not stored in original Parquet.
 
+Live and frozen reads compare observation keys and first-visibility witnesses
+under the same lossless consumed schema. Compatible width changes such as Int32
+to Int64 preserve strict historical visibility and resolve later same-key
+revisions once. Any necessary virtual-key re-encoding is local to consumption;
+original Parquet, event files and frozen receipt identities are unchanged.
+Key schema admission uses metadata and requires a lossless conversion over each
+declared key type. Mixed Int64/Float64 keys are rejected before publication,
+including when an incoming float is exact, because Float64 cannot distinguish
+every retained Int64 above `2**53`. String/numeric key coercion is also rejected.
+No historical scan, index preparation or numerical replay is used to admit a
+key schema change.
+
 Runtime `general_intervals` requires same-date, timing-neutral consumed fields
 and declares inclusive-start/exclusive-end tuple-local date effects. Explicit
 General preparation stores only original-Source-bound changed-tuple interval

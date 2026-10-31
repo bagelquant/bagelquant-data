@@ -14,6 +14,10 @@ from typing import Any, Literal, TypeAlias
 import polars as pl
 
 from bagelquant_data.core.normalization import _date_cast_expr
+from bagelquant_data.core.schema import lossless_cast
+
+
+MAP_VALUES_RUNTIME_VERSION = 2
 
 
 _DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
@@ -62,7 +66,7 @@ class Filter:
 
 @dataclass(frozen=True, slots=True)
 class MapValues:
-    """Map categorical/scalar values, retaining unmapped values by default."""
+    """Map scalar values with a lossless common dtype and retain unmapped values."""
     column: str
     mapping: Mapping[Any, Any]
     output_column: str | None = None
@@ -178,10 +182,8 @@ def apply_transforms(
                 raise ValueError(f"Unsupported filter operator: {operation.operator}")
             frame = frame.filter(expressions[operation.operator]())
         elif isinstance(operation, MapValues):
-            frame = frame.with_columns(
-                pl.col(operation.column).replace(dict(operation.mapping))
-                .alias(operation.output_column or operation.column)
-            )
+            frame = frame.with_columns(_map_values(frame[operation.column], operation)
+                .alias(operation.output_column or operation.column))
         elif isinstance(operation, Cast):
             frame = frame.with_columns(
                 pl.col(name).cast(scalar_dtype(dtype), strict=True)
@@ -203,6 +205,22 @@ def apply_transforms(
                 available_column=operation.available_column,
             )
     return frame
+
+
+def _map_values(source: pl.Series, operation: MapValues) -> pl.Series:
+    """Do not let replacement truncate literals to the source's integer dtype."""
+    if not operation.mapping:
+        return source
+    originals = [pl.Series("value", [value]) for value in operation.mapping.values()]
+    dtype = pl.concat([source.head(0).rename("value").to_frame(),
+        *(value.head(0).to_frame() for value in originals)], how="vertical_relaxed").schema["value"]
+    keys = pl.concat([lossless_cast(pl.Series("key", [key]), source.dtype)
+        for key in operation.mapping])
+    values = pl.concat([lossless_cast(value, dtype) for value in originals])
+    # Only retained values need conversion. An overwritten large integer or
+    # infinite value must not make an otherwise lossless replacement fail.
+    default = lossless_cast(source.set(source.is_in(keys.implode(), nulls_equal=True), None), dtype)
+    return source.replace_strict(keys, values, default=default, return_dtype=dtype)
 
 
 def align_panel(

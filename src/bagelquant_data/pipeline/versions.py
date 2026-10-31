@@ -22,6 +22,7 @@ from bagelquant_data.core.dataset import DatasetSpec, record_key
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.core.schema import (
     align_frame,
+    compatible_key_schema,
     compatible_schema,
 )
 from bagelquant_data.storage.parquet import (
@@ -288,6 +289,10 @@ def commit_versions(
     changed_fields = None
     if spec.update_type == "by_date":
         keys = list(record_key(spec))
+        stored = parquet.canonical_schema(spec.source, spec.name)
+        comparison = compatible_key_schema([frame.schema, *([] if stored is None else [stored])], keys)
+        frame = frame.with_columns(pl.col(key).cast(comparison[key])
+            for key in keys if frame.schema[key] != comparison[key])
         frame = frame.with_columns(_record_hashes(frame, keys, parquet.metadata.data_meta_path))
         payload = sorted(set(frame.columns) - {"time", "year", "month", "_record_id", "_dependency_digest"})
         if preserve_semantic_timing:
@@ -339,6 +344,10 @@ def commit_versions(
                 .collect()
             )
             if old.height:
+                if any(old.schema[key] != comparison[key] for key in keys):
+                    from bagelquant_data.storage.recovery import with_record_key
+                    old = with_record_key(old.drop("_record_id").with_columns(
+                        pl.col(key).cast(comparison[key]) for key in keys), keys=keys)
                 old = old.drop("_payload_hash") if "_payload_hash" in old.columns else old
                 common_schema = compatible_schema([frame.select(payload).schema,
                     old.select([field for field in payload if field in old.columns]).schema])

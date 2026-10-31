@@ -10,7 +10,7 @@ from bagelquant_data.storage.paths import LakePaths
 import polars as pl
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.core.exceptions import DatasetNotFoundError
-from bagelquant_data.core.schema import align_lazy_frame, compatible_schema
+from bagelquant_data.core.schema import align_lazy_frame, compatible_key_schema, lossless_cast
 from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.parquet import ParquetStore
 from bagelquant_data.storage.atomic import _filesystem_path
@@ -217,11 +217,14 @@ class RawQueryService:
             pl.scan_parquet(paths, hive_partitioning=False)
             for paths in grouped.values()
         ]
-        schema = compatible_schema(
+        definition = self.metadata.get_dataset(source,dataset)
+        extra = () if definition is None else tuple(json.loads(definition["spec_json"]).get("primary_key_extra",()))
+        keys = ["source_time", "asset_id", *extra]
+        schema = compatible_key_schema(
             [
                 *([canonical] if canonical is not None else []),
                 *(f.collect_schema() for f in frames),
-            ]
+            ], keys,
         )
         aligned = [align_lazy_frame(f, schema, list(schema)) for f in frames]
         if "source_time" in schema:
@@ -231,9 +234,6 @@ class RawQueryService:
                 aligned = [f.filter(pl.col("source_time") >= _date_value(observation_start)) for f in aligned]
             if observation_end is not None:
                 aligned = [f.filter(pl.col("source_time") <= _date_value(observation_end)) for f in aligned]
-            definition = self.metadata.get_dataset(source,dataset)
-            extra = () if definition is None else tuple(json.loads(definition["spec_json"]).get("primary_key_extra",()))
-            keys = ["source_time","asset_id",*extra]
             from bagelquant_data.storage.recovery import with_record_key
             keyed_schema = {**dict(schema),"_record_id":pl.String}
             aligned = [f.map_batches(lambda frame:with_record_key(frame,keys=keys),schema=keyed_schema,
@@ -359,8 +359,20 @@ def _attested_versions(
         # SQL-style equality drops null keys and merges signed float zero.
         # Match complete typed natural keys temporarily; originals store no hash.
         observation_keys = [name for name in natural_keys if name != "_commit_seq"]
-        event_schema = {**dict(event_frame.collect_schema()),"_record_id":pl.String}
-        event_frame = event_frame.map_batches(lambda part, keys=observation_keys:with_record_key(part,keys=keys),
+        # Original rows and visibility events can retain different losslessly
+        # widened key types. Hash both using the consumed comparison schema.
+        comparison = frame.collect_schema()
+        event_types = event_frame.collect_schema()
+        compatible_key_schema([event_types, comparison], observation_keys)
+        # Compact selection projections may retain an original-bound record ID
+        # while omitting extra key columns. Those channels keep their original
+        # event types; absence is not authority to reinterpret their keys.
+        key_types = {key: comparison[key] for key in observation_keys
+            if key in comparison and event_types[key] != comparison[key]}
+        event_schema = {**dict(event_types), **key_types, "_record_id": pl.String}
+        event_frame = event_frame.map_batches(lambda part, keys=observation_keys, types=key_types:
+            with_record_key(part.with_columns(lossless_cast(part[key], dtype).alias(key)
+                for key, dtype in types.items()), keys=keys),
             schema=event_schema,predicate_pushdown=False,projection_pushdown=False,slice_pushdown=False)
         witnessed = frame.filter(pl.col("_baseline")).join(
             event_frame.select("_commit_seq","_record_id","_attested_date"),

@@ -179,6 +179,13 @@ def project_original(store, batch, *, max_bytes, check_canceled=None, values=Fal
         if work is not None:
             work["owned_transport_bytes"] += len(raw)
     requested: list[str] = [*COLUMNS, *(["value"] if values else []), *(fields or ())]
+    # A consumed projection may omit extra keys, but PIT witness matching still
+    # needs their original types and values until version resolution completes.
+    # Retain them only in this bounded working projection, never in proof bodies.
+    with store.connect() as db:
+        original_bounds = describe_bounds(db, batch, max_bytes=max_bytes // 8)
+    if original_bounds is not None and original_bounds["record"]:
+        requested.extend(original_bounds.get("keys") or ("source_time", "asset_id"))
     columns = tuple(dict[str, None].fromkeys(requested))
     project_batch(store, batch["partition_path"], batch["commit_seq"], batch["content_hash"],
                   columns=columns, consume=consume, buffer_bytes=max_bytes // 2,

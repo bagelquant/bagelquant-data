@@ -34,3 +34,10 @@ retries: Raw owns pacing, attempts, cancellation, pagination and completeness.
 HTTP or invalid-envelope failures cannot certify empty coverage. Injected fake
 clients remain supported for isolated tests. This change has fake-transport
 validation; no live provider validation or measured network speedup is implied.
+
+The documented endpoint remains `http://api.tushare.pro`. Its token and response
+payloads therefore travel without transport encryption or server authentication.
+A supported authenticated TLS endpoint has not been established from the provider
+documentation. Do not assume HTTPS support or change the endpoint without that
+evidence; this transport limitation remains unresolved. This assessment required
+no provider request or credential access.

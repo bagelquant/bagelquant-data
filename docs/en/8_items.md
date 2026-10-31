@@ -178,6 +178,22 @@ coordinates; missing values stay null. Forward filling requires a finite
 `forward_fill_sessions` and explicit coordinate dates, respects availability,
 and stops at a superseding null event.
 
+`MapValues` chooses a common output dtype and verifies exact round trips for
+replacement literals and retained, unmapped values. For example, mapping integer
+`1` to `1.5` preserves `1.5`; mapping a null key is explicit, and an output-column
+name preserves the input column. Unsafe conversions fail instead of rounding
+large integers or truncating fractions. Integer values above `2**53` cannot
+silently pass through a Float64 output when they are not exactly representable.
+
+Native Items containing `MapValues` bind implementation version 2 in their
+numerical identity. Existing older definitions remain readable, together with
+their frozen receipts. Planning, execution and publication require explicit
+re-registration of such a definition before using the corrected implementation.
+Re-registration establishes a changed numerical definition; rebuild its affected
+history explicitly before continuing. Opening or browsing never performs this
+maintenance. External producer revisions and native Items without `MapValues`
+retain their existing identities.
+
 Complex computations register an external producer by stable key/revision:
 
 ```python

@@ -12,7 +12,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from bagelquant_data.core.schema import concat_compatible_frames
+from bagelquant_data.core.schema import align_frame, compatible_key_schema, concat_compatible_frames
 from bagelquant_data.storage.data_meta import DataMetaStore
 from bagelquant_data.storage.paths import LakePaths
 
@@ -401,6 +401,21 @@ def with_record_key(frame: pl.DataFrame, *, keys: list[str] | None = None) -> pl
     # producer/query caller selects the exact declared compound key when needed.
     from bagelquant_data.pipeline.versions import _payload_hashes
     return frame.with_columns(_payload_hashes(frame,keys or ["source_time","asset_id"]).rename("_record_id"))
+
+
+def combine_original_frames(frames: list[pl.DataFrame], *, keys: list[str]) -> pl.DataFrame:
+    """Align immutable consumed pieces and their virtual keys without rewriting originals."""
+    if not frames:
+        return pl.DataFrame()
+    schema = compatible_key_schema((frame.schema for frame in frames), keys)
+    widened = any(any(key in frame.schema and frame.schema[key] != schema[key]
+        for key in keys) for frame in frames)
+    aligned = [align_frame(frame, schema) for frame in frames]
+    if widened and "_record_id" in schema:
+        # Original-bound hashes were created before schema reconciliation.
+        # Rebind only this consumed comparison, leaving retained bytes intact.
+        aligned = [with_record_key(frame.drop("_record_id"), keys=keys) for frame in aligned]
+    return pl.concat(aligned, how="vertical", rechunk=False) if len(aligned) > 1 else aligned[0]
 
 
 def _primitive_audit_key(dtype: pl.DataType) -> bool:

@@ -19,11 +19,12 @@ import polars as pl
 
 from bagelquant_data.core.dataset import DatasetSpec
 from bagelquant_data.core.normalization import _date_cast_expr
+from bagelquant_data.core.schema import lossless_cast
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.execution import ExecutionOptions
 from bagelquant_data.pipeline.versions import VERSION_FIELDS, commit_versions
 from bagelquant_data.query.raw import RawQueryService, _date_value
-from bagelquant_data.transforms import Cast, Filter, MapValues, Select, apply_transforms, scalar_dtype
+from bagelquant_data.transforms import MAP_VALUES_RUNTIME_VERSION, Cast, Filter, MapValues, Select, apply_transforms, scalar_dtype
 
 from .types import BuildContext, DataItemSpec, ItemBuildReport, ItemCompletionAttestation, ItemInput, ItemPublication, Producer, ProducerUpdatePolicy, RawInput, input_payload, spec_from_payload, spec_payload
 from .pit import _comparison_frame, _same_ordered_rows, general_input_snapshot, iter_computed_versions
@@ -42,6 +43,8 @@ def _json(value: Any) -> str:
 def _definition_hash(spec: DataItemSpec) -> str:
     """Bind all numerical declaration fields, retaining description as prose."""
     definition = {key: value for key, value in spec_payload(spec).items() if key != "description"}
+    if not spec.producer_key and any(isinstance(value, MapValues) for value in spec.transforms):
+        definition["native_transform_versions"] = {"MapValues": MAP_VALUES_RUNTIME_VERSION}
     return hashlib.sha256(_json(definition).encode()).hexdigest()
 
 
@@ -614,6 +617,7 @@ class ItemAPI:
             yield
 
     def _policy(self, spec: DataItemSpec) -> ProducerUpdatePolicy | None:
+        self._require_current_implementation(spec)
         if spec.producer_key:
             return self._update_policies.get((spec.producer_key, str(spec.producer_revision)))
         if spec.time_column not in {"time", "source_time"}:
@@ -627,6 +631,15 @@ class ItemAPI:
             if isinstance(operation, MapValues) and (operation.output_column or operation.column) in {"time", "source_time"}:
                 return None
         return ProducerUpdatePolicy("same_date")
+
+    def _require_current_implementation(self, spec: DataItemSpec) -> None:
+        """Keep old numerical completions readable without continuing old native semantics."""
+        if spec.producer_key or not any(isinstance(value, MapValues) for value in spec.transforms):
+            return
+        rows = self._store._rows("select spec_hash from item_definitions where name=? and active=1", (spec.name,))
+        if rows and rows[0]["spec_hash"] != _definition_hash(spec):
+            raise ValueError("Native MapValues implementation changed; explicitly re-register the DataItem "
+                "definition and rebuild its affected history before continuing updates")
 
     def recertify(self, name: str, *, end: DateLike, start: DateLike = "2000-01-01",
                   update_policy: ProducerUpdatePolicy | None = None,
@@ -1198,6 +1211,7 @@ class ItemAPI:
         self._store.ensure_writable()
         semantic_timing = "version_available_date" in frame.columns if _semantic_timing is None else _semantic_timing
         spec = self.get(name)
+        self._require_current_implementation(spec)
         explicit_availability = "available_date" in frame.columns or "version_available_date" in frame.columns
         frame = self._normalize(spec, frame)
         definition_hash = _definition_hash(spec)
@@ -1966,6 +1980,8 @@ class ItemAPI:
             frame = frame.with_columns(pl.col("time").alias("available_date"))
         collision = [value for key, value in mapping.items() if key != value and value in frame.columns]
         frame = frame.drop(collision).rename({key: value for key, value in mapping.items() if key != value})
+        if not spec.producer_key and any(isinstance(value, MapValues) for value in spec.transforms):
+            frame = frame.with_columns(lossless_cast(frame["value"], cast(pl.DataType, scalar_dtype(spec.value_dtype))))
         frame = frame.with_columns(_date_cast_expr("time", frame.schema["time"], strict=True), pl.col("asset_id").cast(pl.String, strict=True), pl.col("value").cast(scalar_dtype(spec.value_dtype), strict=True))
         if frame.select(pl.any_horizontal(pl.col("time").is_null(), pl.col("asset_id").is_null(), pl.col("asset_id").str.strip_chars().str.len_chars() == 0).any()).item():
             raise ValueError("DataItem keys must not be null")
@@ -2003,6 +2019,7 @@ class ItemAPI:
         if cancelled and cancelled():
             return ItemBuildReport(name, "cancelled", 0, None, 0, start, end, "")
         spec = frozen_spec or self.get(name)
+        self._require_current_implementation(spec)
         self._validate_output_anchors(spec, pinned_policy or self._policy(spec))
         from dataclasses import replace
         requests = dict(frozen_receipt.requests) if frozen_receipt is not None else self._input_requests(spec, input_windows)

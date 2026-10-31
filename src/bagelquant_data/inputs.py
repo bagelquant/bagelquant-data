@@ -22,11 +22,11 @@ import polars as pl
 from bagelquant_data.core.hashing import frame_content_hash
 import pyarrow as pa
 
-from bagelquant_data.core.schema import align_frame, compatible_schema, concat_compatible_frames
+from bagelquant_data.core.schema import concat_compatible_frames
 from bagelquant_data.core.types import DateLike
 from bagelquant_data.items.types import DataInput, ItemInput, RawInput, input_from_payload, input_payload
 from bagelquant_data.query.raw import _date_value
-from bagelquant_data.storage.recovery import read_batch, verify_batch
+from bagelquant_data.storage.recovery import combine_original_frames, read_batch, verify_batch
 from bagelquant_data.execution import ExecutionOptions
 from bagelquant_data.storage import immutable_metadata
 
@@ -1862,7 +1862,8 @@ class InputsAPI:
         from bagelquant_data import input_index
         evidence = frozen.evidence[alias]
         coordinate_identity = None if coordinates is None else input_index.identity(coordinates)
-        frame = concat_compatible_frames(pieces) if pieces else pl.DataFrame()
+        frame = combine_original_frames(pieces,
+            keys=["source_time", "asset_id", *evidence["definition"].get("primary_key_extra", ())])
         if fields is not None and not frame.width:
             # An empty consumed projection still has the original declared
             # types. This uses receipt metadata, never original batch bytes.
@@ -3890,7 +3891,8 @@ class InputsAPI:
                     buffered += projected.estimated_size() * 2
                     if projected.width:
                         pieces.append(projected)
-            versions = concat_compatible_frames(pieces) if pieces else pl.DataFrame()
+            versions = combine_original_frames(pieces,
+                keys=["source_time", "asset_id", *evidence["definition"].get("primary_key_extra", ())])
             witnesses = len(evidence["record_checks"]) + versions.height * len(evidence.get("full_commit_checks", ()))
             if witnesses * max(128, versions.estimated_size() // max(1, versions.height)) > budget // 2:
                 raise MemoryError("Timing metadata exceeds max_buffer_bytes")
@@ -4178,8 +4180,8 @@ class InputsAPI:
             # Inference belongs to ingestion. Frozen reads combine typed
             # Originals, including empty/all-null windows, without erasing
             # their registered numeric, category or temporal types.
-            schema = compatible_schema(piece.schema for piece in pieces)
-            frame = pl.concat([align_frame(piece, schema) for piece in pieces], how="vertical", rechunk=False)
+            frame = combine_original_frames(pieces,
+                keys=["source_time", "asset_id", *evidence["definition"].get("primary_key_extra", ())])
         elif evidence["schema_ipc"]:
             schema = pa.ipc.read_schema(pa.BufferReader(bytes.fromhex(evidence["schema_ipc"])))
             frame = cast(pl.DataFrame, pl.from_arrow(pa.Table.from_batches([], schema=schema)))
