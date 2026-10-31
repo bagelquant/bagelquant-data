@@ -703,9 +703,11 @@ class InputsAPI:
                     if context is not None and len(certificates) * 2048 > context.options.max_buffer_bytes // 4:
                         raise MemoryError("Frozen completion metadata exceeds max_buffer_bytes")
 
+            certificates.sort()
+
             def covers(lower, upper, commit=0, check=0):
                 following = lower
-                for left, right, content, checked in sorted(certificates):
+                for left, right, content, checked in certificates:
                     if content < commit or checked < check or right < following:
                         continue
                     if left > following:
@@ -733,23 +735,42 @@ class InputsAPI:
                 for check in evidence[channel]:
                     if cutoff is not None and _date_value(check["pit_date"]) > cutoff:
                         continue
-                    queries = json.loads(check["request_json"])
-                    if not queries:
-                        # Row-scoped same-value attestations have no declared
-                        # range. Require a stronger complete consumer-range
-                        # certificate that includes this original witness.
-                        if not covers(first, last, commit=check["visible_commit"] or 0, check=check["id"]):
-                            return False
-                        continue
-                    scopes = [query["item_range"] for query in queries if "item_range" in query]
-                    if not scopes or len(scopes) != len(queries):
+                    try:
+                        queries = json.loads(check["request_json"])
+                    except (TypeError, ValueError):
                         return False
-                    for scope in scopes:
-                        lower = max(first, _date_value(scope["start"]))
-                        upper = min(last, _date_value(scope["end"]))
+                    if not isinstance(queries, list):
+                        return False
+                    unknown_scope = not queries
+                    for query in queries:
+                        if not isinstance(query, dict) or not query:
+                            return False
+                        if set(query) != {"item_range"}:
+                            unknown_scope = True
+                        if "item_range" not in query:
+                            continue
+                        scope = query["item_range"]
+                        if (not isinstance(scope, dict) or not isinstance(scope.get("start"), str)
+                                or not isinstance(scope.get("end"), str)):
+                            return False
+                        if set(scope) != {"start", "end"}:
+                            unknown_scope = True
+                        try:
+                            lower, upper = _date_value(scope["start"]), _date_value(scope["end"])
+                        except (TypeError, ValueError):
+                            return False
+                        if upper < lower:
+                            return False
+                        lower, upper = max(first, lower), min(last, upper)
                         if lower <= upper and not covers(lower, upper,
                                 commit=check["visible_commit"] or 0, check=check["id"]):
                             return False
+                    # Row-only or unsupported scope, including native timing
+                    # attestations, requires a complete consumer-range witness
+                    # at or after this original content/check boundary.
+                    if unknown_scope and not covers(first, last,
+                            commit=check["visible_commit"] or 0, check=check["id"]):
+                        return False
             return True
 
     def request_identity(self, receipt: FrozenInputReceipt | str, alias: str) -> str:

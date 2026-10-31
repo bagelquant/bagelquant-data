@@ -188,6 +188,33 @@ def test_scalar_values_survive_storage_and_freeze(tmp_path, dtype, values):
     assert lake.inputs.verify(receipt)["valid"]
 
 
+@pytest.mark.parametrize("dtype", ["datetime", pl.Datetime, pl.Datetime("us")])
+def test_canonical_datetime_spec_forms_preserve_materialized_and_frozen_values(tmp_path, dtype):
+    lake = lake_at(tmp_path)
+    spec = DataItemSpec("timestamp", value_dtype=dtype)
+    assert spec == DataItemSpec("timestamp", value_dtype="datetime")
+    lake.items.register(spec)
+    values = [datetime(2020, 1, 1, 12, 34, 56, 123456), None]
+    frame = pl.DataFrame({
+        "time": [date(2020, 1, 1), date(2020, 1, 2)],
+        "asset_id": ["A", "A"], "value": values,
+    })
+    lake.items.ingest("timestamp", frame, ingested_at=datetime(2020, 1, 1, tzinfo=UTC))
+    receipt = lake.inputs.freeze({"timestamp": ItemInput("timestamp")})
+
+    assert lake_at(tmp_path).items.get("timestamp") == spec
+    for actual in (lake.items.read("timestamp").collect(), lake.inputs.read(receipt, "timestamp").collect()):
+        assert actual.schema["value"] == pl.Datetime("us")
+        assert actual["value"].to_list() == values
+    assert lake.inputs.verify(receipt)["valid"]
+
+
+@pytest.mark.parametrize("dtype", [pl.Datetime("ms"), pl.Datetime("ns"), pl.Datetime("us", "UTC")])
+def test_datetime_spec_rejects_unsupported_precision_or_timezone(dtype):
+    with pytest.raises(ValueError, match="Unsupported DataItem scalar dtype"):
+        DataItemSpec("timestamp", value_dtype=dtype)
+
+
 def test_initialization_pins_definition_and_range_and_resumes(tmp_path):
     lake = lake_at(tmp_path)
     raw_prices(lake)

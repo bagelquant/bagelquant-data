@@ -25,6 +25,8 @@ _DTYPES: dict[str, pl.DataType | type[pl.DataType]] = {
 
 def scalar_dtype(value: str | pl.DataType | type[pl.DataType]) -> pl.DataType | type[pl.DataType]:
     """Resolve a supported scalar dtype without importing a numerical package."""
+    if isinstance(value, pl.Datetime) and value.time_unit == "us" and value.time_zone is None:
+        return _DTYPES["datetime"]
     key = str(value).lower()
     if key in {"str", "utf8"}:
         key = "string"

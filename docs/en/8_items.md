@@ -12,6 +12,11 @@ A DataItem has unique deterministic `(time, asset_id)` keys and a declared scala
 `value` type: floats, integers, booleans, strings, dates, datetimes or categorical.
 Definitions, dependencies and producer revisions persist in the Data SQLite.
 
+The `datetime` scalar is timezone-free with microsecond precision. The string
+`"datetime"`, Polars class `pl.Datetime` and exact instance `pl.Datetime("us")`
+declare the same stored type. Other datetime precisions and timezone-bearing
+instances are rejected rather than silently normalized to that type.
+
 Availability-policy mappings accept integer session counts and integer strings.
 Booleans and floating-point values are rejected before coercion, so a fractional
 buffer cannot silently advance availability. Buffers remain nonnegative;

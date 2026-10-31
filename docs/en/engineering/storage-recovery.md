@@ -246,7 +246,11 @@ Complete external ItemPublication binds its declared observation range to
 initial ingest witnesses as well as final replacement checks. Mixed same-value
 and new rows cannot invalidate disjoint complete or empty points. Initial
 ingest never publishes a range certificate; completion remains the final
-successful replacement's authority. Preserve conservative row-only witnesses.
+successful replacement's authority. Preserve conservative row-only witnesses. Frozen completion can admit an
+unsupported visibility scope only when an authenticated complete consumer-range
+certificate includes its original content/check boundary. Native timing witnesses
+use this same rule; missing proofs, later row-only changes and malformed declared
+ranges cannot borrow narrower or older completion authority.
 Optional inputs.completed_range(as_of=...) narrows the original cutoff and
 requires both original producer and completion-check availability. Earlier
 partial rows cannot borrow a later certificate; use captured immutable check
@@ -470,6 +474,9 @@ Backups copy the metadata snapshot and all retained original content/visibility
 files. Total metadata loss requires restoration of that trusted backup. Unverified
 snapshot copies remain explicitly unverified; strict backup audits required
 original evidence. Preserve historical receipts, lake identity and declarations.
+Both copy modes validate new destinations against original metadata, all SQLite
+sidecar names and the lake before writing. Database setup and copy failures clean
+only the newly created destination database, sidecars and lake.
 Snapshot and verified export share one inventory from the copied SQLite view:
 manifest generations, every committed version segment and all registered
 visibility events. Deduplicate confined physical paths; reject malformed paths,

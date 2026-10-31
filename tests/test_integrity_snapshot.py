@@ -92,8 +92,12 @@ def test_snapshot_cleanup_is_confined_to_new_destinations(tmp_path, monkeypatch)
     assert unrelated.read_text() == "preserved"
 
 
-@pytest.mark.parametrize("kind", ["inside_lake", "contains_lake", "contains_metadata", "same_metadata", "future_sidecar"])
-def test_snapshot_rejects_source_overlap_before_writes(tmp_path, kind):
+@pytest.mark.parametrize("operation", ["snapshot", "backup"])
+@pytest.mark.parametrize("kind", [
+    "inside_lake", "contains_lake", "contains_metadata", "same_metadata", "future_sidecar",
+    "lake_at_sidecar", "lake_below_sidecar", "metadata_below_sidecar",
+])
+def test_snapshot_rejects_source_overlap_before_writes(tmp_path, kind, operation):
     lake, _ = prepared(tmp_path)
     metadata = tmp_path / "copy" / "meta.sqlite"
     target = tmp_path / "copy" / "lake"
@@ -105,11 +109,81 @@ def test_snapshot_rejects_source_overlap_before_writes(tmp_path, kind):
         target = lake.data_meta_path.parent
     elif kind == "same_metadata":
         metadata = lake.data_meta_path
-    else:
+    elif kind == "future_sidecar":
         metadata = lake.data_meta_path.with_name(lake.data_meta_path.name + "-journal")
+    else:
+        journal = lake.data_meta_path.with_name(lake.data_meta_path.name + "-journal")
+        if kind == "lake_at_sidecar":
+            target = journal
+        elif kind == "lake_below_sidecar":
+            target = journal / "lake"
+        else:
+            metadata = journal / "copy.sqlite"
+    before = evidence(tmp_path / "source")
     with pytest.raises((ValueError, FileExistsError)):
-        lake.integrity.snapshot(data_meta_path=metadata, lake_path=target)
+        getattr(lake.integrity, operation)(data_meta_path=metadata, lake_path=target)
+    assert evidence(tmp_path / "source") == before
+    assert not lake.data_meta_path.with_name(lake.data_meta_path.name + "-journal").exists()
     assert not (tmp_path / "copy").exists()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "backup"])
+@pytest.mark.parametrize("kind", ["metadata_in_lake", "lake_in_metadata", "lake_at_sidecar", "lake_below_sidecar"])
+def test_copy_rejects_overlapping_destination_roles_before_writes(tmp_path, operation, kind):
+    lake, _ = prepared(tmp_path)
+    metadata = tmp_path / "copy" / "meta.sqlite"
+    if kind == "metadata_in_lake":
+        target = metadata.parent
+    elif kind == "lake_in_metadata":
+        target = metadata / "lake"
+    else:
+        target = metadata.with_name(metadata.name + "-journal")
+        if kind == "lake_below_sidecar":
+            target = target / "lake"
+    before = evidence(tmp_path / "source")
+
+    with pytest.raises(ValueError):
+        getattr(lake.integrity, operation)(data_meta_path=metadata, lake_path=target)
+
+    assert evidence(tmp_path / "source") == before
+    assert not metadata.parent.exists()
+
+
+def test_backup_failed_database_copy_removes_only_new_destinations(tmp_path, monkeypatch):
+    lake, _ = prepared(tmp_path)
+    before = evidence(tmp_path / "source")
+    target = tmp_path / "copy" / "meta.sqlite"
+    original = sqlite3.connect
+
+    def fail_target(database, *args, **kwargs):
+        if database == target:
+            target.write_bytes(b"partial database")
+            raise OSError("target database unavailable")
+        return original(database, *args, **kwargs)
+
+    monkeypatch.setattr(backup.sqlite3, "connect", fail_target)
+    with pytest.raises(OSError, match="target database unavailable"):
+        lake.integrity.backup(data_meta_path=target, lake_path=target.parent / "lake")
+    assert evidence(tmp_path / "source") == before
+    assert not target.exists()
+    assert not (target.parent / "lake").exists()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "backup"])
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_copy_preserves_preexisting_target_metadata_and_sidecars(tmp_path, operation, suffix):
+    lake, _ = prepared(tmp_path)
+    target = tmp_path / "copy" / "meta.sqlite"
+    target.parent.mkdir()
+    existing = target.with_name(target.name + suffix)
+    existing.write_bytes(b"preserved destination")
+    before = evidence(tmp_path)
+
+    with pytest.raises(FileExistsError):
+        getattr(lake.integrity, operation)(data_meta_path=target, lake_path=target.parent / "lake")
+
+    assert evidence(tmp_path) == before
+    assert not (target.parent / "lake").exists()
 
 
 def test_snapshot_rejects_active_rollback_journal_without_cleanup_of_source(tmp_path):

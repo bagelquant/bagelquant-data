@@ -85,44 +85,37 @@ def export(
     authority and all historical metadata remain in the copied SQLite view.
     """
     target = LakePaths.open(data_meta_path=data_meta_path, lake_path=lake_path)
-    if target.data_meta_path.exists() or target.lake.exists():
-        raise FileExistsError("Data backup destinations must be new")
-    if target.data_meta_path.is_relative_to(paths.lake) or target.lake.is_relative_to(
-        paths.lake
-    ):
-        raise ValueError("Data backup must be outside the source lake")
-    if paths.lake.is_relative_to(target.lake):
-        raise ValueError("Data backup destination cannot contain the source lake")
+    sidecars = _validate_destinations(paths, target)
     target.data_meta_path.parent.mkdir(parents=True, exist_ok=True)
     target.lake.mkdir(parents=True)
-    with (
-        data_meta.connect() as reader,
-        closing(sqlite3.connect(target.data_meta_path)) as writer,
-    ):
-        reader.backup(writer)
-        writer.execute("pragma journal_mode=delete")
-        try:
-            location = Path(
-                os.path.relpath(target.lake, target.data_meta_path.parent)
-            ).as_posix()
-        except ValueError:
-            location = target.lake.as_posix()
-        with writer:
-            writer.execute(
-                "update data_meta_state set value=? where key='lake_location'",
-                (location,),
-            )
-    snapshot = DataMetaStore(data_meta_path=target.data_meta_path, read_only=True)
-    snapshot.bind_lake(target.lake)
     try:
+        with (
+            data_meta.connect() as reader,
+            closing(sqlite3.connect(target.data_meta_path)) as writer,
+        ):
+            reader.backup(writer)
+            writer.execute("pragma journal_mode=delete")
+            try:
+                location = Path(
+                    os.path.relpath(target.lake, target.data_meta_path.parent)
+                ).as_posix()
+            except ValueError:
+                location = target.lake.as_posix()
+            with writer:
+                writer.execute(
+                    "update data_meta_state set value=? where key='lake_location'",
+                    (location,),
+                )
+        snapshot = DataMetaStore(data_meta_path=target.data_meta_path, read_only=True)
+        snapshot.bind_lake(target.lake)
         for source,destination,_ in _immutable_files(snapshot,paths,target):
             Path(_filesystem_path(destination.parent)).mkdir(parents=True, exist_ok=True)
             shutil.copy2(_filesystem_path(source),_filesystem_path(destination))
         return verify(snapshot, target)
     except BaseException:
         shutil.rmtree(target.lake)
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            target.data_meta_path.with_name(target.data_meta_path.name+suffix).unlink(missing_ok=True)
+        for path in sidecars:
+            path.unlink(missing_ok=True)
         raise
 
 
@@ -183,20 +176,7 @@ def snapshot(data_meta: DataMetaStore, paths: LakePaths, *,
              data_meta_path: str | Path, lake_path: str | Path) -> dict[str, Any]:
     """Create an independent consistent copy, explicitly without full verification."""
     target = LakePaths.open(data_meta_path=data_meta_path, lake_path=lake_path)
-    sidecars = tuple(target.data_meta_path.with_name(target.data_meta_path.name + suffix)
-                     for suffix in ("", "-wal", "-shm", "-journal"))
-    original_metadata = {paths.data_meta_path.with_name(paths.data_meta_path.name + suffix)
-                         for suffix in ("", "-wal", "-shm", "-journal")}
-    if any(path.exists() or path.is_symlink() for path in (*sidecars, target.lake)):
-        raise FileExistsError("Data snapshot destinations must be new")
-    if (target.data_meta_path.is_relative_to(paths.lake)
-            or target.lake.is_relative_to(paths.lake)
-            or paths.lake.is_relative_to(target.lake)
-            or paths.data_meta_path.is_relative_to(target.lake)
-            or original_metadata.intersection(sidecars)):
-        raise ValueError("Data snapshot destinations must not overlap original storage")
-    if target.data_meta_path == target.lake or target.lake.is_relative_to(target.data_meta_path):
-        raise ValueError("Data metadata and lake destinations overlap")
+    sidecars = _validate_destinations(paths, target)
     target.data_meta_path.parent.mkdir(parents=True, exist_ok=True)
     target.lake.mkdir(parents=True)
     try:
@@ -224,3 +204,23 @@ def snapshot(data_meta: DataMetaStore, paths: LakePaths, *,
         for path in sidecars:
             path.unlink(missing_ok=True)
         raise
+
+
+def _validate_destinations(paths: LakePaths, target: LakePaths) -> tuple[Path, ...]:
+    """Keep both copy modes and their failure cleanup disjoint from originals."""
+    sidecars = tuple(target.data_meta_path.with_name(target.data_meta_path.name + suffix)
+                     for suffix in ("", "-wal", "-shm", "-journal"))
+    original_metadata = {paths.data_meta_path.with_name(paths.data_meta_path.name + suffix)
+                         for suffix in ("", "-wal", "-shm", "-journal")}
+    if any(path.exists() or path.is_symlink() for path in (*sidecars, target.lake)):
+        raise FileExistsError("Data copy destinations must be new")
+    if any(
+        destination.is_relative_to(original) or original.is_relative_to(destination)
+        for destination in (*sidecars, target.lake)
+        for original in (*original_metadata, paths.lake)
+    ):
+        raise ValueError("Data copy destinations must not overlap original storage")
+    if any(target.lake.is_relative_to(path) or path.is_relative_to(target.lake)
+           for path in sidecars):
+        raise ValueError("Data metadata and lake destinations overlap")
+    return sidecars

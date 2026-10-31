@@ -195,8 +195,11 @@ affect only the destination. macOS uses independent copy-on-write filesystem
 clones where supported; other filesystems/platforms fall back to independent
 file copies. All committed immutable value and visibility segments are copied; frozen
 receipts and compact headers remain in SQLite. No symlinks/hardlinks connect original and copy.
-Destinations must be new and must not overlap original metadata/sidecars/lake;
-failed-copy cleanup removes only those newly created destinations. `backup` and
+Both copy modes require new destinations outside original metadata, sidecars and
+the lake, including sidecar names that do not yet exist. The destination lake
+must also be disjoint from destination metadata and sidecar paths. Both modes
+reject overlaps before creating files. A failure during database setup, copying or verification
+removes only the newly created destination database, sidecars and lake. `backup` and
 `verify_backup` retain full verification of every retained proof.
 
 Direct `inputs.verify(source)` audits share one finite read-only SQLite snapshot

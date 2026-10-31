@@ -17,7 +17,12 @@ reference publication uses the writable publication guards described below.
 Item coverage inside the selected frozen Source. Sparse rows and entirely empty
 outputs can cover a complete range. The check uses original completion proofs,
 captured producer parents, content and visibility ceilings; later completion
-flags, builds and row-only ingests cannot extend that authority. It returns
+flags, builds and row-only ingests cannot extend that authority. A row-only or
+unsupported visibility scope, including a native timing attestation, requires
+authenticated complete coverage of the entire consumer range at or after that
+original content and output-check boundary. Recognized `item_range` witnesses
+retain their declared range checks. Malformed request containers, members or
+declared ranges remain unproved. It returns
 `False` for an unproved range, raises for damaged bindings, and rejects Raw
 aliases. It reads metadata only, honors the enclosing read context's buffer and
 cancellation limits, and creates no evidence. This proves completion in the
